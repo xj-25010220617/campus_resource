@@ -98,6 +98,9 @@ class Resource(models.Model):
         max_length=128, blank=True, default='',
         db_index=True, verbose_name='课程学期',
     )
+    chunk_count = models.IntegerField(
+        default=0, verbose_name='分块数量（RAG）',
+    )
     keywords = models.JSONField(
         default=list, blank=True, verbose_name='关键词列表',
     )
@@ -122,6 +125,51 @@ class Resource(models.Model):
 
     def __str__(self):
         return self.title
+
+
+class Chunk(models.Model):
+    """文档分块表（RAG向量化用的chunk，Milvus同步）"""
+    STATUS_CHOICES = [
+        ('pending', '待处理'),
+        ('embedding', '向量化中'),
+        ('indexed', '已入库'),
+        ('failed', '失败'),
+    ]
+
+    resource = models.ForeignKey(
+        Resource, on_delete=models.CASCADE,
+        related_name='chunks', verbose_name='所属资源'
+    )
+    chunk_index = models.IntegerField(verbose_name='分块序号（从0开始）')
+    chunk_text = models.TextField(verbose_name='分块文本内容')
+    page_number = models.IntegerField(default=0, verbose_name='页码')
+    seq_order = models.IntegerField(default=0, verbose_name='顺序号')
+    vector_id = models.CharField(
+        max_length=128, blank=True, default='',
+        db_index=True, verbose_name='Milvus向量ID'
+    )
+    status = models.CharField(
+        max_length=16, choices=STATUS_CHOICES, default='pending',
+        db_index=True, verbose_name='同步状态'
+    )
+    char_count = models.IntegerField(default=0, verbose_name='字符数')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    indexed_at = models.DateTimeField(null=True, blank=True, verbose_name='入库时间')
+
+    class Meta:
+        db_table = 'chunk'
+        verbose_name = '文档分块'
+        verbose_name_plural = verbose_name
+        ordering = ['resource_id', 'chunk_index']
+        unique_together = ['resource', 'chunk_index']
+        indexes = [
+            models.Index(fields=['resource', 'chunk_index'], name='idx_chunk_res_index'),
+            models.Index(fields=['vector_id'], name='idx_chunk_vector'),
+            models.Index(fields=['status'], name='idx_chunk_status'),
+        ]
+
+    def __str__(self):
+        return f'Chunk #{self.chunk_index} of {self.resource_id}'
 
 
 class Favorite(models.Model):

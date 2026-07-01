@@ -8,9 +8,10 @@ urlpatterns = [
     # API docs
     path('api/schema/', SpectacularAPIView.as_view(), name='schema'),
     path('api/docs/', SpectacularSwaggerView.as_view(url_name='schema'), name='swagger-ui'),
-    # App routes (后续逐步添加)
+    # App routes
     path('api/auth/', include('apps.accounts.urls')),
     path('api/', include('apps.classify.urls')),
     path('api/knowledge/', include('apps.knowledge.urls')),
     path('api/chat/', include('apps.chat.urls')),
+    path('api/feedback/', include('apps.feedback.urls')),
 ]

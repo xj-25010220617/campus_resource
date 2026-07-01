@@ -32,6 +32,7 @@ INSTALLED_APPS = [
     'apps.admin_panel',
     'apps.chat',
     'apps.knowledge',
+    'apps.feedback',
 ]
 
 MIDDLEWARE = [
