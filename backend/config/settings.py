@@ -31,6 +31,7 @@ INSTALLED_APPS = [
     'apps.resources',
     'apps.admin_panel',
     'apps.chat',
+    'apps.knowledge',
 ]
 
 MIDDLEWARE = [

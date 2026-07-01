@@ -53,6 +53,16 @@ class IsOwnerOrReadOnly(permissions.BasePermission):
         return False
 
 
+class IsLoginUser(permissions.BasePermission):
+    """登录用户权限 — 仅校验是否已认证，所有角色均可访问"""
+
+    def has_permission(self, request, view):
+        return (
+            request.user
+            and request.user.is_authenticated
+        )
+
+
 class IsAdminOrSuperAdmin(permissions.BasePermission):
     """admin 和 super_admin 可访问，user 不可"""
 

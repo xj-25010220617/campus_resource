@@ -11,5 +11,6 @@ urlpatterns = [
     # App routes (后续逐步添加)
     path('api/auth/', include('apps.accounts.urls')),
     path('api/', include('apps.classify.urls')),
+    path('api/knowledge/', include('apps.knowledge.urls')),
     path('api/chat/', include('apps.chat.urls')),
 ]
