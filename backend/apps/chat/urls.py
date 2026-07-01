@@ -1,9 +1,30 @@
-from django.urls import path
-from .views import ConversationListView, ConversationDetailView, AskView, FeedbackView
+from django.urls import path, include
+from rest_framework.routers import DefaultRouter
+
+from .views import (
+    ConversationViewSet,
+    MessageViewSet,
+    ConversationListView,
+    ConversationDetailView,
+    AskView,
+    FeedbackView,
+)
+
+router = DefaultRouter()
+router.register(r'conversations', ConversationViewSet, basename='conversation')
+router.register(r'message', MessageViewSet, basename='message')
 
 urlpatterns = [
-    path('conversations/', ConversationListView.as_view(), name='conversation_list'),
-    path('conversations/<int:pk>/', ConversationDetailView.as_view(), name='conversation_detail'),
+    # ViewSet 路由（支持 CRUD + 自定义 action）
+    path('', include(router.urls)),
+
+    # 旧接口兼容（如果前端已在用，可保留）
+    path('conversations-list/', ConversationListView.as_view(), name='conversation_list'),
+    path('conversations/<int:pk>/detail/', ConversationDetailView.as_view(), name='conversation_detail'),
+
+    # SSE 流式问答
     path('ask/', AskView.as_view(), name='chat_ask'),
+
+    # 旧版反馈接口
     path('feedback/', FeedbackView.as_view(), name='chat_feedback'),
 ]
