@@ -84,6 +84,9 @@ class CanManageUsers(permissions.BasePermission):
     用户管理权限。
     admin: 只能管理 role=user 的用户
     super_admin: 管理所有（除自己和同级 super_admin）
+
+    使用方式（在视图中显式声明即可）:
+        permission_classes = [IsAuthenticated, CanManageUsers]
     """
 
     def has_permission(self, request, view):
@@ -95,12 +98,12 @@ class CanManageUsers(permissions.BasePermission):
 
     def has_object_permission(self, request, view, obj):
         if request.user.role == 'super_admin':
-            # 不能删除/编辑自己和其他 super_admin
-            if view.action == 'destroy':
+            # DELETE 操作：不能删除自己和其他 super_admin
+            if request.method == 'DELETE':
                 return obj.id != request.user.id and obj.role != 'super_admin'
             return True
 
-        # admin 只能管理 user
+        # admin 只能管理 role=user 的用户
         if request.user.role == 'admin':
             return obj.role == 'user'
 

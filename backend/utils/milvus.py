@@ -19,7 +19,7 @@ class MilvusClient:
     """
 
     COLLECTION_NAME = 'campus_knowledge'
-    VECTOR_DIM = 1024  # DeepSeek Embedding 维度
+    VECTOR_DIM = 1536  # text-embedding-v3 维度（与 llm.py _mock_embed 保持一致）
 
     def __init__(self):
         self._connected = False
@@ -73,6 +73,9 @@ class MilvusClient:
                 FieldSchema(name='vector_id', dtype=DataType.VARCHAR, max_length=128),
                 FieldSchema(name='doc_id', dtype=DataType.INT64),
                 FieldSchema(name='chunk_index', dtype=DataType.INT32),
+                FieldSchema(name='chunk_text', dtype=DataType.VARCHAR, max_length=8192),
+                FieldSchema(name='page_number', dtype=DataType.INT32),
+                FieldSchema(name='seq_order', dtype=DataType.INT32),
                 FieldSchema(name='embedding', dtype=DataType.FLOAT_VECTOR, dim=self.VECTOR_DIM),
             ]
             schema = CollectionSchema(fields, description='校园知识库向量集合')
@@ -119,7 +122,8 @@ class MilvusClient:
         """
         批量插入 chunk 向量。
         参数:
-            chunks: [{'vector_id': str, 'doc_id': int, 'chunk_index': int}, ...]
+            chunks: [{'vector_id': str, 'doc_id': int, 'chunk_index': int,
+                      'chunk_text': str, 'page_number': int, 'seq_order': int}, ...]
             embeddings: [[0.1, 0.2, ...], ...]
         返回:
             vector_id 列表
@@ -135,6 +139,9 @@ class MilvusClient:
             [c['vector_id'] for c in chunks],
             [c['doc_id'] for c in chunks],
             [c['chunk_index'] for c in chunks],
+            [c.get('chunk_text', '') for c in chunks],
+            [c.get('page_number', 0) for c in chunks],
+            [c.get('seq_order', 0) for c in chunks],
             embeddings,
         ]
         collection.insert(data)
@@ -149,19 +156,28 @@ class MilvusClient:
         collection = client.get_collection(name=self.COLLECTION_NAME)
         ids = [c['vector_id'] for c in chunks]
         metadatas = [
-            {'doc_id': c['doc_id'], 'chunk_index': c['chunk_index']}
+            {
+                'doc_id': c['doc_id'],
+                'chunk_index': c['chunk_index'],
+                'page_number': c.get('page_number', 0),
+                'seq_order': c.get('seq_order', 0),
+            }
             for c in chunks
         ]
-        collection.add(ids=ids, embeddings=embeddings, metadatas=metadatas)
+        # ChromaDB 存储文档文本
+        documents = [c.get('chunk_text', '') for c in chunks]
+        collection.add(ids=ids, embeddings=embeddings, metadatas=metadatas, documents=documents)
         return ids
 
     # ------------------------------------------------------------------
     # 向量搜索
     # ------------------------------------------------------------------
-    def search(self, query_embedding: List[float], top_k: int = 20) -> List[dict]:
+    def search(self, query_embedding: List[float], top_k: int = 10) -> List[dict]:
         """
         向量相似度搜索。
-        返回: [{'vector_id': str, 'doc_id': int, 'chunk_index': int, 'score': float}, ...]
+        返回: [{'vector_id': str, 'doc_id': int, 'chunk_index': int,
+                'chunk_text': str, 'page_number': int, 'seq_order': int,
+                'score': float}, ...]
         """
         if self._connected:
             return self._search_milvus(query_embedding, top_k)
@@ -176,7 +192,8 @@ class MilvusClient:
             anns_field='embedding',
             param={'metric_type': 'COSINE', 'params': {'nprobe': 10}},
             limit=top_k,
-            output_fields=['vector_id', 'doc_id', 'chunk_index'],
+            output_fields=['vector_id', 'doc_id', 'chunk_index',
+                           'chunk_text', 'page_number', 'seq_order'],
         )
         hits = []
         for hit in results[0]:
@@ -184,6 +201,9 @@ class MilvusClient:
                 'vector_id': hit.entity.get('vector_id'),
                 'doc_id': hit.entity.get('doc_id'),
                 'chunk_index': hit.entity.get('chunk_index'),
+                'chunk_text': hit.entity.get('chunk_text', ''),
+                'page_number': hit.entity.get('page_number', 0),
+                'seq_order': hit.entity.get('seq_order', 0),
                 'score': hit.score,
             })
         return hits
@@ -195,13 +215,20 @@ class MilvusClient:
         )
         collection = client.get_collection(name=self.COLLECTION_NAME)
         results = collection.query(query_embeddings=[query_embedding], n_results=top_k)
+
         hits = []
         if results and results['ids'] and results['ids'][0]:
             for i, vid in enumerate(results['ids'][0]):
+                meta = results['metadatas'][0][i] if results.get('metadatas') else {}
+                docs_list = results.get('documents')
+                doc_text = docs_list[0][i] if docs_list and docs_list[0] else ''
                 hits.append({
                     'vector_id': vid,
-                    'doc_id': results['metadatas'][0][i].get('doc_id') if results.get('metadatas') else None,
-                    'chunk_index': results['metadatas'][0][i].get('chunk_index') if results.get('metadatas') else None,
+                    'doc_id': meta.get('doc_id'),
+                    'chunk_index': meta.get('chunk_index'),
+                    'chunk_text': doc_text,
+                    'page_number': meta.get('page_number', 0),
+                    'seq_order': meta.get('seq_order', 0),
                     'score': results['distances'][0][i] if results.get('distances') else 0,
                 })
         return hits

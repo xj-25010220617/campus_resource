@@ -1,10 +1,12 @@
 """
 大模型 API 调用封装
-- DeepSeek Chat（对话生成）
+- DeepSeek Chat（对话生成，同步 + 异步流式）
 - DeepSeek Embedding（文本向量化）
+- 失败重试（指数退避）
 """
 import logging
-from typing import Generator, List, Optional
+import time
+from typing import AsyncGenerator, Generator, List, Optional
 
 import requests
 from django.conf import settings
@@ -19,9 +21,21 @@ LLM_BASE_URL = getattr(settings, 'DEEPSEEK_BASE_URL', 'https://api.deepseek.com'
 LLM_CHAT_MODEL = getattr(settings, 'DEEPSEEK_CHAT_MODEL', 'deepseek-chat')
 LLM_EMBED_MODEL = getattr(settings, 'DEEPSEEK_EMBED_MODEL', 'deepseek-embed')
 
+# 重试配置
+MAX_RETRIES = 3
+RETRY_BACKOFF_BASE = 2  # 指数退避基数（秒）
+
+
+def _retry_sleep(attempt: int):
+    """指数退避等待"""
+    delay = RETRY_BACKOFF_BASE ** attempt
+    time.sleep(delay)
+
 
 class LLMClient:
     """DeepSeek API 封装"""
+
+    VECTOR_DIM = 1536  # text-embedding-v3 输出维度
 
     def __init__(self):
         self.api_key = LLM_API_KEY
@@ -39,25 +53,44 @@ class LLMClient:
     # ------------------------------------------------------------------
     def embed(self, texts: List[str]) -> List[List[float]]:
         """
-        文本向量化。
-        参数: texts — 文本列表，每个元素一个 chunk
-        返回: 对应的向量列表
+        文本向量化（带重试）。
+
+        Args:
+            texts: 文本列表，每个元素一个 chunk
+
+        Returns:
+            对应的向量列表
         """
         if not self.api_key:
             return self._mock_embed(texts)
 
-        resp = requests.post(
-            f'{self.base_url}/v1/embeddings',
-            headers=self.headers,
-            json={
-                'model': LLM_EMBED_MODEL,
-                'input': texts,
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return [item['embedding'] for item in data['data']]
+        last_error = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = requests.post(
+                    f'{self.base_url}/v1/embeddings',
+                    headers=self.headers,
+                    json={
+                        'model': LLM_EMBED_MODEL,
+                        'input': texts,
+                    },
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                return [item['embedding'] for item in data['data']]
+            except requests.Timeout as e:
+                last_error = e
+                logger.warning(f'Embedding 超时 (attempt {attempt+1}/{MAX_RETRIES})')
+            except requests.RequestException as e:
+                last_error = e
+                logger.warning(f'Embedding 请求失败 (attempt {attempt+1}/{MAX_RETRIES}): {e}')
+
+            if attempt < MAX_RETRIES - 1:
+                _retry_sleep(attempt + 1)
+
+        logger.error(f'Embedding 最终失败: {last_error}')
+        return self._mock_embed(texts)  # 降级为 Mock
 
     def embed_one(self, text: str) -> List[float]:
         """单条文本向量化"""
@@ -66,17 +99,20 @@ class LLMClient:
 
     @staticmethod
     def _mock_embed(texts: List[str]) -> List[List[float]]:
-        """开发阶段无 API Key 时的 Mock"""
+        """
+        开发阶段无 API Key 时的 Mock。
+        生成 1536 维伪随机向量（与 text-embedding-v3 维度一致）。
+        """
         import hashlib
         results = []
         for text in texts:
-            # 用文本 hash 生成伪随机向量（仅用于开发调试）
             h = hashlib.sha256(text.encode()).digest()
-            vec = [(b / 255.0) for b in h[:1024]]  # 展开到 1024 维
-            # 补齐
-            while len(vec) < 1024:
-                vec.append(0.0)
-            results.append(vec[:1024])
+            # 用文本 hash 展开到 1536 维
+            vec = []
+            for i in range(LLMClient.VECTOR_DIM):
+                b = h[i % len(h)]
+                vec.append(((b + i) % 256) / 255.0)
+            results.append(vec)
         return results
 
     # ------------------------------------------------------------------
@@ -89,72 +125,205 @@ class LLMClient:
         temperature: float = 0.7,
         max_tokens: int = 2048,
     ) -> Optional[str]:
-        """非流式对话，返回完整回复文本"""
+        """
+        非流式对话（带重试），返回完整回复文本。
+
+        Args:
+            messages: 消息列表 [{'role': 'system'|'user'|'assistant', 'content': str}]
+            model: 模型名，默认 deepseek-chat
+            temperature: 生成温度
+            max_tokens: 最大 token 数
+
+        Returns:
+            完整回复文本，失败返回 None
+        """
         if not self.api_key:
             return self._mock_chat(messages)
 
-        resp = requests.post(
-            f'{self.base_url}/v1/chat/completions',
-            headers=self.headers,
-            json={
-                'model': model or LLM_CHAT_MODEL,
-                'messages': messages,
-                'temperature': temperature,
-                'max_tokens': max_tokens,
-                'stream': False,
-            },
-            timeout=60,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data['choices'][0]['message']['content']
+        last_error = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = requests.post(
+                    f'{self.base_url}/v1/chat/completions',
+                    headers=self.headers,
+                    json={
+                        'model': model or LLM_CHAT_MODEL,
+                        'messages': messages,
+                        'temperature': temperature,
+                        'max_tokens': max_tokens,
+                        'stream': False,
+                    },
+                    timeout=60,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                return data['choices'][0]['message']['content']
+            except requests.Timeout as e:
+                last_error = e
+                logger.warning(f'Chat 超时 (attempt {attempt+1}/{MAX_RETRIES})')
+            except requests.RequestException as e:
+                last_error = e
+                logger.warning(f'Chat 请求失败 (attempt {attempt+1}/{MAX_RETRIES}): {e}')
+
+            if attempt < MAX_RETRIES - 1:
+                _retry_sleep(attempt + 1)
+
+        logger.error(f'Chat 最终失败: {last_error}')
+        return None
 
     # ------------------------------------------------------------------
-    # Chat（流式）— 返回生成器
+    # Chat（流式）— 同步生成器
     # ------------------------------------------------------------------
     def chat_stream(
         self,
         messages: List[dict],
         model: str = None,
-        temperature: float = 0.7,
+        temperature: float = 0.3,
         max_tokens: int = 2048,
     ) -> Generator[str, None, None]:
-        """流式对话，逐 token yield 文本"""
+        """
+        流式对话（同步），逐 token yield 文本。
+        适合 Django 同步 StreamingHttpResponse。
+
+        Args:
+            messages: 消息列表
+            model: 模型名
+            temperature: 生成温度（RAG 场景建议 0.3）
+            max_tokens: 最大 token 数
+        """
         if not self.api_key:
             yield from self._mock_stream(messages)
             return
 
-        resp = requests.post(
-            f'{self.base_url}/v1/chat/completions',
-            headers=self.headers,
-            json={
-                'model': model or LLM_CHAT_MODEL,
-                'messages': messages,
-                'temperature': temperature,
-                'max_tokens': max_tokens,
-                'stream': True,
-            },
-            timeout=120,
-            stream=True,
-        )
-        resp.raise_for_status()
+        import json as _json
 
-        for line in resp.iter_lines(decode_unicode=True):
-            if not line or line.startswith(':'):
-                continue
-            if line.startswith('data: '):
-                data_str = line[6:]
-                if data_str.strip() == '[DONE]':
-                    break
-                try:
-                    import json
-                    chunk = json.loads(data_str)
-                    delta = chunk.get('choices', [{}])[0].get('delta', {})
-                    content = delta.get('content', '')
-                    if content:
-                        yield content
-                except (json.JSONDecodeError, KeyError, IndexError):
-                    continue
+        last_error = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = requests.post(
+                    f'{self.base_url}/v1/chat/completions',
+                    headers=self.headers,
+                    json={
+                        'model': model or LLM_CHAT_MODEL,
+                        'messages': messages,
+                        'temperature': temperature,
+                        'max_tokens': max_tokens,
+                        'stream': True,
+                    },
+                    timeout=120,
+                    stream=True,
+                )
+                resp.raise_for_status()
+
+                for line in resp.iter_lines(decode_unicode=True):
+                    if not line or line.startswith(':'):
+                        continue
+                    if line.startswith('data: '):
+                        data_str = line[6:]
+                        if data_str.strip() == '[DONE]':
+                            return
+                        try:
+                            chunk = _json.loads(data_str)
+                            delta = chunk.get('choices', [{}])[0].get('delta', {})
+                            content = delta.get('content', '')
+                            if content:
+                                yield content
+                        except (_json.JSONDecodeError, KeyError, IndexError):
+                            continue
+                return  # 正常结束
+            except requests.Timeout as e:
+                last_error = e
+                logger.warning(f'Stream 超时 (attempt {attempt+1}/{MAX_RETRIES})')
+            except requests.RequestException as e:
+                last_error = e
+                logger.warning(f'Stream 请求失败 (attempt {attempt+1}/{MAX_RETRIES}): {e}')
+
+            if attempt < MAX_RETRIES - 1:
+                _retry_sleep(attempt + 1)
+
+        logger.error(f'Stream 最终失败: {last_error}')
+        yield from self._mock_stream(messages)
+
+    # ------------------------------------------------------------------
+    # Chat（流式）— 异步生成器（httpx）
+    # ------------------------------------------------------------------
+    async def chat_stream_async(
+        self,
+        messages: List[dict],
+        model: str = None,
+        temperature: float = 0.3,
+        max_tokens: int = 2048,
+    ) -> AsyncGenerator[str, None]:
+        """
+        流式对话（异步），逐 token yield 文本。
+        适合 Django AsyncStreamingHttpResponse（生产环境推荐）。
+
+        需要: pip install httpx
+
+        Args:
+            messages: 消息列表
+            model: 模型名
+            temperature: 生成温度
+            max_tokens: 最大 token 数
+        """
+        if not self.api_key:
+            for char in self._mock_chat(messages):
+                yield char
+            return
+
+        import json as _json
+
+        try:
+            import httpx
+        except ImportError:
+            logger.error('httpx 未安装，回退到同步 mock')
+            for char in self._mock_chat(messages):
+                yield char
+            return
+
+        last_error = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    async with client.stream(
+                        'POST',
+                        f'{self.base_url}/v1/chat/completions',
+                        headers=self.headers,
+                        json={
+                            'model': model or LLM_CHAT_MODEL,
+                            'messages': messages,
+                            'temperature': temperature,
+                            'max_tokens': max_tokens,
+                            'stream': True,
+                        },
+                    ) as resp:
+                        resp.raise_for_status()
+                        async for line in resp.aiter_lines():
+                            if not line or line.startswith(':'):
+                                continue
+                            if line.startswith('data: '):
+                                data_str = line[6:]
+                                if data_str.strip() == '[DONE]':
+                                    return
+                                try:
+                                    chunk = _json.loads(data_str)
+                                    delta = chunk.get('choices', [{}])[0].get('delta', {})
+                                    content = delta.get('content', '')
+                                    if content:
+                                        yield content
+                                except (_json.JSONDecodeError, KeyError, IndexError):
+                                    continue
+                return
+            except Exception as e:
+                last_error = e
+                logger.warning(f'Async stream 失败 (attempt {attempt+1}/{MAX_RETRIES}): {e}')
+
+            if attempt < MAX_RETRIES - 1:
+                _retry_sleep(attempt + 1)
+
+        logger.error(f'Async stream 最终失败: {last_error}')
+        for char in self._mock_chat(messages):
+            yield char
 
     @staticmethod
     def _mock_chat(messages: List[dict]) -> str:

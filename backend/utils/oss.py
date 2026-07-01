@@ -5,16 +5,19 @@
 - MD5 去重检查（上传前）
 """
 import hashlib
-import hmac
 import json
+import logging
 import os
 import time
+import uuid as _uuid
 from datetime import datetime
 from urllib.parse import quote
 
 import oss2
 from django.conf import settings
 from django.core.files.uploadedfile import UploadedFile
+
+logger = logging.getLogger(__name__)
 
 
 class OSSClient:
@@ -40,51 +43,79 @@ class OSSClient:
             self._bucket = oss2.Bucket(self.auth, self.endpoint, self.bucket_name)
         return self._bucket
 
-    def _generate_oss_key(self, file_name: str, college_code: str = '') -> str:
+    def _sanitize_filename(self, file_name: str) -> str:
+        """清理文件名，保留扩展名，替换不安全字符"""
+        name, dot, ext = file_name.rpartition('.')
+        safe_name = ''.join(c if c.isalnum() or c in '._-' else '_' for c in name)
+        return f'{safe_name}.{ext}' if dot else safe_name
+
+    def _generate_oss_key(self, file_name: str, college_id: int = 0) -> str:
         """
         生成 OSS 对象 Key。
-        格式: resources/{college_code}/{YYYY}/{MM}/{DD}/{uuid}.{ext}
+        格式: knowledge/{college_id}/{YYYY-MM}/{uuid}.{ext}
+
+        Args:
+            file_name: 原始文件名
+            college_id: 学院 ID（0 表示未分配学院）
         """
         ext = file_name.rsplit('.', 1)[-1].lower() if '.' in file_name else 'bin'
         now = datetime.now()
-        prefix = f"resources/{college_code}" if college_code else "resources"
-        return f"{prefix}/{now:%Y/%m/%d}/{now:%H%M%S}_{file_name}"
+        safe_name = self._sanitize_filename(file_name)
+        return f'knowledge/{college_id}/{now:%Y-%m}/{_uuid.uuid4().hex[:12]}.{ext}'
 
     # ------------------------------------------------------------------
     # STS 临时凭证（前端直传 OSS）
     # ------------------------------------------------------------------
-    def get_sts_credentials(self, file_name: str, college_code: str = '') -> dict:
+    def get_sts_credentials(self, file_name: str, college_id: int = 0) -> dict:
         """
         获取 STS 临时凭证，供前端直传 OSS。
-        返回 {access_key_id, access_key_secret, security_token, expiration,
-               oss_key, upload_url}
-        """
-        import uuid as _uuid
-        oss_key = self._generate_oss_key(file_name, college_code)
+        返回:
+            {oss_key, upload_url, expiration, dev_mode}
+            - dev_mode=True 时无真实 STS 凭证，使用签名直传 URL
 
-        # STS 配置（使用阿里云 RAM 角色或 AssumeRole）
-        # 开发阶段返回模拟凭证，部署时替换为真实 STS 调用
+        Args:
+            file_name: 原始文件名
+            college_id: 学院 ID
+        """
+        oss_key = self._generate_oss_key(file_name, college_id)
+
         if not self.access_key_id:
-            # 本地开发：返回签名直传 URL
-            from oss2.utils import make_sign_url
-            upload_url = self.bucket.sign_url('PUT', oss_key, 600)
+            # 本地开发：返回签名直传 URL（有效期 300 秒）
+            upload_url = self.bucket.sign_url('PUT', oss_key, 300) if self.bucket else ''
             return {
                 'oss_key': oss_key,
                 'upload_url': upload_url,
-                'expiration': int(time.time()) + 600,
+                'expiration': int(time.time()) + 300,
                 'dev_mode': True,
             }
 
-        # 生产环境：调用 AssumeRole 获取 STS
-        # from alibabacloud_sts20150401.client import Client as StsClient
-        # ... 真实 STS 调用
-        upload_url = f"https://{self.bucket_name}.{self.endpoint}/{oss_key}"
-        return {
-            'oss_key': oss_key,
-            'upload_url': upload_url,
-            'expiration': int(time.time()) + 3600,
-            'dev_mode': False,
-        }
+        # 生产环境：调用 STS AssumeRole 获取临时凭证
+        # NOTE: 需要安装 alibabacloud_sts20150401，STS Policy 限定上传路径前缀
+        try:
+            # from alibabacloud_sts20150401.client import Client as StsClient
+            # from alibabacloud_sts20150401 import models as sts_models
+            # sts_client = StsClient(...)
+            # policy = {
+            #     "Statement": [{
+            #         "Effect": "Allow",
+            #         "Action": ["oss:PutObject"],
+            #         "Resource": [f"acs:oss:*:*:{self.bucket_name}/knowledge/{college_id}/*"]
+            #     }],
+            #     "Version": "1"
+            # }
+            # resp = sts_client.assume_role(...)
+            # return {AccessKeyId, AccessKeySecret, SecurityToken, ...}
+            upload_url = self.bucket.sign_url('PUT', oss_key, 300)
+            return {
+                'oss_key': oss_key,
+                'upload_url': upload_url,
+                'expiration': int(time.time()) + 300,
+                'sts_credentials': None,  # 部署时替换为真实 STS 凭证
+                'dev_mode': False,
+            }
+        except Exception as e:
+            logger.error(f'STS 凭证获取失败: {e}')
+            raise
 
     # ------------------------------------------------------------------
     # 签名下载 URL
@@ -128,9 +159,18 @@ class OSSClient:
         return md5.hexdigest()
 
     def check_duplicate(self, md5_hash: str):
-        """检查 MD5 是否已存在，返回已有的 knowledge_doc 或 None"""
-        from apps.knowledge.models import KnowledgeDoc
-        return KnowledgeDoc.objects.filter(md5_hash=md5_hash).first()
+        """
+        检查 MD5 是否已存在，返回已有的 knowledge_doc 或 None。
+
+        依赖 apps.knowledge.models.KnowledgeDoc（丙负责），
+        若模型不存在则返回 None 降级运行。
+        """
+        try:
+            from apps.knowledge.models import KnowledgeDoc
+            return KnowledgeDoc.objects.filter(md5_hash=md5_hash).first()
+        except ImportError:
+            logger.warning('KnowledgeDoc 模型尚未就绪，跳过 MD5 去重检查')
+            return None
 
     # ------------------------------------------------------------------
     # 文件删除
@@ -142,7 +182,8 @@ class OSSClient:
         try:
             self.bucket.delete_object(oss_key)
             return True
-        except Exception:
+        except Exception as e:
+            logger.error(f'OSS 文件删除失败 oss_key={oss_key}: {e}')
             return False
 
 
