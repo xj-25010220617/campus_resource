@@ -1,5 +1,6 @@
 import django_filters
 from django_filters.rest_framework import DjangoFilterBackend
+from drf_spectacular.utils import extend_schema
 from rest_framework import filters, generics, permissions, status
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
@@ -39,6 +40,12 @@ class KnowledgeDocFilter(django_filters.FilterSet):
         ]
 
 
+@extend_schema(
+    summary='知识文档列表',
+    description='分页返回知识文档列表，支持关键词搜索和多条件组合筛选',
+    tags=['知识库管理'],
+    operation_id='知识文档列表',
+)
 class KnowledgeDocListView(generics.ListAPIView):
     """
     知识文档列表接口
@@ -91,6 +98,12 @@ class KnowledgeDocListView(generics.ListAPIView):
         return queryset.order_by('-created_at')
 
 
+@extend_schema(
+    summary='知识文档详情',
+    description='获取文档完整信息或编辑文档元数据',
+    tags=['知识库管理'],
+    operation_id='知识文档详情',
+)
 class KnowledgeDocDetailView(generics.RetrieveUpdateAPIView):
     """
     知识文档详情与编辑接口
@@ -144,6 +157,12 @@ class KnowledgeDocDetailView(generics.RetrieveUpdateAPIView):
         return queryset
 
 
+@extend_schema(
+    summary='删除知识文档',
+    description='删除文档及其关联数据（OSS文件、MySQL记录）',
+    tags=['知识库管理'],
+    operation_id='删除知识文档',
+)
 class KnowledgeDocDeleteView(generics.DestroyAPIView):
     """
     知识文档删除接口
@@ -192,6 +211,12 @@ class KnowledgeDocDeleteView(generics.DestroyAPIView):
         return Response({'detail': '删除成功'})
 
 
+@extend_schema(
+    summary='下载知识文档',
+    description='生成 OSS 签名下载 URL（有效期 300 秒）',
+    tags=['知识库管理'],
+    operation_id='下载知识文档',
+)
 class KnowledgeDocDownloadView(generics.RetrieveAPIView):
     """
     文档下载——生成 OSS 签名下载 URL
@@ -222,6 +247,12 @@ class KnowledgeDocDownloadView(generics.RetrieveAPIView):
         return Response({'download_url': download_url})
 
 
+@extend_schema(
+    summary='关键词列表',
+    description='返回指定文档的所有关键词，按权重降序排列',
+    tags=['关键词管理'],
+    operation_id='关键词列表',
+)
 class KeywordListView(APIView):
     """
     文档关键词列表
@@ -247,6 +278,12 @@ class KeywordListView(APIView):
         return Response(KeywordSerializer(keywords, many=True).data)
 
 
+@extend_schema(
+    summary='添加关键词',
+    description='为指定文档添加关键词，用于提升检索召回时的命中权重',
+    tags=['关键词管理'],
+    operation_id='添加关键词',
+)
 class KeywordCreateView(APIView):
     """
     为文档添加关键词
@@ -299,6 +336,60 @@ class KeywordCreateView(APIView):
         return Response(KeywordSerializer(keyword).data, status=status.HTTP_201_CREATED)
 
 
+@extend_schema(
+    summary='编辑关键词',
+    description='编辑指定关键词的匹配类型和权重',
+    tags=['关键词管理'],
+    operation_id='编辑关键词',
+)
+class KeywordUpdateView(APIView):
+    """
+    编辑关键词
+
+    PUT /api/knowledge/keywords/{id}/
+    功能：编辑指定关键词的匹配类型和权重
+    请求参数（均可选，按需传入）：
+        - phrase (str, optional): 关键词或关键语句
+        - match_type (str, optional): 匹配类型（exact:精确匹配 / fuzzy:模糊匹配 / semantic:语义关联）
+        - weight (int, optional): 权重 1-10，数值越高检索时排名越靠前
+    权限规则：
+        - super_admin（超级管理员）: 可编辑任意文档下的关键词
+        - admin（学院管理员）: 仅能编辑自己上传的文档下的关键词
+    返回：更新后的关键词对象
+    """
+    permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
+
+    def put(self, request, pk):
+        """编辑指定关键词"""
+        keyword = get_object_or_404(Keyword.objects.select_related('doc'), id=pk)
+
+        # 权限校验：超管全放行，其余仅允许编辑自己文档下的关键词
+        if request.user.role != 'super_admin' and keyword.doc.uploader_id != request.user.id:
+            raise PermissionDenied('只能编辑自己上传的文档下的关键词')
+
+        # 参数校验
+        serializer = KeywordCreateSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        # 更新字段（仅更新传入的字段）
+        if 'phrase' in data:
+            keyword.phrase = data['phrase']
+        if 'match_type' in data:
+            keyword.match_type = data['match_type']
+        if 'weight' in data:
+            keyword.weight = data['weight']
+        keyword.save()
+
+        return Response(KeywordSerializer(keyword).data)
+
+
+@extend_schema(
+    summary='删除关键词',
+    description='删除指定关键词记录',
+    tags=['关键词管理'],
+    operation_id='删除关键词',
+)
 class KeywordDeleteView(APIView):
     """
     删除关键词
@@ -324,6 +415,12 @@ class KeywordDeleteView(APIView):
         return Response({'detail': '删除成功'})
 
 
+@extend_schema(
+    summary='获取上传凭证',
+    description='校验文件 MD5 去重后，签发阿里云 OSS STS 临时凭证供前端直传',
+    tags=['文件上传'],
+    operation_id='获取上传凭证',
+)
 class UploadSTSView(APIView):
     """
     获取 OSS 直传 STS 凭证（含 MD5 去重检查）
@@ -368,6 +465,12 @@ class UploadSTSView(APIView):
         })
 
 
+@extend_schema(
+    summary='上传完成回调',
+    description='OSS 前端直传完成后回调，创建知识文档记录',
+    tags=['文件上传'],
+    operation_id='上传完成回调',
+)
 class UploadCallbackView(APIView):
     """
     OSS 上传完成回调，创建知识文档记录

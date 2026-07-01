@@ -141,6 +141,10 @@ SPECTACULAR_SETTINGS = {
     'TITLE': '校园虚拟资源管理系统 API',
     'DESCRIPTION': '成都东软学院校园资源管理平台接口文档',
     'VERSION': '1.0.0',
+    'SCHEMA_PATH_PREFIX': '/api/',
+    'COMPONENT_SPLIT_REQUEST': True,
+    'SERVE_INCLUDE_SCHEMA': False,
+    'OPERATION_ID_PREFIX': '',
 }
 
 # OSS configuration (placeholder — 实际使用时在 .env 中配置)
