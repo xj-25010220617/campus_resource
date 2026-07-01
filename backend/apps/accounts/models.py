@@ -21,12 +21,12 @@ class College(models.Model):
 class User(AbstractUser):
     """自定义用户模型"""
     ROLE_CHOICES = [
-        ('admin', '系统管理员'),
-        ('college_leader', '学院负责人'),
-        ('teacher', '教师'),
+        ('super_admin', '超级管理员'),
+        ('admin', '管理员'),
+        ('user', '普通用户'),
     ]
     role = models.CharField(
-        max_length=16, choices=ROLE_CHOICES, default='teacher',
+        max_length=16, choices=ROLE_CHOICES, default='user',
         verbose_name='角色'
     )
     college = models.ForeignKey(
