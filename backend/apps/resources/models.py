@@ -70,6 +70,38 @@ class Resource(models.Model):
     view_count = models.IntegerField(default=0, verbose_name='浏览量')
     download_count = models.IntegerField(default=0, verbose_name='下载量')
 
+    # RAG 检索增强字段
+    visibility = models.CharField(
+        max_length=16,
+        choices=[
+            ('public', '公开'),
+            ('internal', '校内'),
+            ('restricted', '授权'),
+        ],
+        default='public',
+        db_index=True,
+        verbose_name='可见层级',
+    )
+    target_audience = models.CharField(
+        max_length=16,
+        choices=[
+            ('all', '全部'),
+            ('undergrad', '本科生'),
+            ('postgrad', '研究生'),
+            ('teacher', '教师'),
+            ('staff', '职工'),
+        ],
+        default='all',
+        verbose_name='适用对象',
+    )
+    course_term = models.CharField(
+        max_length=128, blank=True, default='',
+        db_index=True, verbose_name='课程学期',
+    )
+    keywords = models.JSONField(
+        default=list, blank=True, verbose_name='关键词列表',
+    )
+
     # 时间
     created_at = models.DateTimeField(auto_now_add=True, db_index=True, verbose_name='创建时间')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
@@ -84,6 +116,8 @@ class Resource(models.Model):
             models.Index(fields=['discipline', 'college'], name='idx_res_disc_college'),
             models.Index(fields=['status', 'created_at'], name='idx_res_status_created'),
             models.Index(fields=['uploader', 'created_at'], name='idx_res_uploader_created'),
+            models.Index(fields=['visibility'], name='idx_res_visibility'),
+            models.Index(fields=['course_term'], name='idx_res_course_term'),
         ]
 
     def __str__(self):

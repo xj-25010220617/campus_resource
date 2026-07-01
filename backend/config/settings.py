@@ -30,6 +30,7 @@ INSTALLED_APPS = [
     'apps.classify',
     'apps.resources',
     'apps.admin_panel',
+    'apps.chat',
 ]
 
 MIDDLEWARE = [
