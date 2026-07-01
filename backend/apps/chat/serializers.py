@@ -40,3 +40,8 @@ class FeedbackSerializer(serializers.Serializer):
     """问答反馈请求参数"""
     message_id = serializers.IntegerField(help_text='消息ID')
     feedback = serializers.IntegerField(min_value=0, max_value=1, help_text='1=赞 / 0=踩')
+
+
+class MessageRateSerializer(serializers.Serializer):
+    """消息反馈请求参数"""
+    rating = serializers.ChoiceField(choices=['like', 'dislike'], help_text='like=点赞 / dislike=点踩')

@@ -29,6 +29,10 @@ class ChatMessage(models.Model):
         ('user', '用户'),
         ('assistant', 'AI助手'),
     ]
+    RATING_CHOICES = [
+        ('like', '点赞'),
+        ('dislike', '点踩'),
+    ]
     conversation = models.ForeignKey(
         Conversation, on_delete=models.CASCADE,
         related_name='messages', verbose_name='所属会话'
@@ -36,6 +40,10 @@ class ChatMessage(models.Model):
     role = models.CharField(max_length=16, choices=ROLE_CHOICES, verbose_name='角色')
     content = models.TextField(verbose_name='消息内容')
     references = models.JSONField(default=list, blank=True, verbose_name='引用的资源列表')
+    rating = models.CharField(
+        max_length=10, choices=RATING_CHOICES,
+        blank=True, null=True, verbose_name='用户反馈'
+    )
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
 
     class Meta:

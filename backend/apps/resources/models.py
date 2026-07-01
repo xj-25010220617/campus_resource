@@ -193,3 +193,54 @@ class Favorite(models.Model):
 
     def __str__(self):
         return f'{self.user.username} 收藏了 {self.resource.title}'
+
+
+class UploadLog(models.Model):
+    """上传日志"""
+    STATUS_CHOICES = [
+        ('pending', '待处理'),
+        ('success', '成功'),
+        ('failed', '失败'),
+    ]
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name='upload_logs', verbose_name='上传用户'
+    )
+    resource = models.ForeignKey(
+        Resource, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='upload_logs', verbose_name='关联资源'
+    )
+
+    file_name = models.CharField(max_length=256, verbose_name='文件名')
+    file_size = models.BigIntegerField(verbose_name='文件大小（字节）')
+    file_type = models.CharField(max_length=16, verbose_name='文件类型')
+    college = models.ForeignKey(
+        'accounts.College', on_delete=models.PROTECT, verbose_name='所属学院'
+    )
+
+    status = models.CharField(
+        max_length=16, choices=STATUS_CHOICES, default='pending',
+        db_index=True, verbose_name='上传状态'
+    )
+    error_message = models.TextField(blank=True, default='', verbose_name='错误信息')
+
+    ip_address = models.GenericIPAddressField(null=True, blank=True, verbose_name='IP地址')
+    user_agent = models.CharField(max_length=512, blank=True, default='', verbose_name='User-Agent')
+
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True, verbose_name='创建时间')
+    completed_at = models.DateTimeField(null=True, blank=True, verbose_name='完成时间')
+
+    class Meta:
+        db_table = 'upload_log'
+        verbose_name = '上传日志'
+        verbose_name_plural = verbose_name
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['user', 'created_at'], name='idx_ulog_user_created'),
+            models.Index(fields=['status', 'created_at'], name='idx_ulog_status_created'),
+            models.Index(fields=['college', 'created_at'], name='idx_ulog_college_created'),
+        ]
+
+    def __str__(self):
+        return f'{self.user.username} 上传 {self.file_name} [{self.status}]'

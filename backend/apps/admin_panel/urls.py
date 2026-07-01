@@ -1,5 +1,13 @@
-from django.urls import path
+"""Admin Panel - 用户管理路由"""
+from django.urls import path, include
+from rest_framework.routers import DefaultRouter
 
-# 管理后台接口（W4 实现）
+from .views import UserAdminViewSet
+
+
+router = DefaultRouter()
+router.register(r'users', UserAdminViewSet, basename='admin-users')
+
 urlpatterns = [
+    path('', include(router.urls)),
 ]
