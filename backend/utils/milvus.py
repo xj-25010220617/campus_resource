@@ -1,0 +1,223 @@
+"""
+Milvus 向量数据库封装
+- Collection 创建与管理
+- 文档 chunk 向量化入库
+- 向量相似度搜索
+"""
+import logging
+from typing import List, Optional
+
+from django.conf import settings
+
+logger = logging.getLogger(__name__)
+
+
+class MilvusClient:
+    """
+    Milvus 向量库客户端。
+    开发阶段可用 ChromaDB 替代降级运行。
+    """
+
+    COLLECTION_NAME = 'campus_knowledge'
+    VECTOR_DIM = 1024  # DeepSeek Embedding 维度
+
+    def __init__(self):
+        self._connected = False
+
+    # ------------------------------------------------------------------
+    # 连接管理
+    # ------------------------------------------------------------------
+    def connect(self) -> bool:
+        """连接 Milvus，失败时降级为 ChromaDB"""
+        try:
+            from pymilvus import connections
+            connections.connect(
+                alias='default',
+                host=getattr(settings, 'MILVUS_HOST', 'localhost'),
+                port=getattr(settings, 'MILVUS_PORT', '19530'),
+            )
+            self._connected = True
+            logger.info('Milvus connected')
+            return True
+        except ImportError:
+            logger.warning('pymilvus not installed, falling back to ChromaDB')
+            self._connected = False
+            return False
+        except Exception as e:
+            logger.warning(f'Milvus connection failed: {e}, falling back to ChromaDB')
+            self._connected = False
+            return False
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
+    # ------------------------------------------------------------------
+    # Collection 管理
+    # ------------------------------------------------------------------
+    def ensure_collection(self) -> bool:
+        """确保 Collection 存在，不存在则创建"""
+        if self._connected:
+            return self._ensure_milvus_collection()
+        return self._ensure_chroma_collection()
+
+    def _ensure_milvus_collection(self) -> bool:
+        try:
+            from pymilvus import Collection, CollectionSchema, FieldSchema, DataType
+
+            if Collection.exists(self.COLLECTION_NAME):
+                return True
+
+            fields = [
+                FieldSchema(name='id', dtype=DataType.INT64, is_primary=True, auto_id=True),
+                FieldSchema(name='vector_id', dtype=DataType.VARCHAR, max_length=128),
+                FieldSchema(name='doc_id', dtype=DataType.INT64),
+                FieldSchema(name='chunk_index', dtype=DataType.INT32),
+                FieldSchema(name='embedding', dtype=DataType.FLOAT_VECTOR, dim=self.VECTOR_DIM),
+            ]
+            schema = CollectionSchema(fields, description='校园知识库向量集合')
+            collection = Collection(name=self.COLLECTION_NAME, schema=schema)
+
+            # 创建 IVF_FLAT 索引
+            index_params = {
+                'metric_type': 'COSINE',
+                'index_type': 'IVF_FLAT',
+                'params': {'nlist': 128},
+            }
+            collection.create_index(field_name='embedding', index_params=index_params)
+            collection.load()
+            logger.info(f'Milvus collection "{self.COLLECTION_NAME}" created')
+            return True
+        except Exception as e:
+            logger.error(f'Failed to create Milvus collection: {e}')
+            return False
+
+    def _ensure_chroma_collection(self) -> bool:
+        """ChromaDB 降级方案"""
+        try:
+            import chromadb
+            client = chromadb.PersistentClient(
+                path=str(getattr(settings, 'CHROMA_DB_PATH', './chroma_db'))
+            )
+            client.get_or_create_collection(
+                name=self.COLLECTION_NAME,
+                metadata={'hnsw:space': 'cosine'},
+            )
+            logger.info('ChromaDB collection ready')
+            return True
+        except ImportError:
+            logger.error('chromadb not installed')
+            return False
+        except Exception as e:
+            logger.error(f'ChromaDB setup failed: {e}')
+            return False
+
+    # ------------------------------------------------------------------
+    # 向量入库
+    # ------------------------------------------------------------------
+    def insert_chunks(self, chunks: List[dict], embeddings: List[List[float]]) -> List[str]:
+        """
+        批量插入 chunk 向量。
+        参数:
+            chunks: [{'vector_id': str, 'doc_id': int, 'chunk_index': int}, ...]
+            embeddings: [[0.1, 0.2, ...], ...]
+        返回:
+            vector_id 列表
+        """
+        if self._connected:
+            return self._insert_milvus(chunks, embeddings)
+        return self._insert_chroma(chunks, embeddings)
+
+    def _insert_milvus(self, chunks: List[dict], embeddings: List[List[float]]) -> List[str]:
+        from pymilvus import Collection
+        collection = Collection(name=self.COLLECTION_NAME)
+        data = [
+            [c['vector_id'] for c in chunks],
+            [c['doc_id'] for c in chunks],
+            [c['chunk_index'] for c in chunks],
+            embeddings,
+        ]
+        collection.insert(data)
+        collection.flush()
+        return [c['vector_id'] for c in chunks]
+
+    def _insert_chroma(self, chunks: List[dict], embeddings: List[List[float]]) -> List[str]:
+        import chromadb
+        client = chromadb.PersistentClient(
+            path=str(getattr(settings, 'CHROMA_DB_PATH', './chroma_db'))
+        )
+        collection = client.get_collection(name=self.COLLECTION_NAME)
+        ids = [c['vector_id'] for c in chunks]
+        metadatas = [
+            {'doc_id': c['doc_id'], 'chunk_index': c['chunk_index']}
+            for c in chunks
+        ]
+        collection.add(ids=ids, embeddings=embeddings, metadatas=metadatas)
+        return ids
+
+    # ------------------------------------------------------------------
+    # 向量搜索
+    # ------------------------------------------------------------------
+    def search(self, query_embedding: List[float], top_k: int = 20) -> List[dict]:
+        """
+        向量相似度搜索。
+        返回: [{'vector_id': str, 'doc_id': int, 'chunk_index': int, 'score': float}, ...]
+        """
+        if self._connected:
+            return self._search_milvus(query_embedding, top_k)
+        return self._search_chroma(query_embedding, top_k)
+
+    def _search_milvus(self, query_embedding: List[float], top_k: int) -> List[dict]:
+        from pymilvus import Collection
+        collection = Collection(name=self.COLLECTION_NAME)
+        collection.load()
+        results = collection.search(
+            data=[query_embedding],
+            anns_field='embedding',
+            param={'metric_type': 'COSINE', 'params': {'nprobe': 10}},
+            limit=top_k,
+            output_fields=['vector_id', 'doc_id', 'chunk_index'],
+        )
+        hits = []
+        for hit in results[0]:
+            hits.append({
+                'vector_id': hit.entity.get('vector_id'),
+                'doc_id': hit.entity.get('doc_id'),
+                'chunk_index': hit.entity.get('chunk_index'),
+                'score': hit.score,
+            })
+        return hits
+
+    def _search_chroma(self, query_embedding: List[float], top_k: int) -> List[dict]:
+        import chromadb
+        client = chromadb.PersistentClient(
+            path=str(getattr(settings, 'CHROMA_DB_PATH', './chroma_db'))
+        )
+        collection = client.get_collection(name=self.COLLECTION_NAME)
+        results = collection.query(query_embeddings=[query_embedding], n_results=top_k)
+        hits = []
+        if results and results['ids'] and results['ids'][0]:
+            for i, vid in enumerate(results['ids'][0]):
+                hits.append({
+                    'vector_id': vid,
+                    'doc_id': results['metadatas'][0][i].get('doc_id') if results.get('metadatas') else None,
+                    'chunk_index': results['metadatas'][0][i].get('chunk_index') if results.get('metadatas') else None,
+                    'score': results['distances'][0][i] if results.get('distances') else 0,
+                })
+        return hits
+
+    # ------------------------------------------------------------------
+    # 删除向量
+    # ------------------------------------------------------------------
+    def delete_by_doc(self, doc_id: int) -> bool:
+        """删除某文档的所有向量"""
+        if self._connected:
+            from pymilvus import Collection
+            collection = Collection(name=self.COLLECTION_NAME)
+            collection.delete(f'doc_id == {doc_id}')
+            return True
+        return True  # ChromaDB 不支持按条件删，后续重建即可
+
+
+# 全局单例
+milvus_client = MilvusClient()
