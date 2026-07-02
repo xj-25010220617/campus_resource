@@ -126,6 +126,13 @@ class OSSClient:
             return ''
         return self.bucket.sign_url('GET', oss_key, expires)
 
+    def get_preview_url(self, oss_key: str, expires: int = 3600) -> str:
+        """
+        生成带签名的预览 URL（有效期 3600 秒，适合音频/视频播放）。
+        与 get_download_url 相同机制，仅默认有效期更长。
+        """
+        return self.get_download_url(oss_key, expires)
+
     # ------------------------------------------------------------------
     # MD5 去重检查
     # ------------------------------------------------------------------
@@ -171,6 +178,31 @@ class OSSClient:
         except ImportError:
             logger.warning('KnowledgeDoc 模型尚未就绪，跳过 MD5 去重检查')
             return None
+
+    # ------------------------------------------------------------------
+    # 文本直传（后端 PUT Object）
+    # ------------------------------------------------------------------
+    def upload_text(self, content: str, oss_key: str) -> bool:
+        """
+        将文本内容直接上传到 OSS（后端直传）。
+
+        Args:
+            content: 文本内容（字符串）
+            oss_key: OSS 对象 Key
+
+        Returns:
+            True 表示上传成功，False 表示失败
+        """
+        if not self.bucket:
+            logger.error('OSS Bucket 未初始化，无法上传文本')
+            return False
+        try:
+            self.bucket.put_object(oss_key, content.encode('utf-8'))
+            logger.info(f'文本上传成功 oss_key={oss_key}, size={len(content)} chars')
+            return True
+        except Exception as e:
+            logger.error(f'OSS 文本上传失败 oss_key={oss_key}: {e}')
+            return False
 
     # ------------------------------------------------------------------
     # 文件删除

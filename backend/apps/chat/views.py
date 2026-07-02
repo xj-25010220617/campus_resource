@@ -165,7 +165,7 @@ class FeedbackView(generics.CreateAPIView):
     问答反馈接口（兼容旧接口）
 
     POST /api/chat/feedback/
-    功能：用户对问答点赞/点踩，写入 query_log
+    功能：用户根据点赞/点踩，写入 query_log
     参数：
         - message_id (int, required): 消息ID
         - feedback (int, required): 1=赞 / 0=踩

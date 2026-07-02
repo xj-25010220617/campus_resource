@@ -41,12 +41,18 @@ class DisciplineListView(generics.ListAPIView):
 
 class CategoryListView(generics.ListAPIView):
     """
-    资源类型列表（树形）
+    资源类型列表（树形，含图标）
 
     GET /api/categories/
     功能：返回两级树形资源类型结构，一级分类的 parent 为 null
-    返回：树形列表，每条含 id/name/parent/sort_order/children 字段
+    返回：树形列表，每条含 id/name/parent/icon/sort_order/children 字段，
+          icon 字段支持二级分类继承父级图标
     """
     queryset = Category.objects.filter(parent__isnull=True).prefetch_related('children')
     serializer_class = CategorySerializer
     permission_classes = [permissions.IsAuthenticated]
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context['request'] = self.request
+        return context

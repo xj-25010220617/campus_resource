@@ -9,6 +9,8 @@ from .views import (
     KnowledgeDocDetailView,
     KnowledgeDocDownloadView,
     KnowledgeDocListView,
+    KnowledgeDocPreviewView,
+    TextUploadView,
     UploadCallbackView,
     UploadSTSView,
 )
@@ -16,6 +18,7 @@ from .views import (
 
 urlpatterns = [
     # 上传
+    path('upload/text/', TextUploadView.as_view(), name='upload_text'),
     path('upload/sts/', UploadSTSView.as_view(), name='upload_sts'),
     path('upload/callback/', UploadCallbackView.as_view(), name='upload_callback'),
 
@@ -24,6 +27,7 @@ urlpatterns = [
     path('docs/<int:pk>/', KnowledgeDocDetailView.as_view(), name='knowledge_doc_detail'),
     path('docs/<int:pk>/delete/', KnowledgeDocDeleteView.as_view(), name='knowledge_doc_delete'),
     path('docs/<int:pk>/download/', KnowledgeDocDownloadView.as_view(), name='knowledge_doc_download'),
+    path('docs/<int:pk>/preview/', KnowledgeDocPreviewView.as_view(), name='knowledge_doc_preview'),
 
     # 关键词
     path('docs/<int:doc_id>/keywords/', KeywordListView.as_view(), name='keyword_list'),

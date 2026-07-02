@@ -5,11 +5,12 @@ from .models import Resource, UploadLog
 
 
 class ResourceListSerializer(serializers.ModelSerializer):
-    """资源列表序列化器（不含文件内容）"""
+    """资源列表序列化器（含分类完整路径、图标、关键词）"""
     uploader_name = serializers.CharField(source='uploader.username', read_only=True)
     college_name = serializers.CharField(source='college.name', read_only=True)
     discipline_name = serializers.CharField(source='discipline.name', read_only=True)
-    category_name = serializers.CharField(source='category.name', read_only=True)
+    category_name = serializers.SerializerMethodField()
+    category_icon = serializers.SerializerMethodField()
 
     class Meta:
         model = Resource
@@ -17,10 +18,25 @@ class ResourceListSerializer(serializers.ModelSerializer):
             'id', 'title', 'description', 'file_type', 'file_size',
             'uploader', 'uploader_name', 'college', 'college_name',
             'discipline', 'discipline_name', 'category', 'category_name',
+            'category_icon', 'keywords',
             'status', 'visibility', 'view_count', 'download_count',
             'created_at', 'published_at',
         ]
         read_only_fields = fields
+
+    def get_category_name(self, obj):
+        """返回分类完整路径，如 "教学资源 > 教学课件" """
+        if obj.category.parent:
+            return f'{obj.category.parent.name} > {obj.category.name}'
+        return obj.category.name
+
+    def get_category_icon(self, obj):
+        """返回分类图标：二级有则返回，否则继承父级图标"""
+        if obj.category.icon:
+            return obj.category.icon
+        if obj.category.parent and obj.category.parent.icon:
+            return obj.category.parent.icon
+        return ''
 
 
 class ResourceDetailSerializer(ResourceListSerializer):

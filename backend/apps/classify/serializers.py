@@ -21,12 +21,21 @@ class DisciplineSerializer(serializers.ModelSerializer):
 
 
 class CategorySerializer(serializers.ModelSerializer):
-    """资源类型序列化器（树形）"""
+    """资源类型序列化器（树形，含图标继承）"""
     children = serializers.SerializerMethodField()
+    icon = serializers.SerializerMethodField()
 
     class Meta:
         model = Category
-        fields = ['id', 'name', 'parent', 'sort_order', 'children']
+        fields = ['id', 'name', 'parent', 'icon', 'sort_order', 'children']
+
+    def get_icon(self, obj):
+        """返回分类图标：一级返回自身图标，二级有则返回否则继承父级图标"""
+        if obj.icon:
+            return obj.icon
+        if obj.parent and obj.parent.icon:
+            return obj.parent.icon
+        return ''
 
     def get_children(self, obj):
         children = obj.children.all()

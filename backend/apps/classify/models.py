@@ -33,6 +33,7 @@ class Category(models.Model):
         'self', null=True, blank=True, on_delete=models.CASCADE,
         related_name='children', verbose_name='上级分类'
     )
+    icon = models.URLField(max_length=512, blank=True, default='', verbose_name='分类图标URL')
     sort_order = models.IntegerField(default=0, verbose_name='排序')
 
     class Meta:

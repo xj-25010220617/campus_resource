@@ -9,6 +9,8 @@ from rest_framework.views import APIView
 from django.db import transaction
 from django.shortcuts import get_object_or_404
 
+from apps.accounts.models import College
+from apps.classify.models import Category, Discipline
 from config.permissions import IsAdminOrSuperAdmin, IsLoginUser, IsOwnerOrReadOnly
 from utils.oss import oss_client
 
@@ -18,6 +20,7 @@ from .serializers import (
     KeywordSerializer,
     KnowledgeDocListSerializer,
     KnowledgeDocSerializer,
+    TextUploadSerializer,
     UploadCallbackSerializer,
     UploadSTSRequestSerializer,
 )
@@ -71,31 +74,15 @@ class KnowledgeDocListView(generics.ListAPIView):
           college_name / discipline_name / uploader_name / chunk_count / created_at
     """
     serializer_class = KnowledgeDocListSerializer
-    permission_classes = [IsLoginUser]
+    permission_classes = [permissions.IsAuthenticated]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     filterset_class = KnowledgeDocFilter
     search_fields = ['title', 'description']
 
     def get_queryset(self):
-        user = self.request.user
-        queryset = KnowledgeDoc.objects.select_related(
+        return KnowledgeDoc.objects.select_related(
             'college', 'discipline', 'uploader',
-        ).all()
-
-        if user.role == 'super_admin':
-            # 超管：可查看平台全部文档
-            pass
-        elif user.role == 'admin':
-            # 学院管理员：仅查看所属学院文档
-            if user.college_id:
-                queryset = queryset.filter(college_id=user.college_id)
-            else:
-                return queryset.none()
-        else:
-            # 普通用户：仅查看本人上传文档
-            queryset = queryset.filter(uploader=user)
-
-        return queryset.order_by('-created_at')
+        ).all().order_by('-created_at')
 
 
 @extend_schema(
@@ -133,28 +120,19 @@ class KnowledgeDocDetailView(generics.RetrieveUpdateAPIView):
         - PUT: 更新后的文档完整对象
     """
     serializer_class = KnowledgeDocSerializer
-    permission_classes = [IsLoginUser]
+    permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        user = self.request.user
-        queryset = KnowledgeDoc.objects.select_related(
+        return KnowledgeDoc.objects.select_related(
             'college', 'discipline', 'category', 'uploader',
         ).all()
 
-        if user.role == 'super_admin':
-            # 超管：可查看/编辑全部文档
-            pass
-        elif user.role == 'admin':
-            # 学院管理员：仅查看/编辑所属学院文档
-            if user.college_id:
-                queryset = queryset.filter(college_id=user.college_id)
-            else:
-                return queryset.none()
-        else:
-            # 普通用户：仅查看/编辑本人上传文档
-            queryset = queryset.filter(uploader=user)
-
-        return queryset
+    def perform_update(self, serializer):
+        """仅允许超管或文档所有者编辑"""
+        instance = self.get_object()
+        if self.request.user.role != 'super_admin' and instance.uploader_id != self.request.user.id:
+            raise PermissionDenied('只能编辑自己上传的文档')
+        serializer.save()
 
 
 @extend_schema(
@@ -258,22 +236,14 @@ class KeywordListView(APIView):
     文档关键词列表
 
     GET /api/knowledge/docs/{doc_id}/keywords/
-    功能：返回指定文档的所有关键词，按权重（weight）降序排列
-    权限规则：
-        - super_admin（超级管理员）: 可查看任意文档的关键词
-        - admin（学院管理员）: 仅能查看自己上传的文档的关键词
+    功能：返回指定文档的所有关键词，按权重（weight）降序排列，所有登录用户均可查看
     返回：关键词数组，每条包含 id / phrase / match_type / weight / created_by_name / created_at
     """
-    permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
+    permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, doc_id):
         """返回文档的关键词列表"""
         doc = get_object_or_404(KnowledgeDoc, id=doc_id)
-
-        # 权限校验：超管全放行，其余仅允许查看自己上传的文档
-        if request.user.role != 'super_admin' and doc.uploader_id != request.user.id:
-            raise PermissionDenied('只能查看自己上传的文档的关键词')
-
         keywords = doc.keywords.order_by('-weight', '-created_at')
         return Response(KeywordSerializer(keywords, many=True).data)
 
@@ -503,6 +473,9 @@ class UploadCallbackView(APIView):
         # 校验 oss_key 格式合法性（防止路径穿越攻击）
         self._validate_oss_key(data['oss_key'])
 
+        # 校验分类关联数据合法性
+        self._validate_classification(data)
+
         # 再次 MD5 去重（防止并发上传导致重复）
         duplicate_doc = oss_client.check_duplicate(data['md5'])
         if duplicate_doc:
@@ -524,14 +497,21 @@ class UploadCallbackView(APIView):
             source_type='upload',
             uploader=request.user,
             status='uploaded',
-            college_id=(
-                data['college_id']
-                if data.get('college_id') is not None
-                else request.user.college_id
-            ),
-            discipline_id=data.get('discipline_id'),
-            category_id=data.get('category_id'),
+            college_id=data['college_id'],
+            discipline_id=data['discipline_id'],
+            category_id=data['category_id'],
         )
+
+        # 创建关联关键词
+        keywords = data.get('keywords', [])
+        for phrase in keywords:
+            Keyword.objects.create(
+                doc=new_doc,
+                phrase=phrase,
+                match_type='fuzzy',
+                weight=1,
+                created_by=request.user,
+            )
 
         # TODO: 调用 Celery 异步索引任务（甲同学完成后集成）
         # index_document.delay(doc_id=new_doc.id)
@@ -542,6 +522,25 @@ class UploadCallbackView(APIView):
         })
 
     @staticmethod
+    def _validate_classification(data: dict) -> None:
+        """校验分类关联数据——college_id / discipline_id 存在，category_id 必须是二级分类"""
+        # 校验 college_id 存在
+        if not College.objects.filter(id=data['college_id']).exists():
+            raise ValidationError({'college_id': '学院不存在'})
+
+        # 校验 discipline_id 存在
+        if not Discipline.objects.filter(id=data['discipline_id']).exists():
+            raise ValidationError({'discipline_id': '学科方向不存在'})
+
+        # 校验 category_id 存在且必须是二级分类（有 parent）
+        try:
+            category = Category.objects.get(id=data['category_id'])
+        except Category.DoesNotExist:
+            raise ValidationError({'category_id': '资源类型不存在'})
+        if category.parent is None:
+            raise ValidationError({'category_id': '必须是二级分类，不能选择一级分类'})
+
+    @staticmethod
     def _validate_oss_key(oss_key: str) -> None:
         """校验 oss_key 格式合法性，防止路径穿越攻击"""
         if '..' in oss_key:
@@ -550,3 +549,168 @@ class UploadCallbackView(APIView):
             raise ValidationError({'oss_key': '不能以 "/" 开头'})
         if not oss_key.startswith('knowledge/'):
             raise ValidationError({'oss_key': 'OSS Key 格式不合法，必须以 "knowledge/" 开头'})
+
+
+class TextUploadView(APIView):
+    """
+    管理员手动录入文本
+
+    POST /api/knowledge/upload/text/
+    功能：管理员手动输入文本内容，后端直传 OSS 并创建知识文档记录
+    请求参数：
+        - title (str, required): 文档标题
+        - content (str, required): 文本内容
+        - description (str, optional): 文档描述
+        - college_id (int, required): 学院 ID
+        - discipline_id (int, required): 学科方向 ID
+        - category_id (int, required): 资源类型 ID（必须是二级分类）
+        - keywords (list[str], optional): 关键词列表
+    返回：{"id": <doc.id>, "status": "uploaded", "file_name": "<title>.txt"}
+    """
+    permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
+
+    def post(self, request):
+        """处理文本录入请求"""
+        import hashlib
+        import uuid
+        from datetime import datetime
+
+        serializer = TextUploadSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        # 校验分类关联数据合法性（复用 UploadCallbackView 的校验逻辑）
+        UploadCallbackView._validate_classification(data)
+
+        # 生成 OSS 对象 Key
+        now = datetime.now()
+        oss_key = f'knowledge/{data["college_id"]}/{now:%Y-%m}/{uuid.uuid4().hex[:12]}.txt'
+
+        # 上传文本到 OSS
+        content = data['content']
+        success = oss_client.upload_text(content, oss_key)
+        if not success:
+            return Response(
+                {'detail': '文本上传到 OSS 失败，请稍后重试', 'code': 'UPLOAD_FAILED'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        # 计算 MD5
+        md5_hash = hashlib.md5(content.encode('utf-8')).hexdigest()
+
+        # 生成 OSS 访问 URL
+        oss_url = f'https://{oss_client.bucket_name}.{oss_client.endpoint}/{oss_key}'
+
+        # 创建 KnowledgeDoc 记录
+        new_doc = KnowledgeDoc.objects.create(
+            title=data['title'],
+            description=data.get('description', ''),
+            source_type='upload',
+            oss_key=oss_key,
+            oss_url=oss_url,
+            file_name=f'{data["title"]}.txt',
+            file_type='txt',
+            file_size=len(content.encode('utf-8')),
+            md5_hash=md5_hash,
+            college_id=data['college_id'],
+            discipline_id=data['discipline_id'],
+            category_id=data['category_id'],
+            uploader=request.user,
+            status='uploaded',
+        )
+
+        # 创建关联关键词
+        keywords = data.get('keywords', [])
+        for phrase in keywords:
+            Keyword.objects.create(
+                doc=new_doc,
+                phrase=phrase,
+                match_type='fuzzy',
+                weight=1,
+                created_by=request.user,
+            )
+
+        return Response({
+            'id': new_doc.id,
+            'status': new_doc.status,
+            'file_name': new_doc.file_name,
+        })
+
+
+class KnowledgeDocPreviewView(APIView):
+    """
+    文档内容预览接口
+
+    GET /api/knowledge/docs/{id}/preview/
+    功能：根据文件类型返回预览内容——文本类返回原文，音视频/图片/文档返回 OSS 签名预览 URL
+    权限规则：所有登录用户均可预览
+    返回格式：
+        - 文本类: {"preview_type": "text", "content": "<原文>", "file_type": "txt", "file_name": "..."}
+        - 音频类: {"preview_type": "url", "content": "<signed_url>", "file_type": "audio", "file_name": "..."}
+        - 视频类: {"preview_type": "url", "content": "<signed_url>", "file_type": "video", "file_name": "..."}
+        - 图片类: {"preview_type": "url", "content": "<signed_url>", "file_type": "image", "file_name": "..."}
+        - 文档类: {"preview_type": "url", "content": "<signed_url>", "file_type": "document", "file_name": "..."}
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    # 音频扩展名
+    AUDIO_TYPES = {'mp3', 'wav', 'ogg', 'flac', 'aac', 'm4a'}
+    # 视频扩展名
+    VIDEO_TYPES = {'mp4', 'webm', 'mov', 'avi', 'mkv', 'flv'}
+    # 图片扩展名
+    IMAGE_TYPES = {'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'}
+    # 纯文本扩展名（返回原文）
+    TEXT_TYPES = {'txt', 'md', 'html', 'csv', 'json', 'xml', 'yaml', 'yml'}
+
+    def get(self, request, pk):
+        """返回文档预览内容"""
+        doc = get_object_or_404(
+            KnowledgeDoc.objects.select_related('uploader'), id=pk,
+        )
+        ft = doc.file_type.lower() if doc.file_type else 'other'
+
+        # 纯文本：返回原文（从 OSS 拉取）
+        if ft in self.TEXT_TYPES:
+            return self._text_preview(doc, ft)
+
+        # 音频：返回签名预览 URL（前端 <audio> 播放）
+        if ft in self.AUDIO_TYPES:
+            return self._media_preview(doc, 'audio')
+
+        # 视频：返回签名预览 URL（前端 <video> 播放）
+        if ft in self.VIDEO_TYPES:
+            return self._media_preview(doc, 'video')
+
+        # 图片：返回签名预览 URL（前端 <img> 渲染）
+        if ft in self.IMAGE_TYPES:
+            return self._media_preview(doc, 'image')
+
+        # 文档 / 其他：返回签名预览 URL
+        return self._media_preview(doc, 'document')
+
+    def _media_preview(self, doc, file_type):
+        """生成签名预览 URL，供前端 <audio>/<video>/<img> 等标签使用"""
+        preview_url = oss_client.get_preview_url(doc.oss_key)
+        return Response({
+            'preview_type': 'url',
+            'content': preview_url,
+            'file_type': file_type,
+            'file_name': doc.file_name,
+        })
+
+    def _text_preview(self, doc, file_type):
+        """从 OSS 下载文本内容并直接返回"""
+        import requests
+        download_url = oss_client.get_download_url(doc.oss_key, expires=60)
+        try:
+            resp = requests.get(download_url, timeout=10)
+            resp.raise_for_status()
+            text_content = resp.text
+        except Exception:
+            text_content = ''
+        return Response({
+            'preview_type': 'text',
+            'content': text_content,
+            'file_type': file_type,
+            'file_name': doc.file_name,
+        })
