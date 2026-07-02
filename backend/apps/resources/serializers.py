@@ -77,3 +77,29 @@ class UploadLogStatsSerializer(serializers.Serializer):
     by_file_type = serializers.DictField()
     by_college = serializers.ListField()
     by_user = serializers.ListField()
+
+
+class UploadLogCompleteSerializer(serializers.Serializer):
+    """更新上传日志状态序列化器"""
+    status = serializers.ChoiceField(
+        choices=['success', 'failed'],
+        help_text='状态：success=成功，failed=失败'
+    )
+    resource_id = serializers.IntegerField(
+        required=False, allow_null=True,
+        help_text='成功时关联的资源ID'
+    )
+    error_message = serializers.CharField(
+        required=False, allow_blank=True, max_length=1000,
+        help_text='失败时的错误信息'
+    )
+
+    def validate(self, attrs):
+        status_val = attrs.get('status')
+        if status_val == 'success':
+            if 'resource_id' not in attrs or attrs.get('resource_id') is None:
+                raise serializers.ValidationError({'resource_id': '成功状态必须提供 resource_id'})
+        if status_val == 'failed':
+            if not attrs.get('error_message'):
+                raise serializers.ValidationError({'error_message': '失败状态必须提供 error_message'})
+        return attrs

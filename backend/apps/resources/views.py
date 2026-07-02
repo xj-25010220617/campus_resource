@@ -16,6 +16,7 @@ from .serializers import (
     ResourceListSerializer,
     UploadLogSerializer,
     UploadLogStatsSerializer,
+    UploadLogCompleteSerializer,
 )
 
 
@@ -193,3 +194,38 @@ class UploadLogViewSet(viewsets.ReadOnlyModelViewSet):
 
         serializer = UploadLogStatsSerializer(data)
         return Response(serializer.data)
+
+    @action(detail=True, methods=['patch'], url_path='complete')
+    def complete(self, request, pk=None):
+        """更新上传日志状态（内部接口）
+
+        PATCH /api/resources/upload-log/{id}/complete/
+
+        请求体:
+            - status: str, 必填，success 或 failed
+            - resource_id: int, success 时必填，关联的资源ID
+            - error_message: str, failed 时必填，错误信息
+
+        响应:
+            - 200: 更新成功
+            - 400: 参数校验失败
+            - 404: 上传日志不存在
+        """
+        upload_log = self.get_object()
+        serializer = UploadLogCompleteSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        validated_data = serializer.validated_data
+        upload_log.status = validated_data['status']
+        upload_log.completed_at = timezone.now()
+
+        if validated_data['status'] == 'success':
+            upload_log.resource_id = validated_data['resource_id']
+            upload_log.error_message = ''
+        else:
+            upload_log.resource = None
+            upload_log.error_message = validated_data['error_message']
+
+        upload_log.save()
+        return Response(UploadLogSerializer(upload_log).data)
