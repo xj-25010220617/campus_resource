@@ -907,21 +907,101 @@ if latest_only:
     # 取每组最新 ID → queryset.filter(id__in=latest_ids)
 ```
 
-### 10.7 其他配套改动（2026-07-02）
+### 10.7 分类模块改造（Category 两级分类 + 图标继承）
+
+#### 模型层 — `Category.icon` 字段
+
+```python
+# apps/classify/models.py
+class Category(models.Model):
+    """资源类型（支持两级：课件 → PPT课件/PDF课件）"""
+    name = models.CharField(max_length=64, verbose_name='类型名称')
+    parent = models.ForeignKey('self', null=True, blank=True,
+                               on_delete=models.CASCADE,
+                               related_name='children', verbose_name='上级分类')
+    icon = models.URLField(max_length=512, blank=True, default='',
+                           verbose_name='分类图标URL')           # 🆕
+    sort_order = models.IntegerField(default=0, verbose_name='排序')
+```
+
+#### 序列化器 — 图标继承逻辑
+
+```python
+# apps/classify/serializers.py
+class CategorySerializer(serializers.ModelSerializer):
+    children = serializers.SerializerMethodField()
+    icon = serializers.SerializerMethodField()                    # 🆕
+
+    def get_icon(self, obj):
+        """一级返回自身图标，二级有则返回否则继承父级图标"""
+        if obj.icon:
+            return obj.icon
+        if obj.parent and obj.parent.icon:
+            return obj.parent.icon
+        return ''
+```
+
+**图标继承规则：**
+
+```
+一级分类（教学资源）icon = "https://oss/icons/teaching.png"
+  ├─ 二级（教学课件）icon = ""         → 继承 → "teaching.png"
+  ├─ 二级（课程大纲）icon = "自定义"   → 自身 → "自定义"
+  └─ 二级（试题库）  icon = ""         → 继承 → "teaching.png"
+```
+
+#### 视图层 — `category_id` 一级自动展开
+
+资源列表和知识库列表的 `category_id` 筛选统一逻辑：
+
+```python
+# apps/resources/views.py — ResourceListView.get_queryset
+category_id = request.query_params.get('category_id')
+if category_id:
+    category = Category.objects.get(id=category_id)
+    if category.parent is None:
+        # 一级分类：展开为所有子分类 ID
+        child_ids = category.children.values_list('id', flat=True)
+        queryset = queryset.filter(category_id__in=child_ids)
+    else:
+        # 二级分类：精确匹配
+        queryset = queryset.filter(category_id=category_id)
+```
+
+#### 上传校验 — 强制二级分类
+
+```python
+# apps/knowledge/views.py — UploadCallbackView._validate_classification
+category = Category.objects.get(id=data['category_id'])
+if category.parent is None:
+    raise ValidationError({'category_id': '必须是二级分类，不能选择一级分类'})
+```
+
+### 10.8 上传安全加固
+
+| 模块 | 改动 | 说明 |
+|------|------|------|
+| `apps/knowledge/serializers.py` | `ALLOWED_FILE_TYPES` 白名单 | 40+ 种允许类型，拒绝 `.exe` 等 |
+| `apps/knowledge/serializers.py` | `FILE_SIZE_LIMITS` 分级限制 | 文档/音频 50MB，图片 10MB，视频 500MB |
+| `apps/knowledge/serializers.py` | `_validate_file_type()` | 上传前校验，不在白名单返回 400 |
+| `apps/knowledge/serializers.py` | `_validate_file_size()` | 按类型校验大小，超限返回 400 |
+| `apps/knowledge/views.py` | `_validate_oss_key()` | 防路径穿越（拒绝 `..`、`/` 开头、非 `knowledge/` 前缀） |
+| `apps/knowledge/serializers.py` | `UploadCallbackSerializer` college_id/discipline_id/category_id 改为必填 | 防止空分类入库 |
+
+### 10.9 其他配套改动（2026-07-02）
 
 | 模块 | 改动 | 说明 |
 |------|------|------|
 | `apps/knowledge/models.py` | `KnowledgeDoc` 新增 `visibility` 字段 | public/private |
-| `apps/knowledge/serializers.py` | 上传序列化器新增 `visibility` | 默认 `'public'` |
-| `apps/knowledge/views.py` | 新增 `TextUploadView` | 管理员手动录入文本 |
-| `apps/knowledge/views.py` | 新增 `KnowledgeDocPreviewView` | 音视频/文本在线预览 |
-| `utils/oss.py` | 新增 `upload_text` / `get_preview_url` | 文本直传 OSS / 预览签名 URL |
-| `apps/knowledge/serializers.py` | 新增 `ALLOWED_FILE_TYPES` 白名单 | 上传文件类型校验 |
-| `apps/knowledge/serializers.py` | 新增 `FILE_SIZE_LIMITS` | 按类型限制大小（文档50MB/图片10MB/视频500MB） |
-| `apps/classify/models.py` | `Category` 新增 `icon` 字段 | 分类图标，二级继承父级 |
-| `apps/resources/views.py` | 新增 `ResourceListView` | 资源列表查询（全开放） |
+| `apps/knowledge/views.py` | 新增 `TextUploadView` | 管理员手动录入文本（直传 OSS + 创建 KnowledgeDoc） |
+| `apps/knowledge/views.py` | 新增 `KnowledgeDocPreviewView` | 音视频（`<audio>`/`<video>`）/纯文本在线预览 |
+| `utils/oss.py` | 新增 `upload_text()` | 后端 PUT Object 直传文本到 OSS |
+| `utils/oss.py` | 新增 `get_preview_url()` | 3600 秒签名 URL（长有效期适合音视频播放） |
+| `apps/resources/views.py` | 新增 `ResourceListView` | 资源列表查询，全开放 `IsAuthenticated` |
+| `apps/resources/serializers.py` | `ResourceListSerializer` 升级 | `category_name` 完整路径 + `category_icon` + `keywords` |
+| `apps/knowledge/urls.py` | 新增 4 条路由 | `/upload/text/` `/preview/` `/keywords/create/` `/keywords/delete/` |
 
-### 10.8 关键设计决策
+### 10.10 关键设计决策
 
 | 决策 | 方案 | 原因 |
 |------|------|------|
