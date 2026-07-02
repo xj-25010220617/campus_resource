@@ -78,13 +78,18 @@ CONTEXT_MAX_CHARS = 8000
 # ------------------------------------------------------------------
 # Prompt 构造
 # ------------------------------------------------------------------
-def build_rag_prompt(question: str, chunks: List[dict]) -> List[dict]:
+def build_rag_prompt(
+    question: str,
+    chunks: List[dict],
+    history: Optional[List[dict]] = None,
+) -> List[dict]:
     """
-    构造 RAG Prompt。
+    构造 RAG Prompt（支持多轮对话历史）。
 
     Args:
         question: 用户问题
         chunks: 检索结果 [{'content': str, 'doc_title': str, 'page': int, 'score': float}, ...]
+        history: 历史对话 [{'role': 'user'|'assistant', 'content': str}, ...]（可选）
 
     Returns:
         messages 列表，可直接传给 LLM chat
@@ -107,10 +112,88 @@ def build_rag_prompt(question: str, chunks: List[dict]) -> List[dict]:
     refs_text = '\n\n'.join(ref_lines) if ref_lines else '暂无相关参考资料。'
     system_content = SYSTEM_PROMPT.format(references=refs_text)
 
-    return [
-        {'role': 'system', 'content': system_content},
-        {'role': 'user', 'content': question},
-    ]
+    messages = [{'role': 'system', 'content': system_content}]
+
+    # 插入历史对话（多轮上下文）
+    if history:
+        # 截取最近 N 轮（防止超长），保留最后 6 条消息
+        recent_history = history[-6:]
+        for msg in recent_history:
+            if msg['role'] in ('user', 'assistant'):
+                messages.append({
+                    'role': msg['role'],
+                    'content': msg['content'][:2000],  # 每条历史截断
+                })
+
+    # 当前问题
+    messages.append({'role': 'user', 'content': question})
+    return messages
+
+
+# ------------------------------------------------------------------
+# 相关推荐
+# ------------------------------------------------------------------
+_SUGGEST_PROMPT = """你是一个智能问答系统的推荐助手。
+根据用户的提问和 AI 的回答，生成 3 个"用户可能还想问"的相关问题。
+
+要求：
+- 每个问题简短、具体、覆盖不同角度
+- 从回答中挖掘可延伸的方向
+- 用 JSON 数组格式输出，不要额外文字
+
+示例输出：["什么是进程调度？", "操作系统的分类有哪些？", "如何查看 Linux 进程？"]
+
+用户问题：{question}
+AI回答：{answer}
+"""
+
+
+def generate_suggested_questions(
+    question: str,
+    answer: str,
+    max_questions: int = 3,
+) -> List[str]:
+    """根据问答内容生成相关推荐问题。
+
+    Args:
+        question: 用户原始问题
+        answer: AI 完整回答
+        max_questions: 推荐问题数量（默认 3）
+
+    Returns:
+        推荐问题列表，生成失败返回空列表
+    """
+    if not answer or not answer.strip():
+        return []
+
+    import json
+    import re as _re
+
+    prompt = _SUGGEST_PROMPT.format(
+        question=question[:300],
+        answer=answer[:1000],
+    )
+    messages = [{'role': 'user', 'content': prompt}]
+
+    result = llm_client.chat(messages, temperature=0.7, max_tokens=300)
+    if not result:
+        return []
+
+    # 解析 JSON 数组
+    try:
+        return json.loads(result.strip())[:max_questions]
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # 尝试从 markdown 代码块中提取
+    match = _re.search(r'```(?:json)?\s*(\[.*?\])\s*```', result, _re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1))[:max_questions]
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    return []
 
 
 # ------------------------------------------------------------------
