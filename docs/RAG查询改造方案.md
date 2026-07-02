@@ -977,7 +977,119 @@ if category.parent is None:
     raise ValidationError({'category_id': '必须是二级分类，不能选择一级分类'})
 ```
 
-### 10.8 上传安全加固
+### 10.8 文件上传完整流程
+
+#### 流程概览
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  前端                                                             │
+│  ① POST /upload/sts/  {file_name, file_size, md5}                │
+│     ├─ MD5 去重检查（oss_client.check_duplicate）                 │
+│     ├─ 命中 → {"duplicate": true, "resource_id": N}             │
+│     └─ 未命中 → oss_client.get_sts_credentials()                 │
+│                → {oss_key, upload_url, sts_credentials}          │
+│  ② 前端用 STS 凭证直传文件到 OSS（PutObject）                     │
+│  ③ POST /upload/callback/  {oss_key, title, ..., file_type, md5}│
+│     ├─ oss_key 路径穿越校验                                       │
+│     ├─ 分类关联校验（college/discipline 存在，category 二级）     │
+│     ├─ MD5 二次去重（防并发）                                    │
+│     └─ KnowledgeDoc.objects.create(...) + Keyword 批量创建        │
+│  ④ 异步：Celery index_document.delay(doc_id)（待集成）           │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+#### 接口清单
+
+| 方法 | 路径 | 权限 | 说明 |
+|------|------|------|------|
+| `POST` | `/api/knowledge/upload/sts/` | `IsAdminOrSuperAdmin` | 获取 OSS STS 凭证 + MD5 去重 |
+| `POST` | `/api/knowledge/upload/callback/` | `IsAdminOrSuperAdmin` | 上传完成回调，创建 KnowledgeDoc |
+| `POST` | `/api/knowledge/upload/text/` | `IsAdminOrSuperAdmin` | 管理员手动录入文本（后端直传 OSS） |
+
+#### 核心代码
+
+**① STS 凭证签发（含 MD5 去重）**
+
+```python
+# apps/knowledge/views.py — UploadSTSView.post
+def post(self, request):
+    serializer = UploadSTSRequestSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+
+    md5_hash = serializer.validated_data['md5']
+    file_name = serializer.validated_data['file_name']
+    college_id = request.user.college_id or 0
+
+    # MD5 去重检查
+    duplicate_doc = oss_client.check_duplicate(md5_hash)
+    if duplicate_doc:
+        return Response({'duplicate': True, 'resource_id': duplicate_doc.id})
+
+    # 获取 STS 临时凭证
+    credentials = oss_client.get_sts_credentials(file_name, college_id)
+    return Response({
+        'oss_key': credentials['oss_key'],
+        'upload_url': credentials['upload_url'],
+        'sts_credentials': credentials.get('sts_credentials'),
+        'dev_mode': credentials.get('dev_mode', False),
+        'duplicate': False,
+    })
+```
+
+**② 上传回调（创建 KnowledgeDoc + Keyword）**
+
+```python
+# apps/knowledge/views.py — UploadCallbackView.post（精简）
+def post(self, request):
+    data = serializer.validated_data
+    self._validate_oss_key(data['oss_key'])       # 防路径穿越
+    UploadCallbackView._validate_classification(data)  # 分类校验
+
+    duplicate_doc = oss_client.check_duplicate(data['md5'])  # 二次去重
+    if duplicate_doc:
+        return Response({'id': duplicate_doc.id, 'status': duplicate_doc.status, 'duplicate': True})
+
+    new_doc = KnowledgeDoc.objects.create(
+        oss_key=data['oss_key'], title=data['title'], ..., source_type='upload',
+        uploader=request.user, status='uploaded',
+        college_id=data['college_id'], discipline_id=data['discipline_id'],
+        category_id=data['category_id'], visibility=data.get('visibility', 'public'),
+    )
+    # 批量创建关键词
+    for phrase in data.get('keywords', []):
+        Keyword.objects.create(doc=new_doc, phrase=phrase, ...)
+
+    return Response({'id': new_doc.id, 'status': new_doc.status})
+```
+
+**③ 文本直传（后端 PUT Object）**
+
+```python
+# utils/oss.py — OSSClient.upload_text
+def upload_text(self, content: str, oss_key: str) -> bool:
+    try:
+        self.bucket.put_object(oss_key, content.encode('utf-8'))
+        return True
+    except Exception as e:
+        logger.error(f'OSS 文本上传失败 oss_key={oss_key}: {e}')
+        return False
+
+# apps/knowledge/views.py — TextUploadView
+# 流程：校验 → 生成 oss_key → upload_text() → 计算 MD5 → KnowledgeDoc.objects.create()
+```
+
+#### OSS Key 格式
+
+```
+knowledge/{college_id}/{YYYY-MM}/{uuid}.{ext}
+
+示例：
+  knowledge/3/2026-07/a1b2c3d4e5f6.pdf     # 文件上传
+  knowledge/3/2026-07/b2c3d4e5f6a7.txt     # 文本录入
+```
+
+### 10.9 上传安全加固
 
 | 模块 | 改动 | 说明 |
 |------|------|------|
@@ -988,7 +1100,7 @@ if category.parent is None:
 | `apps/knowledge/views.py` | `_validate_oss_key()` | 防路径穿越（拒绝 `..`、`/` 开头、非 `knowledge/` 前缀） |
 | `apps/knowledge/serializers.py` | `UploadCallbackSerializer` college_id/discipline_id/category_id 改为必填 | 防止空分类入库 |
 
-### 10.9 其他配套改动（2026-07-02）
+### 10.10 其他配套改动（2026-07-02）
 
 | 模块 | 改动 | 说明 |
 |------|------|------|
@@ -1001,7 +1113,7 @@ if category.parent is None:
 | `apps/resources/serializers.py` | `ResourceListSerializer` 升级 | `category_name` 完整路径 + `category_icon` + `keywords` |
 | `apps/knowledge/urls.py` | 新增 4 条路由 | `/upload/text/` `/preview/` `/keywords/create/` `/keywords/delete/` |
 
-### 10.10 关键设计决策
+### 10.11 关键设计决策
 
 | 决策 | 方案 | 原因 |
 |------|------|------|
