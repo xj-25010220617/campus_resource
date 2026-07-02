@@ -31,6 +31,10 @@ class KnowledgeDoc(models.Model):
         ('html', 'HTML'),
         ('other', '其他'),
     ]
+    VISIBILITY_CHOICES = [
+        ('public', '公开'),
+        ('private', '私密'),
+    ]
 
     title = models.CharField(max_length=512, verbose_name='文档标题')
     description = models.TextField(default='', verbose_name='文档描述')
@@ -45,6 +49,10 @@ class KnowledgeDoc(models.Model):
     file_type = models.CharField(
         max_length=16, choices=FILE_TYPE_CHOICES, default='other',
         verbose_name='文件类型',
+    )
+    visibility = models.CharField(
+        max_length=16, choices=VISIBILITY_CHOICES, default='public',
+        db_index=True, verbose_name='可见性',
     )
     file_size = models.BigIntegerField(default=0, verbose_name='文件大小（字节）')
     md5_hash = models.CharField(

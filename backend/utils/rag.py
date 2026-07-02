@@ -304,8 +304,10 @@ def _apply_hard_filters(
         doc_id 列表
     """
     from apps.resources.models import Resource
+    from apps.knowledge.models import KnowledgeDoc
     from django.db.models import Q
 
+    # --- Resource 表硬过滤 ---
     qs = Resource.objects.filter(status='published')
 
     # 1. 可见层级权限
@@ -350,7 +352,38 @@ def _apply_hard_filters(
                 published_at__month=int(month),
             )
 
-    return list(qs.values_list('id', flat=True)[:top_k])
+    resource_ids = list(qs.values_list('id', flat=True)[:top_k])
+
+    # --- KnowledgeDoc 表硬过滤（AI 只能检索公开文件）---
+    kd_qs = KnowledgeDoc.objects.filter(status='indexed')
+
+    # AI 检索时强制只看公开文件；后台管理查询时按角色过滤
+    is_admin_query = role in ('admin', 'super_admin')
+    if not is_admin_query:
+        kd_qs = kd_qs.filter(visibility='public')
+    elif role == 'admin':
+        user_college_id = user_context.get('college_id')
+        kd_qs = kd_qs.filter(
+            Q(visibility='public')
+            | Q(visibility='private', college_id=user_college_id)
+            | Q(visibility='private', uploader_id=user_id),
+        )
+    # super_admin: 不过滤
+
+    # 应用相同的学科/学院/分类筛选
+    if (cid := filters.get('college_id')):
+        kd_qs = kd_qs.filter(college_id=cid)
+    if (did := filters.get('discipline_id')):
+        kd_qs = kd_qs.filter(discipline_id=did)
+    if (cat_ids := filters.get('category_ids')):
+        kd_qs = kd_qs.filter(category_id__in=cat_ids)
+    if (ft := filters.get('file_type')):
+        kd_qs = kd_qs.filter(file_type=ft)
+
+    knowledge_doc_ids = list(kd_qs.values_list('id', flat=True)[:top_k])
+
+    # 合并两表 ID（Resource 用正数，KnowledgeDoc 用负数区分来源）
+    return resource_ids + [-kid for kid in knowledge_doc_ids]
 
 
 # ------------------------------------------------------------------
@@ -374,27 +407,48 @@ def _filter_by_permission(
         return []
 
     from apps.resources.models import Resource
+    from apps.knowledge.models import KnowledgeDoc
 
-    doc_ids = [h['doc_id'] for h in hits]
+    resource_ids = [h['doc_id'] for h in hits if h.get('doc_id', 0) > 0]
+    knowledge_ids = [abs(h['doc_id']) for h in hits if h.get('doc_id', 0) < 0]
+
     role = user_context.get('role', 'user')
     user_id = user_context.get('user_id')
+    user_college_id = user_context.get('college_id')
 
-    docs = Resource.objects.filter(id__in=doc_ids).values('id', 'visibility', 'uploader_id')
-    doc_map = {d['id']: d for d in docs}
+    # 构建权限缓存
+    allowed_ids = set()
 
-    filtered = []
-    for hit in hits:
-        doc = doc_map.get(hit['doc_id'])
-        if not doc:
-            continue
-        visibility = doc['visibility']
-        uploader_id = doc['uploader_id']
-        if visibility == 'restricted':
-            if role in ('super_admin', 'admin') or uploader_id == user_id:
-                filtered.append(hit)
-        elif visibility in ('public', 'internal'):
-            filtered.append(hit)
+    # Resource 权限
+    if resource_ids:
+        res_docs = Resource.objects.filter(id__in=resource_ids).values('id', 'visibility', 'uploader_id')
+        for d in res_docs:
+            if d['visibility'] in ('public', 'internal'):
+                allowed_ids.add(d['id'])
+            elif d['visibility'] == 'restricted' and (role in ('super_admin', 'admin') or d['uploader_id'] == user_id):
+                allowed_ids.add(d['id'])
 
+    # KnowledgeDoc 权限（已在 _apply_hard_filters 中过滤，此处二次兜底）
+    if knowledge_ids:
+        from django.db.models import Q
+        kd_qs = KnowledgeDoc.objects.filter(id__in=knowledge_ids)
+        if role == 'super_admin':
+            allowed_ids.update(-kid for kid in kd_qs.values_list('id', flat=True))
+        elif role == 'admin':
+            kd_qs = kd_qs.filter(
+                Q(visibility='public')
+                | Q(visibility='private', college_id=user_college_id)
+                | Q(visibility='private', uploader_id=user_id),
+            )
+            allowed_ids.update(-kid for kid in kd_qs.values_list('id', flat=True))
+        else:
+            kd_qs = kd_qs.filter(
+                Q(visibility='public')
+                | Q(visibility='private', uploader_id=user_id),
+            )
+            allowed_ids.update(-kid for kid in kd_qs.values_list('id', flat=True))
+
+    filtered = [h for h in hits if h.get('doc_id') in allowed_ids]
     return filtered[:5]
 
 
@@ -403,20 +457,32 @@ def _filter_by_permission(
 # ------------------------------------------------------------------
 def _enrich_with_doc_meta(hits: List[dict], min_score: float) -> List[dict]:
     """
-    查询 MySQL resource 表，补全文档标题等元信息。
+    查询 MySQL resource / knowledge_doc 表，补全文档标题等元信息。
     过滤低于 min_score 的结果，返回 Top-5。
+    KnowledgeDoc 的 doc_id 为负数，解码时取绝对值。
     """
-    doc_ids = list({h['doc_id'] for h in hits if h.get('doc_id')})
+    resource_ids = list({h['doc_id'] for h in hits if h.get('doc_id') and h['doc_id'] > 0})
+    knowledge_ids = list({abs(h['doc_id']) for h in hits if h.get('doc_id') and h['doc_id'] < 0})
 
     doc_title_map = {}
-    if doc_ids:
+
+    # Resource 表
+    if resource_ids:
         try:
             from apps.resources.models import Resource
-            docs_qs = Resource.objects.filter(id__in=doc_ids).values('id', 'title')
-            for d in docs_qs:
+            for d in Resource.objects.filter(id__in=resource_ids).values('id', 'title'):
                 doc_title_map[d['id']] = d['title']
         except ImportError:
             logger.debug('Resource 模型尚未就绪，使用占位标题')
+
+    # KnowledgeDoc 表
+    if knowledge_ids:
+        try:
+            from apps.knowledge.models import KnowledgeDoc
+            for d in KnowledgeDoc.objects.filter(id__in=knowledge_ids).values('id', 'title'):
+                doc_title_map[-d['id']] = d['title']  # 负数 key 匹配
+        except ImportError:
+            logger.debug('KnowledgeDoc 模型尚未就绪，使用占位标题')
 
     results = []
     for hit in hits:
@@ -425,7 +491,7 @@ def _enrich_with_doc_meta(hits: List[dict], min_score: float) -> List[dict]:
         if not hit.get('content'):
             continue
         results.append({
-            'doc_id': hit['doc_id'],
+            'doc_id': abs(hit['doc_id']),
             'doc_title': doc_title_map.get(hit['doc_id'], '未知文档'),
             'content': hit['content'],
             'score': round(hit['score'], 4),

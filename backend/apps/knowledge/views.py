@@ -1,6 +1,7 @@
 import django_filters
 import logging
 from django.db import transaction
+from django.db.models import Max, Q
 from django.shortcuts import get_object_or_404
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema
@@ -87,9 +88,57 @@ class KnowledgeDocListView(generics.ListAPIView):
     search_fields = ['title', 'description']
 
     def get_queryset(self):
-        return KnowledgeDoc.objects.select_related(
+        user = self.request.user
+        latest_only = self.request.query_params.get('latest_only', 'true').lower() == 'true'
+
+        queryset = KnowledgeDoc.objects.select_related(
             'college', 'discipline', 'uploader',
-        ).all().order_by('-created_at')
+        ).all()
+
+        # 可见性权限过滤
+        queryset = self._apply_visibility_filter(queryset, user)
+
+        if latest_only:
+            # 按学院+学科+分类分组，取每组最新一条
+            grouped = (
+                queryset
+                .values('college_id', 'discipline_id', 'category_id')
+                .annotate(max_created=Max('created_at'))
+            )
+            latest_ids = []
+            for group in grouped:
+                latest_id = (
+                    queryset
+                    .filter(
+                        college_id=group['college_id'],
+                        discipline_id=group['discipline_id'],
+                        category_id=group['category_id'],
+                        created_at=group['max_created'],
+                    )
+                    .values_list('id', flat=True)
+                    .first()
+                )
+                if latest_id:
+                    latest_ids.append(latest_id)
+            queryset = queryset.filter(id__in=latest_ids)
+
+        return queryset.order_by('-created_at')
+
+    @staticmethod
+    def _apply_visibility_filter(queryset, user):
+        """按用户角色过滤可见性：超管全量，管理员本院+自己，普通用户公开+自己"""
+        if user.role == 'super_admin':
+            return queryset
+        if user.role == 'admin':
+            return queryset.filter(
+                Q(visibility='public')
+                | Q(visibility='private', college_id=user.college_id)
+                | Q(visibility='private', uploader_id=user.id),
+            )
+        return queryset.filter(
+            Q(visibility='public')
+            | Q(visibility='private', uploader_id=user.id),
+        )
 
 
 @extend_schema(
@@ -130,9 +179,11 @@ class KnowledgeDocDetailView(generics.RetrieveUpdateAPIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        return KnowledgeDoc.objects.select_related(
+        user = self.request.user
+        queryset = KnowledgeDoc.objects.select_related(
             'college', 'discipline', 'category', 'uploader',
         ).all()
+        return KnowledgeDocListView._apply_visibility_filter(queryset, user)
 
     def perform_update(self, serializer):
         """仅允许超管或文档所有者编辑"""
@@ -222,9 +273,8 @@ class KnowledgeDocDownloadView(generics.RetrieveAPIView):
 
     def get_queryset(self):
         user = self.request.user
-        if user.role == 'super_admin':
-            return KnowledgeDoc.objects.all()
-        return KnowledgeDoc.objects.filter(uploader=user)
+        queryset = KnowledgeDoc.objects.all()
+        return KnowledgeDocListView._apply_visibility_filter(queryset, user)
 
     def retrieve(self, request, *args, **kwargs):
         instance = self.get_object()
@@ -631,6 +681,7 @@ class TextUploadView(APIView):
             category_id=data['category_id'],
             uploader=request.user,
             status='uploaded',
+            visibility=data.get('visibility', 'public'),
         )
 
         # 创建关联关键词
