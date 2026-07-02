@@ -1,6 +1,7 @@
 from django.urls import path
 
 from .views import (
+    ExtractFreshnessView,
     KeywordCreateView,
     KeywordDeleteView,
     KeywordListView,
@@ -24,6 +25,7 @@ urlpatterns = [
     path('docs/<int:pk>/', KnowledgeDocDetailView.as_view(), name='knowledge_doc_detail'),
     path('docs/<int:pk>/delete/', KnowledgeDocDeleteView.as_view(), name='knowledge_doc_delete'),
     path('docs/<int:pk>/download/', KnowledgeDocDownloadView.as_view(), name='knowledge_doc_download'),
+    path('docs/<int:pk>/extract-freshness/', ExtractFreshnessView.as_view(), name='extract_freshness'),
 
     # 关键词
     path('docs/<int:doc_id>/keywords/', KeywordListView.as_view(), name='keyword_list'),

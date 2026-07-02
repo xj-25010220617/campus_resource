@@ -1,0 +1,348 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "校园虚拟资源管理系统 API",
+    "description": "上传日志接口文档",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8000/api",
+      "description": "开发环境"
+    }
+  ],
+  "paths": {
+    "/resources/upload-log/": {
+      "get": {
+        "tags": ["上传日志"],
+        "summary": "上传日志列表",
+        "description": "分页获取上传日志列表，支持按用户、学院、状态、时间过滤",
+        "operationId": "listUploadLogs",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "schema": {"type": "integer", "default": 1}
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "schema": {"type": "integer", "default": 20}
+          },
+          {
+            "name": "user_id",
+            "in": "query",
+            "description": "按用户ID过滤",
+            "schema": {"type": "integer"}
+          },
+          {
+            "name": "college_id",
+            "in": "query",
+            "description": "按学院ID过滤",
+            "schema": {"type": "integer"}
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "description": "按状态过滤: pending, success, failed",
+            "schema": {"type": "string", "enum": ["pending", "success", "failed"]}
+          },
+          {
+            "name": "date_from",
+            "in": "query",
+            "description": "开始日期 (YYYY-MM-DD)",
+            "schema": {"type": "string", "format": "date"}
+          },
+          {
+            "name": "date_to",
+            "in": "query",
+            "description": "结束日期 (YYYY-MM-DD)",
+            "schema": {"type": "string", "format": "date"}
+          },
+          {
+            "name": "ordering",
+            "in": "query",
+            "description": "排序字段，默认 -created_at",
+            "schema": {"type": "string"}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/UploadLogListResponse"}
+              }
+            }
+          },
+          "401": {"description": "未认证"},
+          "403": {"description": "权限不足，需 admin+"}
+        }
+      }
+    },
+    "/resources/upload-log/{id}/": {
+      "get": {
+        "tags": ["上传日志"],
+        "summary": "上传日志详情",
+        "description": "获取单条上传日志的详细信息",
+        "operationId": "getUploadLogDetail",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "日志ID",
+            "schema": {"type": "integer"}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/UploadLogDetail"}
+              }
+            }
+          },
+          "401": {"description": "未认证"},
+          "403": {"description": "权限不足"},
+          "404": {"description": "日志不存在"}
+        }
+      }
+    },
+    "/resources/upload-log/stats/": {
+      "get": {
+        "tags": ["上传日志"],
+        "summary": "上传统计",
+        "description": "获取上传统计数据，支持按用户/学院/时间聚合",
+        "operationId": "getUploadLogStats",
+        "parameters": [
+          {
+            "name": "group_by",
+            "in": "query",
+            "description": "分组字段: user, college, date, status",
+            "schema": {"type": "string", "enum": ["user", "college", "date", "status"]}
+          },
+          {
+            "name": "date_from",
+            "in": "query",
+            "description": "开始日期",
+            "schema": {"type": "string", "format": "date"}
+          },
+          {
+            "name": "date_to",
+            "in": "query",
+            "description": "结束日期",
+            "schema": {"type": "string", "format": "date"}
+          },
+          {
+            "name": "college_id",
+            "in": "query",
+            "description": "按学院ID过滤",
+            "schema": {"type": "integer"}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/UploadStatsResponse"}
+              }
+            }
+          },
+          "401": {"description": "未认证"},
+          "403": {"description": "权限不足"}
+        }
+      }
+    },
+    "/resources/upload-log/create/": {
+      "post": {
+        "tags": ["上传日志"],
+        "summary": "创建上传日志",
+        "description": "创建一条上传日志记录（内部接口）",
+        "operationId": "createUploadLog",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {"$ref": "#/components/schemas/UploadLogCreate"}
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "创建成功",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/UploadLogDetail"}
+              }
+            }
+          },
+          "400": {"description": "参数错误"},
+          "401": {"description": "未认证"}
+        }
+      }
+    },
+    "/resources/upload-log/{id}/complete/": {
+      "patch": {
+        "tags": ["上传日志"],
+        "summary": "更新上传日志状态",
+        "description": "更新上传日志状态为 success 或 failed（内部接口）",
+        "operationId": "completeUploadLog",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "日志ID",
+            "schema": {"type": "integer"}
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {"$ref": "#/components/schemas/UploadLogComplete"}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "更新成功",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/UploadLogDetail"}
+              }
+            }
+          },
+          "400": {"description": "参数错误"},
+          "401": {"description": "未认证"},
+          "404": {"description": "日志不存在"}
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "UploadLogBase": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "integer", "description": "日志ID"},
+          "user_id": {"type": "integer", "description": "用户ID"},
+          "resource_id": {"type": "integer", "nullable": true, "description": "关联资源ID"},
+          "file_name": {"type": "string", "description": "文件名"},
+          "file_size": {"type": "integer", "description": "文件大小(字节)"},
+          "file_type": {"type": "string", "description": "文件类型"},
+          "college_id": {"type": "integer", "description": "学院ID"},
+          "status": {"type": "string", "enum": ["pending", "success", "failed"], "description": "状态"},
+          "error_message": {"type": "string", "nullable": true, "description": "错误信息"},
+          "ip_address": {"type": "string", "nullable": true, "description": "IP地址"},
+          "user_agent": {"type": "string", "nullable": true, "description": "User-Agent"},
+          "created_at": {"type": "string", "format": "date-time", "description": "创建时间"},
+          "completed_at": {"type": "string", "format": "date-time", "nullable": true, "description": "完成时间"}
+        }
+      },
+      "UploadLogDetail": {
+        "allOf": [
+          {"$ref": "#/components/schemas/UploadLogBase"},
+          {
+            "type": "object",
+            "properties": {
+              "user": {"$ref": "#/components/schemas/UserBrief"},
+              "college": {"$ref": "#/components/schemas/CollegeBrief"},
+              "resource": {"$ref": "#/components/schemas/ResourceBrief", "nullable": true}
+            }
+          }
+        ]
+      },
+      "UploadLogListResponse": {
+        "type": "object",
+        "properties": {
+          "count": {"type": "integer", "description": "总数"},
+          "next": {"type": "string", "nullable": true},
+          "previous": {"type": "string", "nullable": true},
+          "results": {
+            "type": "array",
+            "items": {"$ref": "#/components/schemas/UploadLogDetail"}
+          }
+        }
+      },
+      "UploadLogCreate": {
+        "type": "object",
+        "required": ["file_name", "file_size", "file_type", "college_id"],
+        "properties": {
+          "user_id": {"type": "integer", "description": "用户ID"},
+          "file_name": {"type": "string", "description": "文件名"},
+          "file_size": {"type": "integer", "description": "文件大小"},
+          "file_type": {"type": "string", "description": "文件类型"},
+          "college_id": {"type": "integer", "description": "学院ID"},
+          "ip_address": {"type": "string", "description": "IP地址"},
+          "user_agent": {"type": "string", "description": "User-Agent"}
+        }
+      },
+      "UploadLogComplete": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": {"type": "string", "enum": ["success", "failed"], "description": "状态"},
+          "resource_id": {"type": "integer", "nullable": true, "description": "成功时关联资源ID"},
+          "error_message": {"type": "string", "nullable": true, "description": "失败时错误信息"}
+        }
+      },
+      "UploadStatsResponse": {
+        "type": "object",
+        "properties": {
+          "total_count": {"type": "integer", "description": "总上传次数"},
+          "success_count": {"type": "integer", "description": "成功次数"},
+          "failed_count": {"type": "integer", "description": "失败次数"},
+          "total_size": {"type": "integer", "description": "总文件大小"},
+          "groups": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "key": {"type": "string", "description": "分组键"},
+                "count": {"type": "integer", "description": "数量"},
+                "success_count": {"type": "integer"},
+                "failed_count": {"type": "integer"},
+                "total_size": {"type": "integer"}
+              }
+            }
+          }
+        }
+      },
+      "UserBrief": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "integer"},
+          "username": {"type": "string"},
+          "real_name": {"type": "string", "nullable": true}
+        }
+      },
+      "CollegeBrief": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "integer"},
+          "name": {"type": "string"}
+        }
+      },
+      "ResourceBrief": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "integer"},
+          "title": {"type": "string"}
+        }
+      }
+    },
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "JWT Token"
+      }
+    }
+  },
+  "security": [{"BearerAuth": []}]
+}

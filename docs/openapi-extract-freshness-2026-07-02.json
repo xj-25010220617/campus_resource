@@ -1,0 +1,228 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "校园虚拟资源管理系统 API",
+    "description": "成都东软学院校园资源管理平台接口文档（AI 提取发布日期片段）",
+    "version": "1.0.0"
+  },
+  "components": {
+    "securitySchemes": {
+      "cookieAuth": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "sessionid"
+      }
+    },
+    "schemas": {
+      "ExtractFreshnessAccepted": {
+        "type": "object",
+        "description": "异步模式返回（async=true 且 Celery 可用）",
+        "properties": {
+          "task_id": {
+            "type": "string",
+            "description": "Celery 任务 ID",
+            "example": "8f4a1b3c-7d2e-4f9a-b0c1-1e2f3a4b5c6d"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["queued"],
+            "example": "queued"
+          },
+          "doc_id": {
+            "type": "integer",
+            "example": 42
+          }
+        },
+        "required": ["task_id", "status", "doc_id"]
+      },
+      "ExtractFreshnessSync": {
+        "type": "object",
+        "description": "同步模式返回（async=false 或 Celery 不可用降级）",
+        "properties": {
+          "freshness_date": {
+            "type": "string",
+            "nullable": true,
+            "format": "date",
+            "description": "提取的发布日期 YYYY-MM-DD，未找到时为 null",
+            "example": "2025-03-15"
+          },
+          "confidence": {
+            "type": "string",
+            "enum": ["high", "medium", "low", "none"],
+            "description": "置信度：high/medium=AI 有原文支撑；low=AI 给的不确定；none=未提取到",
+            "example": "high"
+          },
+          "source_excerpt": {
+            "type": "string",
+            "description": "LLM 引用作为依据的原文片段（≤200 字）",
+            "example": "本资料适用于 2025 年春季学期，修订日期 2025-03-10"
+          },
+          "raw_response": {
+            "type": "object",
+            "description": "LLM 原始返回 + 解析结果，便于审计追溯",
+            "additionalProperties": true,
+            "example": {
+              "parsed": {
+                "date": "2025-03-15",
+                "confidence": "high"
+              },
+              "raw": "{\"date\":\"2025-03-15\",\"confidence\":\"high\"}"
+            }
+          }
+        },
+        "required": ["freshness_date", "confidence", "source_excerpt", "raw_response"]
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "description": "统一错误格式（CONVENTIONS.md 错误码段）",
+        "properties": {
+          "detail": {
+            "type": "string",
+            "example": "只有管理员可以触发 AI 日期提取"
+          },
+          "code": {
+            "type": "string",
+            "enum": ["UNAUTHORIZED", "PERMISSION_DENIED", "NOT_FOUND", "VALIDATION_ERROR"],
+            "example": "PERMISSION_DENIED"
+          }
+        },
+        "required": ["detail", "code"]
+      }
+    }
+  },
+  "paths": {
+    "/api/knowledge/docs/{id}/extract-freshness/": {
+      "post": {
+        "operationId": "AI提取发布日期",
+        "summary": "AI 提取发布日期",
+        "description": "调用 LLM 从文档内容中提取发布日期 / 适用学期，写回 freshness_date。\n\n**功能**：\n1. 从 OSS 下载指定文档\n2. 按文件类型抽取文本（PDF/DOCX/PPTX/XLSX/MD/TXT/HTML）\n3. 调用 DeepSeek 提取\"发布日期 / 适用学期\"\n4. 把结果写回 KnowledgeDoc.freshness_date\n\n**权限**：\n- super_admin: 可对任意文档触发\n- admin: 仅可对自己上传的文档触发\n\n**异步说明**：\n- async=true（默认）：202 Accepted，立即返回 task_id；由 Celery worker 后台跑\n- async=false：200 OK 同步阻塞返回结果，限调试用\n- Celery 不可用时无论 async 取值如何都会降级同步执行",
+        "tags": ["文件上传"],
+        "security": [{ "cookieAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "KnowledgeDoc 主键",
+            "schema": { "type": "integer", "minimum": 1 }
+          },
+          {
+            "name": "async",
+            "in": "query",
+            "required": false,
+            "description": "是否异步执行（默认 true，Celery worker 后台跑）",
+            "schema": { "type": "boolean", "default": true }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Accepted - 任务已入队（async=true 且 Celery 可用）",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ExtractFreshnessAccepted" },
+                "examples": {
+                  "queued": {
+                    "summary": "异步任务入队",
+                    "value": {
+                      "task_id": "8f4a1b3c-7d2e-4f9a-b0c1-1e2f3a4b5c6d",
+                      "status": "queued",
+                      "doc_id": 42
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "OK - 同步执行完成（async=false 或 Celery 不可用降级）",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ExtractFreshnessSync" },
+                "examples": {
+                  "high_confidence": {
+                    "summary": "高置信度提取",
+                    "value": {
+                      "freshness_date": "2025-03-15",
+                      "confidence": "high",
+                      "source_excerpt": "本资料适用于 2025 年春季学期，修订日期 2025-03-10",
+                      "raw_response": {
+                        "parsed": {
+                          "date": "2025-03-15",
+                          "confidence": "high",
+                          "source_excerpt": "..."
+                        },
+                        "raw": "{\"date\":\"2025-03-15\",\"confidence\":\"high\"}"
+                      }
+                    }
+                  },
+                  "no_text": {
+                    "summary": "图片/视频/音频类型（无文本可抽）",
+                    "value": {
+                      "freshness_date": null,
+                      "confidence": "none",
+                      "source_excerpt": "文件类型 image 暂不支持文本提取",
+                      "raw_response": {}
+                    }
+                  },
+                  "doc_missing": {
+                    "summary": "文档不存在（同步模式特殊 200）",
+                    "value": {
+                      "detail": "文档不存在",
+                      "code": "NOT_FOUND"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UNAUTHORIZED - 未登录",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": {
+                  "detail": "Authentication credentials were not provided.",
+                  "code": "UNAUTHORIZED"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "PERMISSION_DENIED - 越权触发（非管理员 / admin 触发他人上传的文档）",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "examples": {
+                  "not_admin": {
+                    "value": {
+                      "detail": "只有管理员可以触发 AI 日期提取",
+                      "code": "PERMISSION_DENIED"
+                    }
+                  },
+                  "not_owner": {
+                    "value": {
+                      "detail": "只能对自己上传的文档触发 AI 日期提取",
+                      "code": "PERMISSION_DENIED"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NOT_FOUND - 文档不存在",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                "example": {
+                  "detail": "No KnowledgeDoc matches the given query.",
+                  "code": "NOT_FOUND"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

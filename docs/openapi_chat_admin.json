@@ -1,0 +1,400 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "校园虚拟资源管理系统 API",
+    "description": "会话管理与用户管理接口",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8000/api",
+      "description": "开发环境"
+    }
+  ],
+  "paths": {
+    "/chat/conversations/": {
+      "get": {
+        "tags": ["Chat-会话管理"],
+        "summary": "会话列表",
+        "description": "返回当前用户的会话列表（不含消息详情），按更新时间倒序",
+        "operationId": "listConversations",
+        "parameters": [
+          {"name": "page", "in": "query", "schema": {"type": "integer", "default": 1}},
+          {"name": "page_size", "in": "query", "schema": {"type": "integer", "default": 20}}
+        ],
+        "responses": {
+          "200": {"description": "成功"},
+          "401": {"description": "未认证"}
+        }
+      },
+      "post": {
+        "tags": ["Chat-会话管理"],
+        "summary": "新建会话",
+        "description": "创建新会话",
+        "operationId": "createConversation",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["title"],
+                "properties": {"title": {"type": "string", "description": "会话标题"}}
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {"description": "创建成功"},
+          "400": {"description": "参数错误"},
+          "401": {"description": "未认证"}
+        }
+      }
+    },
+    "/chat/conversations/{id}/": {
+      "get": {
+        "tags": ["Chat-会话管理"],
+        "summary": "会话详情",
+        "description": "返回指定会话的完整消息列表",
+        "operationId": "getConversationDetail",
+        "parameters": [
+          {"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}, "description": "会话ID"}
+        ],
+        "responses": {
+          "200": {"description": "成功"},
+          "401": {"description": "未认证"},
+          "403": {"description": "无权限"},
+          "404": {"description": "会话不存在"}
+        }
+      },
+      "patch": {
+        "tags": ["Chat-会话管理"],
+        "summary": "编辑会话",
+        "description": "修改会话标题",
+        "operationId": "updateConversation",
+        "parameters": [
+          {"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {"title": {"type": "string"}}
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {"description": "成功"},
+          "400": {"description": "参数错误"},
+          "401": {"description": "未认证"},
+          "403": {"description": "无权限"},
+          "404": {"description": "会话不存在"}
+        }
+      },
+      "delete": {
+        "tags": ["Chat-会话管理"],
+        "summary": "删除会话",
+        "description": "删除指定会话（级联删除所有消息）",
+        "operationId": "deleteConversation",
+        "parameters": [
+          {"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}
+        ],
+        "responses": {
+          "204": {"description": "删除成功"},
+          "401": {"description": "未认证"},
+          "403": {"description": "无权限"},
+          "404": {"description": "会话不存在"}
+        }
+      }
+    },
+    "/chat/ask/": {
+      "post": {
+        "tags": ["Chat-AI问答"],
+        "summary": "AI问答",
+        "description": "接收用户提问 → LLM解析 → 三层检索 → 生成回答，返回SSE流式响应",
+        "operationId": "askQuestion",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "conversation_id": {"type": "integer", "nullable": true, "description": "会话ID（可选，不传则创建新会话）"},
+                  "question": {"type": "string", "description": "用户问题"}
+                },
+                "required": ["question"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "SSE流式响应",
+            "content": {
+              "text/event-stream": {
+                "schema": {"type": "string"}
+              }
+            }
+          },
+          "401": {"description": "未认证"},
+          "400": {"description": "参数错误"}
+        }
+      }
+    },
+    "/chat/message/{id}/rate/": {
+      "post": {
+        "tags": ["Chat-消息反馈"],
+        "summary": "消息反馈",
+        "description": "用户对AI回答点赞/点踩",
+        "operationId": "rateMessage",
+        "parameters": [
+          {"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}, "description": "消息ID"}
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["rating"],
+                "properties": {
+                  "rating": {"type": "string", "enum": ["like", "dislike"], "description": "点赞或点踩"}
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {"description": "成功"},
+          "400": {"description": "参数错误"},
+          "401": {"description": "未认证"},
+          "403": {"description": "无权限"},
+          "404": {"description": "消息不存在"}
+        }
+      }
+    },
+    "/chat/message/{id}/references/": {
+      "get": {
+        "tags": ["Chat-消息反馈"],
+        "summary": "查看引用来源",
+        "description": "查看AI回答引用的资源列表（仅admin/super_admin）",
+        "operationId": "getMessageReferences",
+        "parameters": [
+          {"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}, "description": "消息ID"}
+        ],
+        "responses": {
+          "200": {"description": "成功"},
+          "401": {"description": "未认证"},
+          "403": {"description": "无权限（需admin+）"},
+          "404": {"description": "消息不存在"}
+        }
+      }
+    },
+    "/admin/users/": {
+      "get": {
+        "tags": ["Admin-用户管理"],
+        "summary": "用户列表",
+        "description": "获取用户列表（分页），admin只能看普通用户，super_admin可看全部",
+        "operationId": "listUsers",
+        "parameters": [
+          {"name": "page", "in": "query", "schema": {"type": "integer", "default": 1}},
+          {"name": "page_size", "in": "query", "schema": {"type": "integer", "default": 20}},
+          {"name": "role", "in": "query", "schema": {"type": "string", "enum": ["user", "admin", "super_admin"]}},
+          {"name": "college_id", "in": "query", "schema": {"type": "integer"}},
+          {"name": "is_active", "in": "query", "schema": {"type": "boolean"}},
+          {"name": "search", "in": "query", "schema": {"type": "string"}, "description": "搜索用户名/邮箱"}
+        ],
+        "responses": {
+          "200": {"description": "成功"},
+          "401": {"description": "未认证"},
+          "403": {"description": "无权限（需admin+）"}
+        }
+      },
+      "post": {
+        "tags": ["Admin-用户管理"],
+        "summary": "新建用户",
+        "description": "创建新用户",
+        "operationId": "createUser",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["username", "password", "role"],
+                "properties": {
+                  "username": {"type": "string", "description": "用户名（工号/学号）"},
+                  "password": {"type": "string", "description": "密码"},
+                  "email": {"type": "string", "format": "email"},
+                  "role": {"type": "string", "enum": ["user", "admin", "super_admin"]},
+                  "college": {"type": "integer", "description": "学院ID"},
+                  "phone": {"type": "string"},
+                  "first_name": {"type": "string"},
+                  "last_name": {"type": "string"}
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {"description": "创建成功"},
+          "400": {"description": "参数错误"},
+          "401": {"description": "未认证"},
+          "403": {"description": "无权限"}
+        }
+      }
+    },
+    "/admin/users/{id}/": {
+      "put": {
+        "tags": ["Admin-用户管理"],
+        "summary": "编辑用户",
+        "description": "编辑用户信息",
+        "operationId": "updateUser",
+        "parameters": [
+          {"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "email": {"type": "string", "format": "email"},
+                  "first_name": {"type": "string"},
+                  "last_name": {"type": "string"},
+                  "role": {"type": "string", "enum": ["user", "admin", "super_admin"]},
+                  "college": {"type": "integer"},
+                  "phone": {"type": "string"},
+                  "avatar": {"type": "string", "format": "uri"},
+                  "is_active": {"type": "boolean"}
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {"description": "成功"},
+          "400": {"description": "参数错误"},
+          "401": {"description": "未认证"},
+          "403": {"description": "无权限"},
+          "404": {"description": "用户不存在"}
+        }
+      },
+      "delete": {
+        "tags": ["Admin-用户管理"],
+        "summary": "删除用户",
+        "description": "删除用户（不能删除自己，不能删除同级超管）",
+        "operationId": "deleteUser",
+        "parameters": [
+          {"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}
+        ],
+        "responses": {
+          "204": {"description": "删除成功"},
+          "401": {"description": "未认证"},
+          "403": {"description": "无权限（不能删除自己或超管）"},
+          "404": {"description": "用户不存在"}
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Conversation": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "integer"},
+          "title": {"type": "string"},
+          "created_at": {"type": "string", "format": "date-time"},
+          "updated_at": {"type": "string", "format": "date-time"}
+        }
+      },
+      "ConversationDetail": {
+        "allOf": [
+          {"$ref": "#/components/schemas/Conversation"},
+          {
+            "type": "object",
+            "properties": {
+              "messages": {
+                "type": "array",
+                "items": {"$ref": "#/components/schemas/ChatMessage"}
+              }
+            }
+          }
+        ]
+      },
+      "ChatMessage": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "integer"},
+          "role": {"type": "string", "enum": ["user", "assistant"]},
+          "content": {"type": "string"},
+          "references": {
+            "type": "array",
+            "items": {"$ref": "#/components/schemas/Reference"},
+            "description": "AI回答引用的资源列表"
+          },
+          "rating": {"type": "string", "enum": ["like", "dislike"], "nullable": true},
+          "created_at": {"type": "string", "format": "date-time"}
+        }
+      },
+      "Reference": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "integer"},
+          "title": {"type": "string"},
+          "description": {"type": "string"},
+          "file_type": {"type": "string"}
+        }
+      },
+      "User": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "integer"},
+          "username": {"type": "string"},
+          "email": {"type": "string", "nullable": true},
+          "role": {"type": "string"},
+          "role_display": {"type": "string"},
+          "college_id": {"type": "integer", "nullable": true},
+          "college_name": {"type": "string", "nullable": true},
+          "phone": {"type": "string", "nullable": true},
+          "avatar": {"type": "string", "nullable": true},
+          "first_name": {"type": "string"},
+          "last_name": {"type": "string"},
+          "is_active": {"type": "boolean"},
+          "date_joined": {"type": "string", "format": "date-time"}
+        }
+      },
+      "PaginatedConversationList": {
+        "type": "object",
+        "properties": {
+          "count": {"type": "integer"},
+          "next": {"type": "string", "nullable": true},
+          "previous": {"type": "string", "nullable": true},
+          "results": {"type": "array", "items": {"$ref": "#/components/schemas/Conversation"}}
+        }
+      },
+      "PaginatedUserList": {
+        "type": "object",
+        "properties": {
+          "count": {"type": "integer"},
+          "next": {"type": "string", "nullable": true},
+          "previous": {"type": "string", "nullable": true},
+          "results": {"type": "array", "items": {"$ref": "#/components/schemas/User"}}
+        }
+      }
+    },
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    }
+  },
+  "security": [{"BearerAuth": []}]
+}
