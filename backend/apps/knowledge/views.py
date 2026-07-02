@@ -526,8 +526,9 @@ class UploadCallbackView(APIView):
         # 自动触发 AI 日期提取（异步，不阻塞上传主链路）
         # 遵循 CONVENTIONS.md 第 9 节：异常处理下沉到 utils 层，视图层不写 try/except
         from utils.celery_dispatcher import safe_delay
-        from .tasks import extract_freshness_task
+        from .tasks import extract_freshness_task, index_document_task
         safe_delay(extract_freshness_task, new_doc.id)
+        safe_delay(index_document_task, new_doc.id)
 
         return Response({
             'id': new_doc.id,
