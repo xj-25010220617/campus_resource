@@ -197,45 +197,7 @@ def generate_suggested_questions(
 
 
 # ------------------------------------------------------------------
-# 检索主入口
-# ------------------------------------------------------------------
-def retrieve(
-    question: str,
-    top_k: int = RAG_TOP_K,
-    min_score: float = RAG_SCORE_THRESHOLD,
-    college_id: int = None,
-) -> List[dict]:
-    """
-    检索管道：向量检索 + 关键词匹配 → 重排序 → 加载 doc 元信息。
-
-    Args:
-        question: 用户问题
-        top_k: Milvus 检索返回数量
-        min_score: 最低分阈值（低于此分数不返回）
-        college_id: 限制检索范围到指定学院（None 表示全量检索）
-
-    Returns:
-        [{'chunk_id': int, 'doc_id': int, 'doc_title': str,
-          'content': str, 'score': float, 'page': int}, ...]
-    """
-    # 1. 向量检索（带缓存）
-    question_embedding = _cached_embed(question)
-    vector_hits = []
-    if question_embedding:
-        vector_hits = milvus_client.search(question_embedding, top_k=top_k)
-
-    # 2. 关键词匹配（MySQL LIKE，作为向量检索补充）
-    keyword_hits = _keyword_search(question, top_k=top_k, college_id=college_id)
-
-    # 3. 合并 + 重排序
-    merged = _merge_and_rerank(vector_hits, keyword_hits)
-
-    # 4. 加载 doc 元信息（title、college 等）
-    return _enrich_with_doc_meta(merged, min_score)
-
-
-# ------------------------------------------------------------------
-# 关键词搜索（降级方案 / 补充检索）
+# 关键词搜索（双表支持）
 # ------------------------------------------------------------------
 def _keyword_search(
     question: str,
@@ -243,52 +205,101 @@ def _keyword_search(
     doc_ids: Optional[List[int]] = None,
 ) -> List[dict]:
     """
-    MySQL 关键词匹配搜索。
-    搜索范围：resource.title + resource.description + resource.course_term
-    支持限定 doc_ids 范围（硬过滤后的候选集）。
+    MySQL 关键词匹配搜索（支持 Resource 和 KnowledgeDoc 双表）。
+
+    - Resource 命中的 doc_id 为正数，KnowledgeDoc 命中的 doc_id 为负数。
+    - 关键词路命中时返回 content 字段（title + description 拼接），
+      解决旧版 content='' 被 _enrich_with_doc_meta 过滤掉的问题。
 
     Args:
         question: 用户问题
         top_k: 返回数量
-        doc_ids: 限定检索的 doc_id 列表（来自硬过滤）
+        doc_ids: 限定检索的 doc_id 列表（来自硬过滤，正负混排）
     """
-    try:
-        from apps.resources.models import Resource
-    except ImportError:
-        logger.debug('Resource 模型尚未就绪，跳过关键词搜索')
-        return []
-
     try:
         import jieba
         keywords = list(jieba.cut(question))[:10]
     except ImportError:
         keywords = question.split()[:10]
 
+    if not keywords:
+        return []
+
     from django.db.models import Q
+    from apps.resources.models import Resource
 
-    query = Q()
-    for kw in keywords:
-        if len(kw) >= 2:
-            query |= Q(title__icontains=kw)
-            query |= Q(description__icontains=kw)
-            query |= Q(course_term__icontains=kw)
-
-    qs = Resource.objects.filter(query, status='published')
+    # 拆分 doc_ids（正数=Resource，负数=KnowledgeDoc 的真实 ID）
+    resource_candidate_ids = None
+    kdoc_candidate_ids = None
     if doc_ids is not None:
-        qs = qs.filter(id__in=doc_ids)
+        resource_candidate_ids = [d for d in doc_ids if d > 0]
+        kdoc_candidate_ids = [abs(d) for d in doc_ids if d < 0]
 
-    docs = qs.values_list('id', 'title')[:top_k]
+    # ---------- Resource 表关键词匹配 ----------
+    resource_results = []
+    if resource_candidate_ids is not None and not resource_candidate_ids:
+        # 硬过滤后无 Resource 候选，直接跳过 Resource 表
+        pass
+    else:
+        kw_query = Q()
+        for kw in keywords:
+            if len(kw) >= 2:
+                kw_query |= Q(title__icontains=kw)
+                kw_query |= Q(description__icontains=kw)
+                kw_query |= Q(course_term__icontains=kw)
 
-    results = []
-    for doc_id, doc_title in docs:
-        results.append({
-            'doc_id': doc_id,
-            'doc_title': doc_title,
-            'score': 0.55,
-            'content': '',
-            'page': 0,
-        })
-    return results
+        resource_qs = Resource.objects.filter(
+            kw_query, status='published'
+        )
+        if resource_candidate_ids is not None:
+            resource_qs = resource_qs.filter(id__in=resource_candidate_ids)
+
+        # 取 title + description 前 300 字作为 content
+        for d in resource_qs.values('id', 'title', 'description')[:top_k]:
+            excerpt = (d['description'] or '')[:300]
+            resource_results.append({
+                'doc_id': d['id'],
+                'doc_title': d['title'],
+                'content': f"{d['title']} {excerpt}".strip(),
+                'score': 0.55,
+                'page': 0,
+            })
+
+    # ---------- KnowledgeDoc 表关键词匹配 ----------
+    kdoc_results = []
+    if kdoc_candidate_ids is not None and not kdoc_candidate_ids:
+        pass
+    else:
+        try:
+            from apps.knowledge.models import KnowledgeDoc
+
+            kw_query = Q()
+            for kw in keywords:
+                if len(kw) >= 2:
+                    kw_query |= Q(title__icontains=kw)
+                    kw_query |= Q(description__icontains=kw)
+
+            kdoc_qs = KnowledgeDoc.objects.filter(
+                kw_query, status='indexed'
+            )
+            if kdoc_candidate_ids is not None:
+                kdoc_qs = kdoc_qs.filter(id__in=kdoc_candidate_ids)
+
+            for d in kdoc_qs.values('id', 'title', 'description')[:top_k]:
+                excerpt = (d['description'] or '')[:300]
+                kdoc_results.append({
+                    'doc_id': -d['id'],           # 负数区分来源
+                    'doc_title': d['title'],
+                    'content': f"{d['title']} {excerpt}".strip(),
+                    'score': 0.55,
+                    'page': 0,
+                })
+        except ImportError:
+            logger.debug('KnowledgeDoc 模型尚未就绪，跳过知识库关键词搜索')
+
+    # 合并（Resource 在前，KnowledgeDoc 在后，截取 top_k）
+    combined = resource_results + kdoc_results
+    return combined[:top_k]
 
 
 def _keywords_boost_from_filters(filters: dict) -> dict:

@@ -3,6 +3,8 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
 from rest_framework import serializers
 
+from apps.accounts.models import College
+
 
 User = get_user_model()
 
@@ -78,3 +80,47 @@ class UserUpdateSerializer(serializers.ModelSerializer):
         if value == 'super_admin' and request_user.role != 'super_admin':
             raise serializers.ValidationError('只有超级管理员可以设置超级管理员角色')
         return value
+
+
+class CollegeSerializer(serializers.ModelSerializer):
+    """学院列表序列化器"""
+
+    class Meta:
+        model = College
+        fields = ['id', 'name', 'code', 'sort_order']
+
+
+class ResetPasswordSerializer(serializers.Serializer):
+    """重置密码序列化器"""
+    new_password = serializers.CharField(
+        required=True,
+        validators=[validate_password],
+        style={'input_type': 'password'},
+        help_text='新密码（必填）'
+    )
+    password_confirm = serializers.CharField(
+        required=True,
+        style={'input_type': 'password'},
+        help_text='确认新密码（必填）'
+    )
+
+    def validate(self, attrs):
+        if attrs['new_password'] != attrs['password_confirm']:
+            raise serializers.ValidationError({'password_confirm': '两次输入的密码不一致'})
+        return attrs
+
+
+class BatchResetPasswordSerializer(serializers.Serializer):
+    """批量重置密码序列化器"""
+    user_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1),
+        min_length=1,
+        max_length=100,
+        help_text='用户ID列表（最多100个）'
+    )
+    new_password = serializers.CharField(
+        required=True,
+        validators=[validate_password],
+        style={'input_type': 'password'},
+        help_text='新密码（必填）'
+    )

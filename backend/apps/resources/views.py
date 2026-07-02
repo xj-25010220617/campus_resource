@@ -1,8 +1,9 @@
 """Resources - 资源列表与上传日志视图"""
-from django.db.models import Count, Sum, Q
+from django.db.models import Count, Sum
 from django.db.models.functions import Cast
 from django.db.models import TextField
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from rest_framework import generics, viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -90,77 +91,105 @@ class UploadLogViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         queryset = super().get_queryset()
-        # 按时间范围过滤
         start_date = self.request.query_params.get('start_date')
         end_date = self.request.query_params.get('end_date')
         if start_date:
-            queryset = queryset.filter(created_at__gte=start_date)
+            start = parse_datetime(start_date) if 'T' in start_date else timezone.make_aware(
+                __import__('datetime').datetime.strptime(start_date, '%Y-%m-%d'))
+            queryset = queryset.filter(created_at__gte=start)
         if end_date:
-            queryset = queryset.filter(created_at__lte=end_date)
-        # 按用户过滤
+            end = parse_datetime(end_date) if 'T' in end_date else timezone.make_aware(
+                __import__('datetime').datetime.strptime(end_date, '%Y-%m-%d').replace(
+                    hour=23, minute=59, second=59))
+            queryset = queryset.filter(created_at__lte=end)
         user_id = self.request.query_params.get('user_id')
         if user_id:
             queryset = queryset.filter(user_id=user_id)
+        college_id = self.request.query_params.get('college_id')
+        if college_id:
+            queryset = queryset.filter(college_id=college_id)
         return queryset
 
     @action(detail=False, methods=['get'])
     def stats(self, request):
-        """上传统计"""
-        queryset = self.get_queryset()
+        """上传统计
 
-        # 基础统计
+        Query 参数:
+            - start_date / end_date: 时间范围（ISO 格式或 YYYY-MM-DD）
+            - user_id: 上传用户 ID
+            - college_id: 学院 ID
+            - group_by: 逗号分隔的子集，仅返回指定的分组，
+              可选值: status / file_type / college / user / all（默认 all）
+        """
+        queryset = self.get_queryset()
+        group_by_raw = request.query_params.get('group_by', 'all')
+        allowed = {'status', 'file_type', 'college', 'user', 'all'}
+        group_by = {
+            g.strip() for g in group_by_raw.split(',') if g.strip()
+        } & allowed
+        if not group_by or 'all' in group_by:
+            group_by = {'status', 'file_type', 'college', 'user'}
+
         total_count = queryset.count()
         success_count = queryset.filter(status='success').count()
         failed_count = queryset.filter(status='failed').count()
         total_size = queryset.aggregate(s=Sum('file_size'))['s'] or 0
-
-        # 按状态统计
-        by_status = dict(
-            queryset.values('status')
-            .annotate(count=Count('id'))
-            .values_list('status', 'count')
-        )
-
-        # 按文件类型统计
-        by_file_type = {}
-        for ft, label in UploadLog.FILE_TYPE_CHOICES:
-            count = queryset.filter(file_type=ft).count()
-            if count > 0:
-                by_file_type[ft] = {'label': label, 'count': count}
-
-        # 按学院统计
-        by_college = list(
-            queryset.values('college__id', 'college__name')
-            .annotate(count=Count('id'), total_size=Sum('file_size'))
-            .order_by('-count')[:20]
-        )
-        by_college = [
-            {'id': c['college__id'], 'name': c['college__name'],
-             'count': c['count'], 'total_size': c['total_size']}
-            for c in by_college
-        ]
-
-        # 按用户统计（TOP 10）
-        by_user = list(
-            queryset.values('user__id', 'user__username')
-            .annotate(count=Count('id'), total_size=Sum('file_size'))
-            .order_by('-count')[:10]
-        )
-        by_user = [
-            {'id': u['user__id'], 'username': u['user__username'],
-             'count': u['count'], 'total_size': u['total_size']}
-            for u in by_user
-        ]
 
         data = {
             'total_count': total_count,
             'success_count': success_count,
             'failed_count': failed_count,
             'total_size': total_size,
-            'by_status': by_status,
-            'by_file_type': by_file_type,
-            'by_college': by_college,
-            'by_user': by_user,
         }
+
+        if 'status' in group_by:
+            data['by_status'] = dict(
+                queryset.values('status')
+                .annotate(count=Count('id'))
+                .values_list('status', 'count')
+            )
+        else:
+            data['by_status'] = {}
+
+        if 'file_type' in group_by:
+            by_file_type_qs = queryset.values('file_type').annotate(count=Count('id'))
+            data['by_file_type'] = {
+                item['file_type'] or 'unknown': {
+                    'label': item['file_type'] or '未知',
+                    'count': item['count'],
+                }
+                for item in by_file_type_qs
+            }
+        else:
+            data['by_file_type'] = {}
+
+        if 'college' in group_by:
+            by_college_qs = list(
+                queryset.values('college__id', 'college__name')
+                .annotate(count=Count('id'), total_size=Sum('file_size'))
+                .order_by('-count')[:20]
+            )
+            data['by_college'] = [
+                {'id': c['college__id'], 'name': c['college__name'],
+                 'count': c['count'], 'total_size': c['total_size']}
+                for c in by_college_qs
+            ]
+        else:
+            data['by_college'] = []
+
+        if 'user' in group_by:
+            by_user_qs = list(
+                queryset.values('user__id', 'user__username')
+                .annotate(count=Count('id'), total_size=Sum('file_size'))
+                .order_by('-count')[:10]
+            )
+            data['by_user'] = [
+                {'id': u['user__id'], 'username': u['user__username'],
+                 'count': u['count'], 'total_size': u['total_size']}
+                for u in by_user_qs
+            ]
+        else:
+            data['by_user'] = []
+
         serializer = UploadLogStatsSerializer(data)
         return Response(serializer.data)

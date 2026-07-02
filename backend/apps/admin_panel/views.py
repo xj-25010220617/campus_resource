@@ -1,12 +1,18 @@
 """Admin Panel - 用户管理视图"""
 from django.contrib.auth import get_user_model
-from rest_framework import permissions, status, viewsets
+from django.shortcuts import get_object_or_404
+from rest_framework import generics, permissions, status, viewsets
 from rest_framework.response import Response
 
+from apps.accounts.models import College
+
 from .serializers import (
+    CollegeSerializer,
+    ResetPasswordSerializer,
     UserAdminSerializer,
     UserCreateSerializer,
     UserUpdateSerializer,
+    BatchResetPasswordSerializer,
 )
 
 
@@ -125,3 +131,173 @@ class UserAdminViewSet(viewsets.ModelViewSet):
             return super().destroy(request, *args, **kwargs)
         except PermissionError as e:
             return Response({'detail': str(e)}, status=status.HTTP_403_FORBIDDEN)
+
+
+class ResetPasswordView(generics.GenericAPIView):
+    """
+    重置单个用户密码接口
+
+    POST /api/admin/users/{id}/reset_password/
+    功能：管理员重置指定用户的密码
+    参数：
+        - new_password (str): 新密码
+        - password_confirm (str): 确认新密码
+    返回：操作结果
+    """
+    permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
+    serializer_class = ResetPasswordSerializer
+
+    def post(self, request, pk):
+        user = generics.get_object_or_404(User.objects.select_related('college'), pk=pk)
+        request_user = request.user
+
+        # 权限校验：admin 只能重置普通用户密码
+        if request_user.role == 'admin' and user.role != 'user':
+            return Response(
+                {'detail': '无权重置此用户的密码'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        # 不能重置自己的密码
+        if user.id == request_user.id:
+            return Response(
+                {'detail': '不能重置自己的密码'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user.set_password(serializer.validated_data['new_password'])
+        user.save(update_fields=['password'])
+
+        return Response({'detail': '密码重置成功'})
+
+
+class BatchResetPasswordView(generics.GenericAPIView):
+    """
+    批量重置用户密码接口
+
+    POST /api/admin/users/batch_reset_password/
+    功能：管理员批量重置多个用户的密码
+    参数：
+        - user_ids (list[int]): 用户ID列表（最多100个）
+        - new_password (str): 新密码
+    返回：操作结果（成功数量、失败数量）
+    """
+    permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
+    serializer_class = BatchResetPasswordSerializer
+
+    def post(self, request):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        user_ids = serializer.validated_data['user_ids']
+        new_password = serializer.validated_data['new_password']
+        request_user = request.user
+
+        success_count = 0
+        fail_count = 0
+        fail_reasons = []
+
+        users = User.objects.filter(id__in=user_ids).select_related('college')
+        found_ids = set(users.values_list('id', flat=True))
+
+        # 处理未找到的用户
+        for uid in user_ids:
+            if uid not in found_ids:
+                fail_count += 1
+                fail_reasons.append({'id': uid, 'reason': '用户不存在'})
+
+        for user in users:
+            # 权限校验
+            if request_user.role == 'admin' and user.role != 'user':
+                fail_count += 1
+                fail_reasons.append({'id': user.id, 'username': user.username, 'reason': '无权重置此用户'})
+                continue
+
+            if user.id == request_user.id:
+                fail_count += 1
+                fail_reasons.append({'id': user.id, 'username': user.username, 'reason': '不能重置自己'})
+                continue
+
+            user.set_password(new_password)
+            user.save(update_fields=['password'])
+            success_count += 1
+
+        return Response({
+            'detail': f'批量重置完成：成功 {success_count} 个，失败 {fail_count} 个',
+            'success_count': success_count,
+            'fail_count': fail_count,
+            'fail_reasons': fail_reasons if fail_reasons else None,
+        })
+
+
+class BatchDeleteUsersView(generics.GenericAPIView):
+    """
+    批量删除用户账号接口
+
+    POST /api/admin/users/batch_delete/
+    功能：管理员批量删除多个用户账号
+    参数：
+        - user_ids (list[int]): 用户ID列表（最多100个）
+    返回：操作结果（成功数量、失败数量）
+    """
+    permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
+
+    def post(self, request):
+        user_ids = request.data.get('user_ids', [])
+        request_user = request.user
+
+        if not user_ids:
+            return Response({'detail': '请提供用户ID列表'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if len(user_ids) > 100:
+            return Response({'detail': '一次最多删除100个用户'}, status=status.HTTP_400_BAD_REQUEST)
+
+        success_count = 0
+        fail_count = 0
+        fail_reasons = []
+
+        users = User.objects.filter(id__in=user_ids)
+        found_ids = set(users.values_list('id', flat=True))
+
+        # 处理未找到的用户
+        for uid in user_ids:
+            if uid not in found_ids:
+                fail_count += 1
+                fail_reasons.append({'id': uid, 'reason': '用户不存在'})
+
+        for user in users:
+            # 不能删除自己
+            if user.id == request_user.id:
+                fail_count += 1
+                fail_reasons.append({'id': user.id, 'username': user.username, 'reason': '不能删除自己'})
+                continue
+
+            # 权限校验：admin 只能删除普通用户
+            if request_user.role == 'admin' and user.role != 'user':
+                fail_count += 1
+                fail_reasons.append({'id': user.id, 'username': user.username, 'reason': '无权删除此用户'})
+                continue
+
+            user.delete()
+            success_count += 1
+
+        return Response({
+            'detail': f'批量删除完成：成功 {success_count} 个，失败 {fail_count} 个',
+            'success_count': success_count,
+            'fail_count': fail_count,
+            'fail_reasons': fail_reasons if fail_reasons else None,
+        })
+
+
+class CollegeListView(generics.ListAPIView):
+    """
+    学院列表查询接口
+
+    GET /api/admin/colleges/
+    返回：所有学院列表，按 sort_order 排序
+    """
+    permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
+    queryset = College.objects.all()
+    serializer_class = CollegeSerializer

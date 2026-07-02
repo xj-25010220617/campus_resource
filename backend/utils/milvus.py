@@ -172,26 +172,52 @@ class MilvusClient:
     # ------------------------------------------------------------------
     # 向量搜索
     # ------------------------------------------------------------------
-    def search(self, query_embedding: List[float], top_k: int = 10) -> List[dict]:
+    def search(
+        self,
+        query_embedding: List[float],
+        top_k: int = 10,
+        filter_ids: Optional[List[int]] = None,
+    ) -> List[dict]:
         """
-        向量相似度搜索。
-        返回: [{'vector_id': str, 'doc_id': int, 'chunk_index': int,
-                'chunk_text': str, 'page_number': int, 'seq_order': int,
-                'score': float}, ...]
+        向量相似度搜索（支持按 doc_id 范围硬过滤）。
+
+        Args:
+            query_embedding: 查询向量
+            top_k: 返回数量
+            filter_ids: 限定 doc_id 范围（来自 SQL 硬过滤，为空/None 时不过滤）
+
+        Returns:
+            [{'vector_id': str, 'doc_id': int, 'chunk_index': int,
+              'chunk_text': str, 'page_number': int, 'seq_order': int,
+              'score': float}, ...]
         """
         if self._connected:
-            return self._search_milvus(query_embedding, top_k)
-        return self._search_chroma(query_embedding, top_k)
+            return self._search_milvus(query_embedding, top_k, filter_ids)
+        return self._search_chroma(query_embedding, top_k, filter_ids)
 
-    def _search_milvus(self, query_embedding: List[float], top_k: int) -> List[dict]:
+    def _search_milvus(
+        self,
+        query_embedding: List[float],
+        top_k: int,
+        filter_ids: Optional[List[int]],
+    ) -> List[dict]:
         from pymilvus import Collection
         collection = Collection(name=self.COLLECTION_NAME)
         collection.load()
+
+        # 硬过滤：只检索指定 doc_id 范围内的向量（来自 SQL 硬过滤）
+        expr = None
+        if filter_ids:
+            # Milvus 表达式：doc_id in [1, 2, 3, ...]
+            # 为防止空列表出错，跳过 expr
+            expr = f'doc_id in {filter_ids}'
+
         results = collection.search(
             data=[query_embedding],
             anns_field='embedding',
             param={'metric_type': 'COSINE', 'params': {'nprobe': 10}},
             limit=top_k,
+            expr=expr,
             output_fields=['vector_id', 'doc_id', 'chunk_index',
                            'chunk_text', 'page_number', 'seq_order'],
         )
@@ -208,23 +234,42 @@ class MilvusClient:
             })
         return hits
 
-    def _search_chroma(self, query_embedding: List[float], top_k: int) -> List[dict]:
+    def _search_chroma(
+        self,
+        query_embedding: List[float],
+        top_k: int,
+        filter_ids: Optional[List[int]],
+    ) -> List[dict]:
         import chromadb
         client = chromadb.PersistentClient(
             path=str(getattr(settings, 'CHROMA_DB_PATH', './chroma_db'))
         )
         collection = client.get_collection(name=self.COLLECTION_NAME)
-        results = collection.query(query_embeddings=[query_embedding], n_results=top_k)
+
+        # 检索时若限定了 doc_id 范围，过滤后可能数量不足，
+        # 因此多取 5 倍以保证在过滤后仍有 top_k 条命中
+        fetch_k = top_k * 5 if filter_ids else top_k
+        results = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=fetch_k,
+        )
 
         hits = []
         if results and results['ids'] and results['ids'][0]:
+            filter_set = set(filter_ids) if filter_ids else None
             for i, vid in enumerate(results['ids'][0]):
                 meta = results['metadatas'][0][i] if results.get('metadatas') else {}
                 docs_list = results.get('documents')
                 doc_text = docs_list[0][i] if docs_list and docs_list[0] else ''
+                doc_id = meta.get('doc_id')
+
+                # doc_id 硬过滤（跨版本兼容性兜底）
+                if filter_set is not None and doc_id not in filter_set:
+                    continue
+
                 hits.append({
                     'vector_id': vid,
-                    'doc_id': meta.get('doc_id'),
+                    'doc_id': doc_id,
                     'chunk_index': meta.get('chunk_index'),
                     'chunk_text': doc_text,
                     'page_number': meta.get('page_number', 0),

@@ -1,0 +1,296 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "校园虚拟资源管理系统 API - 管理员扩展接口",
+    "description": "管理员端用户管理扩展接口：重置密码、批量重置密码、批量删除、学院列表",
+    "version": "1.1.0"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8000/api",
+      "description": "开发环境"
+    }
+  ],
+  "paths": {
+    "/admin/users/{id}/reset_password/": {
+      "post": {
+        "tags": ["Admin-用户管理"],
+        "summary": "重置单个用户密码",
+        "description": "管理员重置指定用户的密码。admin只能重置普通用户，super_admin可以重置所有用户（除自己外）",
+        "operationId": "resetUserPassword",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "integer"},
+            "description": "用户ID"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["new_password", "password_confirm"],
+                "properties": {
+                  "new_password": {
+                    "type": "string",
+                    "description": "新密码（需符合密码复杂度要求）",
+                    "example": "NewPass123!"
+                  },
+                  "password_confirm": {
+                    "type": "string",
+                    "description": "确认新密码",
+                    "example": "NewPass123!"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "密码重置成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "detail": {"type": "string", "example": "密码重置成功"}
+                  }
+                }
+              }
+            }
+          },
+          "400": {"description": "参数错误（如密码不一致）"},
+          "401": {"description": "未认证"},
+          "403": {"description": "无权限（不能重置自己或无权操作该用户）"},
+          "404": {"description": "用户不存在"}
+        }
+      }
+    },
+    "/admin/users/batch_reset_password/": {
+      "post": {
+        "tags": ["Admin-用户管理"],
+        "summary": "批量重置用户密码",
+        "description": "管理员批量重置多个用户的密码为相同密码。一次最多处理100个用户",
+        "operationId": "batchResetUserPassword",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["user_ids", "new_password"],
+                "properties": {
+                  "user_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "minItems": 1,
+                    "maxItems": 100,
+                    "description": "用户ID列表（最多100个）",
+                    "example": [1, 2, 3, 4, 5]
+                  },
+                  "new_password": {
+                    "type": "string",
+                    "description": "新密码（所有选中用户将使用相同密码）",
+                    "example": "TempPass123!"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "批量重置完成",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "detail": {"type": "string", "example": "批量重置完成：成功 5 个，失败 0 个"},
+                    "success_count": {"type": "integer", "example": 5},
+                    "fail_count": {"type": "integer", "example": 0},
+                    "fail_reasons": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {"type": "integer"},
+                          "username": {"type": "string"},
+                          "reason": {"type": "string"}
+                        }
+                      },
+                      "nullable": true,
+                      "example": null
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {"description": "参数错误（如超过100个用户）"},
+          "401": {"description": "未认证"},
+          "403": {"description": "无权限"}
+        }
+      }
+    },
+    "/admin/users/batch_delete/": {
+      "post": {
+        "tags": ["Admin-用户管理"],
+        "summary": "批量删除用户账号",
+        "description": "管理员批量删除多个用户账号。不能删除自己，admin不能删除其他admin/super_admin",
+        "operationId": "batchDeleteUsers",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["user_ids"],
+                "properties": {
+                  "user_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "minItems": 1,
+                    "maxItems": 100,
+                    "description": "用户ID列表（最多100个）",
+                    "example": [10, 11, 12]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "批量删除完成",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "detail": {"type": "string", "example": "批量删除完成：成功 3 个，失败 0 个"},
+                    "success_count": {"type": "integer", "example": 3},
+                    "fail_count": {"type": "integer", "example": 0},
+                    "fail_reasons": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {"type": "integer"},
+                          "username": {"type": "string"},
+                          "reason": {"type": "string"}
+                        }
+                      },
+                      "nullable": true,
+                      "example": null
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {"description": "参数错误（如超过100个用户或未提供user_ids）"},
+          "401": {"description": "未认证"},
+          "403": {"description": "无权限"}
+        }
+      }
+    },
+    "/admin/colleges/": {
+      "get": {
+        "tags": ["Admin-学院管理"],
+        "summary": "学院列表查询",
+        "description": "获取所有学院列表，按排序字段sort_order升序排列",
+        "operationId": "listColleges",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "schema": {"type": "integer", "default": 1},
+            "description": "页码"
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "schema": {"type": "integer", "default": 20},
+            "description": "每页数量"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "count": {"type": "integer", "description": "总数量"},
+                    "next": {"type": "string", "nullable": true},
+                    "previous": {"type": "string", "nullable": true},
+                    "results": {
+                      "type": "array",
+                      "items": {"$ref": "#/components/schemas/College"}
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {"description": "未认证"},
+          "403": {"description": "无权限（需admin+）"}
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "College": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "integer", "description": "学院ID"},
+          "name": {"type": "string", "description": "学院名称"},
+          "code": {"type": "string", "description": "学院代码"},
+          "sort_order": {"type": "integer", "description": "排序序号"}
+        },
+        "example": {
+          "id": 1,
+          "name": "计算机与软件学院",
+          "code": "CS",
+          "sort_order": 1
+        }
+      },
+      "BatchOperationResult": {
+        "type": "object",
+        "properties": {
+          "detail": {"type": "string"},
+          "success_count": {"type": "integer"},
+          "fail_count": {"type": "integer"},
+          "fail_reasons": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {"type": "integer"},
+                "username": {"type": "string"},
+                "reason": {"type": "string"}
+              }
+            },
+            "nullable": true
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    }
+  },
+  "security": [{"BearerAuth": []}]
+}

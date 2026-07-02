@@ -1,4 +1,5 @@
 import logging
+import time
 
 from django.http import StreamingHttpResponse
 from django.shortcuts import get_object_or_404
@@ -14,6 +15,7 @@ from apps.resources.serializers import ResourceListSerializer
 from utils import rag
 from utils.llm import llm_client
 from utils.sse import _format_sse, build_references_events
+from apps.classify.utils.query_parser import parse as parse_query
 
 from .models import Conversation, ChatMessage, QueryLog
 from .serializers import (
@@ -195,6 +197,11 @@ class AskView(APIView):
         question = serializer.validated_data['question']
         conversation_id = serializer.validated_data.get('conversation_id')
         user = request.user
+        user_context = {
+            'user_id': user.id,
+            'role': getattr(user, 'role', 'user'),
+            'college_id': getattr(user, 'college_id', None),
+        }
 
         # 1. 获取或新建会话
         if conversation_id:
@@ -220,13 +227,28 @@ class AskView(APIView):
             .values('role', 'content')
         )
 
-        # 4. RAG 检索
-        user_context = {
-            'user_id': user.id,
-            'role': user.role,
-            'college_id': user.college_id,
-        }
-        results = rag.retrieve(question, user_context=user_context)
+        # 3.1 问题解析（LLM 抽取硬过滤条件，失败走规则回退）
+        parsed = parse_query(question, user_context)
+        logger.debug(f'parsed_filters: {parsed}')
+
+        # 3.2 RAG 检索（新版：硬过滤 + 双路召回 + 权限校验）
+        results = rag.retrieve(
+            question=question,
+            user_context=user_context,
+            parsed_filters=parsed,
+        )
+
+        # 3.3 写 query_log（预创建，response_ms 在流结束后回填）
+        start_ts = time.time()
+        query_log = QueryLog.objects.create(
+            user=user,
+            conversation=conversation,
+            question=question,
+            parsed_filters=parsed,
+            hit_count=len(results),
+            top_doc_ids=[r['doc_id'] for r in results],
+            response_ms=0,
+        )
 
         # 5. 构造 Prompt（含历史上下文）
         messages = rag.build_rag_prompt(question, results, history=history)
@@ -244,47 +266,56 @@ class AskView(APIView):
 
         # 7. SSE 流式响应
         def event_stream():
-            """生成 SSE 事件流"""
-            # start 事件
-            yield _format_sse('start', {
-                'conversation_id': conversation.id,
-                'message_id': assistant_msg.id,
-            })
+            """生成 SSE 事件流（finally 保证 query_log 回填）"""
+            try:
+                # start 事件
+                yield _format_sse('start', {
+                    'conversation_id': conversation.id,
+                    'message_id': assistant_msg.id,
+                })
 
-            # 流式生成
-            collected_tokens = []
-            stream = llm_client.chat_stream(messages)
-            for token in stream:
-                if token:
-                    collected_tokens.append(token)
-                    yield _format_sse('token', {'content': token})
+                # 流式生成
+                collected_tokens = []
+                stream = llm_client.chat_stream(messages)
+                for token in stream:
+                    if token:
+                        collected_tokens.append(token)
+                        yield _format_sse('token', {'content': token})
 
-            full_answer = ''.join(collected_tokens)
+                full_answer = ''.join(collected_tokens)
 
-            # 保存 AI 回答（流结束后写库）
-            if full_answer:
-                ChatMessage.objects.filter(id=assistant_msg.id).update(
-                    content=full_answer,
-                )
-                logger.info(
-                    'AI 回答完成 msg_id=%d conv_id=%d tokens=%d',
-                    assistant_msg.id, conversation.id, len(collected_tokens),
-                )
+                # 保存 AI 回答（流结束后写库）
+                if full_answer:
+                    ChatMessage.objects.filter(id=assistant_msg.id).update(
+                        content=full_answer,
+                    )
+                    logger.info(
+                        'AI 回答完成 msg_id=%d conv_id=%d tokens=%d',
+                        assistant_msg.id, conversation.id, len(collected_tokens),
+                    )
 
-            # 生成相关推荐（调用 LLM 生成 3 个相关问题）
-            suggested = rag.generate_suggested_questions(question, full_answer)
-            if suggested:
-                yield _format_sse('suggested', suggested)
+                # 生成相关推荐（调用 LLM 生成 3 个相关问题）
+                suggested = rag.generate_suggested_questions(question, full_answer)
+                if suggested:
+                    yield _format_sse('suggested', suggested)
 
-            # 引用溯源
-            refs = build_references_events(results, user.role, user.id)
-            if 'references' in refs:
-                yield _format_sse('references', refs['references'])
-            if 'references_detail' in refs and is_authorized:
-                yield _format_sse('references_detail', refs['references_detail'])
+                # 引用溯源
+                refs = build_references_events(results, user.role, user.id)
+                if 'references' in refs:
+                    yield _format_sse('references', refs['references'])
+                if 'references_detail' in refs and is_authorized:
+                    yield _format_sse('references_detail', refs['references_detail'])
 
-            # done 事件
-            yield _format_sse('done', {'message_id': assistant_msg.id})
+                # done 事件
+                yield _format_sse('done', {'message_id': assistant_msg.id})
+
+            finally:
+                # 保证流中断时 response_ms 也能回填（客户端断连、Django 回收 generator 时触发）
+                elapsed_ms = int((time.time() - start_ts) * 1000)
+                try:
+                    QueryLog.objects.filter(id=query_log.id).update(response_ms=elapsed_ms)
+                except Exception:
+                    logger.warning('回填 response_ms 失败 query_log.id=%d', query_log.id)
 
         response = StreamingHttpResponse(
             event_stream(),
@@ -301,7 +332,7 @@ class FeedbackView(generics.CreateAPIView):
     问答反馈接口（兼容旧接口）
 
     POST /api/chat/feedback/
-    功能：用户根据点赞/点踩，写入 query_log
+    功能：用户根据点赞/点踩，写入 query_log.user_feedback
     参数：
         - message_id (int, required): 消息ID
         - feedback (int, required): 1=赞 / 0=踩
@@ -309,3 +340,36 @@ class FeedbackView(generics.CreateAPIView):
     """
     serializer_class = FeedbackSerializer
     permission_classes = [permissions.IsAuthenticated]
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        message_id = serializer.validated_data['message_id']
+        feedback = serializer.validated_data['feedback']
+        user = request.user
+
+        # 找到消息，验证所有权
+        msg = get_object_or_404(
+            ChatMessage, id=message_id, conversation__user=user,
+        )
+
+        # 找到该会话最近一条 QueryLog，回填 user_feedback
+        QueryLog.objects.filter(
+            conversation=msg.conversation,
+            user=user,
+        ).order_by('-created_at').first()
+
+        # 用 update 而非 save，避免触发 save() 逻辑
+        updated = QueryLog.objects.filter(
+            conversation=msg.conversation,
+            user=user,
+        ).order_by('-created_at').update(user_feedback=feedback)
+
+        if not updated:
+            logger.warning('FeedbackView: 未找到对应 QueryLog msg_id=%d user_id=%d', message_id, user.id)
+
+        return Response(
+            {'detail': '反馈已记录'},
+            status=status.HTTP_200_OK,
+        )
