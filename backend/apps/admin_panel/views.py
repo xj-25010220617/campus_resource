@@ -1,7 +1,6 @@
 """Admin Panel - 用户管理视图"""
 from django.contrib.auth import get_user_model
 from django.shortcuts import get_object_or_404
-from drf_spectacular.utils import extend_schema
 from rest_framework import generics, permissions, status, viewsets
 from rest_framework.response import Response
 
@@ -31,11 +30,6 @@ class IsAdminOrSuperAdmin(permissions.BasePermission):
         )
 
 
-@extend_schema(
-    summary='用户管理',
-    description='管理后台用户管理接口，支持列表、创建、编辑、删除',
-    tags=['管理后台'],
-)
 class UserAdminViewSet(viewsets.ModelViewSet):
     """
     管理后台用户管理接口
@@ -139,12 +133,6 @@ class UserAdminViewSet(viewsets.ModelViewSet):
             return Response({'detail': str(e)}, status=status.HTTP_403_FORBIDDEN)
 
 
-@extend_schema(
-    summary='重置用户密码',
-    description='管理员重置指定用户的密码',
-    tags=['管理后台'],
-    operation_id='重置用户密码',
-)
 class ResetPasswordView(generics.GenericAPIView):
     """
     重置单个用户密码接口

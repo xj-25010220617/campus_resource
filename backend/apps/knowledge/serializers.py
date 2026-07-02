@@ -26,7 +26,11 @@ class KnowledgeDocSerializer(serializers.ModelSerializer):
             'freshness_date',
             'created_at', 'updated_at', 'indexed_at',
         ]
-        read_only_fields = ['id', 'chunk_count', 'created_at', 'updated_at', 'indexed_at']
+        read_only_fields = [
+            'id', 'source_type', 'oss_key', 'oss_url', 'file_name', 'file_type',
+            'file_size', 'md5_hash', 'page_count', 'uploader',
+            'chunk_count', 'created_at', 'updated_at', 'indexed_at',
+        ]
 
 
 class KnowledgeDocListSerializer(serializers.ModelSerializer):
@@ -196,6 +200,27 @@ class TextUploadSerializer(serializers.Serializer):
     keywords = serializers.ListField(
         child=serializers.CharField(), required=False, default=list,
         help_text='关键词列表（可选）',
+    )
+    visibility = serializers.CharField(
+        max_length=16, default='public',
+        help_text='可见性（public:公开 / private:私密）',
+    )
+
+
+class FileUploadSerializer(serializers.Serializer):
+    """文件上传请求参数（multipart/form-data）"""
+
+    file = serializers.FileField(help_text='上传的文件')
+    title = serializers.CharField(max_length=512, help_text='文档标题')
+    description = serializers.CharField(
+        default='', allow_blank=True, help_text='文档描述（可选）',
+    )
+    college_id = serializers.IntegerField(help_text='学院ID')
+    discipline_id = serializers.IntegerField(help_text='学科方向ID')
+    category_id = serializers.IntegerField(help_text='资源类型ID（必须是二级分类）')
+    keywords = serializers.CharField(
+        default='', allow_blank=True,
+        help_text='关键词 JSON 数组，如 ["关键词1","关键词2"]（可选）',
     )
     visibility = serializers.CharField(
         max_length=16, default='public',

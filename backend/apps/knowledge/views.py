@@ -5,7 +5,7 @@ from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema
-from rest_framework import filters, generics, permissions, status
+from rest_framework import filters, generics, parsers, permissions, status
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -22,6 +22,8 @@ from utils.oss import oss_client
 from .extractor import extract_freshness_for_doc
 from .models import Keyword, KnowledgeDoc
 from .serializers import (
+    ALLOWED_FILE_TYPES,
+    FileUploadSerializer,
     KeywordCreateSerializer,
     KeywordSerializer,
     KnowledgeDocListSerializer,
@@ -851,7 +853,109 @@ class ExtractFreshnessView(APIView):
             'raw_response': result.raw_response,
         })
 
-    @staticmethod
-    def _raise_permission_error(message: str):
-        raise PermissionDenied({'detail': message, 'code': 'PERMISSION_DENIED'})
+
+class FileUploadView(APIView):
+    """
+    文件直传上传接口（multipart/form-data）
+
+    POST /api/knowledge/upload/file/
+    功能：接收前端上传的文件，后端存到 OSS 并创建知识文档记录
+    请求参数（form-data）：
+        - file (file, required): 上传的文件
+        - title (str, required): 文档标题
+        - description (str, optional): 文档描述
+        - college_id (int, required): 学院 ID
+        - discipline_id (int, required): 学科方向 ID
+        - category_id (int, required): 资源类型 ID（必须是二级分类）
+        - keywords (str, optional): JSON 数组字符串，如 '["关键词1","关键词2"]'
+        - visibility (str, optional): public/private，默认 public
+    返回：{"id": <doc.id>, "status": "uploaded", "file_name": "..."}
+    """
+    permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
+    parser_classes = [parsers.MultiPartParser, parsers.FormParser]
+
+    def post(self, request):
+        """处理文件上传"""
+        import hashlib
+        import json
+        import uuid
+        from datetime import datetime
+
+        serializer = FileUploadSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        uploaded_file = data['file']
+
+        # 校验分类关联数据合法性
+        UploadCallbackView._validate_classification(data)
+
+        # 校验文件类型
+        ext = uploaded_file.name.rsplit('.', 1)[-1].lower() if '.' in uploaded_file.name else 'other'
+        if ext not in ALLOWED_FILE_TYPES:
+            raise ValidationError(
+                {'file': f'不支持的文件类型 ".{ext}"，支持的类型：{", ".join(sorted(ALLOWED_FILE_TYPES))}'}
+            )
+
+        # 生成 OSS 对象 Key
+        now = datetime.now()
+        safe_filename = f'{uuid.uuid4().hex[:12]}.{ext}'
+        oss_key = f'knowledge/{data["college_id"]}/{now:%Y-%m}/{safe_filename}'
+
+        # 读取文件二进制内容 + 计算 MD5
+        file_bytes = uploaded_file.read()
+        md5_hash = hashlib.md5(file_bytes).hexdigest()
+
+        # 上传到 OSS（开发环境 OSS 不可用时降级：跳过上传、仍创建 DB 记录）
+        oss_url = ''
+        oss_uploaded = False
+        if oss_client.bucket is not None:
+            try:
+                oss_client.bucket.put_object(oss_key, file_bytes)
+                oss_url = f'https://{oss_client.bucket_name}.{oss_client.endpoint}/{oss_key}'
+                oss_uploaded = True
+                logger.info(f'OSS 上传成功 oss_key={oss_key}, size={len(file_bytes)}')
+            except Exception as e:
+                logger.warning(f'OSS 上传失败（降级跳过）: {e}')
+        if not oss_uploaded:
+            logger.warning('OSS 上传跳过，仅创建数据库记录（本地开发/OSS 不可用）')
+
+        # 创建 KnowledgeDoc 记录
+        new_doc = KnowledgeDoc.objects.create(
+            title=data['title'],
+            description=data.get('description', ''),
+            source_type='upload',
+            oss_key=oss_key,
+            oss_url=oss_url,
+            file_name=uploaded_file.name,
+            file_type=ext,
+            file_size=uploaded_file.size,
+            md5_hash=md5_hash,
+            college_id=data['college_id'],
+            discipline_id=data['discipline_id'],
+            category_id=data['category_id'],
+            uploader=request.user,
+            status='uploaded',
+            visibility=data.get('visibility', 'public'),
+        )
+
+        # 解析并创建关联关键词（兼容 JSON 字符串和列表两种格式）
+        raw_keywords = data.get('keywords', '')
+        if isinstance(raw_keywords, str) and raw_keywords.strip():
+            try:
+                raw_keywords = json.loads(raw_keywords)
+            except (json.JSONDecodeError, TypeError):
+                raw_keywords = []
+        elif not isinstance(raw_keywords, list):
+            raw_keywords = []
+        for phrase in raw_keywords:
+            Keyword.objects.create(
+                doc=new_doc, phrase=phrase,
+                match_type='fuzzy', weight=1, created_by=request.user,
+            )
+
+        return Response({
+            'id': new_doc.id,
+            'status': new_doc.status,
+            'file_name': new_doc.file_name,
+        })
 

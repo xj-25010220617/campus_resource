@@ -78,12 +78,6 @@ class MeView(generics.RetrieveUpdateAPIView):
         return self.request.user
 
 
-@extend_schema(
-    summary='修改密码',
-    description='用户自己修改密码，需提供旧密码验证',
-    tags=['用户管理'],
-    operation_id='修改密码',
-)
 class ChangePasswordView(APIView):
     """
     修改密码
@@ -109,12 +103,6 @@ class ChangePasswordView(APIView):
         return Response({'detail': '密码修改成功'}, status=status.HTTP_200_OK)
 
 
-@extend_schema(
-    summary='SSO登录跳转',
-    description='Mock模式返回测试码列表，正式模式重定向至学校统一认证页面',
-    tags=['用户管理'],
-    operation_id='SSO登录跳转',
-)
 class SsoLoginView(APIView):
     """
     SSO 登录跳转
@@ -161,12 +149,6 @@ class SsoLoginView(APIView):
         )
 
 
-@extend_schema(
-    summary='SSO登录回调',
-    description='Mock模式接受code参数创建/查找用户并签发JWT',
-    tags=['用户管理'],
-    operation_id='SSO登录回调',
-)
 class SsoCallbackView(APIView):
     """
     SSO 登录回调

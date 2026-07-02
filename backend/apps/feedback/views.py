@@ -1,6 +1,5 @@
 import logging
 
-from drf_spectacular.utils import extend_schema
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 
@@ -12,12 +11,6 @@ from .serializers import FeedbackQuestionListSerializer, FeedbackQuestionAnswerS
 logger = logging.getLogger(__name__)
 
 
-@extend_schema(
-    summary='待回答问题列表',
-    description='返回待回答的问题列表，支持按学院筛选',
-    tags=['反馈管理'],
-    operation_id='待回答问题列表',
-)
 class FeedbackPendingListView(generics.ListAPIView):
     """
     待人工回答的问题列表
@@ -52,12 +45,6 @@ class FeedbackPendingListView(generics.ListAPIView):
         return queryset.select_related('college')
 
 
-@extend_schema(
-    summary='提交人工回答',
-    description='管理员提交人工回答，状态变为answered',
-    tags=['反馈管理'],
-    operation_id='提交人工回答',
-)
 class FeedbackAnswerView(generics.UpdateAPIView):
     """
     提交人工回答
