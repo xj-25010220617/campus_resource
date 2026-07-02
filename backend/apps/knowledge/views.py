@@ -1,7 +1,7 @@
 import django_filters
 import logging
 from django.db import transaction
-from django.db.models import Max, Q
+from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema
@@ -42,13 +42,23 @@ class KnowledgeDocFilter(django_filters.FilterSet):
     file_type = django_filters.CharFilter(field_name='file_type')
     status = django_filters.CharFilter(field_name='status')
     source_type = django_filters.CharFilter(field_name='source_type')
+    days_back = django_filters.NumberFilter(method='filter_days_back')
 
     class Meta:
         model = KnowledgeDoc
         fields = [
             'college_id', 'discipline_id', 'category_id',
-            'file_type', 'status', 'source_type',
+            'file_type', 'status', 'source_type', 'days_back',
         ]
+
+    def filter_days_back(self, queryset, name, value):
+        """按时间范围过滤，days_back=0 表示不限时间"""
+        if value and value > 0:
+            from datetime import timedelta
+            from django.utils import timezone
+            since_date = timezone.now() - timedelta(days=value)
+            return queryset.filter(created_at__gte=since_date)
+        return queryset
 
 
 @extend_schema(
@@ -89,7 +99,6 @@ class KnowledgeDocListView(generics.ListAPIView):
 
     def get_queryset(self):
         user = self.request.user
-        latest_only = self.request.query_params.get('latest_only', 'true').lower() == 'true'
 
         queryset = KnowledgeDoc.objects.select_related(
             'college', 'discipline', 'uploader',
@@ -98,29 +107,18 @@ class KnowledgeDocListView(generics.ListAPIView):
         # 可见性权限过滤
         queryset = self._apply_visibility_filter(queryset, user)
 
-        if latest_only:
-            # 按学院+学科+分类分组，取每组最新一条
-            grouped = (
-                queryset
-                .values('college_id', 'discipline_id', 'category_id')
-                .annotate(max_created=Max('created_at'))
-            )
-            latest_ids = []
-            for group in grouped:
-                latest_id = (
-                    queryset
-                    .filter(
-                        college_id=group['college_id'],
-                        discipline_id=group['discipline_id'],
-                        category_id=group['category_id'],
-                        created_at=group['max_created'],
-                    )
-                    .values_list('id', flat=True)
-                    .first()
-                )
-                if latest_id:
-                    latest_ids.append(latest_id)
-            queryset = queryset.filter(id__in=latest_ids)
+        # 默认时间范围过滤：近一年（days_back=0 表示不限时间）
+        days_back = self.request.query_params.get('days_back', '365')
+        try:
+            days_back = int(days_back)
+        except (ValueError, TypeError):
+            days_back = 365
+
+        if days_back > 0:
+            from datetime import timedelta
+            from django.utils import timezone
+            since_date = timezone.now() - timedelta(days=days_back)
+            queryset = queryset.filter(created_at__gte=since_date)
 
         return queryset.order_by('-created_at')
 

@@ -15,6 +15,15 @@ logger = logging.getLogger(__name__)
 
 
 # ------------------------------------------------------------------
+# 历史意图检测
+# ------------------------------------------------------------------
+def _detect_history_intent(question: str) -> bool:
+    """检测用户是否有查看历史数据的意图（关键词匹配）"""
+    history_keywords = ['历年', '所有', '历史', '全部', '以往', '过去', '各年']
+    return any(keyword in question for keyword in history_keywords)
+
+
+# ------------------------------------------------------------------
 # Embedding 缓存（LRU + TTL，避免相同问题重复调 Embedding API）
 # ------------------------------------------------------------------
 _EMBEDDING_CACHE_TTL = 300  # 5 分钟
@@ -400,9 +409,22 @@ def _apply_hard_filters(
     from apps.resources.models import Resource
     from apps.knowledge.models import KnowledgeDoc
     from django.db.models import Q
+    from datetime import timedelta
+    from django.utils import timezone
+
+    # --- 默认时间范围：近一年（用户明确要求历史时跳过）---
+    time_range = filters.get('time_range')
+    need_history = filters.get('need_history', False)
+    one_year_ago = None
+    if not time_range and not need_history:
+        one_year_ago = timezone.now() - timedelta(days=365)
 
     # --- Resource 表硬过滤 ---
     qs = Resource.objects.filter(status='published')
+
+    # 默认一年时间过滤
+    if one_year_ago:
+        qs = qs.filter(published_at__gte=one_year_ago)
 
     # 1. 可见层级权限
     role = user_context.get('role', 'user')
@@ -450,6 +472,10 @@ def _apply_hard_filters(
 
     # --- KnowledgeDoc 表硬过滤（AI 只能检索公开文件）---
     kd_qs = KnowledgeDoc.objects.filter(status='indexed')
+
+    # 默认一年时间过滤
+    if one_year_ago:
+        kd_qs = kd_qs.filter(created_at__gte=one_year_ago)
 
     # AI 检索时强制只看公开文件；后台管理查询时按角色过滤
     is_admin_query = role in ('admin', 'super_admin')
@@ -622,6 +648,9 @@ def retrieve(
     """
     user_context = user_context or {'role': 'user'}
     parsed_filters = parsed_filters or {}
+
+    # 检测用户是否需要历史数据（含"历年/历史/全部"等关键词则不限时间）
+    parsed_filters['need_history'] = _detect_history_intent(question)
 
     # 1. SQL 硬过滤 → 候选 ID 列表
     candidate_ids = _apply_hard_filters(parsed_filters, user_context, top_k=500)

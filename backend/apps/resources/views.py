@@ -4,6 +4,7 @@ from django.db.models.functions import Cast
 from django.db.models import TextField
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
+from drf_spectacular.utils import extend_schema
 from rest_framework import generics, viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -20,6 +21,12 @@ from .serializers import (
 )
 
 
+@extend_schema(
+    summary='资源列表',
+    description='分页返回已发布资源列表，支持按学院、学科、分类、关键词筛选',
+    tags=['资源管理'],
+    operation_id='资源列表',
+)
 class ResourceListView(generics.ListAPIView):
     """
     资源列表接口
@@ -81,6 +88,11 @@ class ResourceListView(generics.ListAPIView):
         return queryset.order_by('-created_at')
 
 
+@extend_schema(
+    summary='上传日志',
+    description='上传日志管理，支持查看和统计功能',
+    tags=['资源管理'],
+)
 class UploadLogViewSet(viewsets.ReadOnlyModelViewSet):
     """上传日志 ViewSet（只读）"""
     queryset = UploadLog.objects.select_related('user', 'college', 'resource')

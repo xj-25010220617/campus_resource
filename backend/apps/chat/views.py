@@ -3,6 +3,7 @@ import time
 
 from django.http import StreamingHttpResponse
 from django.shortcuts import get_object_or_404
+from drf_spectacular.utils import extend_schema
 from rest_framework import generics, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -31,6 +32,11 @@ from .serializers import (
 logger = logging.getLogger(__name__)
 
 
+@extend_schema(
+    summary='会话管理',
+    description='会话管理接口，支持列表、创建、详情、编辑、删除',
+    tags=['AI对话'],
+)
 class ConversationViewSet(ModelViewSet):
     """
     会话 ViewSet
@@ -56,6 +62,11 @@ class ConversationViewSet(ModelViewSet):
         serializer.save(user=self.request.user)
 
 
+@extend_schema(
+    summary='消息管理',
+    description='消息反馈和引用来源查看',
+    tags=['AI对话'],
+)
 class MessageViewSet(ModelViewSet):
     """
     消息 ViewSet（用于消息反馈和引用来源查看）
@@ -131,6 +142,12 @@ class MessageViewSet(ModelViewSet):
         return Response(serializer.data)
 
 
+@extend_schema(
+    summary='会话列表',
+    description='返回当前用户的会话列表',
+    tags=['AI对话'],
+    operation_id='会话列表',
+)
 class ConversationListView(generics.ListAPIView):
     """
     会话列表（兼容旧接口）
@@ -145,6 +162,12 @@ class ConversationListView(generics.ListAPIView):
         return Conversation.objects.filter(user=self.request.user).order_by('-updated_at')
 
 
+@extend_schema(
+    summary='会话详情',
+    description='返回指定会话的完整消息列表',
+    tags=['AI对话'],
+    operation_id='会话详情',
+)
 class ConversationDetailView(generics.RetrieveAPIView):
     """
     会话详情（兼容旧接口）
@@ -159,6 +182,12 @@ class ConversationDetailView(generics.RetrieveAPIView):
         return Conversation.objects.filter(user=self.request.user).prefetch_related('messages')
 
 
+@extend_schema(
+    summary='AI问答',
+    description='AI问答接口，流式输出回答结果',
+    tags=['AI对话'],
+    operation_id='AI问答',
+)
 class AskView(APIView):
     """
     AI 问答接口（流式输出）

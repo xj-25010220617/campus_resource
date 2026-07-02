@@ -1,3 +1,4 @@
+from drf_spectacular.utils import extend_schema
 from rest_framework import generics, permissions
 
 from apps.accounts.models import College
@@ -5,6 +6,12 @@ from .models import Discipline, Category
 from .serializers import CollegeSerializer, DisciplineSerializer, CategorySerializer
 
 
+@extend_schema(
+    summary='学院列表',
+    description='返回全校所有二级学院，按 sort_order 排序',
+    tags=['分类管理'],
+    operation_id='学院列表',
+)
 class CollegeListView(generics.ListAPIView):
     """
     学院列表
@@ -18,6 +25,12 @@ class CollegeListView(generics.ListAPIView):
     permission_classes = [permissions.IsAuthenticated]
 
 
+@extend_schema(
+    summary='学科方向列表',
+    description='返回所有学科方向，支持按门类筛选，按 sort_order 排序',
+    tags=['分类管理'],
+    operation_id='学科方向列表',
+)
 class DisciplineListView(generics.ListAPIView):
     """
     学科方向列表
@@ -39,6 +52,12 @@ class DisciplineListView(generics.ListAPIView):
         return queryset
 
 
+@extend_schema(
+    summary='资源类型列表',
+    description='返回两级树形资源类型结构，一级分类的 parent 为 null',
+    tags=['分类管理'],
+    operation_id='资源类型列表',
+)
 class CategoryListView(generics.ListAPIView):
     """
     资源类型列表（树形，含图标）

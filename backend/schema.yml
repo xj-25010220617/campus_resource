@@ -1,0 +1,3183 @@
+openapi: 3.0.3
+info:
+  title: 校园虚拟资源管理系统 API
+  version: 1.0.0
+  description: 成都东软学院校园资源管理平台接口文档
+paths:
+  /api/admin/colleges/:
+    get:
+      operationId: admin_colleges_list
+      description: |-
+        学院列表查询接口
+
+        GET /api/admin/colleges/
+        返回：所有学院列表，按 sort_order 排序
+      parameters:
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      tags:
+      - admin
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedCollegeList'
+          description: ''
+  /api/admin/users/:
+    get:
+      operationId: admin_users_list
+      description: 管理后台用户管理接口，支持列表、创建、编辑、删除
+      summary: 用户管理
+      parameters:
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      tags:
+      - 管理后台
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedUserAdminList'
+          description: ''
+    post:
+      operationId: admin_users_create
+      description: 管理后台用户管理接口，支持列表、创建、编辑、删除
+      summary: 用户管理
+      tags:
+      - 管理后台
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserCreateRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/UserCreateRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/UserCreateRequest'
+        required: true
+      security:
+      - jwtAuth: []
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserCreate'
+          description: ''
+  /api/admin/users/{id}/:
+    get:
+      operationId: admin_users_retrieve
+      description: 管理后台用户管理接口，支持列表、创建、编辑、删除
+      summary: 用户管理
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        description: A unique integer value identifying this 用户.
+        required: true
+      tags:
+      - 管理后台
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserAdmin'
+          description: ''
+    put:
+      operationId: admin_users_update
+      description: 管理后台用户管理接口，支持列表、创建、编辑、删除
+      summary: 用户管理
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        description: A unique integer value identifying this 用户.
+        required: true
+      tags:
+      - 管理后台
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserUpdateRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/UserUpdateRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/UserUpdateRequest'
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserUpdate'
+          description: ''
+    patch:
+      operationId: admin_users_partial_update
+      description: 管理后台用户管理接口，支持列表、创建、编辑、删除
+      summary: 用户管理
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        description: A unique integer value identifying this 用户.
+        required: true
+      tags:
+      - 管理后台
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchedUserUpdateRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PatchedUserUpdateRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/PatchedUserUpdateRequest'
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserUpdate'
+          description: ''
+    delete:
+      operationId: admin_users_destroy
+      description: 管理后台用户管理接口，支持列表、创建、编辑、删除
+      summary: 用户管理
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        description: A unique integer value identifying this 用户.
+        required: true
+      tags:
+      - 管理后台
+      security:
+      - jwtAuth: []
+      responses:
+        '204':
+          description: No response body
+  /api/admin/users/{id}/reset_password/:
+    post:
+      operationId: 重置用户密码
+      description: 管理员重置指定用户的密码
+      summary: 重置用户密码
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      tags:
+      - 管理后台
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResetPasswordRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/ResetPasswordRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/ResetPasswordRequest'
+        required: true
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResetPassword'
+          description: ''
+  /api/admin/users/batch_delete/:
+    post:
+      operationId: admin_users_batch_delete_create
+      description: |-
+        批量删除用户账号接口
+
+        POST /api/admin/users/batch_delete/
+        功能：管理员批量删除多个用户账号
+        参数：
+            - user_ids (list[int]): 用户ID列表（最多100个）
+        返回：操作结果（成功数量、失败数量）
+      tags:
+      - admin
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          description: No response body
+  /api/admin/users/batch_reset_password/:
+    post:
+      operationId: admin_users_batch_reset_password_create
+      description: |-
+        批量重置用户密码接口
+
+        POST /api/admin/users/batch_reset_password/
+        功能：管理员批量重置多个用户的密码
+        参数：
+            - user_ids (list[int]): 用户ID列表（最多100个）
+            - new_password (str): 新密码
+        返回：操作结果（成功数量、失败数量）
+      tags:
+      - admin
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchResetPasswordRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/BatchResetPasswordRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/BatchResetPasswordRequest'
+        required: true
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchResetPassword'
+          description: ''
+  /api/auth/change-password/:
+    post:
+      operationId: 修改密码
+      description: 用户自己修改密码，需提供旧密码验证
+      summary: 修改密码
+      tags:
+      - 用户管理
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          description: No response body
+  /api/auth/login/:
+    post:
+      operationId: auth_login_create
+      description: |-
+        Takes a set of user credentials and returns an access and refresh JSON web
+        token pair to prove the authentication of those credentials.
+      tags:
+      - auth
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TokenObtainPairRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/TokenObtainPairRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/TokenObtainPairRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenObtainPair'
+          description: ''
+  /api/auth/me/:
+    get:
+      operationId: 当前用户信息
+      description: 获取当前登录用户的个人信息，或更新个人资料
+      summary: 当前用户信息
+      tags:
+      - 用户管理
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+          description: ''
+    put:
+      operationId: 当前用户信息_3
+      description: 获取当前登录用户的个人信息，或更新个人资料
+      summary: 当前用户信息
+      tags:
+      - 用户管理
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/UserRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/UserRequest'
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+          description: ''
+    patch:
+      operationId: 当前用户信息_2
+      description: 获取当前登录用户的个人信息，或更新个人资料
+      summary: 当前用户信息
+      tags:
+      - 用户管理
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchedUserRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PatchedUserRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/PatchedUserRequest'
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+          description: ''
+  /api/auth/refresh/:
+    post:
+      operationId: auth_refresh_create
+      description: |-
+        Takes a refresh type JSON web token and returns an access type JSON web
+        token if the refresh token is valid.
+      tags:
+      - auth
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TokenRefreshRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/TokenRefreshRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/TokenRefreshRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenRefresh'
+          description: ''
+  /api/auth/sso/callback/:
+    post:
+      operationId: SSO登录回调
+      description: Mock模式接受code参数创建/查找用户并签发JWT
+      summary: SSO登录回调
+      tags:
+      - 用户管理
+      security:
+      - jwtAuth: []
+      - {}
+      responses:
+        '200':
+          description: No response body
+  /api/auth/sso/login/:
+    get:
+      operationId: SSO登录跳转
+      description: Mock模式返回测试码列表，正式模式重定向至学校统一认证页面
+      summary: SSO登录跳转
+      tags:
+      - 用户管理
+      security:
+      - jwtAuth: []
+      - {}
+      responses:
+        '200':
+          description: No response body
+  /api/categories/:
+    get:
+      operationId: 资源类型列表
+      description: 返回两级树形资源类型结构，一级分类的 parent 为 null
+      summary: 资源类型列表
+      parameters:
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      tags:
+      - 分类管理
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedCategoryList'
+          description: ''
+  /api/chat/ask/:
+    post:
+      operationId: AI问答
+      description: AI问答接口，流式输出回答结果
+      summary: AI问答
+      tags:
+      - AI对话
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          description: No response body
+  /api/chat/conversations/:
+    get:
+      operationId: chat_conversations_list
+      description: 会话管理接口，支持列表、创建、详情、编辑、删除
+      summary: 会话管理
+      parameters:
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      tags:
+      - AI对话
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedConversationListList'
+          description: ''
+    post:
+      operationId: chat_conversations_create
+      description: 会话管理接口，支持列表、创建、详情、编辑、删除
+      summary: 会话管理
+      tags:
+      - AI对话
+      security:
+      - jwtAuth: []
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Conversation'
+          description: ''
+  /api/chat/conversations-list/:
+    get:
+      operationId: 会话列表
+      description: 返回当前用户的会话列表
+      summary: 会话列表
+      parameters:
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      tags:
+      - AI对话
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedConversationListList'
+          description: ''
+  /api/chat/conversations/{id}/:
+    get:
+      operationId: chat_conversations_retrieve
+      description: 会话管理接口，支持列表、创建、详情、编辑、删除
+      summary: 会话管理
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: string
+        required: true
+      tags:
+      - AI对话
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Conversation'
+          description: ''
+    put:
+      operationId: chat_conversations_update
+      description: 会话管理接口，支持列表、创建、详情、编辑、删除
+      summary: 会话管理
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: string
+        required: true
+      tags:
+      - AI对话
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Conversation'
+          description: ''
+    patch:
+      operationId: chat_conversations_partial_update
+      description: 会话管理接口，支持列表、创建、详情、编辑、删除
+      summary: 会话管理
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: string
+        required: true
+      tags:
+      - AI对话
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Conversation'
+          description: ''
+    delete:
+      operationId: chat_conversations_destroy
+      description: 会话管理接口，支持列表、创建、详情、编辑、删除
+      summary: 会话管理
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: string
+        required: true
+      tags:
+      - AI对话
+      security:
+      - jwtAuth: []
+      responses:
+        '204':
+          description: No response body
+  /api/chat/conversations/{id}/detail/:
+    get:
+      operationId: 会话详情
+      description: 返回指定会话的完整消息列表
+      summary: 会话详情
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      tags:
+      - AI对话
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Conversation'
+          description: ''
+  /api/chat/feedback/:
+    post:
+      operationId: chat_feedback_create
+      description: |-
+        问答反馈接口（兼容旧接口）
+
+        POST /api/chat/feedback/
+        功能：用户根据点赞/点踩，写入 query_log.user_feedback
+        参数：
+            - message_id (int, required): 消息ID
+            - feedback (int, required): 1=赞 / 0=踩
+        返回：{"detail": "反馈已记录"}
+      tags:
+      - chat
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FeedbackRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/FeedbackRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/FeedbackRequest'
+        required: true
+      security:
+      - jwtAuth: []
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Feedback'
+          description: ''
+  /api/chat/message/:
+    get:
+      operationId: chat_message_list
+      description: 消息反馈和引用来源查看
+      summary: 消息管理
+      parameters:
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      tags:
+      - AI对话
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedChatMessageList'
+          description: ''
+    post:
+      operationId: chat_message_create
+      description: 消息反馈和引用来源查看
+      summary: 消息管理
+      tags:
+      - AI对话
+      security:
+      - jwtAuth: []
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatMessage'
+          description: ''
+  /api/chat/message/{id}/:
+    get:
+      operationId: chat_message_retrieve
+      description: 消息反馈和引用来源查看
+      summary: 消息管理
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        description: A unique integer value identifying this 聊天消息.
+        required: true
+      tags:
+      - AI对话
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatMessage'
+          description: ''
+    put:
+      operationId: chat_message_update
+      description: 消息反馈和引用来源查看
+      summary: 消息管理
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        description: A unique integer value identifying this 聊天消息.
+        required: true
+      tags:
+      - AI对话
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatMessage'
+          description: ''
+    patch:
+      operationId: chat_message_partial_update
+      description: 消息反馈和引用来源查看
+      summary: 消息管理
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        description: A unique integer value identifying this 聊天消息.
+        required: true
+      tags:
+      - AI对话
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatMessage'
+          description: ''
+    delete:
+      operationId: chat_message_destroy
+      description: 消息反馈和引用来源查看
+      summary: 消息管理
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        description: A unique integer value identifying this 聊天消息.
+        required: true
+      tags:
+      - AI对话
+      security:
+      - jwtAuth: []
+      responses:
+        '204':
+          description: No response body
+  /api/chat/message/{id}/rate/:
+    post:
+      operationId: chat_message_rate_create
+      description: 消息反馈和引用来源查看
+      summary: 消息管理
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        description: A unique integer value identifying this 聊天消息.
+        required: true
+      tags:
+      - AI对话
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatMessage'
+          description: ''
+  /api/chat/message/{id}/references/:
+    get:
+      operationId: chat_message_references_retrieve
+      description: 消息反馈和引用来源查看
+      summary: 消息管理
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        description: A unique integer value identifying this 聊天消息.
+        required: true
+      tags:
+      - AI对话
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatMessage'
+          description: ''
+  /api/colleges/:
+    get:
+      operationId: 学院列表
+      description: 返回全校所有二级学院，按 sort_order 排序
+      summary: 学院列表
+      parameters:
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      tags:
+      - 分类管理
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedCollegeList'
+          description: ''
+  /api/disciplines/:
+    get:
+      operationId: 学科方向列表
+      description: 返回所有学科方向，支持按门类筛选，按 sort_order 排序
+      summary: 学科方向列表
+      parameters:
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      tags:
+      - 分类管理
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedDisciplineList'
+          description: ''
+  /api/feedback/{id}/answer/:
+    post:
+      operationId: 提交人工回答
+      description: 管理员提交人工回答，状态变为answered
+      summary: 提交人工回答
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      tags:
+      - 反馈管理
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FeedbackQuestionAnswerRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/FeedbackQuestionAnswerRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/FeedbackQuestionAnswerRequest'
+        required: true
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FeedbackQuestionAnswer'
+          description: ''
+  /api/feedback/pending/:
+    get:
+      operationId: 待回答问题列表
+      description: 返回待回答的问题列表，支持按学院筛选
+      summary: 待回答问题列表
+      parameters:
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      tags:
+      - 反馈管理
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedFeedbackQuestionListList'
+          description: ''
+  /api/knowledge/docs/:
+    get:
+      operationId: 知识文档列表
+      description: 分页返回知识文档列表，支持关键词搜索和多条件组合筛选
+      summary: 知识文档列表
+      parameters:
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      tags:
+      - 知识库管理
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedKnowledgeDocListList'
+          description: ''
+  /api/knowledge/docs/{doc_id}/keywords/:
+    get:
+      operationId: 关键词列表
+      description: 返回指定文档的所有关键词，按权重降序排列
+      summary: 关键词列表
+      parameters:
+      - in: path
+        name: doc_id
+        schema:
+          type: integer
+        required: true
+      tags:
+      - 关键词管理
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          description: No response body
+  /api/knowledge/docs/{doc_id}/keywords/create/:
+    post:
+      operationId: 添加关键词
+      description: 为指定文档添加关键词，用于提升检索召回时的命中权重
+      summary: 添加关键词
+      parameters:
+      - in: path
+        name: doc_id
+        schema:
+          type: integer
+        required: true
+      tags:
+      - 关键词管理
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          description: No response body
+  /api/knowledge/docs/{id}/:
+    get:
+      operationId: 知识文档详情
+      description: 获取文档完整信息或编辑文档元数据
+      summary: 知识文档详情
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      tags:
+      - 知识库管理
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgeDoc'
+          description: ''
+    put:
+      operationId: 知识文档详情_3
+      description: 获取文档完整信息或编辑文档元数据
+      summary: 知识文档详情
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      tags:
+      - 知识库管理
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/KnowledgeDocRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/KnowledgeDocRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/KnowledgeDocRequest'
+        required: true
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgeDoc'
+          description: ''
+    patch:
+      operationId: 知识文档详情_2
+      description: 获取文档完整信息或编辑文档元数据
+      summary: 知识文档详情
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      tags:
+      - 知识库管理
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchedKnowledgeDocRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/PatchedKnowledgeDocRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/PatchedKnowledgeDocRequest'
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgeDoc'
+          description: ''
+  /api/knowledge/docs/{id}/delete/:
+    delete:
+      operationId: 删除知识文档
+      description: 删除文档及其关联数据（OSS文件、MySQL记录）
+      summary: 删除知识文档
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      tags:
+      - 知识库管理
+      security:
+      - jwtAuth: []
+      responses:
+        '204':
+          description: No response body
+  /api/knowledge/docs/{id}/download/:
+    get:
+      operationId: 下载知识文档
+      description: 生成 OSS 签名下载 URL（有效期 300 秒）
+      summary: 下载知识文档
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      tags:
+      - 知识库管理
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          description: No response body
+  /api/knowledge/docs/{id}/extract-freshness/:
+    post:
+      operationId: AI提取发布日期
+      description: 调用 LLM 从文档内容中提取发布日期 / 适用学期，写回 freshness_date
+      summary: AI 提取发布日期
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      tags:
+      - 文件上传
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          description: No response body
+  /api/knowledge/docs/{id}/preview/:
+    get:
+      operationId: knowledge_docs_preview_retrieve
+      description: 返回文档预览内容
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      tags:
+      - knowledge
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          description: No response body
+  /api/knowledge/keywords/{id}/:
+    put:
+      operationId: 编辑关键词
+      description: 编辑指定关键词的匹配类型和权重
+      summary: 编辑关键词
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      tags:
+      - 关键词管理
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          description: No response body
+  /api/knowledge/keywords/{id}/delete/:
+    delete:
+      operationId: 删除关键词
+      description: 删除指定关键词记录
+      summary: 删除关键词
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        required: true
+      tags:
+      - 关键词管理
+      security:
+      - jwtAuth: []
+      responses:
+        '204':
+          description: No response body
+  /api/knowledge/upload/callback/:
+    post:
+      operationId: 上传完成回调
+      description: OSS 前端直传完成后回调，创建知识文档记录
+      summary: 上传完成回调
+      tags:
+      - 文件上传
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          description: No response body
+  /api/knowledge/upload/sts/:
+    post:
+      operationId: 获取上传凭证
+      description: 校验文件 MD5 去重后，签发阿里云 OSS STS 临时凭证供前端直传
+      summary: 获取上传凭证
+      tags:
+      - 文件上传
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          description: No response body
+  /api/knowledge/upload/text/:
+    post:
+      operationId: knowledge_upload_text_create
+      description: 处理文本录入请求
+      tags:
+      - knowledge
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          description: No response body
+  /api/resources/:
+    get:
+      operationId: 资源列表
+      description: 分页返回已发布资源列表，支持按学院、学科、分类、关键词筛选
+      summary: 资源列表
+      parameters:
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      tags:
+      - 资源管理
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedResourceListList'
+          description: ''
+  /api/resources/upload-log/:
+    get:
+      operationId: resources_upload_log_list
+      description: 上传日志管理，支持查看和统计功能
+      summary: 上传日志
+      parameters:
+      - in: query
+        name: college
+        schema:
+          type: integer
+      - in: query
+        name: file_type
+        schema:
+          type: string
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      - in: query
+        name: status
+        schema:
+          type: string
+          title: 上传状态
+          enum:
+          - failed
+          - pending
+          - success
+        description: |-
+          * `pending` - 待处理
+          * `success` - 成功
+          * `failed` - 失败
+      tags:
+      - 资源管理
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedUploadLogList'
+          description: ''
+  /api/resources/upload-log/{id}/:
+    get:
+      operationId: resources_upload_log_retrieve
+      description: 上传日志管理，支持查看和统计功能
+      summary: 上传日志
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        description: A unique integer value identifying this 上传日志.
+        required: true
+      tags:
+      - 资源管理
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadLog'
+          description: ''
+  /api/resources/upload-log/{id}/complete/:
+    patch:
+      operationId: resources_upload_log_complete_partial_update
+      description: 上传日志管理，支持查看和统计功能
+      summary: 上传日志
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        description: A unique integer value identifying this 上传日志.
+        required: true
+      tags:
+      - 资源管理
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadLog'
+          description: ''
+  /api/resources/upload-log/stats/:
+    get:
+      operationId: resources_upload_log_stats_retrieve
+      description: 上传日志管理，支持查看和统计功能
+      summary: 上传日志
+      tags:
+      - 资源管理
+      security:
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadLog'
+          description: ''
+components:
+  schemas:
+    BatchResetPassword:
+      type: object
+      description: 批量重置密码序列化器
+      properties:
+        user_ids:
+          type: array
+          items:
+            type: integer
+            minimum: 1
+          description: 用户ID列表（最多100个）
+          maxItems: 100
+          minItems: 1
+        new_password:
+          type: string
+          description: 新密码（必填）
+      required:
+      - new_password
+      - user_ids
+    BatchResetPasswordRequest:
+      type: object
+      description: 批量重置密码序列化器
+      properties:
+        user_ids:
+          type: array
+          items:
+            type: integer
+            minimum: 1
+          description: 用户ID列表（最多100个）
+          maxItems: 100
+          minItems: 1
+        new_password:
+          type: string
+          minLength: 1
+          description: 新密码（必填）
+      required:
+      - new_password
+      - user_ids
+    Category:
+      type: object
+      description: 资源类型序列化器（树形，含图标继承）
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        name:
+          type: string
+          title: 类型名称
+          maxLength: 64
+        parent:
+          type: integer
+          nullable: true
+          title: 上级分类
+        icon:
+          type: string
+          readOnly: true
+        sort_order:
+          type: integer
+          maximum: 2147483647
+          minimum: -2147483648
+          title: 排序
+        children:
+          type: string
+          readOnly: true
+      required:
+      - children
+      - icon
+      - id
+      - name
+    CategoryEnum:
+      enum:
+      - 工学
+      - 管理学
+      - 艺术学
+      - 文学
+      - 医学
+      type: string
+      description: |-
+        * `工学` - 工学
+        * `管理学` - 管理学
+        * `艺术学` - 艺术学
+        * `文学` - 文学
+        * `医学` - 医学
+    ChatMessage:
+      type: object
+      description: 聊天消息序列化器（只读）
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        role:
+          allOf:
+          - $ref: '#/components/schemas/ChatMessageRoleEnum'
+          readOnly: true
+          title: 角色
+        content:
+          type: string
+          readOnly: true
+          title: 消息内容
+        references:
+          readOnly: true
+          title: 引用的资源列表
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+          title: 创建时间
+      required:
+      - content
+      - created_at
+      - id
+      - references
+      - role
+    ChatMessageRoleEnum:
+      enum:
+      - user
+      - assistant
+      type: string
+      description: |-
+        * `user` - 用户
+        * `assistant` - AI助手
+    College:
+      type: object
+      description: 学院列表序列化器
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        name:
+          type: string
+          title: 学院名称
+          maxLength: 64
+        code:
+          type: string
+          title: 学院代码
+          maxLength: 16
+        sort_order:
+          type: integer
+          maximum: 2147483647
+          minimum: -2147483648
+          title: 排序
+      required:
+      - code
+      - id
+      - name
+    Conversation:
+      type: object
+      description: 会话序列化器（只读）
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        title:
+          type: string
+          readOnly: true
+          title: 会话标题
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChatMessage'
+          readOnly: true
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+          title: 创建时间
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+          title: 更新时间
+      required:
+      - created_at
+      - id
+      - messages
+      - title
+      - updated_at
+    ConversationList:
+      type: object
+      description: 会话列表序列化器（不含 messages）
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        title:
+          type: string
+          readOnly: true
+          title: 会话标题
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+          title: 创建时间
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+          title: 更新时间
+      required:
+      - created_at
+      - id
+      - title
+      - updated_at
+    Discipline:
+      type: object
+      description: 学科方向序列化器
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        name:
+          type: string
+          title: 学科方向名称
+          maxLength: 64
+        category:
+          allOf:
+          - $ref: '#/components/schemas/CategoryEnum'
+          title: 学科门类
+        sort_order:
+          type: integer
+          maximum: 2147483647
+          minimum: -2147483648
+          title: 排序
+      required:
+      - category
+      - id
+      - name
+    Feedback:
+      type: object
+      description: 问答反馈请求参数
+      properties:
+        message_id:
+          type: integer
+          description: 消息ID
+        feedback:
+          type: integer
+          maximum: 1
+          minimum: 0
+          description: 1=赞 / 0=踩
+      required:
+      - feedback
+      - message_id
+    FeedbackQuestionAnswer:
+      type: object
+      description: 提交人工回答序列化器
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        question:
+          type: string
+          readOnly: true
+          title: 问题原文
+        status:
+          allOf:
+          - $ref: '#/components/schemas/Status5b4Enum'
+          readOnly: true
+          title: 状态
+        answered_at:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+          title: 回答时间
+      required:
+      - answered_at
+      - id
+      - question
+      - status
+    FeedbackQuestionAnswerRequest:
+      type: object
+      description: 提交人工回答序列化器
+      properties:
+        answer_text:
+          type: string
+          writeOnly: true
+          minLength: 1
+          title: 回答内容
+      required:
+      - answer_text
+    FeedbackQuestionList:
+      type: object
+      description: 待回答列表序列化器
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        question:
+          type: string
+          title: 问题原文
+        college:
+          type: integer
+          nullable: true
+          title: 所属学院
+        college_name:
+          type: string
+          readOnly: true
+        status:
+          allOf:
+          - $ref: '#/components/schemas/Status5b4Enum'
+          readOnly: true
+          title: 状态
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+          title: 创建时间
+      required:
+      - college_name
+      - created_at
+      - id
+      - question
+      - status
+    FeedbackRequest:
+      type: object
+      description: 问答反馈请求参数
+      properties:
+        message_id:
+          type: integer
+          description: 消息ID
+        feedback:
+          type: integer
+          maximum: 1
+          minimum: 0
+          description: 1=赞 / 0=踩
+      required:
+      - feedback
+      - message_id
+    FileType815Enum:
+      enum:
+      - pdf
+      - doc
+      - ppt
+      - xls
+      - image
+      - video
+      - audio
+      - md
+      - txt
+      - html
+      - other
+      type: string
+      description: |-
+        * `pdf` - PDF
+        * `doc` - Word
+        * `ppt` - PPT
+        * `xls` - Excel
+        * `image` - 图片
+        * `video` - 视频
+        * `audio` - 音频
+        * `md` - Markdown
+        * `txt` - 纯文本
+        * `html` - HTML
+        * `other` - 其他
+    KnowledgeDoc:
+      type: object
+      description: 知识文档详情序列化器
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        title:
+          type: string
+          title: 文档标题
+          maxLength: 512
+        description:
+          type: string
+          title: 文档描述
+        source_type:
+          allOf:
+          - $ref: '#/components/schemas/SourceTypeEnum'
+          title: 来源类型
+        source_url:
+          type: string
+          title: 来源URL
+          maxLength: 1024
+        oss_key:
+          type: string
+          title: OSS对象Key
+          maxLength: 512
+        oss_url:
+          type: string
+          title: OSS访问URL
+          maxLength: 1024
+        file_name:
+          type: string
+          title: 原始文件名
+          maxLength: 256
+        file_type:
+          allOf:
+          - $ref: '#/components/schemas/FileType815Enum'
+          title: 文件类型
+        file_size:
+          type: integer
+          maximum: 9223372036854775807
+          minimum: -9223372036854775808
+          format: int64
+          title: 文件大小（字节）
+        md5_hash:
+          type: string
+          title: MD5哈希
+          maxLength: 32
+        page_count:
+          type: integer
+          maximum: 2147483647
+          minimum: -2147483648
+          title: 文档页数
+        discipline:
+          type: integer
+          nullable: true
+          title: 学科方向
+        discipline_name:
+          type: string
+          readOnly: true
+        category:
+          type: integer
+          nullable: true
+          title: 资源类型
+        category_name:
+          type: string
+          readOnly: true
+        college:
+          type: integer
+          nullable: true
+          title: 所属学院
+        college_name:
+          type: string
+          readOnly: true
+        uploader:
+          type: integer
+          nullable: true
+          title: 上传者
+        uploader_name:
+          type: string
+          readOnly: true
+        status:
+          allOf:
+          - $ref: '#/components/schemas/StatusFefEnum'
+          title: 状态
+        chunk_count:
+          type: integer
+          readOnly: true
+          title: 分块数量
+        is_sensitive:
+          type: boolean
+          title: 敏感内容标记
+        sensitive_checked:
+          type: boolean
+          title: 是否已做敏感检查
+        freshness_date:
+          type: string
+          format: date
+          nullable: true
+          title: 内容截止日期
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+          title: 创建时间
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+          title: 更新时间
+        indexed_at:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+          title: 索引完成时间
+      required:
+      - category_name
+      - chunk_count
+      - college_name
+      - created_at
+      - discipline_name
+      - id
+      - indexed_at
+      - source_type
+      - title
+      - updated_at
+      - uploader_name
+    KnowledgeDocList:
+      type: object
+      description: 知识文档列表序列化器（简化版，用于列表页展示）
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        title:
+          type: string
+          title: 文档标题
+          maxLength: 512
+        file_type:
+          allOf:
+          - $ref: '#/components/schemas/FileType815Enum'
+          title: 文件类型
+        file_size:
+          type: integer
+          maximum: 9223372036854775807
+          minimum: -9223372036854775808
+          format: int64
+          title: 文件大小（字节）
+        status:
+          allOf:
+          - $ref: '#/components/schemas/StatusFefEnum'
+          title: 状态
+        college_name:
+          type: string
+          readOnly: true
+        discipline_name:
+          type: string
+          readOnly: true
+        uploader_name:
+          type: string
+          readOnly: true
+        chunk_count:
+          type: integer
+          maximum: 2147483647
+          minimum: -2147483648
+          title: 分块数量
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+          title: 创建时间
+      required:
+      - college_name
+      - created_at
+      - discipline_name
+      - id
+      - title
+      - uploader_name
+    KnowledgeDocRequest:
+      type: object
+      description: 知识文档详情序列化器
+      properties:
+        title:
+          type: string
+          minLength: 1
+          title: 文档标题
+          maxLength: 512
+        description:
+          type: string
+          minLength: 1
+          title: 文档描述
+        source_type:
+          allOf:
+          - $ref: '#/components/schemas/SourceTypeEnum'
+          title: 来源类型
+        source_url:
+          type: string
+          minLength: 1
+          title: 来源URL
+          maxLength: 1024
+        oss_key:
+          type: string
+          minLength: 1
+          title: OSS对象Key
+          maxLength: 512
+        oss_url:
+          type: string
+          minLength: 1
+          title: OSS访问URL
+          maxLength: 1024
+        file_name:
+          type: string
+          minLength: 1
+          title: 原始文件名
+          maxLength: 256
+        file_type:
+          allOf:
+          - $ref: '#/components/schemas/FileType815Enum'
+          title: 文件类型
+        file_size:
+          type: integer
+          maximum: 9223372036854775807
+          minimum: -9223372036854775808
+          format: int64
+          title: 文件大小（字节）
+        md5_hash:
+          type: string
+          minLength: 1
+          title: MD5哈希
+          maxLength: 32
+        page_count:
+          type: integer
+          maximum: 2147483647
+          minimum: -2147483648
+          title: 文档页数
+        discipline:
+          type: integer
+          nullable: true
+          title: 学科方向
+        category:
+          type: integer
+          nullable: true
+          title: 资源类型
+        college:
+          type: integer
+          nullable: true
+          title: 所属学院
+        uploader:
+          type: integer
+          nullable: true
+          title: 上传者
+        status:
+          allOf:
+          - $ref: '#/components/schemas/StatusFefEnum'
+          title: 状态
+        is_sensitive:
+          type: boolean
+          title: 敏感内容标记
+        sensitive_checked:
+          type: boolean
+          title: 是否已做敏感检查
+        freshness_date:
+          type: string
+          format: date
+          nullable: true
+          title: 内容截止日期
+      required:
+      - source_type
+      - title
+    PaginatedCategoryList:
+      type: object
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/Category'
+    PaginatedChatMessageList:
+      type: object
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChatMessage'
+    PaginatedCollegeList:
+      type: object
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/College'
+    PaginatedConversationListList:
+      type: object
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConversationList'
+    PaginatedDisciplineList:
+      type: object
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/Discipline'
+    PaginatedFeedbackQuestionListList:
+      type: object
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/FeedbackQuestionList'
+    PaginatedKnowledgeDocListList:
+      type: object
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/KnowledgeDocList'
+    PaginatedResourceListList:
+      type: object
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResourceList'
+    PaginatedUploadLogList:
+      type: object
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/UploadLog'
+    PaginatedUserAdminList:
+      type: object
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserAdmin'
+    PatchedKnowledgeDocRequest:
+      type: object
+      description: 知识文档详情序列化器
+      properties:
+        title:
+          type: string
+          minLength: 1
+          title: 文档标题
+          maxLength: 512
+        description:
+          type: string
+          minLength: 1
+          title: 文档描述
+        source_type:
+          allOf:
+          - $ref: '#/components/schemas/SourceTypeEnum'
+          title: 来源类型
+        source_url:
+          type: string
+          minLength: 1
+          title: 来源URL
+          maxLength: 1024
+        oss_key:
+          type: string
+          minLength: 1
+          title: OSS对象Key
+          maxLength: 512
+        oss_url:
+          type: string
+          minLength: 1
+          title: OSS访问URL
+          maxLength: 1024
+        file_name:
+          type: string
+          minLength: 1
+          title: 原始文件名
+          maxLength: 256
+        file_type:
+          allOf:
+          - $ref: '#/components/schemas/FileType815Enum'
+          title: 文件类型
+        file_size:
+          type: integer
+          maximum: 9223372036854775807
+          minimum: -9223372036854775808
+          format: int64
+          title: 文件大小（字节）
+        md5_hash:
+          type: string
+          minLength: 1
+          title: MD5哈希
+          maxLength: 32
+        page_count:
+          type: integer
+          maximum: 2147483647
+          minimum: -2147483648
+          title: 文档页数
+        discipline:
+          type: integer
+          nullable: true
+          title: 学科方向
+        category:
+          type: integer
+          nullable: true
+          title: 资源类型
+        college:
+          type: integer
+          nullable: true
+          title: 所属学院
+        uploader:
+          type: integer
+          nullable: true
+          title: 上传者
+        status:
+          allOf:
+          - $ref: '#/components/schemas/StatusFefEnum'
+          title: 状态
+        is_sensitive:
+          type: boolean
+          title: 敏感内容标记
+        sensitive_checked:
+          type: boolean
+          title: 是否已做敏感检查
+        freshness_date:
+          type: string
+          format: date
+          nullable: true
+          title: 内容截止日期
+    PatchedUserRequest:
+      type: object
+      description: 用户信息序列化器
+      properties:
+        email:
+          type: string
+          format: email
+          title: 电子邮件地址
+          maxLength: 254
+        first_name:
+          type: string
+          title: 名字
+          maxLength: 150
+        last_name:
+          type: string
+          title: 姓氏
+          maxLength: 150
+        phone:
+          type: string
+          title: 手机号
+          maxLength: 11
+        avatar:
+          type: string
+          format: uri
+          title: 头像URL
+          maxLength: 200
+    PatchedUserUpdateRequest:
+      type: object
+      description: 编辑用户序列化器
+      properties:
+        email:
+          type: string
+          format: email
+          title: 电子邮件地址
+          maxLength: 254
+        first_name:
+          type: string
+          title: 名字
+          maxLength: 150
+        last_name:
+          type: string
+          title: 姓氏
+          maxLength: 150
+        role:
+          allOf:
+          - $ref: '#/components/schemas/Role4aaEnum'
+          title: 角色
+        college:
+          type: integer
+          nullable: true
+          title: 所属学院
+        phone:
+          type: string
+          title: 手机号
+          maxLength: 11
+        avatar:
+          type: string
+          format: uri
+          title: 头像URL
+          maxLength: 200
+        is_active:
+          type: boolean
+          title: 有效
+          description: 指明用户是否被认为是活跃的。以反选代替删除帐号。
+    ResetPassword:
+      type: object
+      description: 重置密码序列化器
+      properties:
+        new_password:
+          type: string
+          description: 新密码（必填）
+        password_confirm:
+          type: string
+          description: 确认新密码（必填）
+      required:
+      - new_password
+      - password_confirm
+    ResetPasswordRequest:
+      type: object
+      description: 重置密码序列化器
+      properties:
+        new_password:
+          type: string
+          minLength: 1
+          description: 新密码（必填）
+        password_confirm:
+          type: string
+          minLength: 1
+          description: 确认新密码（必填）
+      required:
+      - new_password
+      - password_confirm
+    ResourceList:
+      type: object
+      description: 资源列表序列化器（含分类完整路径、图标、关键词）
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        title:
+          type: string
+          readOnly: true
+          title: 资源标题
+        description:
+          type: string
+          readOnly: true
+          title: 资源描述
+        file_type:
+          allOf:
+          - $ref: '#/components/schemas/ResourceListFileTypeEnum'
+          readOnly: true
+          title: 文件类型
+        file_size:
+          type: integer
+          readOnly: true
+          title: 文件大小（字节）
+        uploader:
+          type: integer
+          readOnly: true
+          title: 上传者
+        uploader_name:
+          type: string
+          readOnly: true
+        college:
+          type: integer
+          readOnly: true
+          title: 所属学院
+        college_name:
+          type: string
+          readOnly: true
+        discipline:
+          type: integer
+          readOnly: true
+          title: 学科方向
+        discipline_name:
+          type: string
+          readOnly: true
+        category:
+          type: integer
+          readOnly: true
+          title: 资源类型
+        category_name:
+          type: string
+          readOnly: true
+        category_icon:
+          type: string
+          readOnly: true
+        keywords:
+          readOnly: true
+          title: 关键词列表
+        status:
+          allOf:
+          - $ref: '#/components/schemas/ResourceListStatusEnum'
+          readOnly: true
+          title: 状态
+        visibility:
+          allOf:
+          - $ref: '#/components/schemas/VisibilityEnum'
+          readOnly: true
+          title: 可见层级
+        view_count:
+          type: integer
+          readOnly: true
+          title: 浏览量
+        download_count:
+          type: integer
+          readOnly: true
+          title: 下载量
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+          title: 创建时间
+        published_at:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+          title: 发布时间
+      required:
+      - category
+      - category_icon
+      - category_name
+      - college
+      - college_name
+      - created_at
+      - description
+      - discipline
+      - discipline_name
+      - download_count
+      - file_size
+      - file_type
+      - id
+      - keywords
+      - published_at
+      - status
+      - title
+      - uploader
+      - uploader_name
+      - view_count
+      - visibility
+    ResourceListFileTypeEnum:
+      enum:
+      - pdf
+      - doc
+      - ppt
+      - xls
+      - image
+      - video
+      - audio
+      - other
+      type: string
+      description: |-
+        * `pdf` - PDF
+        * `doc` - Word
+        * `ppt` - PowerPoint
+        * `xls` - Excel
+        * `image` - 图片
+        * `video` - 视频
+        * `audio` - 音频
+        * `other` - 其他
+    ResourceListStatusEnum:
+      enum:
+      - draft
+      - pending
+      - published
+      - rejected
+      - archived
+      type: string
+      description: |-
+        * `draft` - 草稿
+        * `pending` - 待审核
+        * `published` - 已发布
+        * `rejected` - 已退回
+        * `archived` - 已归档
+    Role4aaEnum:
+      enum:
+      - super_admin
+      - admin
+      - user
+      type: string
+      description: |-
+        * `super_admin` - 超级管理员
+        * `admin` - 管理员
+        * `user` - 普通用户
+    SourceTypeEnum:
+      enum:
+      - upload
+      - website
+      - library
+      type: string
+      description: |-
+        * `upload` - 内部上传
+        * `website` - 官网爬虫
+        * `library` - 图书馆摘要
+    Status5b4Enum:
+      enum:
+      - pending
+      - answered
+      - ignored
+      type: string
+      description: |-
+        * `pending` - 待回答
+        * `answered` - 已回答
+        * `ignored` - 已忽略
+    StatusFefEnum:
+      enum:
+      - uploaded
+      - parsing
+      - chunking
+      - embedding
+      - indexed
+      - failed
+      type: string
+      description: |-
+        * `uploaded` - 已上传
+        * `parsing` - 解析中
+        * `chunking` - 分块中
+        * `embedding` - 向量化中
+        * `indexed` - 已索引
+        * `failed` - 失败
+    TokenObtainPair:
+      type: object
+      properties:
+        access:
+          type: string
+          readOnly: true
+        refresh:
+          type: string
+          readOnly: true
+      required:
+      - access
+      - refresh
+    TokenObtainPairRequest:
+      type: object
+      properties:
+        username:
+          type: string
+          writeOnly: true
+          minLength: 1
+        password:
+          type: string
+          writeOnly: true
+          minLength: 1
+      required:
+      - password
+      - username
+    TokenRefresh:
+      type: object
+      properties:
+        access:
+          type: string
+          readOnly: true
+      required:
+      - access
+    TokenRefreshRequest:
+      type: object
+      properties:
+        refresh:
+          type: string
+          writeOnly: true
+          minLength: 1
+      required:
+      - refresh
+    UploadLog:
+      type: object
+      description: 上传日志序列化器
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        user:
+          type: integer
+          readOnly: true
+          title: 上传用户
+        user_name:
+          type: string
+          readOnly: true
+        resource:
+          type: integer
+          readOnly: true
+          nullable: true
+          title: 关联资源
+        resource_title:
+          type: string
+          readOnly: true
+          nullable: true
+        file_name:
+          type: string
+          readOnly: true
+          title: 文件名
+        file_size:
+          type: integer
+          readOnly: true
+          title: 文件大小（字节）
+        file_type:
+          type: string
+          readOnly: true
+          title: 文件类型
+        college:
+          type: integer
+          readOnly: true
+          title: 所属学院
+        college_name:
+          type: string
+          readOnly: true
+        status:
+          allOf:
+          - $ref: '#/components/schemas/UploadLogStatusEnum'
+          readOnly: true
+          title: 上传状态
+        error_message:
+          type: string
+          readOnly: true
+          title: 错误信息
+        ip_address:
+          type: string
+          readOnly: true
+          nullable: true
+          title: IP地址
+        user_agent:
+          type: string
+          readOnly: true
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+          title: 创建时间
+        completed_at:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+          title: 完成时间
+      required:
+      - college
+      - college_name
+      - completed_at
+      - created_at
+      - error_message
+      - file_name
+      - file_size
+      - file_type
+      - id
+      - ip_address
+      - resource
+      - resource_title
+      - status
+      - user
+      - user_agent
+      - user_name
+    UploadLogStatusEnum:
+      enum:
+      - pending
+      - success
+      - failed
+      type: string
+      description: |-
+        * `pending` - 待处理
+        * `success` - 成功
+        * `failed` - 失败
+    User:
+      type: object
+      description: 用户信息序列化器
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        username:
+          type: string
+          readOnly: true
+          title: 用户名
+          description: 必填；长度为150个字符或以下；只能包含字母、数字、特殊字符“@”、“.”、“-”和“_”。
+        email:
+          type: string
+          format: email
+          title: 电子邮件地址
+          maxLength: 254
+        first_name:
+          type: string
+          title: 名字
+          maxLength: 150
+        last_name:
+          type: string
+          title: 姓氏
+          maxLength: 150
+        role:
+          allOf:
+          - $ref: '#/components/schemas/Role4aaEnum'
+          readOnly: true
+          title: 角色
+        role_display:
+          type: string
+          readOnly: true
+        college:
+          type: integer
+          readOnly: true
+          nullable: true
+          title: 所属学院
+        college_name:
+          type: string
+          readOnly: true
+        phone:
+          type: string
+          title: 手机号
+          maxLength: 11
+        avatar:
+          type: string
+          format: uri
+          title: 头像URL
+          maxLength: 200
+        date_joined:
+          type: string
+          format: date-time
+          readOnly: true
+          title: 加入日期
+      required:
+      - college
+      - college_name
+      - date_joined
+      - id
+      - role
+      - role_display
+      - username
+    UserAdmin:
+      type: object
+      description: 管理后台用户详情序列化器
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        username:
+          type: string
+          title: 用户名
+          description: 必填；长度为150个字符或以下；只能包含字母、数字、特殊字符“@”、“.”、“-”和“_”。
+          pattern: ^[\w.@+-]+$
+          maxLength: 150
+        email:
+          type: string
+          format: email
+          title: 电子邮件地址
+          maxLength: 254
+        first_name:
+          type: string
+          title: 名字
+          maxLength: 150
+        last_name:
+          type: string
+          title: 姓氏
+          maxLength: 150
+        role:
+          allOf:
+          - $ref: '#/components/schemas/Role4aaEnum'
+          title: 角色
+        role_display:
+          type: string
+          readOnly: true
+        college:
+          type: integer
+          nullable: true
+          title: 所属学院
+        college_name:
+          type: string
+          readOnly: true
+        phone:
+          type: string
+          title: 手机号
+          maxLength: 11
+        avatar:
+          type: string
+          format: uri
+          title: 头像URL
+          maxLength: 200
+        is_active:
+          type: boolean
+          title: 有效
+          description: 指明用户是否被认为是活跃的。以反选代替删除帐号。
+        date_joined:
+          type: string
+          format: date-time
+          readOnly: true
+          title: 加入日期
+        last_login:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+          title: 上次登录
+        resource_count:
+          type: integer
+          readOnly: true
+      required:
+      - college_name
+      - date_joined
+      - id
+      - last_login
+      - resource_count
+      - role_display
+      - username
+    UserCreate:
+      type: object
+      description: 新建用户序列化器
+      properties:
+        username:
+          type: string
+          title: 用户名
+          description: 必填；长度为150个字符或以下；只能包含字母、数字、特殊字符“@”、“.”、“-”和“_”。
+          pattern: ^[\w.@+-]+$
+          maxLength: 150
+        email:
+          type: string
+          format: email
+          title: 电子邮件地址
+          maxLength: 254
+        first_name:
+          type: string
+          title: 名字
+          maxLength: 150
+        last_name:
+          type: string
+          title: 姓氏
+          maxLength: 150
+        role:
+          allOf:
+          - $ref: '#/components/schemas/Role4aaEnum'
+          title: 角色
+        college:
+          type: integer
+          nullable: true
+          title: 所属学院
+        phone:
+          type: string
+          title: 手机号
+          maxLength: 11
+        avatar:
+          type: string
+          format: uri
+          title: 头像URL
+          maxLength: 200
+      required:
+      - username
+    UserCreateRequest:
+      type: object
+      description: 新建用户序列化器
+      properties:
+        username:
+          type: string
+          minLength: 1
+          title: 用户名
+          description: 必填；长度为150个字符或以下；只能包含字母、数字、特殊字符“@”、“.”、“-”和“_”。
+          pattern: ^[\w.@+-]+$
+          maxLength: 150
+        email:
+          type: string
+          format: email
+          title: 电子邮件地址
+          maxLength: 254
+        password:
+          type: string
+          writeOnly: true
+          minLength: 1
+          description: 密码（必填）
+        password_confirm:
+          type: string
+          writeOnly: true
+          minLength: 1
+          description: 确认密码（必填）
+        first_name:
+          type: string
+          title: 名字
+          maxLength: 150
+        last_name:
+          type: string
+          title: 姓氏
+          maxLength: 150
+        role:
+          allOf:
+          - $ref: '#/components/schemas/Role4aaEnum'
+          title: 角色
+        college:
+          type: integer
+          nullable: true
+          title: 所属学院
+        phone:
+          type: string
+          title: 手机号
+          maxLength: 11
+        avatar:
+          type: string
+          format: uri
+          title: 头像URL
+          maxLength: 200
+      required:
+      - password
+      - password_confirm
+      - username
+    UserRequest:
+      type: object
+      description: 用户信息序列化器
+      properties:
+        email:
+          type: string
+          format: email
+          title: 电子邮件地址
+          maxLength: 254
+        first_name:
+          type: string
+          title: 名字
+          maxLength: 150
+        last_name:
+          type: string
+          title: 姓氏
+          maxLength: 150
+        phone:
+          type: string
+          title: 手机号
+          maxLength: 11
+        avatar:
+          type: string
+          format: uri
+          title: 头像URL
+          maxLength: 200
+    UserUpdate:
+      type: object
+      description: 编辑用户序列化器
+      properties:
+        email:
+          type: string
+          format: email
+          title: 电子邮件地址
+          maxLength: 254
+        first_name:
+          type: string
+          title: 名字
+          maxLength: 150
+        last_name:
+          type: string
+          title: 姓氏
+          maxLength: 150
+        role:
+          allOf:
+          - $ref: '#/components/schemas/Role4aaEnum'
+          title: 角色
+        college:
+          type: integer
+          nullable: true
+          title: 所属学院
+        phone:
+          type: string
+          title: 手机号
+          maxLength: 11
+        avatar:
+          type: string
+          format: uri
+          title: 头像URL
+          maxLength: 200
+        is_active:
+          type: boolean
+          title: 有效
+          description: 指明用户是否被认为是活跃的。以反选代替删除帐号。
+    UserUpdateRequest:
+      type: object
+      description: 编辑用户序列化器
+      properties:
+        email:
+          type: string
+          format: email
+          title: 电子邮件地址
+          maxLength: 254
+        first_name:
+          type: string
+          title: 名字
+          maxLength: 150
+        last_name:
+          type: string
+          title: 姓氏
+          maxLength: 150
+        role:
+          allOf:
+          - $ref: '#/components/schemas/Role4aaEnum'
+          title: 角色
+        college:
+          type: integer
+          nullable: true
+          title: 所属学院
+        phone:
+          type: string
+          title: 手机号
+          maxLength: 11
+        avatar:
+          type: string
+          format: uri
+          title: 头像URL
+          maxLength: 200
+        is_active:
+          type: boolean
+          title: 有效
+          description: 指明用户是否被认为是活跃的。以反选代替删除帐号。
+    VisibilityEnum:
+      enum:
+      - public
+      - internal
+      - restricted
+      type: string
+      description: |-
+        * `public` - 公开
+        * `internal` - 校内
+        * `restricted` - 授权
+  securitySchemes:
+    jwtAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
