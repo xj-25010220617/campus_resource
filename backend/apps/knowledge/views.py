@@ -1,10 +1,14 @@
 import django_filters
+import logging
+from django.db import transaction
+from django.shortcuts import get_object_or_404
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema
 from rest_framework import filters, generics, permissions, status
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
+
 
 from django.db import transaction
 from django.shortcuts import get_object_or_404
@@ -14,6 +18,7 @@ from apps.classify.models import Category, Discipline
 from config.permissions import IsAdminOrSuperAdmin, IsLoginUser, IsOwnerOrReadOnly
 from utils.oss import oss_client
 
+from .extractor import extract_freshness_for_doc
 from .models import Keyword, KnowledgeDoc
 from .serializers import (
     KeywordCreateSerializer,
@@ -24,6 +29,8 @@ from .serializers import (
     UploadCallbackSerializer,
     UploadSTSRequestSerializer,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class KnowledgeDocFilter(django_filters.FilterSet):
@@ -516,6 +523,12 @@ class UploadCallbackView(APIView):
         # TODO: 调用 Celery 异步索引任务（甲同学完成后集成）
         # index_document.delay(doc_id=new_doc.id)
 
+        # 自动触发 AI 日期提取（异步，不阻塞上传主链路）
+        # 遵循 CONVENTIONS.md 第 9 节：异常处理下沉到 utils 层，视图层不写 try/except
+        from utils.celery_dispatcher import safe_delay
+        from .tasks import extract_freshness_task
+        safe_delay(extract_freshness_task, new_doc.id)
+
         return Response({
             'id': new_doc.id,
             'status': new_doc.status,
@@ -549,6 +562,7 @@ class UploadCallbackView(APIView):
             raise ValidationError({'oss_key': '不能以 "/" 开头'})
         if not oss_key.startswith('knowledge/'):
             raise ValidationError({'oss_key': 'OSS Key 格式不合法，必须以 "knowledge/" 开头'})
+
 
 
 class TextUploadView(APIView):
@@ -714,3 +728,80 @@ class KnowledgeDocPreviewView(APIView):
             'file_type': file_type,
             'file_name': doc.file_name,
         })
+@extend_schema(
+    summary='AI 提取发布日期',
+    description='调用 LLM 从文档内容中提取发布日期 / 适用学期，写回 freshness_date',
+    tags=['文件上传'],
+    operation_id='AI提取发布日期',
+)
+class ExtractFreshnessView(APIView):
+    """
+    AI 提取发布日期
+
+    POST /api/knowledge/docs/{id}/extract-freshness/
+    功能：
+        1. 从 OSS 下载指定文档
+        2. 按文件类型抽取文本（PDF/DOCX/PPTX/XLSX/MD/TXT/HTML）
+        3. 调用 DeepSeek 提取"发布日期 / 适用学期"
+        4. 把结果写回 KnowledgeDoc.freshness_date
+    参数：
+        - id (path int, required): KnowledgeDoc 主键
+        - async (query bool, default=true): true=异步（Celery）；false=同步阻塞（限调试）
+    权限：
+        - super_admin: 可对任意文档触发
+        - admin: 仅可对自己上传的文档触发
+    返回：
+        - 202 Accepted: {"task_id": "...", "status": "queued", "doc_id": <int>}
+        - 200 OK: 单个对象 {freshness_date, confidence, source_excerpt, raw_response}
+    错误码：
+        - 401 UNAUTHORIZED: 未登录
+        - 403 PERMISSION_DENIED: 越权触发
+        - 404 NOT_FOUND: 文档不存在
+    注意：
+        - 图片/视频/音频类型无法抽取文本，confidence='none'
+        - 失败时 freshness_date 留空，前端可再次手动触发
+    """
+    permission_classes = [IsLoginUser]
+
+    def post(self, request, pk):
+        doc = get_object_or_404(KnowledgeDoc, pk=pk)
+
+        # 权限校验：超管全放行，admin 仅限自己上传的文档
+        if request.user.role not in ('super_admin', 'admin'):
+            self._raise_permission_error('只有管理员可以触发 AI 日期提取')
+        if request.user.role == 'admin' and doc.uploader_id != request.user.id:
+            self._raise_permission_error('只能对自己上传的文档触发 AI 日期提取')
+
+        # 是否走异步
+        run_async = request.query_params.get('async', 'true').lower() != 'false'
+        if run_async:
+            from .tasks import extract_freshness_task
+            from utils.celery_dispatcher import safe_delay
+            # safe_delay 返回 AsyncResult → Celery 入队成功；返回 None → Celery 不可用
+            async_result = safe_delay(extract_freshness_task, doc.id)
+            if async_result is not None:
+                return Response(
+                    {'task_id': async_result.id, 'status': 'queued', 'doc_id': doc.id},
+                    status=status.HTTP_202_ACCEPTED,
+                )
+            # Celery 不可用 → 降级到同步执行
+
+        # 同步执行（async=false 显式 OR Celery 不可用降级）
+        result = extract_freshness_for_doc(doc.id)
+        if result is None:
+            return Response(
+                {'detail': '文档不存在', 'code': 'NOT_FOUND'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        # 200 返回单个对象（按 CONVENTIONS.md 第 8 节："返回单个对象"）
+        return Response({
+            'freshness_date': result.freshness_date,
+            'confidence': result.confidence,
+            'source_excerpt': result.source_excerpt,
+            'raw_response': result.raw_response,
+        })
+
+    @staticmethod
+    def _raise_permission_error(message: str):
+        raise PermissionDenied({'detail': message, 'code': 'PERMISSION_DENIED'})
+

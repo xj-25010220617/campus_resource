@@ -79,6 +79,10 @@ DATABASES = {
             'charset': 'utf8mb4',
             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
         },
+        'TEST': {
+            'NAME': 'campus_resource',
+            'DEPENDENCIES': [],
+        },
     }
 }
 
