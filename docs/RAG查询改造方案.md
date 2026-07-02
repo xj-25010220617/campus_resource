@@ -1,12 +1,14 @@
 # RAG 三层检索改造方案
 
 > **模块**：AI 智能问答（Chat / RAG）
-> **日期**：2026-07-01
-> **作者**：3471691973-eg
-> **状态**：待评审
+> **日期**：2026-07-01（初版）/ 2026-07-02（KnowledgeDoc 双表集成更新）
+> **作者**：3471691973-eg / Fressia-zzt
+> **状态**：已实施
 > **关联文档**：
+> - [数据库变更记录：knowledge_doc 表](database-changes/knowledge_doc.md)
 > - [数据库变更记录：query_log 表](database-changes/query_log.md)
 > - [代码改动记录：2026-07-01](code-changes/2026-07-01.md)
+> - [代码改动记录：2026-07-02](code-changes/2026-07-02.md)
 
 ---
 
@@ -58,13 +60,29 @@
 └─────────────────────┬───────────────────────────────┘
                       ↓
 ┌─────────────────────────────────────────────────────┐
+│  步骤 1：问题解析（query_parser.parse）                │
+│  输出：{college, discipline, course_term,            │
+│         category, target_audience, file_type,        │
+│         time_range}                                  │
+│  实现：LLM 抽取（DeepSeek）+ 失败回退规则匹配         │
+└─────────────────────┬───────────────────────────────┘
+                      ↓
+┌─────────────────────────────────────────────────────┐
 │  步骤 2：SQL 硬过滤（apply_hard_filters）             │
-│  WHERE status='published'                            │
-│    AND visibility IN (用户可见层级)                   │
-│    AND college_id IN (...)                           │
-│    AND category_id IN (子节点子树)                    │
-│    AND file_type IN (...)                            │
-│  候选：~300 条                                       │
+│  ┌─ Resource 表硬过滤 ────────────────────────────┐ │
+│  │ WHERE status='published'                       │ │
+│  │   AND visibility IN (用户可见层级)              │ │
+│  │   AND college_id IN (...)                      │ │
+│  │   AND category_id IN (子节点子树)               │ │
+│  │   AND file_type IN (...)                       │ │
+│  └────────────────────────────────────────────────┘ │
+│  ┌─ KnowledgeDoc 表硬过滤（🆕 2026-07-02）────────┐ │
+│  │ WHERE status='indexed'                         │ │
+│  │   AND visibility='public'（AI 仅检索公开文档）  │ │
+│  │   AND college_id / discipline_id / category_id  │ │
+│  └────────────────────────────────────────────────┘ │
+│  候选：~500 条（Resource + KnowledgeDoc 合并）       │
+│  双表 ID 编码：Resource 用正数，KnowledgeDoc 用负数  │
 └─────────────────────┬───────────────────────────────┘
                       ↓
 ┌─────────────────────────────────────────────────────┐
@@ -733,8 +751,194 @@ class AskView(APIView):
 
 ---
 
-## 十、关联资源
+## 十、2026-07-02 更新：KnowledgeDoc 双表集成 + public/private 可见性
 
-- [database-changes/query_log.md](database-changes/query_log.md) — 数据库变更
-- [code-changes/2026-07-01.md](code-changes/2026-07-01.md) — 代码改动
+### 10.1 背景
+
+2026-07-01 的改造方案仅覆盖 `Resource` 表（资源模块）。2026-07-02 完成了 `KnowledgeDoc` 表（知识库模块）的建模，并在 RAG 管道中实现了 **双表联合检索**。同时引入了 `public`/`private` 可见性属性，区分"AI 可检索"与"仅后台可见"的文档。
+
+### 10.2 KnowledgeDoc 模型
+
+```python
+# apps/knowledge/models.py — KnowledgeDoc 模型核心字段
+
+class KnowledgeDoc(models.Model):
+    STATUS_CHOICES = [
+        ('uploaded', '已上传'), ('parsing', '解析中'),
+        ('chunking', '分块中'), ('embedding', '向量化中'),
+        ('indexed', '已索引'), ('failed', '失败'),
+    ]
+    VISIBILITY_CHOICES = [                          # 🆕 可见性
+        ('public', '公开'),                        # AI 可检索，所有人可见
+        ('private', '私密'),                       # AI 不可检索，仅权限用户可见
+    ]
+
+    title = CharField(max_length=512)               # 文档标题
+    description = TextField()                       # 文档描述（FULLTEXT 搜索）
+    college = FK('accounts.College', SET_NULL)      # 所属学院
+    discipline = FK('classify.Discipline', SET_NULL) # 学科方向
+    category = FK('classify.Category', SET_NULL)    # 资源类型（必须是二级分类）
+    uploader = FK(AUTH_USER_MODEL, SET_NULL)        # 上传者
+    status = CharField(choices=STATUS_CHOICES)       # 索引状态
+    visibility = CharField(choices=VISIBILITY_CHOICES, default='public', db_index=True)
+    # ... 其他字段（oss_key, file_type, file_size, md5_hash 等）
+```
+
+### 10.3 可见性权限矩阵
+
+| 角色 | 公开文件（public） | 私密文件（private） | AI 检索范围 |
+|------|-------------------|---------------------|-------------|
+| `super_admin` | ✅ 全部 | ✅ 全部 | 仅 public |
+| `admin` | ✅ 全部 | ✅ 本院 + 自己上传 | 仅 public |
+| `user` | ✅ 全部 | ✅ 自己上传 | 仅 public |
+| **AI（匿名）** | ✅ | ❌ | **仅 public** |
+
+### 10.4 RAG 管道双表集成
+
+#### `_apply_hard_filters` 改造
+
+```python
+def _apply_hard_filters(filters, user_context, top_k=500) -> List[int]:
+    from apps.resources.models import Resource
+    from apps.knowledge.models import KnowledgeDoc  # 🆕
+    from django.db.models import Q
+
+    # --- Resource 表硬过滤（原有逻辑）---
+    resource_ids = list(Resource.objects.filter(status='published', ...)
+                        .values_list('id', flat=True)[:top_k])
+
+    # --- KnowledgeDoc 表硬过滤（🆕 2026-07-02）---
+    kd_qs = KnowledgeDoc.objects.filter(status='indexed')
+
+    role = user_context.get('role', 'user')
+    is_admin_query = role in ('admin', 'super_admin')
+
+    if not is_admin_query:
+        # ⚠️ AI 检索：强制只看公开文件
+        kd_qs = kd_qs.filter(visibility='public')
+    elif role == 'admin':
+        # 学院管理员：公开 + 本院私密 + 自己私密
+        kd_qs = kd_qs.filter(
+            Q(visibility='public')
+            | Q(visibility='private', college_id=user_context.get('college_id'))
+            | Q(visibility='private', uploader_id=user_context.get('user_id')),
+        )
+    # super_admin: 不过滤
+
+    # 学科/学院/分类筛选（与 Resource 共享过滤条件）
+    if (cid := filters.get('college_id')):
+        kd_qs = kd_qs.filter(college_id=cid)
+    if (did := filters.get('discipline_id')):
+        kd_qs = kd_qs.filter(discipline_id=did)
+    if (cat_ids := filters.get('category_ids')):
+        kd_qs = kd_qs.filter(category_id__in=cat_ids)
+
+    knowledge_doc_ids = list(kd_qs.values_list('id', flat=True)[:top_k])
+
+    # 双表 ID 编码策略：Resource 用正数，KnowledgeDoc 用负数
+    return resource_ids + [-kid for kid in knowledge_doc_ids]
+```
+
+#### `_enrich_with_doc_meta` 双表元信息加载
+
+```python
+def _enrich_with_doc_meta(hits, min_score):
+    # 按正负号拆分 Resource / KnowledgeDoc ID
+    resource_ids = [h['doc_id'] for h in hits if h.get('doc_id', 0) > 0]
+    knowledge_ids = [abs(h['doc_id']) for h in hits if h.get('doc_id', 0) < 0]
+
+    doc_title_map = {}
+    # Resource 表
+    if resource_ids:
+        for d in Resource.objects.filter(id__in=resource_ids).values('id', 'title'):
+            doc_title_map[d['id']] = d['title']
+    # 🆕 KnowledgeDoc 表
+    if knowledge_ids:
+        for d in KnowledgeDoc.objects.filter(id__in=knowledge_ids).values('id', 'title'):
+            doc_title_map[-d['id']] = d['title']  # 负数 key 匹配
+    # ...
+```
+
+#### `_filter_by_permission` 双表权限兜底
+
+```python
+def _filter_by_permission(hits, user_context):
+    # 分别对 Resource 和 KnowledgeDoc 做权限校验
+    # KnowledgeDoc 使用 visibility 字段（public/private）
+    # Resource 使用 visibility 字段（public/internal/restricted）
+    # 返回值统一取正数 ID
+    return filtered[:5]
+```
+
+### 10.5 视图层可见性过滤
+
+所有知识库查询视图（列表/详情/下载）通过静态方法 `_apply_visibility_filter` 统一过滤：
+
+```python
+# apps/knowledge/views.py
+
+@staticmethod
+def _apply_visibility_filter(queryset, user):
+    """按用户角色过滤可见性"""
+    if user.role == 'super_admin':
+        return queryset
+    if user.role == 'admin':
+        return queryset.filter(
+            Q(visibility='public')
+            | Q(visibility='private', college_id=user.college_id)
+            | Q(visibility='private', uploader_id=user.id),
+        )
+    return queryset.filter(
+        Q(visibility='public')
+        | Q(visibility='private', uploader_id=user.id),
+    )
+```
+
+复用于 `KnowledgeDocListView`、`KnowledgeDocDetailView`、`KnowledgeDocDownloadView`。
+
+### 10.6 列表 `latest_only` 去重分组
+
+列表视图新增 `latest_only` 参数（默认 `true`），在同一 `(college_id, discipline_id, category_id)` 组合内只返回最新一条文档，避免列表冗余：
+
+```python
+if latest_only:
+    grouped = queryset.values('college_id', 'discipline_id', 'category_id') \
+                      .annotate(max_created=Max('created_at'))
+    # 取每组最新 ID → queryset.filter(id__in=latest_ids)
+```
+
+### 10.7 其他配套改动（2026-07-02）
+
+| 模块 | 改动 | 说明 |
+|------|------|------|
+| `apps/knowledge/models.py` | `KnowledgeDoc` 新增 `visibility` 字段 | public/private |
+| `apps/knowledge/serializers.py` | 上传序列化器新增 `visibility` | 默认 `'public'` |
+| `apps/knowledge/views.py` | 新增 `TextUploadView` | 管理员手动录入文本 |
+| `apps/knowledge/views.py` | 新增 `KnowledgeDocPreviewView` | 音视频/文本在线预览 |
+| `utils/oss.py` | 新增 `upload_text` / `get_preview_url` | 文本直传 OSS / 预览签名 URL |
+| `apps/knowledge/serializers.py` | 新增 `ALLOWED_FILE_TYPES` 白名单 | 上传文件类型校验 |
+| `apps/knowledge/serializers.py` | 新增 `FILE_SIZE_LIMITS` | 按类型限制大小（文档50MB/图片10MB/视频500MB） |
+| `apps/classify/models.py` | `Category` 新增 `icon` 字段 | 分类图标，二级继承父级 |
+| `apps/resources/views.py` | 新增 `ResourceListView` | 资源列表查询（全开放） |
+
+### 10.8 关键设计决策
+
+| 决策 | 方案 | 原因 |
+|------|------|------|
+| 双表 ID 编码 | Resource 正数，KnowledgeDoc 负数 | 无需改 Milvus 数据结构，后端透明区分来源 |
+| AI 检索范围 | 仅 public | 私密文档仅后台可见，防止敏感内容经 AI 泄露 |
+| 可见性校验层级 | SQL 硬过滤 + 权限二次兜底 | 硬过滤缩范围（性能），权限兜底（安全） |
+| `latest_only` 默认 true | 分组取最新 | 同一分类下多版本文档仅展示最新版，减少噪音 |
+| Category 二级分类强制 | 上传时校验 `parent IS NOT NULL` | 避免粗粒度分类，确保检索精度 |
+
+---
+
+## 十一、关联资源
+
+- [database-changes/knowledge_doc.md](database-changes/knowledge_doc.md) — 知识文档表
+- [database-changes/keyword.md](database-changes/keyword.md) — 关键词表
+- [database-changes/doc_chunk.md](database-changes/doc_chunk.md) — 文档切片表
+- [database-changes/query_log.md](database-changes/query_log.md) — 查询日志表
+- [code-changes/2026-07-01.md](code-changes/2026-07-01.md) — 代码改动（D1）
+- [code-changes/2026-07-02.md](code-changes/2026-07-02.md) — 代码改动（D2）
 - [CONVENTIONS.md](CONVENTIONS.md) — 团队代码规范
