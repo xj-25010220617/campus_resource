@@ -1,10 +1,19 @@
+import logging
+
+from django.http import StreamingHttpResponse
+from django.shortcuts import get_object_or_404
 from rest_framework import generics, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.views import APIView
 from rest_framework.viewsets import ModelViewSet
 
 from apps.resources.models import Resource
 from apps.resources.serializers import ResourceListSerializer
+
+from utils import rag
+from utils.llm import llm_client
+from utils.sse import _format_sse, build_references_events
 
 from .models import Conversation, ChatMessage, QueryLog
 from .serializers import (
@@ -15,6 +24,9 @@ from .serializers import (
     FeedbackSerializer,
     MessageRateSerializer,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class ConversationViewSet(ModelViewSet):
@@ -145,19 +157,143 @@ class ConversationDetailView(generics.RetrieveAPIView):
         return Conversation.objects.filter(user=self.request.user).prefetch_related('messages')
 
 
-class AskView(generics.CreateAPIView):
+class AskView(APIView):
     """
-    AI 问答接口（三层检索升级版）
+    AI 问答接口（流式输出）
 
     POST /api/chat/ask/
-    功能：接收用户提问 → LLM 解析硬过滤 → SQL 缩范围 → 双路召回 → 权限校验 → 生成回答
+    功能：
+        1. 接收用户提问 → RAG 双路检索 → AI 流式生成
+        2. 支持多轮对话（传入 conversation_id）
+        3. SSE 逐字输出（text/event-stream）
+        4. 流结束后自动生成 3 个相关推荐问题
+        5. 按用户角色返回引用溯源
     参数：
-        - conversation_id (int, optional): 会话ID（不传则新建）
-        - question (str, required): 用户提问
+        - conversation_id (int, optional): 会话ID（不传则新建会话）
+        - question (str, required): 用户提问（最长 2000 字符）
     返回：SSE 流式响应（text/event-stream）
+        事件类型：
+        - event: start          → data: {"conversation_id": int, "message_id": int}
+        - event: token          → data: {"content": "..."}
+        - event: suggested      → data: ["问题1", "问题2", "问题3"]
+        - event: references     → data: {"count": 3, "summary": "参考了3份文档"}
+        - event: references_detail → data: [{"doc_id": int, "doc_title": "...", ...}]
+        - event: done           → data: {"message_id": int}
+    权限：
+        - 所有登录用户可用
+        - 引用详情：admin/super_admin 可看完整详情，普通用户仅看摘要
+    注意：
+        - 前端用 EventSource 或 fetch + ReadableStream 消费
+        - 捕获 error 事件处理异常
     """
-    serializer_class = AskSerializer
     permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, *args, **kwargs):
+        serializer = AskSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        question = serializer.validated_data['question']
+        conversation_id = serializer.validated_data.get('conversation_id')
+        user = request.user
+
+        # 1. 获取或新建会话
+        if conversation_id:
+            conversation = get_object_or_404(
+                Conversation, id=conversation_id, user=user,
+            )
+        else:
+            conversation = Conversation.objects.create(
+                user=user, title=question[:50],
+            )
+            logger.info('新建会话 id=%d user=%s', conversation.id, user.username)
+
+        # 2. 保存用户消息
+        ChatMessage.objects.create(
+            conversation=conversation, role='user', content=question,
+        )
+
+        # 3. 获取历史消息（用于多轮对话上下文）
+        history = list(
+            conversation.messages
+            .filter(role__in=['user', 'assistant'])
+            .order_by('created_at')
+            .values('role', 'content')
+        )
+
+        # 4. RAG 检索
+        user_context = {
+            'user_id': user.id,
+            'role': user.role,
+            'college_id': user.college_id,
+        }
+        results = rag.retrieve(question, user_context=user_context)
+
+        # 5. 构造 Prompt（含历史上下文）
+        messages = rag.build_rag_prompt(question, results, history=history)
+
+        # 6. 创建 AI 消息占位（流结束后写入完整内容）
+        is_authorized = user.role in ('admin', 'super_admin')
+        references_detail = build_references_events(
+            results, user.role, user.id,
+        ).get('references_detail', [])
+
+        assistant_msg = ChatMessage.objects.create(
+            conversation=conversation, role='assistant',
+            content='', references=references_detail,
+        )
+
+        # 7. SSE 流式响应
+        def event_stream():
+            """生成 SSE 事件流"""
+            # start 事件
+            yield _format_sse('start', {
+                'conversation_id': conversation.id,
+                'message_id': assistant_msg.id,
+            })
+
+            # 流式生成
+            collected_tokens = []
+            stream = llm_client.chat_stream(messages)
+            for token in stream:
+                if token:
+                    collected_tokens.append(token)
+                    yield _format_sse('token', {'content': token})
+
+            full_answer = ''.join(collected_tokens)
+
+            # 保存 AI 回答（流结束后写库）
+            if full_answer:
+                ChatMessage.objects.filter(id=assistant_msg.id).update(
+                    content=full_answer,
+                )
+                logger.info(
+                    'AI 回答完成 msg_id=%d conv_id=%d tokens=%d',
+                    assistant_msg.id, conversation.id, len(collected_tokens),
+                )
+
+            # 生成相关推荐（调用 LLM 生成 3 个相关问题）
+            suggested = rag.generate_suggested_questions(question, full_answer)
+            if suggested:
+                yield _format_sse('suggested', suggested)
+
+            # 引用溯源
+            refs = build_references_events(results, user.role, user.id)
+            if 'references' in refs:
+                yield _format_sse('references', refs['references'])
+            if 'references_detail' in refs and is_authorized:
+                yield _format_sse('references_detail', refs['references_detail'])
+
+            # done 事件
+            yield _format_sse('done', {'message_id': assistant_msg.id})
+
+        response = StreamingHttpResponse(
+            event_stream(),
+            content_type='text/event-stream',
+        )
+        response['Cache-Control'] = 'no-cache'
+        response['X-Accel-Buffering'] = 'no'
+        response['Access-Control-Allow-Origin'] = '*'
+        return response
 
 
 class FeedbackView(generics.CreateAPIView):

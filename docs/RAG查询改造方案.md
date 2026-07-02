@@ -1,12 +1,14 @@
 # RAG 三层检索改造方案
 
 > **模块**：AI 智能问答（Chat / RAG）
-> **日期**：2026-07-01
-> **作者**：3471691973-eg
-> **状态**：待评审
+> **日期**：2026-07-01（初版）/ 2026-07-02（KnowledgeDoc 双表集成更新）
+> **作者**：3471691973-eg / Fressia-zzt
+> **状态**：已实施
 > **关联文档**：
+> - [数据库变更记录：knowledge_doc 表](database-changes/knowledge_doc.md)
 > - [数据库变更记录：query_log 表](database-changes/query_log.md)
 > - [代码改动记录：2026-07-01](code-changes/2026-07-01.md)
+> - [代码改动记录：2026-07-02](code-changes/2026-07-02.md)
 
 ---
 
@@ -58,13 +60,29 @@
 └─────────────────────┬───────────────────────────────┘
                       ↓
 ┌─────────────────────────────────────────────────────┐
+│  步骤 1：问题解析（query_parser.parse）                │
+│  输出：{college, discipline, course_term,            │
+│         category, target_audience, file_type,        │
+│         time_range}                                  │
+│  实现：LLM 抽取（DeepSeek）+ 失败回退规则匹配         │
+└─────────────────────┬───────────────────────────────┘
+                      ↓
+┌─────────────────────────────────────────────────────┐
 │  步骤 2：SQL 硬过滤（apply_hard_filters）             │
-│  WHERE status='published'                            │
-│    AND visibility IN (用户可见层级)                   │
-│    AND college_id IN (...)                           │
-│    AND category_id IN (子节点子树)                    │
-│    AND file_type IN (...)                            │
-│  候选：~300 条                                       │
+│  ┌─ Resource 表硬过滤 ────────────────────────────┐ │
+│  │ WHERE status='published'                       │ │
+│  │   AND visibility IN (用户可见层级)              │ │
+│  │   AND college_id IN (...)                      │ │
+│  │   AND category_id IN (子节点子树)               │ │
+│  │   AND file_type IN (...)                       │ │
+│  └────────────────────────────────────────────────┘ │
+│  ┌─ KnowledgeDoc 表硬过滤（🆕 2026-07-02）────────┐ │
+│  │ WHERE status='indexed'                         │ │
+│  │   AND visibility='public'（AI 仅检索公开文档）  │ │
+│  │   AND college_id / discipline_id / category_id  │ │
+│  └────────────────────────────────────────────────┘ │
+│  候选：~500 条（Resource + KnowledgeDoc 合并）       │
+│  双表 ID 编码：Resource 用正数，KnowledgeDoc 用负数  │
 └─────────────────────┬───────────────────────────────┘
                       ↓
 ┌─────────────────────────────────────────────────────┐
@@ -733,8 +751,386 @@ class AskView(APIView):
 
 ---
 
-## 十、关联资源
+## 十、2026-07-02 更新：KnowledgeDoc 双表集成 + public/private 可见性
 
-- [database-changes/query_log.md](database-changes/query_log.md) — 数据库变更
-- [code-changes/2026-07-01.md](code-changes/2026-07-01.md) — 代码改动
+### 10.1 背景
+
+2026-07-01 的改造方案仅覆盖 `Resource` 表（资源模块）。2026-07-02 完成了 `KnowledgeDoc` 表（知识库模块）的建模，并在 RAG 管道中实现了 **双表联合检索**。同时引入了 `public`/`private` 可见性属性，区分"AI 可检索"与"仅后台可见"的文档。
+
+### 10.2 KnowledgeDoc 模型
+
+```python
+# apps/knowledge/models.py — KnowledgeDoc 模型核心字段
+
+class KnowledgeDoc(models.Model):
+    STATUS_CHOICES = [
+        ('uploaded', '已上传'), ('parsing', '解析中'),
+        ('chunking', '分块中'), ('embedding', '向量化中'),
+        ('indexed', '已索引'), ('failed', '失败'),
+    ]
+    VISIBILITY_CHOICES = [                          # 🆕 可见性
+        ('public', '公开'),                        # AI 可检索，所有人可见
+        ('private', '私密'),                       # AI 不可检索，仅权限用户可见
+    ]
+
+    title = CharField(max_length=512)               # 文档标题
+    description = TextField()                       # 文档描述（FULLTEXT 搜索）
+    college = FK('accounts.College', SET_NULL)      # 所属学院
+    discipline = FK('classify.Discipline', SET_NULL) # 学科方向
+    category = FK('classify.Category', SET_NULL)    # 资源类型（必须是二级分类）
+    uploader = FK(AUTH_USER_MODEL, SET_NULL)        # 上传者
+    status = CharField(choices=STATUS_CHOICES)       # 索引状态
+    visibility = CharField(choices=VISIBILITY_CHOICES, default='public', db_index=True)
+    # ... 其他字段（oss_key, file_type, file_size, md5_hash 等）
+```
+
+### 10.3 可见性权限矩阵
+
+| 角色 | 公开文件（public） | 私密文件（private） | AI 检索范围 |
+|------|-------------------|---------------------|-------------|
+| `super_admin` | ✅ 全部 | ✅ 全部 | 仅 public |
+| `admin` | ✅ 全部 | ✅ 本院 + 自己上传 | 仅 public |
+| `user` | ✅ 全部 | ✅ 自己上传 | 仅 public |
+| **AI（匿名）** | ✅ | ❌ | **仅 public** |
+
+### 10.4 RAG 管道双表集成
+
+#### `_apply_hard_filters` 改造
+
+```python
+def _apply_hard_filters(filters, user_context, top_k=500) -> List[int]:
+    from apps.resources.models import Resource
+    from apps.knowledge.models import KnowledgeDoc  # 🆕
+    from django.db.models import Q
+
+    # --- Resource 表硬过滤（原有逻辑）---
+    resource_ids = list(Resource.objects.filter(status='published', ...)
+                        .values_list('id', flat=True)[:top_k])
+
+    # --- KnowledgeDoc 表硬过滤（🆕 2026-07-02）---
+    kd_qs = KnowledgeDoc.objects.filter(status='indexed')
+
+    role = user_context.get('role', 'user')
+    is_admin_query = role in ('admin', 'super_admin')
+
+    if not is_admin_query:
+        # ⚠️ AI 检索：强制只看公开文件
+        kd_qs = kd_qs.filter(visibility='public')
+    elif role == 'admin':
+        # 学院管理员：公开 + 本院私密 + 自己私密
+        kd_qs = kd_qs.filter(
+            Q(visibility='public')
+            | Q(visibility='private', college_id=user_context.get('college_id'))
+            | Q(visibility='private', uploader_id=user_context.get('user_id')),
+        )
+    # super_admin: 不过滤
+
+    # 学科/学院/分类筛选（与 Resource 共享过滤条件）
+    if (cid := filters.get('college_id')):
+        kd_qs = kd_qs.filter(college_id=cid)
+    if (did := filters.get('discipline_id')):
+        kd_qs = kd_qs.filter(discipline_id=did)
+    if (cat_ids := filters.get('category_ids')):
+        kd_qs = kd_qs.filter(category_id__in=cat_ids)
+
+    knowledge_doc_ids = list(kd_qs.values_list('id', flat=True)[:top_k])
+
+    # 双表 ID 编码策略：Resource 用正数，KnowledgeDoc 用负数
+    return resource_ids + [-kid for kid in knowledge_doc_ids]
+```
+
+#### `_enrich_with_doc_meta` 双表元信息加载
+
+```python
+def _enrich_with_doc_meta(hits, min_score):
+    # 按正负号拆分 Resource / KnowledgeDoc ID
+    resource_ids = [h['doc_id'] for h in hits if h.get('doc_id', 0) > 0]
+    knowledge_ids = [abs(h['doc_id']) for h in hits if h.get('doc_id', 0) < 0]
+
+    doc_title_map = {}
+    # Resource 表
+    if resource_ids:
+        for d in Resource.objects.filter(id__in=resource_ids).values('id', 'title'):
+            doc_title_map[d['id']] = d['title']
+    # 🆕 KnowledgeDoc 表
+    if knowledge_ids:
+        for d in KnowledgeDoc.objects.filter(id__in=knowledge_ids).values('id', 'title'):
+            doc_title_map[-d['id']] = d['title']  # 负数 key 匹配
+    # ...
+```
+
+#### `_filter_by_permission` 双表权限兜底
+
+```python
+def _filter_by_permission(hits, user_context):
+    # 分别对 Resource 和 KnowledgeDoc 做权限校验
+    # KnowledgeDoc 使用 visibility 字段（public/private）
+    # Resource 使用 visibility 字段（public/internal/restricted）
+    # 返回值统一取正数 ID
+    return filtered[:5]
+```
+
+### 10.5 视图层可见性过滤
+
+所有知识库查询视图（列表/详情/下载）通过静态方法 `_apply_visibility_filter` 统一过滤：
+
+```python
+# apps/knowledge/views.py
+
+@staticmethod
+def _apply_visibility_filter(queryset, user):
+    """按用户角色过滤可见性"""
+    if user.role == 'super_admin':
+        return queryset
+    if user.role == 'admin':
+        return queryset.filter(
+            Q(visibility='public')
+            | Q(visibility='private', college_id=user.college_id)
+            | Q(visibility='private', uploader_id=user.id),
+        )
+    return queryset.filter(
+        Q(visibility='public')
+        | Q(visibility='private', uploader_id=user.id),
+    )
+```
+
+复用于 `KnowledgeDocListView`、`KnowledgeDocDetailView`、`KnowledgeDocDownloadView`。
+
+### 10.6 列表 `latest_only` 去重分组
+
+列表视图新增 `latest_only` 参数（默认 `true`），在同一 `(college_id, discipline_id, category_id)` 组合内只返回最新一条文档，避免列表冗余：
+
+```python
+if latest_only:
+    grouped = queryset.values('college_id', 'discipline_id', 'category_id') \
+                      .annotate(max_created=Max('created_at'))
+    # 取每组最新 ID → queryset.filter(id__in=latest_ids)
+```
+
+### 10.7 分类模块改造（Category 两级分类 + 图标继承）
+
+#### 模型层 — `Category.icon` 字段
+
+```python
+# apps/classify/models.py
+class Category(models.Model):
+    """资源类型（支持两级：课件 → PPT课件/PDF课件）"""
+    name = models.CharField(max_length=64, verbose_name='类型名称')
+    parent = models.ForeignKey('self', null=True, blank=True,
+                               on_delete=models.CASCADE,
+                               related_name='children', verbose_name='上级分类')
+    icon = models.URLField(max_length=512, blank=True, default='',
+                           verbose_name='分类图标URL')           # 🆕
+    sort_order = models.IntegerField(default=0, verbose_name='排序')
+```
+
+#### 序列化器 — 图标继承逻辑
+
+```python
+# apps/classify/serializers.py
+class CategorySerializer(serializers.ModelSerializer):
+    children = serializers.SerializerMethodField()
+    icon = serializers.SerializerMethodField()                    # 🆕
+
+    def get_icon(self, obj):
+        """一级返回自身图标，二级有则返回否则继承父级图标"""
+        if obj.icon:
+            return obj.icon
+        if obj.parent and obj.parent.icon:
+            return obj.parent.icon
+        return ''
+```
+
+**图标继承规则：**
+
+```
+一级分类（教学资源）icon = "https://oss/icons/teaching.png"
+  ├─ 二级（教学课件）icon = ""         → 继承 → "teaching.png"
+  ├─ 二级（课程大纲）icon = "自定义"   → 自身 → "自定义"
+  └─ 二级（试题库）  icon = ""         → 继承 → "teaching.png"
+```
+
+#### 视图层 — `category_id` 一级自动展开
+
+资源列表和知识库列表的 `category_id` 筛选统一逻辑：
+
+```python
+# apps/resources/views.py — ResourceListView.get_queryset
+category_id = request.query_params.get('category_id')
+if category_id:
+    category = Category.objects.get(id=category_id)
+    if category.parent is None:
+        # 一级分类：展开为所有子分类 ID
+        child_ids = category.children.values_list('id', flat=True)
+        queryset = queryset.filter(category_id__in=child_ids)
+    else:
+        # 二级分类：精确匹配
+        queryset = queryset.filter(category_id=category_id)
+```
+
+#### 上传校验 — 强制二级分类
+
+```python
+# apps/knowledge/views.py — UploadCallbackView._validate_classification
+category = Category.objects.get(id=data['category_id'])
+if category.parent is None:
+    raise ValidationError({'category_id': '必须是二级分类，不能选择一级分类'})
+```
+
+### 10.8 文件上传完整流程
+
+#### 流程概览
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  前端                                                             │
+│  ① POST /upload/sts/  {file_name, file_size, md5}                │
+│     ├─ MD5 去重检查（oss_client.check_duplicate）                 │
+│     ├─ 命中 → {"duplicate": true, "resource_id": N}             │
+│     └─ 未命中 → oss_client.get_sts_credentials()                 │
+│                → {oss_key, upload_url, sts_credentials}          │
+│  ② 前端用 STS 凭证直传文件到 OSS（PutObject）                     │
+│  ③ POST /upload/callback/  {oss_key, title, ..., file_type, md5}│
+│     ├─ oss_key 路径穿越校验                                       │
+│     ├─ 分类关联校验（college/discipline 存在，category 二级）     │
+│     ├─ MD5 二次去重（防并发）                                    │
+│     └─ KnowledgeDoc.objects.create(...) + Keyword 批量创建        │
+│  ④ 异步：Celery index_document.delay(doc_id)（待集成）           │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+#### 接口清单
+
+| 方法 | 路径 | 权限 | 说明 |
+|------|------|------|------|
+| `POST` | `/api/knowledge/upload/sts/` | `IsAdminOrSuperAdmin` | 获取 OSS STS 凭证 + MD5 去重 |
+| `POST` | `/api/knowledge/upload/callback/` | `IsAdminOrSuperAdmin` | 上传完成回调，创建 KnowledgeDoc |
+| `POST` | `/api/knowledge/upload/text/` | `IsAdminOrSuperAdmin` | 管理员手动录入文本（后端直传 OSS） |
+
+#### 核心代码
+
+**① STS 凭证签发（含 MD5 去重）**
+
+```python
+# apps/knowledge/views.py — UploadSTSView.post
+def post(self, request):
+    serializer = UploadSTSRequestSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+
+    md5_hash = serializer.validated_data['md5']
+    file_name = serializer.validated_data['file_name']
+    college_id = request.user.college_id or 0
+
+    # MD5 去重检查
+    duplicate_doc = oss_client.check_duplicate(md5_hash)
+    if duplicate_doc:
+        return Response({'duplicate': True, 'resource_id': duplicate_doc.id})
+
+    # 获取 STS 临时凭证
+    credentials = oss_client.get_sts_credentials(file_name, college_id)
+    return Response({
+        'oss_key': credentials['oss_key'],
+        'upload_url': credentials['upload_url'],
+        'sts_credentials': credentials.get('sts_credentials'),
+        'dev_mode': credentials.get('dev_mode', False),
+        'duplicate': False,
+    })
+```
+
+**② 上传回调（创建 KnowledgeDoc + Keyword）**
+
+```python
+# apps/knowledge/views.py — UploadCallbackView.post（精简）
+def post(self, request):
+    data = serializer.validated_data
+    self._validate_oss_key(data['oss_key'])       # 防路径穿越
+    UploadCallbackView._validate_classification(data)  # 分类校验
+
+    duplicate_doc = oss_client.check_duplicate(data['md5'])  # 二次去重
+    if duplicate_doc:
+        return Response({'id': duplicate_doc.id, 'status': duplicate_doc.status, 'duplicate': True})
+
+    new_doc = KnowledgeDoc.objects.create(
+        oss_key=data['oss_key'], title=data['title'], ..., source_type='upload',
+        uploader=request.user, status='uploaded',
+        college_id=data['college_id'], discipline_id=data['discipline_id'],
+        category_id=data['category_id'], visibility=data.get('visibility', 'public'),
+    )
+    # 批量创建关键词
+    for phrase in data.get('keywords', []):
+        Keyword.objects.create(doc=new_doc, phrase=phrase, ...)
+
+    return Response({'id': new_doc.id, 'status': new_doc.status})
+```
+
+**③ 文本直传（后端 PUT Object）**
+
+```python
+# utils/oss.py — OSSClient.upload_text
+def upload_text(self, content: str, oss_key: str) -> bool:
+    try:
+        self.bucket.put_object(oss_key, content.encode('utf-8'))
+        return True
+    except Exception as e:
+        logger.error(f'OSS 文本上传失败 oss_key={oss_key}: {e}')
+        return False
+
+# apps/knowledge/views.py — TextUploadView
+# 流程：校验 → 生成 oss_key → upload_text() → 计算 MD5 → KnowledgeDoc.objects.create()
+```
+
+#### OSS Key 格式
+
+```
+knowledge/{college_id}/{YYYY-MM}/{uuid}.{ext}
+
+示例：
+  knowledge/3/2026-07/a1b2c3d4e5f6.pdf     # 文件上传
+  knowledge/3/2026-07/b2c3d4e5f6a7.txt     # 文本录入
+```
+
+### 10.9 上传安全加固
+
+| 模块 | 改动 | 说明 |
+|------|------|------|
+| `apps/knowledge/serializers.py` | `ALLOWED_FILE_TYPES` 白名单 | 40+ 种允许类型，拒绝 `.exe` 等 |
+| `apps/knowledge/serializers.py` | `FILE_SIZE_LIMITS` 分级限制 | 文档/音频 50MB，图片 10MB，视频 500MB |
+| `apps/knowledge/serializers.py` | `_validate_file_type()` | 上传前校验，不在白名单返回 400 |
+| `apps/knowledge/serializers.py` | `_validate_file_size()` | 按类型校验大小，超限返回 400 |
+| `apps/knowledge/views.py` | `_validate_oss_key()` | 防路径穿越（拒绝 `..`、`/` 开头、非 `knowledge/` 前缀） |
+| `apps/knowledge/serializers.py` | `UploadCallbackSerializer` college_id/discipline_id/category_id 改为必填 | 防止空分类入库 |
+
+### 10.10 其他配套改动（2026-07-02）
+
+| 模块 | 改动 | 说明 |
+|------|------|------|
+| `apps/knowledge/models.py` | `KnowledgeDoc` 新增 `visibility` 字段 | public/private |
+| `apps/knowledge/views.py` | 新增 `TextUploadView` | 管理员手动录入文本（直传 OSS + 创建 KnowledgeDoc） |
+| `apps/knowledge/views.py` | 新增 `KnowledgeDocPreviewView` | 音视频（`<audio>`/`<video>`）/纯文本在线预览 |
+| `utils/oss.py` | 新增 `upload_text()` | 后端 PUT Object 直传文本到 OSS |
+| `utils/oss.py` | 新增 `get_preview_url()` | 3600 秒签名 URL（长有效期适合音视频播放） |
+| `apps/resources/views.py` | 新增 `ResourceListView` | 资源列表查询，全开放 `IsAuthenticated` |
+| `apps/resources/serializers.py` | `ResourceListSerializer` 升级 | `category_name` 完整路径 + `category_icon` + `keywords` |
+| `apps/knowledge/urls.py` | 新增 4 条路由 | `/upload/text/` `/preview/` `/keywords/create/` `/keywords/delete/` |
+
+### 10.11 关键设计决策
+
+| 决策 | 方案 | 原因 |
+|------|------|------|
+| 双表 ID 编码 | Resource 正数，KnowledgeDoc 负数 | 无需改 Milvus 数据结构，后端透明区分来源 |
+| AI 检索范围 | 仅 public | 私密文档仅后台可见，防止敏感内容经 AI 泄露 |
+| 可见性校验层级 | SQL 硬过滤 + 权限二次兜底 | 硬过滤缩范围（性能），权限兜底（安全） |
+| `latest_only` 默认 true | 分组取最新 | 同一分类下多版本文档仅展示最新版，减少噪音 |
+| Category 二级分类强制 | 上传时校验 `parent IS NOT NULL` | 避免粗粒度分类，确保检索精度 |
+
+---
+
+## 十一、关联资源
+
+- [database-changes/knowledge_doc.md](database-changes/knowledge_doc.md) — 知识文档表
+- [database-changes/keyword.md](database-changes/keyword.md) — 关键词表
+- [database-changes/doc_chunk.md](database-changes/doc_chunk.md) — 文档切片表
+- [database-changes/query_log.md](database-changes/query_log.md) — 查询日志表
+- [code-changes/2026-07-01.md](code-changes/2026-07-01.md) — 代码改动（D1）
+- [code-changes/2026-07-02.md](code-changes/2026-07-02.md) — 代码改动（D2）
 - [CONVENTIONS.md](CONVENTIONS.md) — 团队代码规范

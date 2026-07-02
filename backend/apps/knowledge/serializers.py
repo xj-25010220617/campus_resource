@@ -65,6 +65,23 @@ FILE_SIZE_LIMITS = {
     'other': 50 * 1024 * 1024,
 }
 
+# 允许上传的文件类型白名单
+ALLOWED_FILE_TYPES = {
+    # 文档类
+    'pdf', 'doc', 'docx', 'ppt', 'pptx', 'xls', 'xlsx',
+    'txt', 'md', 'html',
+    # 图片类
+    'png', 'jpg', 'jpeg', 'gif', 'webp',
+    # 音频类
+    'mp3', 'wav', 'ogg', 'flac', 'aac', 'm4a',
+    # 视频类
+    'mp4', 'webm', 'mov', 'avi', 'mkv', 'flv',
+    # 压缩包类
+    'zip', 'rar',
+    # 其他（兜底）
+    'other',
+}
+
 
 def _validate_file_size(file_size: int, file_type: str) -> None:
     """校验文件大小是否在允许范围内，超限抛出 ValidationError"""
@@ -75,6 +92,15 @@ def _validate_file_size(file_size: int, file_type: str) -> None:
         cur_mb = file_size // (1024 * 1024)
         raise serializers.ValidationError(
             f'{ft} 文件大小不能超过 {max_mb}MB，当前大小 {cur_mb}MB'
+        )
+
+
+def _validate_file_type(file_type: str) -> None:
+    """校验文件类型是否在允许范围内，不支持则抛出 ValidationError"""
+    ft = (file_type or 'other').lower()
+    if ft not in ALLOWED_FILE_TYPES:
+        raise serializers.ValidationError(
+            f'不支持的文件类型 "{ft}"，支持的类型：{", ".join(sorted(ALLOWED_FILE_TYPES))}'
         )
 
 
@@ -90,6 +116,10 @@ class UploadSTSRequestSerializer(serializers.Serializer):
 
     def validate_file_size(self, value):
         _validate_file_size(value, self.initial_data.get('file_type', 'other'))
+        return value
+
+    def validate_file_type(self, value):
+        _validate_file_type(value)
         return value
 
 
@@ -110,9 +140,17 @@ class UploadCallbackSerializer(serializers.Serializer):
         child=serializers.CharField(), required=False, default=list,
         help_text='关键词列表（可选）',
     )
+    visibility = serializers.CharField(
+        max_length=16, default='public',
+        help_text='可见性（public:公开 / private:私密）',
+    )
 
     def validate_file_size(self, value):
         _validate_file_size(value, self.initial_data.get('file_type', 'other'))
+        return value
+
+    def validate_file_type(self, value):
+        _validate_file_type(value)
         return value
 
 
@@ -158,4 +196,8 @@ class TextUploadSerializer(serializers.Serializer):
     keywords = serializers.ListField(
         child=serializers.CharField(), required=False, default=list,
         help_text='关键词列表（可选）',
+    )
+    visibility = serializers.CharField(
+        max_length=16, default='public',
+        help_text='可见性（public:公开 / private:私密）',
     )
