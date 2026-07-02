@@ -1,7 +1,6 @@
 """Admin Panel - 用户管理视图"""
 from django.contrib.auth import get_user_model
 from rest_framework import permissions, status, viewsets
-from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from .serializers import (
@@ -74,6 +73,15 @@ class UserAdminViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save()
 
+    def create(self, request, *args, **kwargs):
+        """新建用户：用详情序列化器重新输出，保证响应字段完整。"""
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        output = UserAdminSerializer(serializer.instance)
+        headers = self.get_success_headers(output.data)
+        return Response(output.data, status=status.HTTP_201_CREATED, headers=headers)
+
     def perform_update(self, serializer):
         # 防止编辑时越权
         instance = serializer.instance
@@ -83,6 +91,21 @@ class UserAdminViewSet(viewsets.ModelViewSet):
         if request_user.role == 'admin' and instance.role != 'user':
             raise PermissionError('无权修改此用户')
         serializer.save()
+
+    def update(self, request, *args, **kwargs):
+        """更新用户（整量）：用详情序列化器重新输出，保证响应字段完整。"""
+        partial = kwargs.pop('partial', False)
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+        output = UserAdminSerializer(serializer.instance)
+        return Response(output.data)
+
+    def partial_update(self, request, *args, **kwargs):
+        """更新用户（局部）：同上，调用 update 时传入 partial=True。"""
+        kwargs['partial'] = True
+        return self.update(request, *args, **kwargs)
 
     def perform_destroy(self, instance):
         request_user = self.request.user
