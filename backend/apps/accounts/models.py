@@ -35,6 +35,10 @@ class User(AbstractUser):
     )
     phone = models.CharField(max_length=11, blank=True, default='', verbose_name='手机号')
     avatar = models.URLField(blank=True, default='', verbose_name='头像URL')
+    sso_uid = models.CharField(
+        max_length=128, null=True, blank=True, unique=True,
+        db_index=True, verbose_name='SSO统一ID',
+    )
 
     class Meta:
         db_table = 'user'
