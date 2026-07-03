@@ -90,15 +90,6 @@ class UserAdminViewSet(viewsets.ModelViewSet):
             qs = qs.filter(department_id=department_id)
 
         is_active = self.request.query_params.get('is_active')
-<<<<<<< Updated upstream
-        if is_active is not None:
-            qs = qs.filter(is_active=is_active.lower() == 'true')
-
-<<<<<<< HEAD
-        return qs.order_by('-date_joined')
-=======
-        return queryset.order_by('-date_joined')
-=======
         if is_active and is_active.lower() in ('true', 'false'):
             qs = qs.filter(is_active=is_active.lower() == 'true')
 
@@ -107,8 +98,6 @@ class UserAdminViewSet(viewsets.ModelViewSet):
             qs = qs.filter(username__icontains=search)
 
         return qs.order_by('-date_joined')
->>>>>>> Stashed changes
->>>>>>> zyr
 
     def perform_create(self, serializer):
         u = self.request.user
