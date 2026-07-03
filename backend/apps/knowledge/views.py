@@ -29,6 +29,7 @@ from utils.oss import oss_client
 from .extractor import extract_freshness_for_doc
 from .models import Keyword, KnowledgeDoc
 from .serializers import (
+    AIClassifySerializer,
     ALLOWED_FILE_TYPES,
     FileUploadSerializer,
     KeywordCreateSerializer,
@@ -591,10 +592,11 @@ class UploadCallbackView(APIView):
             uploader=request.user,
             status='uploaded',
             scope=data['scope'],
-            college_id=data.get('college_id'),
-            department_id=data.get('department_id'),
+            college_id=data.get('college_id') or request.user.college_id,
+            department_id=data.get('department_id') or request.user.department_id,
             discipline_id=data.get('discipline_id'),
             category_id=data.get('category_id'),
+            visibility=data.get('visibility', 'public'),
         )
 
         # 创建关联关键词
@@ -723,8 +725,8 @@ class TextUploadView(APIView):
             file_size=len(content.encode('utf-8')),
             md5_hash=md5_hash,
             scope=data['scope'],
-            college_id=data.get('college_id'),
-            department_id=data.get('department_id'),
+            college_id=data.get('college_id') or request.user.college_id,
+            department_id=data.get('department_id') or request.user.department_id,
             discipline_id=data.get('discipline_id'),
             category_id=data.get('category_id'),
             uploader=request.user,
@@ -999,8 +1001,8 @@ class FileUploadView(APIView):
             file_size=uploaded_file.size,
             md5_hash=md5_hash,
             scope=data['scope'],
-            college_id=data.get('college_id'),
-            department_id=data.get('department_id'),
+            college_id=data.get('college_id') or request.user.college_id,
+            department_id=data.get('department_id') or request.user.department_id,
             discipline_id=data.get('discipline_id'),
             category_id=data.get('category_id'),
             uploader=request.user,
@@ -1027,5 +1029,91 @@ class FileUploadView(APIView):
             'id': new_doc.id,
             'status': new_doc.status,
             'file_name': new_doc.file_name,
+        })
+
+
+class AIClassifyView(APIView):
+    """
+    AI 智能分类推荐
+
+    POST /api/knowledge/upload/ai-classify/
+    功能：接收文件标题和内容片段，调用 LLM 分析并推荐最匹配的二级分类
+    请求参数：
+        - title (str, required): 文件标题
+        - content (str, optional): 文本内容片段（建议前 2000 字）
+    返回：{"first_level": {"id": 1, "name": "教学资源"}, "second_level": {"id": 5, "name": "教学课件"}, "confidence": "high"}
+    """
+    permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
+
+    def post(self, request):
+        """AI 分析并推荐分类"""
+        import json
+        import re
+
+        serializer = AIClassifySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        title = data['title']
+        content = data.get('content', '')
+
+        first_level = list(Category.objects.filter(parent__isnull=True).values('id', 'name'))
+        second_level = list(Category.objects.filter(parent__isnull=False).values(
+            'id', 'name', 'parent__name',
+        ))
+        if not first_level or not second_level:
+            return Response(
+                {'detail': '分类数据尚未初始化，请联系管理员', 'code': 'NO_CATEGORIES'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        l1_list = ', '.join(c['name'] for c in first_level)
+        l2_list = ', '.join(f"{c['parent__name']}>{c['name']}" for c in second_level)
+
+        prompt = (
+            f"你是校园知识库分类助手。请根据文件信息推荐最合适的一级和二级分类。\n\n"
+            f"一级分类（仅限）：{l1_list}\n"
+            f"二级分类（仅限）：{l2_list}\n\n"
+            f"文件标题：{title}\n"
+            f"文件内容片段：{content[:2000]}\n\n"
+            f"只返回JSON：{{\"first_level\":\"一级名\",\"second_level\":\"二级名\",\"confidence\":\"high|medium|low\"}}"
+        )
+
+        try:
+            from utils.llm import llm_client
+            raw = llm_client.chat(
+                messages=[{'role': 'user', 'content': prompt}],
+                temperature=0.0, max_tokens=150,
+            )
+        except Exception as e:
+            logger.error(f'LLM 分类推荐失败: {e}')
+            return Response(
+                {'detail': 'AI 服务暂时不可用，请手动选择分类', 'code': 'AI_UNAVAILABLE'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        if not raw:
+            return Response(
+                {'detail': 'AI 未返回有效结果', 'code': 'EMPTY_RESPONSE'},
+                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+
+        try:
+            match = re.search(r'\{.*\}', raw, re.DOTALL)
+            result = json.loads(match.group(0)) if match else json.loads(raw)
+        except (json.JSONDecodeError, AttributeError):
+            logger.warning(f'LLM 分类解析失败 raw={raw[:200]}')
+            return Response(
+                {'detail': 'AI 结果解析失败，请手动选择分类', 'code': 'PARSE_ERROR'},
+                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+
+        l1 = next((c for c in first_level if c['name'] == result.get('first_level', '')), None)
+        l2 = next((c for c in second_level if c['name'] == result.get('second_level', '')), None)
+
+        return Response({
+            'first_level': {'id': l1['id'], 'name': l1['name']} if l1 else None,
+            'second_level': {'id': l2['id'], 'name': l2['name']} if l2 else None,
+            'confidence': result.get('confidence', 'medium'),
         })
 

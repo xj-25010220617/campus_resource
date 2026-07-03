@@ -241,3 +241,12 @@ class FileUploadSerializer(serializers.Serializer):
         max_length=16, default='public',
         help_text='可见性（public:公开 / private:私密）',
     )
+
+
+class AIClassifySerializer(serializers.Serializer):
+    """AI 智能分类推荐请求参数"""
+
+    title = serializers.CharField(max_length=512, help_text='文件标题')
+    content = serializers.CharField(
+        default='', allow_blank=True, help_text='文本内容片段（可选，建议前 2000 字）',
+    )

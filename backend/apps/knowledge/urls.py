@@ -1,6 +1,7 @@
 from django.urls import path
 
 from .views import (
+    AIClassifyView,
     ExtractFreshnessView,
     FileUploadView,
     KeywordCreateView,
@@ -23,6 +24,7 @@ urlpatterns = [
     path('upload/file/', FileUploadView.as_view(), name='upload_file'),
     path('upload/text/', TextUploadView.as_view(), name='upload_text'),
     path('upload/sts/', UploadSTSView.as_view(), name='upload_sts'),
+    path('upload/ai-classify/', AIClassifyView.as_view(), name='upload_ai_classify'),
     path('upload/callback/', UploadCallbackView.as_view(), name='upload_callback'),
 
     # 文档

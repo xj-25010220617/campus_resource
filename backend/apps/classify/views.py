@@ -3,7 +3,10 @@ from rest_framework import generics, permissions
 
 from apps.accounts.models import College
 from .models import Discipline, Category, Department
-from .serializers import CollegeSerializer, DisciplineSerializer, CategorySerializer, DepartmentSerializer
+from .serializers import (
+    CategorySerializer, CollegeSerializer, DepartmentSerializer,
+    DisciplineSerializer, FirstLevelCategorySerializer, SecondLevelCategorySerializer,
+)
 
 
 @extend_schema(
@@ -94,3 +97,36 @@ class DepartmentListView(generics.ListAPIView):
     queryset = Department.objects.filter(parent__isnull=True).prefetch_related('children')
     serializer_class = DepartmentSerializer
     permission_classes = [permissions.IsAuthenticated]
+
+
+class FirstLevelCategoryListView(generics.ListAPIView):
+    """
+    一级分类列表（不含子级，供下拉框使用）
+
+    GET /api/categories/first-level/
+    功能：返回所有一级分类，按 sort_order 排序，供前端第一个下拉框使用
+    返回：[{id, name, icon}, ...]
+    """
+    queryset = Category.objects.filter(parent__isnull=True)
+    serializer_class = FirstLevelCategorySerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+
+class SecondLevelCategoryListView(generics.ListAPIView):
+    """
+    二级分类列表（按父级筛选，供联动下拉框使用）
+
+    GET /api/categories/second-level/?parent_id=<id>
+    功能：选择一级分类后，返回该一级分类下的所有二级分类
+    参数：
+        - parent_id (int, required): 一级分类 ID
+    返回：[{id, name}, ...]
+    """
+    serializer_class = SecondLevelCategorySerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        parent_id = self.request.query_params.get('parent_id')
+        if not parent_id:
+            return Category.objects.none()
+        return Category.objects.filter(parent_id=parent_id)

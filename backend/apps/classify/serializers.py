@@ -57,3 +57,19 @@ class DepartmentSerializer(serializers.ModelSerializer):
         if children.exists():
             return DepartmentSerializer(children, many=True).data
         return []
+
+
+class FirstLevelCategorySerializer(serializers.ModelSerializer):
+    """一级分类序列化器（简化版，供下拉框）"""
+
+    class Meta:
+        model = Category
+        fields = ['id', 'name', 'icon']
+
+
+class SecondLevelCategorySerializer(serializers.ModelSerializer):
+    """二级分类序列化器（简化版，供联动下拉框）"""
+
+    class Meta:
+        model = Category
+        fields = ['id', 'name']
