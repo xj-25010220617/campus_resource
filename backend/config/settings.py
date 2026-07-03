@@ -33,6 +33,7 @@ INSTALLED_APPS = [
     'apps.chat',
     'apps.knowledge',
     'apps.feedback',
+    'apps.faq',
 ]
 
 MIDDLEWARE = [
@@ -181,3 +182,17 @@ CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = 'Asia/Shanghai'
+
+# ------------------------------------------------------------------
+# FAQ 自动生成配置
+# ------------------------------------------------------------------
+# 最小占比阈值（百分比）— 超过此比例的问题才提取为 FAQ
+FAQ_MIN_RATIO = 0.5
+# 每次最多保留的高频问题簇数
+FAQ_MAX_CLUSTERS = 20
+# 向量聚类相似度阈值
+FAQ_CLUSTER_THRESHOLD = 0.85
+# 与已有 FAQ 去重阈值
+FAQ_DEDUP_THRESHOLD = 0.90
+# 日志采集天数
+FAQ_ANALYSIS_DAYS = 7
