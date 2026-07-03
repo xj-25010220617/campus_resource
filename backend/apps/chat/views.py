@@ -4,7 +4,7 @@ import time
 from django.http import StreamingHttpResponse
 from django.shortcuts import get_object_or_404
 from drf_spectacular.utils import extend_schema
-from rest_framework import generics, permissions, status
+from rest_framework import generics, parsers, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -21,12 +21,9 @@ from apps.classify.utils.query_parser import parse as parse_query
 
 from .models import Conversation, ChatMessage, QueryLog, SensitiveLog
 from .serializers import (
-    ConversationSerializer,
-    ConversationListSerializer,
-    ChatMessageSerializer,
-    AskSerializer,
-    FeedbackSerializer,
-    MessageRateSerializer,
+    AskSerializer, ChatMessageSerializer, ConversationListSerializer,
+    ConversationSerializer, FeedbackSerializer, MessageRateSerializer,
+    VoiceAskSerializer,
 )
 
 
@@ -426,3 +423,108 @@ class FeedbackView(generics.CreateAPIView):
             {'detail': '反馈已记录'},
             status=status.HTTP_200_OK,
         )
+
+
+class VoiceAskView(APIView):
+    """
+    语音问答接口
+
+    POST /api/chat/voice-ask/
+    功能：接收音频文件 → FunASR 语音转文字 → RAG 检索 → LLM 流式 SSE 回答
+    请求参数（form-data）：
+        - audio_file (file, required): 音频文件，支持 WAV/MP3/PCM，最大 10MB
+        - conversation_id (int, optional): 会话 ID，不传则新建
+    返回：SSE 流式响应（text/event-stream）
+    错误：
+        - 400: 文件无效
+        - 500: 语音识别失败
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    parser_classes = [parsers.MultiPartParser, parsers.FormParser]
+
+    def post(self, request):
+        """处理语音问答"""
+        from utils.asr import speech_to_text
+
+        serializer = VoiceAskSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        # 读取音频文件
+        audio_file = data['audio_file']
+        if audio_file.size > 10 * 1024 * 1024:
+            return Response(
+                {'detail': '音频文件不能超过 10MB', 'code': 'FILE_TOO_LARGE'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        audio_data = audio_file.read()
+
+        # 语音 → 文字
+        text = speech_to_text(audio_data, audio_file.name.rsplit('.', 1)[-1] if '.' in audio_file.name else 'wav')
+        if not text:
+            return Response(
+                {'detail': '语音识别失败，请确认音频清晰且包含中文语音', 'code': 'ASR_FAILED'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        # 复用 AskView 的 RAG 检索 + LLM 流式逻辑
+        return self._stream_answer(text, request.user, data.get('conversation_id'))
+
+    def _stream_answer(self, question: str, user, conversation_id):
+        """RAG 检索 + LLM 流式 SSE，复用 AskView 核心逻辑"""
+        from django.http import StreamingHttpResponse
+        from utils.sse import _format_sse, build_references_events
+
+        user_context = {
+            'user_id': user.id, 'role': user.role,
+            'college_id': user.college_id, 'department_id': user.department_id,
+        }
+        parsed = parse_query(question, user_context)
+        hits = rag.retrieve(
+            question=question, user_context=user_context,
+            parsed_filters=parsed, top_k=rag.RAG_TOP_K,
+            min_score=rag.RAG_SCORE_THRESHOLD,
+        )
+        messages = rag.build_rag_prompt(question, hits)
+        sensitive_hit = any(check_sensitive(m.get('content', '')) for m in messages)
+
+        # 处理或创建会话
+        if conversation_id:
+            conv = get_object_or_404(Conversation, id=conversation_id, user=user)
+        else:
+            conv = Conversation.objects.create(user=user, title=question[:50])
+        ChatMessage.objects.create(conversation=conv, role='user', content=question)
+
+        # 写查询日志
+        log = QueryLog.objects.create(
+            user=user, question=question, parsed_filters=parsed,
+            hit_count=len(hits), top_doc_ids=[h['doc_id'] for h in hits],
+            conversation=conv,
+        )
+
+        def generate():
+            full_answer = ''
+            t0 = time.time()
+            try:
+                for chunk in llm_client.chat_stream(messages):
+                    full_answer += chunk
+                    yield _format_sse(chunk, conv.id, step='msg')
+                yield _format_sse('__DONE__', conv.id, step='done')
+                yield build_references_events(hits, rag.RAG_REFERENCE_THRESHOLD)
+            except Exception as e:
+                logger.error(f'LLM 流式输出失败: {e}')
+                yield _format_sse(f'\n\n[系统提示] 回答生成失败，请稍后重试。', conv.id, step='error')
+
+            # 保存 AI 消息
+            ai_msg = ChatMessage.objects.create(
+                conversation=conv, role='assistant', content=full_answer,
+                references={'hits': hits, 'sensitive': sensitive_hit},
+            )
+            log.response_ms = int((time.time() - t0) * 1000)
+            log.save()
+
+        response = StreamingHttpResponse(generate(), content_type='text/event-stream')
+        response['Cache-Control'] = 'no-cache'
+        response['X-Accel-Buffering'] = 'no'
+        response['X-Message-Id'] = str(log.id)
+        return response

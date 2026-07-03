@@ -181,3 +181,9 @@ CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = 'Asia/Shanghai'
+
+# ------------------------------------------------------------------
+# ASR 语音识别（FunASR）
+# ------------------------------------------------------------------
+ASR_MODEL_NAME = 'damo/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404'
+ASR_TIMEOUT = 30

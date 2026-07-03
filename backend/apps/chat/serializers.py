@@ -45,3 +45,13 @@ class FeedbackSerializer(serializers.Serializer):
 class MessageRateSerializer(serializers.Serializer):
     """消息反馈请求参数"""
     rating = serializers.ChoiceField(choices=['like', 'dislike'], help_text='like=点赞 / dislike=点踩')
+
+
+class VoiceAskSerializer(serializers.Serializer):
+    """语音问答请求参数（multipart/form-data）"""
+
+    audio_file = serializers.FileField(help_text='音频文件，支持 WAV/MP3/PCM，最大 10MB')
+    conversation_id = serializers.IntegerField(
+        required=False, allow_null=True,
+        help_text='会话ID（不传则新建）',
+    )

@@ -2,12 +2,9 @@ from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 
 from .views import (
-    ConversationViewSet,
-    MessageViewSet,
-    ConversationListView,
-    ConversationDetailView,
-    AskView,
-    FeedbackView,
+    AskView, ConversationDetailView, ConversationListView,
+    ConversationViewSet, FeedbackView, MessageViewSet,
+    VoiceAskView,
 )
 
 router = DefaultRouter()
@@ -24,6 +21,7 @@ urlpatterns = [
 
     # SSE 流式问答
     path('ask/', AskView.as_view(), name='chat_ask'),
+    path('voice-ask/', VoiceAskView.as_view(), name='voice_ask'),
 
     # 反馈接口
     path('feedback/', FeedbackView.as_view(), name='chat_feedback'),
