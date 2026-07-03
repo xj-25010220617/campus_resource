@@ -1,0 +1,457 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Campus Resource - Admin Me & Departments",
+    "description": "校园资源平台 - 管理后台两个查询接口的 OpenAPI 定义。\n\n涵盖：\n- GET /api/admin/me/         当前登录用户信息（含管理范围）\n- GET /api/admin/departments/  部门树形列表（仅管理员）\n\n权限模型（参考 backend/apps/admin_panel/permissions.py）：\n- ADMIN_ROLES = {super_admin, college_admin, dept_admin, admin}\n- /api/admin/me/         任何已登录用户\n- /api/admin/departments/ 仅 ADMIN_ROLES",
+    "version": "1.0.0",
+    "contact": {
+      "name": "Backend Team"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8000",
+      "description": "本地开发服务器"
+    },
+    {
+      "url": "https://{host}",
+      "description": "生产环境",
+      "variables": {
+        "host": {
+          "default": "campus.example.com",
+          "description": "生产域名"
+        }
+      }
+    }
+  ],
+  "tags": [
+    {
+      "name": "Admin / Me",
+      "description": "当前管理员信息"
+    },
+    {
+      "name": "Admin / Departments",
+      "description": "部门列表（管理后台）"
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "JWT 认证，header: Authorization: Bearer <access_token>"
+      },
+      "CookieAuth": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "sessionid",
+        "description": "Django Session Cookie（Swagger 调试用）"
+      }
+    },
+    "schemas": {
+      "Role": {
+        "type": "string",
+        "enum": ["super_admin", "college_admin", "dept_admin", "admin", "user"],
+        "description": "用户角色枚举",
+        "example": "college_admin"
+      },
+      "ManageScope": {
+        "type": "string",
+        "enum": ["all", "college", "department", "self"],
+        "description": "管理范围标签",
+        "example": "college"
+      },
+      "Permissions": {
+        "type": "object",
+        "required": ["manage_users", "manage_resources", "manage_scope"],
+        "properties": {
+          "manage_users": {
+            "type": "boolean",
+            "description": "是否可进入用户管理模块"
+          },
+          "manage_resources": {
+            "type": "boolean",
+            "description": "是否可进入资源管理模块"
+          },
+          "manage_scope": {
+            "$ref": "#/components/schemas/ManageScope"
+          }
+        }
+      },
+      "CurrentUser": {
+        "type": "object",
+        "required": [
+          "id",
+          "username",
+          "email",
+          "role",
+          "role_display",
+          "is_staff",
+          "is_superuser",
+          "college_id",
+          "college_name",
+          "department_id",
+          "department_name",
+          "permissions"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "用户主键",
+            "example": 12
+          },
+          "username": {
+            "type": "string",
+            "description": "用户名（唯一）",
+            "example": "zhang_san"
+          },
+          "email": {
+            "type": ["string", "null"],
+            "description": "邮箱",
+            "example": "zhang@example.com"
+          },
+          "role": {
+            "$ref": "#/components/schemas/Role"
+          },
+          "role_display": {
+            "type": "string",
+            "description": "角色中文显示名",
+            "example": "学院管理员"
+          },
+          "is_staff": {
+            "type": "boolean",
+            "description": "Django staff 标志"
+          },
+          "is_superuser": {
+            "type": "boolean",
+            "description": "Django superuser 标志"
+          },
+          "college_id": {
+            "type": ["integer", "null"],
+            "description": "所属学院 ID；部门管理员 / 校级用户为 null",
+            "example": 2
+          },
+          "college_name": {
+            "type": ["string", "null"],
+            "description": "所属学院名称",
+            "example": "计算机学院"
+          },
+          "department_id": {
+            "type": ["integer", "null"],
+            "description": "所属部门 ID；学院管理员 / 学生为 null",
+            "example": null
+          },
+          "department_name": {
+            "type": ["string", "null"],
+            "description": "所属部门名称",
+            "example": null
+          },
+          "permissions": {
+            "$ref": "#/components/schemas/Permissions"
+          }
+        }
+      },
+      "Department": {
+        "type": "object",
+        "description": "部门节点（树形结构，递归）",
+        "required": ["id", "name", "parent", "sort_order", "children"],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "minimum": 1,
+            "example": 1
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 128,
+            "example": "校级领导"
+          },
+          "parent": {
+            "type": ["integer", "null"],
+            "description": "上级部门 ID；一级部门为 null",
+            "example": null
+          },
+          "sort_order": {
+            "type": "integer",
+            "description": "排序值，越小越靠前",
+            "example": 1
+          },
+          "children": {
+            "type": "array",
+            "description": "子部门列表",
+            "items": {
+              "$ref": "#/components/schemas/Department"
+            },
+            "example": []
+          }
+        }
+      },
+      "DepartmentList": {
+        "type": "array",
+        "description": "部门树（一级 + 子级）",
+        "items": {
+          "$ref": "#/components/schemas/Department"
+        }
+      },
+      "Error401": {
+        "type": "object",
+        "required": ["detail"],
+        "properties": {
+          "detail": {
+            "type": "string",
+            "example": "Authentication credentials were not provided."
+          }
+        }
+      },
+      "Error403": {
+        "type": "object",
+        "required": ["detail"],
+        "properties": {
+          "detail": {
+            "type": "string",
+            "example": "You do not have permission to perform this action."
+          }
+        }
+      },
+      "Error405": {
+        "type": "object",
+        "required": ["detail"],
+        "properties": {
+          "detail": {
+            "type": "string",
+            "example": "Method \"POST\" not allowed."
+          }
+        }
+      }
+    },
+    "responses": {
+      "Unauthorized": {
+        "description": "未登录或 token 失效",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error401"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "已登录但无权限",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error403"
+            }
+          }
+        }
+      },
+      "MethodNotAllowed": {
+        "description": "HTTP 方法不被允许",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error405"
+            }
+          }
+        }
+      }
+    }
+  },
+  "security": [
+    { "BearerAuth": [] },
+    { "CookieAuth": [] }
+  ],
+  "paths": {
+    "/api/admin/me/": {
+      "get": {
+        "tags": ["Admin / Me"],
+        "summary": "获取当前管理员信息",
+        "description": "返回当前登录用户的归属和权限范围。\n\n- 权限：任何已登录用户（含 role=user）\n- 用途：前端路由守卫 / 菜单渲染 / 业务按钮可见性控制\n- 不分页\n",
+        "operationId": "getCurrentUser",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CurrentUser"
+                },
+                "examples": {
+                  "superAdmin": {
+                    "summary": "超级管理员",
+                    "value": {
+                      "id": 1,
+                      "username": "root",
+                      "email": "root@example.com",
+                      "role": "super_admin",
+                      "role_display": "超级管理员",
+                      "is_staff": true,
+                      "is_superuser": true,
+                      "college_id": null,
+                      "college_name": null,
+                      "department_id": null,
+                      "department_name": null,
+                      "permissions": {
+                        "manage_users": true,
+                        "manage_resources": true,
+                        "manage_scope": "all"
+                      }
+                    }
+                  },
+                  "collegeAdmin": {
+                    "summary": "学院管理员",
+                    "value": {
+                      "id": 12,
+                      "username": "zhang_san",
+                      "email": "zhang@example.com",
+                      "role": "college_admin",
+                      "role_display": "学院管理员",
+                      "is_staff": false,
+                      "is_superuser": false,
+                      "college_id": 2,
+                      "college_name": "计算机学院",
+                      "department_id": null,
+                      "department_name": null,
+                      "permissions": {
+                        "manage_users": true,
+                        "manage_resources": true,
+                        "manage_scope": "college"
+                      }
+                    }
+                  },
+                  "deptAdmin": {
+                    "summary": "部门管理员",
+                    "value": {
+                      "id": 23,
+                      "username": "li_si",
+                      "email": "li@example.com",
+                      "role": "dept_admin",
+                      "role_display": "部门管理员",
+                      "is_staff": false,
+                      "is_superuser": false,
+                      "college_id": null,
+                      "college_name": null,
+                      "department_id": 5,
+                      "department_name": "党委办公室",
+                      "permissions": {
+                        "manage_users": true,
+                        "manage_resources": true,
+                        "manage_scope": "department"
+                      }
+                    }
+                  },
+                  "userRole": {
+                    "summary": "普通用户（学生/员工）",
+                    "value": {
+                      "id": 88,
+                      "username": "student_001",
+                      "email": "",
+                      "role": "user",
+                      "role_display": "普通用户",
+                      "is_staff": false,
+                      "is_superuser": false,
+                      "college_id": 2,
+                      "college_name": "计算机学院",
+                      "department_id": null,
+                      "department_name": null,
+                      "permissions": {
+                        "manage_users": false,
+                        "manage_resources": false,
+                        "manage_scope": "self"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          }
+        }
+      }
+    },
+    "/api/admin/departments/": {
+      "get": {
+        "tags": ["Admin / Departments"],
+        "summary": "获取部门列表（树形）",
+        "description": "返回所有部门（一级 + 子级）的树形结构。\n\n- 权限：仅管理员（role ∈ {super_admin, college_admin, dept_admin, admin}）\n- 排序：ORDER BY sort_order ASC, id ASC\n- 不分页\n- Query 参数：\n  - college_id (int, optional): 当前 Department 模型尚未挂 college 字段，传此参数暂不起作用，后续数据库迁移后才会生效\n",
+        "operationId": "listDepartments",
+        "parameters": [
+          {
+            "name": "college_id",
+            "in": "query",
+            "required": false,
+            "description": "按所属学院筛选（暂未生效，见 description）",
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DepartmentList"
+                },
+                "examples": {
+                  "twoLevelTree": {
+                    "summary": "两级部门树示例",
+                    "value": [
+                      {
+                        "id": 1,
+                        "name": "校级领导",
+                        "parent": null,
+                        "sort_order": 1,
+                        "children": [
+                          {
+                            "id": 11,
+                            "name": "党委办公室",
+                            "parent": 1,
+                            "sort_order": 1,
+                            "children": []
+                          },
+                          {
+                            "id": 12,
+                            "name": "校长办公室",
+                            "parent": 1,
+                            "sort_order": 2,
+                            "children": []
+                          }
+                        ]
+                      },
+                      {
+                        "id": 2,
+                        "name": "教务处",
+                        "parent": null,
+                        "sort_order": 2,
+                        "children": []
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "405": {
+            "$ref": "#/components/responses/MethodNotAllowed"
+          }
+        }
+      }
+    }
+  }
+}

@@ -76,7 +76,7 @@ class UserAdminViewSet(viewsets.ModelViewSet):
         if request_user.role == 'super_admin':
             qs = qs.exclude(role='super_admin')
 
-        # 支持过滤参数
+        # 支持过滤参数（跳过空值，避免 Apifox/Postman 遗留空参数行干扰）
         role = self.request.query_params.get('role')
         if role:
             qs = qs.filter(role=role)
@@ -90,8 +90,12 @@ class UserAdminViewSet(viewsets.ModelViewSet):
             qs = qs.filter(department_id=department_id)
 
         is_active = self.request.query_params.get('is_active')
-        if is_active is not None:
+        if is_active and is_active.lower() in ('true', 'false'):
             qs = qs.filter(is_active=is_active.lower() == 'true')
+
+        search = self.request.query_params.get('search')
+        if search:
+            qs = qs.filter(username__icontains=search)
 
         return qs.order_by('-date_joined')
 

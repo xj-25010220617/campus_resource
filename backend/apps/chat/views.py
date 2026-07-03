@@ -3,6 +3,7 @@ import time
 
 from django.http import StreamingHttpResponse
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from drf_spectacular.utils import extend_schema
 from rest_framework import generics, parsers, permissions, status
 from rest_framework.decorators import action
@@ -10,8 +11,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.viewsets import ModelViewSet
 
-from apps.resources.models import Resource
-from apps.resources.serializers import ResourceListSerializer
+from apps.knowledge.models import KnowledgeDoc
 
 from utils import rag
 from utils.llm import llm_client
@@ -70,7 +70,7 @@ class MessageViewSet(ModelViewSet):
     消息 ViewSet（用于消息反馈和引用来源查看）
 
     POST   /api/chat/message/{id}/rate/        - 消息反馈（点赞/点踩）
-    GET    /api/chat/message/{id}/references/   - 查看引用来源
+    GET    /api/chat/message/{id}/references/  - 查看引用来源（KnowledgeDoc + freshness_date）
     """
     queryset = ChatMessage.objects.all()
     serializer_class = ChatMessageSerializer
@@ -109,14 +109,27 @@ class MessageViewSet(ModelViewSet):
 
         return Response({'status': 'ok', 'rating': rating})
 
+    @extend_schema(
+        summary='查看消息引用来源',
+        description=(
+            '返回消息引用的知识文档列表（KnowledgeDoc），每条记录包含 '
+            'KnowledgeDoc 元数据 + content_snippet + freshness_date（AI 提取的发布日期）。'
+            'freshness_date 为 null 时，前端可继续调 '
+            'POST /api/knowledge/docs/{doc_id}/extract-freshness/ 主动触发提取。'
+        ),
+        tags=['AI对话'],
+    )
     @action(detail=True, methods=['get'], url_path='references')
     def references(self, request, pk=None):
         """
         GET /api/chat/message/{id}/references/
         查看引用来源文档（仅 admin/super_admin 可用）
-        """
-        from config.permissions import CanViewReferences
 
+        返回每条引用对应的 KnowledgeDoc 元数据 + AI 提取的发布日期，
+        前端可在不调 extract-freshness 接口的情况下拿到 freshness_date。
+        freshness_date 为 null 时，前端可继续调
+        POST /api/knowledge/docs/{doc_id}/extract-freshness/ 主动触发提取。
+        """
         # 权限检查
         if request.user.role not in ('admin', 'super_admin'):
             return Response(
@@ -125,19 +138,47 @@ class MessageViewSet(ModelViewSet):
             )
 
         message = self.get_object()
-        resource_ids = message.references or []
+        references_detail = message.references or []
 
-        if not resource_ids:
+        if not references_detail:
             return Response([])
 
-        # 根据用户角色过滤资源
-        queryset = Resource.objects.filter(id__in=resource_ids)
+        # message.references 实际存的是 build_references_events 返回的
+        # references_detail 列表（list[dict]），每个元素的 doc_id 是
+        # KnowledgeDoc.id。为兼容历史纯 ID 列表的脏数据做一次判断。
+        if isinstance(references_detail[0], dict):
+            doc_ids = [r['doc_id'] for r in references_detail]
+            snippet_map = {
+                r['doc_id']: r.get('content_snippet', '')
+                for r in references_detail
+            }
+        else:
+            doc_ids = list(references_detail)
+            snippet_map = {}
+
+        # 查询 KnowledgeDoc（doc_id 即 KnowledgeDoc.id，不是 Resource.id）
+        queryset = KnowledgeDoc.objects.filter(id__in=doc_ids)
         if request.user.role == 'admin':
-            # admin 只能看自己上传的资源引用
+            # admin 只能看自己上传的文档引用
             queryset = queryset.filter(uploader=request.user)
 
-        serializer = ResourceListSerializer(queryset, many=True)
-        return Response(serializer.data)
+        # 用列表序列化器作为基础字段，再叠加 content_snippet / freshness_date
+        base_data = KnowledgeDocListSerializer(queryset, many=True).data
+        doc_map = {item['id']: item for item in base_data}
+
+        data = []
+        for doc_id in doc_ids:
+            item = doc_map.get(doc_id)
+            if not item:
+                continue
+            doc = queryset.get(id=doc_id)
+            item['content_snippet'] = snippet_map.get(doc_id, '')
+            item['freshness_date'] = (
+                doc.freshness_date.isoformat() if doc.freshness_date else None
+            )
+            data.append(item)
+
+        return Response(data)
 
 
 @extend_schema(
@@ -528,3 +569,39 @@ class VoiceAskView(APIView):
         response['X-Accel-Buffering'] = 'no'
         response['X-Message-Id'] = str(log.id)
         return response
+class HotQuestionsView(APIView):
+    """
+    热点问题广场 — "大家都在问"
+
+    GET /api/chat/hot-questions/?days=7&top_k=10
+
+    实时统计近期用户高频提问，按提问次数降序排列。
+    适合展示在智能问答主界面。
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        days = int(request.query_params.get('days', 7))
+        top_k = int(request.query_params.get('top_k', 10))
+
+        since = timezone.now() - timezone.timedelta(days=days)
+
+        from django.db.models import Count
+
+        questions_qs = (
+            ChatMessage.objects
+            .filter(role='user', created_at__gte=since)
+            .values('content')
+            .annotate(count=Count('id'))
+            .order_by('-count')[:top_k]
+        )
+
+        results = [
+            {
+                'question': item['content'],
+                'count': item['count'],
+            }
+            for item in questions_qs
+        ]
+
+        return Response(results)

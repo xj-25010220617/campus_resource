@@ -16,4 +16,5 @@ urlpatterns = [
     path('api/feedback/', include('apps.feedback.urls')),
     path('api/admin/', include('apps.admin_panel.urls')),
     path('api/resources/', include('apps.resources.urls')),
+    path('api/', include('apps.faq.urls')),
 ]
