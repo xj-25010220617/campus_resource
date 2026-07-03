@@ -907,13 +907,29 @@ class FileUploadView(APIView):
 
         # 上传到 OSS
         try:
+            # 检查 OSS 客户端是否已正确初始化
+            if not oss_client.bucket:
+                logger.error(f'OSS Bucket 未初始化，请检查 OSS 配置')
+                return Response(
+                    {'detail': 'OSS 配置异常，请联系管理员', 'code': 'OSS_CONFIG_ERROR'},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+            
             oss_client.bucket.put_object(oss_key, file_bytes)
             oss_url = f'https://{oss_client.bucket_name}.{oss_client.endpoint}/{oss_key}'
             logger.info(f'OSS 上传成功 oss_key={oss_key}, size={len(file_bytes)}')
-        except Exception as e:
-            logger.error(f'OSS 文件上传失败 oss_key={oss_key}: {e}')
+        except oss2.exceptions.OssError as e:
+            # OSS 服务端错误（权限、Bucket不存在等）
+            logger.error(f'OSS 服务端错误 oss_key={oss_key}: {e}')
             return Response(
-                {'detail': '文件上传到 OSS 失败，请稍后重试', 'code': 'UPLOAD_FAILED'},
+                {'detail': f'OSS 服务错误: {str(e)}', 'code': 'OSS_SERVER_ERROR'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        except Exception as e:
+            # 其他错误（网络、配置等）
+            logger.error(f'OSS 文件上传失败 oss_key={oss_key}: {type(e).__name__}: {e}')
+            return Response(
+                {'detail': f'文件上传失败: {str(e)}', 'code': 'UPLOAD_FAILED'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 

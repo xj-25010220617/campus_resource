@@ -46,3 +46,24 @@ class Category(models.Model):
         if self.parent:
             return f'{self.parent.name} > {self.name}'
         return self.name
+
+
+class Department(models.Model):
+    """部门（支持两级：校级领导 → 党委办公室）"""
+    name = models.CharField(max_length=128, verbose_name='部门名称')
+    parent = models.ForeignKey(
+        'self', null=True, blank=True, on_delete=models.CASCADE,
+        related_name='children', verbose_name='上级部门'
+    )
+    sort_order = models.IntegerField(default=0, verbose_name='排序')
+
+    class Meta:
+        db_table = 'department'
+        verbose_name = '部门'
+        verbose_name_plural = verbose_name
+        ordering = ['sort_order', 'id']
+
+    def __str__(self):
+        if self.parent:
+            return f'{self.parent.name} > {self.name}'
+        return self.name

@@ -2,8 +2,8 @@ from drf_spectacular.utils import extend_schema
 from rest_framework import generics, permissions
 
 from apps.accounts.models import College
-from .models import Discipline, Category
-from .serializers import CollegeSerializer, DisciplineSerializer, CategorySerializer
+from .models import Discipline, Category, Department
+from .serializers import CollegeSerializer, DisciplineSerializer, CategorySerializer, DepartmentSerializer
 
 
 @extend_schema(
@@ -75,3 +75,22 @@ class CategoryListView(generics.ListAPIView):
         context = super().get_serializer_context()
         context['request'] = self.request
         return context
+
+
+@extend_schema(
+    summary='部门列表',
+    description='返回两级树形部门结构，一级部门的 parent 为 null',
+    tags=['分类管理'],
+    operation_id='部门列表',
+)
+class DepartmentListView(generics.ListAPIView):
+    """
+    部门列表（树形结构）
+
+    GET /api/departments/
+    功能：返回两级树形部门结构，一级部门的 parent 为 null
+    返回：树形列表，每条含 id/name/parent/sort_order/children 字段
+    """
+    queryset = Department.objects.filter(parent__isnull=True).prefetch_related('children')
+    serializer_class = DepartmentSerializer
+    permission_classes = [permissions.IsAuthenticated]

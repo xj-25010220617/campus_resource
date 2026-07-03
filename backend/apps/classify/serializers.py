@@ -1,7 +1,7 @@
 from rest_framework import serializers
 
 from apps.accounts.models import College
-from .models import Discipline, Category
+from .models import Discipline, Category, Department
 
 
 class CollegeSerializer(serializers.ModelSerializer):
@@ -41,4 +41,19 @@ class CategorySerializer(serializers.ModelSerializer):
         children = obj.children.all()
         if children.exists():
             return CategorySerializer(children, many=True).data
+        return []
+
+
+class DepartmentSerializer(serializers.ModelSerializer):
+    """部门序列化器（树形结构）"""
+    children = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Department
+        fields = ['id', 'name', 'parent', 'sort_order', 'children']
+
+    def get_children(self, obj):
+        children = obj.children.all()
+        if children.exists():
+            return DepartmentSerializer(children, many=True).data
         return []
