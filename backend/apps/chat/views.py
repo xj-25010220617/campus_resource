@@ -15,10 +15,11 @@ from apps.resources.serializers import ResourceListSerializer
 
 from utils import rag
 from utils.llm import llm_client
+from utils.sensitive_filter import check_sensitive
 from utils.sse import _format_sse, build_references_events
 from apps.classify.utils.query_parser import parse as parse_query
 
-from .models import Conversation, ChatMessage, QueryLog
+from .models import Conversation, ChatMessage, QueryLog, SensitiveLog
 from .serializers import (
     ConversationSerializer,
     ConversationListSerializer,
@@ -231,6 +232,29 @@ class AskView(APIView):
             'role': getattr(user, 'role', 'user'),
             'college_id': getattr(user, 'college_id', None),
         }
+
+        # 0. 敏感内容检查
+        sensitive_result = check_sensitive(question)
+        if sensitive_result.is_sensitive:
+            logger.warning(
+                '敏感内容拦截: user=%s question=%s... rules=%s',
+                user.username, question[:60], sensitive_result.matched_rules,
+            )
+            SensitiveLog.objects.create(
+                user=user,
+                question=question,
+                matched_rules=sensitive_result.matched_rules,
+                matched_texts=sensitive_result.matched_texts,
+                refuse_message=sensitive_result.refuse_message,
+            )
+            return Response(
+                {
+                    'detail': sensitive_result.refuse_message,
+                    'code': 'SENSITIVE_CONTENT',
+                    'matched_rules': sensitive_result.matched_rules,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         # 1. 获取或新建会话
         if conversation_id:
