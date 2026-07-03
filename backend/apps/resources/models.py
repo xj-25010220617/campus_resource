@@ -57,6 +57,10 @@ class Resource(models.Model):
     college = models.ForeignKey(
         'accounts.College', on_delete=models.PROTECT, verbose_name='所属学院'
     )
+    department = models.ForeignKey(
+        'classify.Department', on_delete=models.SET_NULL,
+        null=True, blank=True, verbose_name='所属部门',
+    )
 
     # 审核信息
     audit_comment = models.TextField(blank=True, default='', verbose_name='审核意见')
@@ -217,6 +221,10 @@ class UploadLog(models.Model):
     file_type = models.CharField(max_length=16, verbose_name='文件类型')
     college = models.ForeignKey(
         'accounts.College', on_delete=models.PROTECT, verbose_name='所属学院'
+    )
+    department = models.ForeignKey(
+        'classify.Department', on_delete=models.SET_NULL,
+        null=True, blank=True, verbose_name='所属部门',
     )
 
     status = models.CharField(

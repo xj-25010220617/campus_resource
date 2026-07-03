@@ -1,44 +1,31 @@
-# resource 表
+---
+## 变更 #2：新增 department_id 字段
 
-> **变更类型**：表创建（首次）  
-> **变更日期**：2026-06-30 15:30:00  
-> **变更人员**：xj-25010220617  
-> **变更原因**：MVP 初始化，创建资源核心表  
-> **影响范围**：新建表，无现有数据影响  
-> **回滚方案**：DROP TABLE IF EXISTS resource;
+> **变更类型**：字段新增
+> **变更日期**：2026-07-03 11:24:00
+> **变更人员**：zyr
+> **变更原因**：实现"学院资源 / 部门资源"互斥归属 — 资源要么归属学院，要么归属部门，二者只能选其一。新增可空外键 `department_id`，配合 `college_id` 字段一起表示归属。
+> **影响范围**：新增字段默认为 NULL，对现有数据零影响。应用层（`apps/admin_panel/permissions.py` 的 `scope_resources`）按 `college_id IS NOT NULL XOR department_id IS NOT NULL` 做互斥约束。
+> **回滚方案**：`ALTER TABLE \`resource\` DROP FOREIGN KEY \`fk_resource_department\`; ALTER TABLE \`resource\` DROP INDEX \`idx_resource_department_id\`; ALTER TABLE \`resource\` DROP COLUMN \`department_id\`;`
 
 ```sql
-CREATE TABLE `resource` (
-    `id` BIGINT AUTO_INCREMENT NOT NULL PRIMARY KEY,
-    `title` VARCHAR(256) NOT NULL,
-    `description` LONGTEXT NOT NULL DEFAULT '',
-    `oss_key` VARCHAR(512) NOT NULL,
-    `oss_url` VARCHAR(1024) NOT NULL,
-    `file_name` VARCHAR(256) NOT NULL,
-    `file_size` BIGINT NOT NULL,
-    `file_type` VARCHAR(16) NOT NULL,
-    `md5_hash` VARCHAR(32) NOT NULL,
-    `status` VARCHAR(16) NOT NULL DEFAULT 'draft',
-    `audit_comment` LONGTEXT NOT NULL DEFAULT '',
-    `view_count` INTEGER NOT NULL DEFAULT 0,
-    `download_count` INTEGER NOT NULL DEFAULT 0,
-    `created_at` DATETIME(6) NOT NULL,
-    `updated_at` DATETIME(6) NOT NULL,
-    `published_at` DATETIME(6) NULL,
-    `discipline_id` BIGINT NOT NULL,
-    `category_id` BIGINT NOT NULL,
-    `uploader_id` BIGINT NOT NULL,
-    `college_id` BIGINT NOT NULL,
-    `auditor_id` BIGINT NULL,
-    CONSTRAINT `fk_resource_discipline` FOREIGN KEY (`discipline_id`) REFERENCES `discipline`(`id`) ON DELETE RESTRICT,
-    CONSTRAINT `fk_resource_category` FOREIGN KEY (`category_id`) REFERENCES `category`(`id`) ON DELETE RESTRICT,
-    CONSTRAINT `fk_resource_uploader` FOREIGN KEY (`uploader_id`) REFERENCES `user`(`id`) ON DELETE CASCADE,
-    CONSTRAINT `fk_resource_college` FOREIGN KEY (`college_id`) REFERENCES `college`(`id`) ON DELETE RESTRICT,
-    CONSTRAINT `fk_resource_auditor` FOREIGN KEY (`auditor_id`) REFERENCES `user`(`id`) ON DELETE SET NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+ALTER TABLE `resource`
+    ADD COLUMN `department_id` BIGINT NULL COMMENT '所属部门ID（与 college_id 互斥：非空则 college_id 必须为空）' AFTER `college_id`;
 
-CREATE INDEX `idx_res_disc_college` ON `resource`(`discipline_id`, `college_id`);
-CREATE INDEX `idx_res_status_created` ON `resource`(`status`, `created_at`);
-CREATE INDEX `idx_res_uploader_created` ON `resource`(`uploader_id`, `created_at`);
-CREATE INDEX `idx_res_md5` ON `resource`(`md5_hash`);
+ALTER TABLE `resource`
+    ADD CONSTRAINT `fk_resource_department`
+        FOREIGN KEY (`department_id`) REFERENCES `department`(`id`) ON DELETE SET NULL;
+
+CREATE INDEX `idx_resource_department_id` ON `resource`(`department_id`);
 ```
+
+**字段说明：**
+
+| 字段 | 类型 | 约束 | 说明 |
+|------|------|------|------|
+| `department_id` | BIGINT | NULL, FK(department.id), ON DELETE SET NULL | 所属部门（与 college_id 互斥） |
+
+**互斥语义：**
+- 学院资源：`college_id` 非空 AND `department_id` IS NULL
+- 部门资源：`department_id` 非空 AND `college_id` IS NULL
+- 公共资源：两者均为 NULL（默认行为，便于跨部门文档）

@@ -1,17 +1,22 @@
 """Resources - 资源列表与上传日志视图"""
+import datetime as _datetime
+
 from django.db.models import Count, Sum
 from django.db.models.functions import Cast
 from django.db.models import TextField
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
-from drf_spectacular.utils import extend_schema
-from rest_framework import generics, viewsets, status
+
+from rest_framework import generics, permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
+
+from drf_spectacular.utils import extend_schema
 
 from apps.classify.models import Category
+from apps.admin_panel.permissions import IsAnyAdmin, scope_upload_logs, scope_resources_for_browse
 from config.permissions import IsAdminOrSuperAdmin
+
 from .models import Resource, UploadLog
 from .serializers import (
     ResourceListSerializer,
@@ -40,18 +45,25 @@ class ResourceListView(generics.ListAPIView):
         - discipline_id (int, optional): 按学科方向ID精确筛选
         - category_id (int, optional): 按资源类型筛选，一级分类自动包含其下所有二级分类
         - keyword (str, optional): 按关键词模糊匹配
-    权限规则：所有登录用户均可查看资源列表
+    权限规则：
+        - super_admin：全校已发布资源
+        - admin / college_admin：本学院已发布资源（department IS NULL）
+        - dept_admin：本部门已发布资源（college IS NULL）
+        - user（普通用户）：什么都看不到，只能通过 /api/chat/ask/ AI 检索
     返回：DRF 分页包装后的资源列表，每条包含 id / title / description / file_type / file_size /
           uploader_name / college_name / discipline_name / category_name（完整路径）/
           category_icon / keywords / status / visibility / view_count / download_count / created_at
     """
     serializer_class = ResourceListSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
         queryset = Resource.objects.select_related(
             'college', 'discipline', 'category', 'uploader',
         ).all()
+
+        # 范围过滤：user 直接 qs.none()，其余按本学院/本部门只返回 status='published' 的资源
+        queryset = scope_resources_for_browse(queryset, self.request.user)
 
         # 学院筛选
         college_id = self.request.query_params.get('college_id')
@@ -94,26 +106,56 @@ class ResourceListView(generics.ListAPIView):
     tags=['资源管理'],
 )
 class UploadLogViewSet(viewsets.ReadOnlyModelViewSet):
-    """上传日志 ViewSet（只读）"""
-    queryset = UploadLog.objects.select_related('user', 'college', 'resource')
+    """上传日志 ViewSet（只读）
+
+    GET /api/resources/upload-logs/
+    功能：分页返回上传日志列表，支持按状态/文件类型/学院/部门/用户/时间筛选
+    Query 参数：
+        - start_date / end_date: 时间范围（ISO 或 YYYY-MM-DD）
+        - user_id: 上传用户 ID
+        - college_id: 学院 ID
+        - department_id: 部门 ID
+        - status: 上传状态
+        - file_type: 文件类型
+    权限：
+        - super_admin：平台全部
+        - college_admin / admin：本学院日志
+        - dept_admin：本部门日志
+        - 其他：无权限
+    """
+    queryset = UploadLog.objects.select_related(
+        'user', 'college', 'department', 'resource',
+    )
     serializer_class = UploadLogSerializer
-    permission_classes = [IsAuthenticated, IsAdminOrSuperAdmin]
-    filterset_fields = ['status', 'file_type', 'college']
+    permission_classes = [permissions.IsAuthenticated, IsAnyAdmin]
+    filterset_fields = ['status', 'file_type', 'college', 'department']
     search_fields = ['file_name', 'user__username']
     ordering_fields = ['created_at', 'file_size']
 
     def get_queryset(self):
         queryset = super().get_queryset()
+        # 范围过滤（按当前用户角色限定可见日志范围）
+        queryset = scope_upload_logs(queryset, self.request.user)
+
         start_date = self.request.query_params.get('start_date')
         end_date = self.request.query_params.get('end_date')
         if start_date:
-            start = parse_datetime(start_date) if 'T' in start_date else timezone.make_aware(
-                __import__('datetime').datetime.strptime(start_date, '%Y-%m-%d'))
+            start = (
+                parse_datetime(start_date) if 'T' in start_date
+                else timezone.make_aware(
+                    _datetime.datetime.strptime(start_date, '%Y-%m-%d')
+                )
+            )
             queryset = queryset.filter(created_at__gte=start)
         if end_date:
-            end = parse_datetime(end_date) if 'T' in end_date else timezone.make_aware(
-                __import__('datetime').datetime.strptime(end_date, '%Y-%m-%d').replace(
-                    hour=23, minute=59, second=59))
+            end = (
+                parse_datetime(end_date) if 'T' in end_date
+                else timezone.make_aware(
+                    _datetime.datetime.strptime(end_date, '%Y-%m-%d').replace(
+                        hour=23, minute=59, second=59,
+                    )
+                )
+            )
             queryset = queryset.filter(created_at__lte=end)
         user_id = self.request.query_params.get('user_id')
         if user_id:
@@ -121,6 +163,9 @@ class UploadLogViewSet(viewsets.ReadOnlyModelViewSet):
         college_id = self.request.query_params.get('college_id')
         if college_id:
             queryset = queryset.filter(college_id=college_id)
+        department_id = self.request.query_params.get('department_id')
+        if department_id:
+            queryset = queryset.filter(department_id=department_id)
         return queryset
 
     @action(detail=False, methods=['get'])

@@ -1,18 +1,25 @@
-import django_filters
+"""Knowledge - 知识文档与关键词视图
+
+包含：文档 CRUD、上传（STS 回调 / 文本录入 / 文件直传）、预览、关键词管理。
+"""
 import logging
+from datetime import datetime, timedelta
+
+import django_filters
+import requests
+
 from django.db import transaction
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
+
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema
+
 from rest_framework import filters, generics, parsers, permissions, status
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
-
-
-from django.db import transaction
-from django.shortcuts import get_object_or_404
 
 from apps.accounts.models import College
 from apps.classify.models import Category, Discipline
@@ -32,6 +39,7 @@ from .serializers import (
     UploadCallbackSerializer,
     UploadSTSRequestSerializer,
 )
+
 
 logger = logging.getLogger(__name__)
 
@@ -56,8 +64,6 @@ class KnowledgeDocFilter(django_filters.FilterSet):
     def filter_days_back(self, queryset, name, value):
         """按时间范围过滤，days_back=0 表示不限时间"""
         if value and value > 0:
-            from datetime import timedelta
-            from django.utils import timezone
             since_date = timezone.now() - timedelta(days=value)
             return queryset.filter(created_at__gte=since_date)
         return queryset
@@ -117,8 +123,6 @@ class KnowledgeDocListView(generics.ListAPIView):
             days_back = 365
 
         if days_back > 0:
-            from datetime import timedelta
-            from django.utils import timezone
             since_date = timezone.now() - timedelta(days=days_back)
             queryset = queryset.filter(created_at__gte=since_date)
 
@@ -126,19 +130,29 @@ class KnowledgeDocListView(generics.ListAPIView):
 
     @staticmethod
     def _apply_visibility_filter(queryset, user):
-        """按用户角色过滤可见性：超管全量，管理员本院+自己，普通用户公开+自己"""
+        """按用户角色过滤可见性：
+
+        - super_admin：全量
+        - admin / college_admin：本院 public + 本院 private + 自己上传的
+        - dept_admin：本部门员工上传 + public
+        - user（普通学生）：什么都看不到，只能通过 AI 问答检索
+        """
         if user.role == 'super_admin':
             return queryset
-        if user.role == 'admin':
+        if user.role in ('admin', 'college_admin'):
             return queryset.filter(
                 Q(visibility='public')
                 | Q(visibility='private', college_id=user.college_id)
                 | Q(visibility='private', uploader_id=user.id),
             )
-        return queryset.filter(
-            Q(visibility='public')
-            | Q(visibility='private', uploader_id=user.id),
-        )
+        if user.role == 'dept_admin':
+            # 部门管理员：仅看本部门员工上传的 + 公开文档
+            return queryset.filter(
+                Q(visibility='public')
+                | Q(uploader__department_id=user.department_id),
+            )
+        # user：彻底无权限查看文档列表/详情，只能通过 /api/chat/ask/ AI 检索
+        return queryset.none()
 
 
 @extend_schema(
@@ -229,8 +243,6 @@ class KnowledgeDocDeleteView(generics.DestroyAPIView):
         if instance.oss_key:
             deleted = oss_client.delete(instance.oss_key)
             if not deleted:
-                import logging
-                logger = logging.getLogger(__name__)
                 logger.warning(f'OSS 文件删除失败 oss_key={instance.oss_key}，跳过')
 
         # 2. 删除 MySQL 记录
@@ -638,7 +650,6 @@ class TextUploadView(APIView):
         """处理文本录入请求"""
         import hashlib
         import uuid
-        from datetime import datetime
 
         serializer = TextUploadSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -709,7 +720,10 @@ class KnowledgeDocPreviewView(APIView):
 
     GET /api/knowledge/docs/{id}/preview/
     功能：根据文件类型返回预览内容——文本类返回原文，音视频/图片/文档返回 OSS 签名预览 URL
-    权限规则：所有登录用户均可预览
+    权限规则：
+        - super_admin：可预览平台全部文档
+        - admin / college_admin / dept_admin：按对应角色权限预览
+        - user（普通学生）：不能直接预览单条文档，请通过 /api/chat/ask/ AI 检索
     返回格式：
         - 文本类: {"preview_type": "text", "content": "<原文>", "file_type": "txt", "file_name": "..."}
         - 音频类: {"preview_type": "url", "content": "<signed_url>", "file_type": "audio", "file_name": "..."}
@@ -730,6 +744,9 @@ class KnowledgeDocPreviewView(APIView):
 
     def get(self, request, pk):
         """返回文档预览内容"""
+        # user 角色不能直接预览单条文档，只能通过 /api/chat/ask/ AI 检索
+        if request.user.role == 'user':
+            raise PermissionDenied('请通过 AI 助手检索资料')
         doc = get_object_or_404(
             KnowledgeDoc.objects.select_related('uploader'), id=pk,
         )
@@ -766,13 +783,13 @@ class KnowledgeDocPreviewView(APIView):
 
     def _text_preview(self, doc, file_type):
         """从 OSS 下载文本内容并直接返回"""
-        import requests
         download_url = oss_client.get_download_url(doc.oss_key, expires=60)
         try:
             resp = requests.get(download_url, timeout=10)
             resp.raise_for_status()
             text_content = resp.text
-        except Exception:
+        except requests.RequestException as e:
+            logger.error(f'预览文本下载失败 oss_key={doc.oss_key}: {e}')
             text_content = ''
         return Response({
             'preview_type': 'text',
@@ -879,7 +896,6 @@ class FileUploadView(APIView):
         import hashlib
         import json
         import uuid
-        from datetime import datetime
 
         serializer = FileUploadSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)

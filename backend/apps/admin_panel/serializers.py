@@ -1,6 +1,7 @@
 """Admin Panel - 用户管理序列化器"""
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
+
 from rest_framework import serializers
 
 from apps.accounts.models import College
@@ -12,6 +13,7 @@ User = get_user_model()
 class UserAdminSerializer(serializers.ModelSerializer):
     """管理后台用户详情序列化器"""
     college_name = serializers.CharField(source='college.name', read_only=True)
+    department_name = serializers.CharField(source='department.name', read_only=True)
     role_display = serializers.CharField(source='get_role_display', read_only=True)
     resource_count = serializers.IntegerField(source='resources.count', read_only=True)
 
@@ -19,11 +21,16 @@ class UserAdminSerializer(serializers.ModelSerializer):
         model = User
         fields = [
             'id', 'username', 'email', 'first_name', 'last_name',
-            'role', 'role_display', 'college', 'college_name',
+            'role', 'role_display',
+            'college', 'college_name',
+            'department', 'department_name',
             'phone', 'avatar', 'is_active', 'date_joined',
             'last_login', 'resource_count',
         ]
-        read_only_fields = ['id', 'date_joined', 'last_login', 'resource_count']
+        read_only_fields = [
+            'id', 'username', 'date_joined', 'last_login', 'resource_count',
+            'role_display', 'college_name', 'department_name',
+        ]
 
 
 class UserCreateSerializer(serializers.ModelSerializer):
@@ -46,7 +53,7 @@ class UserCreateSerializer(serializers.ModelSerializer):
         model = User
         fields = [
             'username', 'email', 'password', 'password_confirm',
-            'first_name', 'last_name', 'role', 'college',
+            'first_name', 'last_name', 'role', 'college', 'department',
             'phone', 'avatar',
         ]
 
@@ -70,7 +77,8 @@ class UserUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
         fields = [
-            'email', 'first_name', 'last_name', 'role', 'college',
+            'email', 'first_name', 'last_name', 'role',
+            'college', 'department',
             'phone', 'avatar', 'is_active',
         ]
 
@@ -80,6 +88,27 @@ class UserUpdateSerializer(serializers.ModelSerializer):
         if value == 'super_admin' and request_user.role != 'super_admin':
             raise serializers.ValidationError('只有超级管理员可以设置超级管理员角色')
         return value
+
+    def validate(self, attrs):
+        """组合校验：role × college × department"""
+        role = attrs.get('role', getattr(self.instance, 'role', None))
+        college = attrs.get('college', getattr(self.instance, 'college', None))
+        department = attrs.get('department', getattr(self.instance, 'department', None))
+
+        if role == 'college_admin':
+            if college is None:
+                raise serializers.ValidationError({'college': '学院管理员必须设置学院'})
+            if department is not None:
+                raise serializers.ValidationError({'department': '学院管理员不能设置部门'})
+        elif role == 'dept_admin':
+            if department is None:
+                raise serializers.ValidationError({'department': '部门管理员必须设置部门'})
+            if college is not None:
+                raise serializers.ValidationError({'college': '部门管理员不能设置学院'})
+        elif role == 'user':
+            if college is None:
+                raise serializers.ValidationError({'college': '学生必须设置学院'})
+        return attrs
 
 
 class CollegeSerializer(serializers.ModelSerializer):
