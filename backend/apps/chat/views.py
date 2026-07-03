@@ -503,8 +503,12 @@ class VoiceAskView(APIView):
         # 语音 → 文字
         text = speech_to_text(audio_data, audio_file.name.rsplit('.', 1)[-1] if '.' in audio_file.name else 'wav')
         if not text:
+            from utils.asr import _model_error
+            detail = '语音识别失败，请确认音频清晰且包含中文语音'
+            if _model_error:
+                detail = f'语音识别失败: {_model_error}'
             return Response(
-                {'detail': '语音识别失败，请确认音频清晰且包含中文语音', 'code': 'ASR_FAILED'},
+                {'detail': detail, 'code': 'ASR_FAILED'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
@@ -543,26 +547,27 @@ class VoiceAskView(APIView):
             conversation=conv,
         )
 
+        ai_msg_ref = [None]  # mutable holder, set after stream
+
         def generate():
             full_answer = ''
             t0 = time.time()
             try:
                 for chunk in llm_client.chat_stream(messages):
                     full_answer += chunk
-                    yield _format_sse(chunk, conv.id, step='msg')
-                yield _format_sse('__DONE__', conv.id, step='done')
+                    yield _format_sse('msg', chunk)
+                ai_msg = ChatMessage.objects.create(
+                    conversation=conv, role='assistant', content=full_answer,
+                    references={'hits': hits, 'sensitive': sensitive_hit},
+                )
+                ai_msg_ref[0] = ai_msg
+                log.response_ms = int((time.time() - t0) * 1000)
+                log.save()
+                yield _format_sse('done', {'message_id': ai_msg.id})
                 yield build_references_events(hits, rag.RAG_REFERENCE_THRESHOLD)
             except Exception as e:
                 logger.error(f'LLM 流式输出失败: {e}')
-                yield _format_sse(f'\n\n[系统提示] 回答生成失败，请稍后重试。', conv.id, step='error')
-
-            # 保存 AI 消息
-            ai_msg = ChatMessage.objects.create(
-                conversation=conv, role='assistant', content=full_answer,
-                references={'hits': hits, 'sensitive': sensitive_hit},
-            )
-            log.response_ms = int((time.time() - t0) * 1000)
-            log.save()
+                yield _format_sse('error', f'回答生成失败: {e}')
 
         response = StreamingHttpResponse(generate(), content_type='text/event-stream')
         response['Cache-Control'] = 'no-cache'

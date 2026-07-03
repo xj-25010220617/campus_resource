@@ -186,8 +186,9 @@ CELERY_TIMEZONE = 'Asia/Shanghai'
 # ------------------------------------------------------------------
 # ASR 语音识别（FunASR）
 # ------------------------------------------------------------------
-ASR_MODEL_NAME = 'damo/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404'
+ASR_MODEL_NAME = 'iic/SenseVoiceSmall'
 ASR_TIMEOUT = 30
+ASR_DEBUG = True   # 开启后控制台打印 FunASR 原始返回值，排查完可关掉
 # FAQ 自动生成配置
 # ------------------------------------------------------------------
 # 最小占比阈值（百分比）— 超过此比例的问题才提取为 FAQ
