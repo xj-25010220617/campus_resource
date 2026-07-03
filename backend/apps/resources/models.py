@@ -3,7 +3,17 @@ from django.conf import settings
 
 
 class Resource(models.Model):
-    """资源（核心表）"""
+    """资源（核心表）
+    
+    外键ID对应关系：
+    - college_id: 1=计算机与软件学院, 2=智能科学与工程学院, 3=信息与商务管理学院, 4=数字艺术与设计学院,
+                  5=外国语学院, 6=健康医疗科技学院, 7=马克思主义学院, 8=通识教育学院, 9=创新创业学院,
+                  10=继续教育学院, 11=国际教育学院, 12=体育教学部, 13=图书馆
+    - department_id: 1=校级领导, 2=党政管理部门, 3=教学管理部门, 4=学生工作部门, 5=科研与服务部门,
+                      6=后勤保障部门, 7=继续教育与国际教育
+    - category_id: 1=教学资源, 2=学术资料, 3=管理文件, 4=校园资讯, 5=校园生活, 6=媒体聚焦
+    - discipline_id: 1-31 对应各专业方向
+    """
     STATUS_CHOICES = [
         ('draft', '草稿'),
         ('pending', '待审核'),
@@ -20,6 +30,11 @@ class Resource(models.Model):
         ('video', '视频'),
         ('audio', '音频'),
         ('other', '其他'),
+    ]
+    SCOPE_CHOICES = [
+        ('school', '全校'),
+        ('college', '学院'),
+        ('department', '部门'),
     ]
 
     title = models.CharField(max_length=256, verbose_name='资源标题')
@@ -39,7 +54,10 @@ class Resource(models.Model):
 
     # 分类关联
     discipline = models.ForeignKey(
-        'classify.Discipline', on_delete=models.PROTECT, verbose_name='学科方向'
+        'classify.Discipline',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        verbose_name='学科方向',
     )
     category = models.ForeignKey(
         'classify.Category', on_delete=models.PROTECT, verbose_name='资源类型'
@@ -55,11 +73,18 @@ class Resource(models.Model):
         related_name='resources', verbose_name='上传者'
     )
     college = models.ForeignKey(
-        'accounts.College', on_delete=models.PROTECT, verbose_name='所属学院'
+        'accounts.College',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        verbose_name='所属学院',
     )
     department = models.ForeignKey(
         'classify.Department', on_delete=models.SET_NULL,
         null=True, blank=True, verbose_name='所属部门',
+    )
+    scope = models.CharField(
+        max_length=16, choices=SCOPE_CHOICES, default='college',
+        db_index=True, verbose_name='归属范围',
     )
 
     # 审核信息
@@ -220,11 +245,13 @@ class UploadLog(models.Model):
     file_size = models.BigIntegerField(verbose_name='文件大小（字节）')
     file_type = models.CharField(max_length=16, verbose_name='文件类型')
     college = models.ForeignKey(
-        'accounts.College', on_delete=models.PROTECT, verbose_name='所属学院'
+        'accounts.College', on_delete=models.PROTECT, 
+        verbose_name='所属学院（id:1=计算机与软件学院,2=智能科学与工程学院...）'
     )
     department = models.ForeignKey(
         'classify.Department', on_delete=models.SET_NULL,
-        null=True, blank=True, verbose_name='所属部门',
+        null=True, blank=True, 
+        verbose_name='所属部门（一级:1=校级领导,2=党政管理部门,3=教学管理部门...）',
     )
 
     status = models.CharField(

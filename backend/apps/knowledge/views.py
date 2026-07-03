@@ -22,7 +22,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.accounts.models import College
-from apps.classify.models import Category, Discipline
+from apps.classify.models import Category, Department, Discipline
 from config.permissions import IsAdminOrSuperAdmin, IsLoginUser, IsOwnerOrReadOnly
 from utils.oss import oss_client
 
@@ -113,7 +113,7 @@ class KnowledgeDocListView(generics.ListAPIView):
         ).all()
 
         # 可见性权限过滤
-        queryset = self._apply_visibility_filter(queryset, user)
+        queryset = self._admin_scope_filter(queryset, user)
 
         # 默认时间范围过滤：近一年（days_back=0 表示不限时间）
         days_back = self.request.query_params.get('days_back', '365')
@@ -129,30 +129,52 @@ class KnowledgeDocListView(generics.ListAPIView):
         return queryset.order_by('-created_at')
 
     @staticmethod
-    def _apply_visibility_filter(queryset, user):
-        """按用户角色过滤可见性：
-
+    def _admin_scope_filter(queryset, user):
+        """管理后台权限过滤：
         - super_admin：全量
-        - admin / college_admin：本院 public + 本院 private + 自己上传的
-        - dept_admin：本部门员工上传 + public
-        - user（普通学生）：什么都看不到，只能通过 AI 问答检索
+        - college_admin / admin：scope=school + scope=college且本院 + 自己上传的
+        - dept_admin：scope=school + scope=department且本部门 + 自己上传的
+        - user：无权限（只能通过 AI 检索）
         """
         if user.role == 'super_admin':
             return queryset
-        if user.role in ('admin', 'college_admin'):
+        if user.role in ('college_admin', 'admin'):
             return queryset.filter(
-                Q(visibility='public')
-                | Q(visibility='private', college_id=user.college_id)
-                | Q(visibility='private', uploader_id=user.id),
+                Q(scope='school')
+                | Q(scope='college', college_id=user.college_id)
+                | Q(uploader_id=user.id),
             )
         if user.role == 'dept_admin':
-            # 部门管理员：仅看本部门员工上传的 + 公开文档
             return queryset.filter(
-                Q(visibility='public')
-                | Q(uploader__department_id=user.department_id),
+                Q(scope='school')
+                | Q(scope='department', department_id=user.department_id)
+                | Q(uploader_id=user.id),
             )
-        # user：彻底无权限查看文档列表/详情，只能通过 /api/chat/ask/ AI 检索
         return queryset.none()
+
+    @staticmethod
+    def _rag_scope_filter(queryset, user_context):
+        """AI 检索权限过滤：
+        - private 文档绝不检索
+        - scope=school + public：所有人
+        - scope=college + public：本院用户
+        - scope=department + public：本部门用户
+        """
+        role = user_context.get('role', 'user')
+        user_id = user_context.get('user_id')
+        college_id = user_context.get('college_id')
+        dept_id = user_context.get('department_id')
+        qs = queryset.filter(visibility='public')
+        if role == 'super_admin':
+            return qs
+        conditions = Q(scope='school')
+        if college_id:
+            conditions |= Q(scope='college', college_id=college_id)
+        if dept_id:
+            conditions |= Q(scope='department', department_id=dept_id)
+        if user_id:
+            conditions |= Q(uploader_id=user_id)
+        return qs.filter(conditions)
 
 
 @extend_schema(
@@ -197,7 +219,7 @@ class KnowledgeDocDetailView(generics.RetrieveUpdateAPIView):
         queryset = KnowledgeDoc.objects.select_related(
             'college', 'discipline', 'category', 'uploader',
         ).all()
-        return KnowledgeDocListView._apply_visibility_filter(queryset, user)
+        return KnowledgeDocListView._admin_scope_filter(queryset, user)
 
     def perform_update(self, serializer):
         """仅允许超管或文档所有者编辑"""
@@ -286,7 +308,7 @@ class KnowledgeDocDownloadView(generics.RetrieveAPIView):
     def get_queryset(self):
         user = self.request.user
         queryset = KnowledgeDoc.objects.all()
-        return KnowledgeDocListView._apply_visibility_filter(queryset, user)
+        return KnowledgeDocListView._admin_scope_filter(queryset, user)
 
     def retrieve(self, request, *args, **kwargs):
         instance = self.get_object()
@@ -494,7 +516,9 @@ class UploadSTSView(APIView):
             })
 
         # 获取 STS 临时凭证
-        credentials = oss_client.get_sts_credentials(file_name, college_id)
+        scope = request.data.get('scope', 'college')
+        owner_id = college_id if scope == 'college' else (request.data.get('department_id', 0) if scope == 'department' else 0)
+        credentials = oss_client.get_sts_credentials(file_name, scope, owner_id)
         return Response({
             'oss_key': credentials['oss_key'],
             'upload_url': credentials['upload_url'],
@@ -566,9 +590,11 @@ class UploadCallbackView(APIView):
             source_type='upload',
             uploader=request.user,
             status='uploaded',
-            college_id=data['college_id'],
-            discipline_id=data['discipline_id'],
-            category_id=data['category_id'],
+            scope=data['scope'],
+            college_id=data.get('college_id'),
+            department_id=data.get('department_id'),
+            discipline_id=data.get('discipline_id'),
+            category_id=data.get('category_id'),
         )
 
         # 创建关联关键词
@@ -599,22 +625,28 @@ class UploadCallbackView(APIView):
 
     @staticmethod
     def _validate_classification(data: dict) -> None:
-        """校验分类关联数据——college_id / discipline_id 存在，category_id 必须是二级分类"""
-        # 校验 college_id 存在
-        if not College.objects.filter(id=data['college_id']).exists():
-            raise ValidationError({'college_id': '学院不存在'})
+        """校验 scope 对应的归属对象存在；category_id 可选，有值时必须为二级分类"""
+        scope = data.get('scope', 'college')
+        if scope == 'college':
+            if not data.get('college_id'):
+                raise ValidationError({'college_id': 'scope=college 时必须提供学院ID'})
+            if not College.objects.filter(id=data['college_id']).exists():
+                raise ValidationError({'college_id': '学院不存在'})
+        elif scope == 'department':
+            if not data.get('department_id'):
+                raise ValidationError({'department_id': 'scope=department 时必须提供部门ID'})
+            if not Department.objects.filter(id=data['department_id']).exists():
+                raise ValidationError({'department_id': '部门不存在'})
+        # scope=school 不需要额外校验
 
-        # 校验 discipline_id 存在
-        if not Discipline.objects.filter(id=data['discipline_id']).exists():
-            raise ValidationError({'discipline_id': '学科方向不存在'})
-
-        # 校验 category_id 存在且必须是二级分类（有 parent）
-        try:
-            category = Category.objects.get(id=data['category_id'])
-        except Category.DoesNotExist:
-            raise ValidationError({'category_id': '资源类型不存在'})
-        if category.parent is None:
-            raise ValidationError({'category_id': '必须是二级分类，不能选择一级分类'})
+        # category_id 可选，有值时校验为二级分类
+        if data.get('category_id'):
+            try:
+                category = Category.objects.get(id=data['category_id'])
+            except Category.DoesNotExist:
+                raise ValidationError({'category_id': '资源类型不存在'})
+            if category.parent is None:
+                raise ValidationError({'category_id': '必须是二级分类，不能选择一级分类'})
 
     @staticmethod
     def _validate_oss_key(oss_key: str) -> None:
@@ -660,7 +692,9 @@ class TextUploadView(APIView):
 
         # 生成 OSS 对象 Key
         now = datetime.now()
-        oss_key = f'knowledge/{data["college_id"]}/{now:%Y-%m}/{uuid.uuid4().hex[:12]}.txt'
+        scope = data['scope']
+        owner_id = data.get('college_id') or data.get('department_id') or 0
+        oss_key = f'knowledge/{scope}/{owner_id}/{now:%Y-%m}/{uuid.uuid4().hex[:12]}.txt'
 
         # 上传文本到 OSS
         content = data['content']
@@ -688,9 +722,11 @@ class TextUploadView(APIView):
             file_type='txt',
             file_size=len(content.encode('utf-8')),
             md5_hash=md5_hash,
-            college_id=data['college_id'],
-            discipline_id=data['discipline_id'],
-            category_id=data['category_id'],
+            scope=data['scope'],
+            college_id=data.get('college_id'),
+            department_id=data.get('department_id'),
+            discipline_id=data.get('discipline_id'),
+            category_id=data.get('category_id'),
             uploader=request.user,
             status='uploaded',
             visibility=data.get('visibility', 'public'),
@@ -915,7 +951,9 @@ class FileUploadView(APIView):
         # 生成 OSS 对象 Key
         now = datetime.now()
         safe_filename = f'{uuid.uuid4().hex[:12]}.{ext}'
-        oss_key = f'knowledge/{data["college_id"]}/{now:%Y-%m}/{safe_filename}'
+        scope = data['scope']
+        owner_id = data.get('college_id') or data.get('department_id') or 0
+        oss_key = f'knowledge/{scope}/{owner_id}/{now:%Y-%m}/{safe_filename}'
 
         # 读取文件二进制内容 + 计算 MD5
         file_bytes = uploaded_file.read()
@@ -960,9 +998,11 @@ class FileUploadView(APIView):
             file_type=ext,
             file_size=uploaded_file.size,
             md5_hash=md5_hash,
-            college_id=data['college_id'],
-            discipline_id=data['discipline_id'],
-            category_id=data['category_id'],
+            scope=data['scope'],
+            college_id=data.get('college_id'),
+            department_id=data.get('department_id'),
+            discipline_id=data.get('discipline_id'),
+            category_id=data.get('category_id'),
             uploader=request.user,
             status='uploaded',
             visibility=data.get('visibility', 'public'),

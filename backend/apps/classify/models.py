@@ -49,7 +49,17 @@ class Category(models.Model):
 
 
 class Department(models.Model):
-    """部门（支持两级：校级领导 → 党委办公室）"""
+    """部门（两级树形结构）
+    
+    一级部门ID：
+    - 1=校级领导
+    - 2=党政管理部门
+    - 3=教学管理部门
+    - 4=学生工作部门
+    - 5=科研与服务部门
+    - 6=后勤保障部门
+    - 7=继续教育与国际教育
+    """
     name = models.CharField(max_length=128, verbose_name='部门名称')
     parent = models.ForeignKey(
         'self', null=True, blank=True, on_delete=models.CASCADE,
