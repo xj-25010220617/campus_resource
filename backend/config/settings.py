@@ -184,6 +184,10 @@ CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = 'Asia/Shanghai'
 
 # ------------------------------------------------------------------
+# ASR 语音识别（FunASR）
+# ------------------------------------------------------------------
+ASR_MODEL_NAME = 'damo/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404'
+ASR_TIMEOUT = 30
 # FAQ 自动生成配置
 # ------------------------------------------------------------------
 # 最小占比阈值（百分比）— 超过此比例的问题才提取为 FAQ
