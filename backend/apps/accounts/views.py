@@ -20,6 +20,14 @@ User = get_user_model()
 # code → 自动创建/查找的用户信息
 # ------------------------------------------------------------------
 MOCK_SSO_USERS = {
+    'mock_super_admin': {
+        'sso_uid': 'sso_10000',
+        'username': 'sso_super_admin',
+        'role': 'super_admin',
+        'first_name': 'SSO',
+        'last_name': '超级管理员',
+        'email': 'sso_super_admin@nsu.edu.cn',
+    },
     'mock_admin': {
         'sso_uid': 'sso_10001',
         'username': 'sso_admin',
