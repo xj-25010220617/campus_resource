@@ -90,3 +90,32 @@ class QueryLog(models.Model):
 
     def __str__(self):
         return f'查询 #{self.id}：{self.question[:30]}'
+
+
+class SensitiveLog(models.Model):
+    """敏感内容拦截日志"""
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='sensitive_logs',
+        verbose_name='触发用户',
+    )
+    question = models.TextField(verbose_name='用户问题原文')
+    matched_rules = models.JSONField(verbose_name='命中的规则列表')
+    matched_texts = models.JSONField(verbose_name='命中的敏感文本片段')
+    refuse_message = models.TextField(verbose_name='拒绝回复内容')
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True, verbose_name='触发时间')
+
+    class Meta:
+        db_table = 'sensitive_log'
+        verbose_name = '敏感内容日志'
+        verbose_name_plural = verbose_name
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['user', 'created_at'], name='idx_slog_user_created'),
+        ]
+
+    def __str__(self):
+        username = self.user.username if self.user else '匿名'
+        return f'{username} 触发敏感过滤：{self.question[:30]}'

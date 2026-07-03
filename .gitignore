@@ -38,3 +38,4 @@ celerybeat-schedule
 # OS
 .DS_Store
 Thumbs.db
+natapp.exe
