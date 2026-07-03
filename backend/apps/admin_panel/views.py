@@ -55,7 +55,7 @@ class UserAdminViewSet(viewsets.ModelViewSet):
             # 排除其他 super_admin（不能管理同级的 super_admin）
             queryset = queryset.exclude(role='super_admin')
 
-        # 支持过滤参数
+        # 支持过滤参数（跳过空值，避免 Apifox/Postman 遗留空参数行干扰）
         role = self.request.query_params.get('role')
         if role:
             queryset = queryset.filter(role=role)
@@ -65,10 +65,21 @@ class UserAdminViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(college_id=college_id)
 
         is_active = self.request.query_params.get('is_active')
+<<<<<<< Updated upstream
         if is_active is not None:
             queryset = queryset.filter(is_active=is_active.lower() == 'true')
 
         return queryset.order_by('-date_joined')
+=======
+        if is_active and is_active.lower() in ('true', 'false'):
+            qs = qs.filter(is_active=is_active.lower() == 'true')
+
+        search = self.request.query_params.get('search')
+        if search:
+            qs = qs.filter(username__icontains=search)
+
+        return qs.order_by('-date_joined')
+>>>>>>> Stashed changes
 
     def perform_create(self, serializer):
         serializer.save()
