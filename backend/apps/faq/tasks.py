@@ -1,0 +1,195 @@
+"""
+FAQ 自动生成 — Celery 定时任务
+
+流程:
+  阶段1: 采集近一周用户问题
+  阶段2: 向量聚类合并相似问题
+  阶段3: 按占比筛选高频簇
+  阶段4: LLM 生成 FAQ 草稿
+
+调度: 每周一 03:00（通过 Celery Beat）
+"""
+import logging
+from datetime import timedelta
+
+from celery import shared_task
+from django.utils import timezone
+
+from apps.chat.models import ChatMessage
+from utils.llm import llm_client
+
+from .models import FAQItem, FAQGenerationLog
+from .utils import (
+    cluster_similar_questions,
+    filter_by_ratio,
+    generate_faq_draft,
+    cosine_similarity,
+)
+
+logger = logging.getLogger(__name__)
+
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=120)
+def generate_faq_weekly(self):
+    """
+    主入口：每周 FAQ 自动提取流程。
+
+    由 Celery Beat 定时触发（每周一 03:00）。
+    也可手动调用: python manage.py shell -c "from apps.faq.tasks import generate_faq_weekly; generate_faq_weekly()"
+    """
+    # 防重叠：检查是否有正在运行的
+    running_log = FAQGenerationLog.objects.filter(status='running').first()
+    if running_log:
+        # 超过 2 小时视为僵死，允许重新运行
+        if running_log.started_at and running_log.started_at > timezone.now() - timedelta(hours=2):
+            logger.warning('FAQ 生成任务已在运行中（log_id=%d），跳过本次触发', running_log.id)
+            return
+        else:
+            logger.warning('发现僵死的 FAQ 生成任务（log_id=%d），重新开始', running_log.id)
+            running_log.status = 'failed'
+            running_log.error_message = '超时自动标记为失败'
+            running_log.completed_at = timezone.now()
+            running_log.save(update_fields=['status', 'error_message', 'completed_at'])
+
+    # 创建运行日志
+    log = FAQGenerationLog.objects.create(status='running')
+    logger.info('FAQ 自动生成开始（log_id=%d）', log.id)
+
+    try:
+        # ---- 阶段1: 采集 ----
+        since = timezone.now() - timedelta(days=7)
+        messages = (
+            ChatMessage.objects
+            .filter(role='user', created_at__gte=since)
+            .select_related('conversation')
+            .only('content', 'conversation_id', 'created_at')
+        )
+
+        total_questions = messages.count()
+        logger.info('阶段1: 采集近7天用户问题 %d 条', total_questions)
+
+        if total_questions == 0:
+            log.status = 'completed'
+            log.total_questions = 0
+            log.completed_at = timezone.now()
+            log.save(update_fields=['status', 'total_questions', 'completed_at'])
+            logger.info('无用户问题日志，FAQ 生成结束')
+            return
+
+        # 去重 + 获取对应 AI 回答
+        seen = set()
+        question_answer_pairs = []
+        for msg in messages:
+            content = msg.content.strip()
+            if not content or content in seen:
+                continue
+            seen.add(content)
+
+            # 获取对应 AI 回答（紧跟着的同会话下一条 assistant 消息）
+            ai_reply = (
+                ChatMessage.objects
+                .filter(
+                    conversation_id=msg.conversation_id,
+                    role='assistant',
+                    created_at__gt=msg.created_at,
+                )
+                .order_by('created_at')
+                .first()
+            )
+            answer = ai_reply.content if ai_reply else ''
+
+            question_answer_pairs.append((content, answer))
+
+        log.total_questions = total_questions
+        log.save(update_fields=['total_questions'])
+        logger.info('去重后获得 %d 个独立问题', len(question_answer_pairs))
+
+        # ---- 阶段2: 向量聚类 ----
+        clusters = cluster_similar_questions(question_answer_pairs)
+        log.clusters_found = len(clusters)
+        log.save(update_fields=['clusters_found'])
+
+        if not clusters:
+            log.status = 'completed'
+            log.completed_at = timezone.now()
+            log.save(update_fields=['status', 'completed_at'])
+            logger.info('未形成有效问题簇，FAQ 生成结束')
+            return
+
+        # ---- 阶段3: 比例筛选 ----
+        high_freq_clusters = filter_by_ratio(clusters, total_questions)
+        logger.info('阶段3: 高频簇 %d 个', len(high_freq_clusters))
+
+        if not high_freq_clusters:
+            log.status = 'completed'
+            log.completed_at = timezone.now()
+            log.save(update_fields=['status', 'completed_at'])
+            logger.info('无高频问题簇，FAQ 生成结束')
+            return
+
+        # ---- 阶段4: 生成 FAQ 草稿 ----
+        drafts_created = 0
+        dedup_threshold = getattr(settings, 'FAQ_DEDUP_THRESHOLD', 0.90)
+
+        for cluster in high_freq_clusters:
+            try:
+                # 跳过与已有 FAQ 过度相似的问题
+                representative = cluster.questions[0][:200]
+                existing = FAQItem.objects.filter(
+                    status__in=['draft', 'published'],
+                ).order_by('-created_at')[:50]
+
+                # 向量相似度比较
+                cluster_vector = llm_client.embed_one(representative)
+                should_skip = False
+                for exist in existing:
+                    if not exist.question:
+                        continue
+                    exist_vector = llm_client.embed_one(exist.question[:200])
+                    if cosine_similarity(cluster_vector, exist_vector) >= dedup_threshold:
+                        should_skip = True
+                        logger.info('跳过已存在的 FAQ: %s（相似度 >= %.2f）', representative[:40], dedup_threshold)
+                        break
+
+                if should_skip:
+                    continue
+
+                # 调用 LLM 生成
+                result = generate_faq_draft(cluster)
+                if not result:
+                    logger.warning('LLM 生成失败，跳过该簇')
+                    continue
+
+                # 保存为草稿
+                FAQItem.objects.create(
+                    question=result['question'][:500],
+                    answer=result['answer'],
+                    tags=result.get('tags', []),
+                    college_id=result.get('college_id'),
+                    status='draft',
+                    frequency=round((cluster.size / total_questions) * 100, 2),
+                    variant_count=cluster.size,
+                    source_period_start=since,
+                    source_period_end=timezone.now(),
+                )
+                drafts_created += 1
+                logger.info('生成 FAQ 草稿: %s', result['question'][:40])
+
+            except Exception as e:
+                logger.error(f'处理问题簇时出错: {e}')
+                continue
+
+        # 完成
+        log.status = 'completed'
+        log.drafts_generated = drafts_created
+        log.completed_at = timezone.now()
+        log.save(update_fields=['status', 'drafts_generated', 'completed_at'])
+        logger.info('FAQ 自动生成完成: 生成 %d 条草稿', drafts_created)
+
+    except Exception as e:
+        logger.error(f'FAQ 自动生成失败: {e}')
+        log.status = 'failed'
+        log.error_message = str(e)[:2000]
+        log.completed_at = timezone.now()
+        log.save(update_fields=['status', 'error_message', 'completed_at'])
+        raise self.retry(exc=e)

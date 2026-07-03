@@ -3,6 +3,7 @@ import time
 
 from django.http import StreamingHttpResponse
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from drf_spectacular.utils import extend_schema
 from rest_framework import generics, permissions, status
 from rest_framework.decorators import action
@@ -402,3 +403,41 @@ class FeedbackView(generics.CreateAPIView):
             {'detail': '反馈已记录'},
             status=status.HTTP_200_OK,
         )
+
+
+class HotQuestionsView(APIView):
+    """
+    热点问题广场 — "大家都在问"
+
+    GET /api/chat/hot-questions/?days=7&top_k=10
+
+    实时统计近期用户高频提问，按提问次数降序排列。
+    适合展示在智能问答主界面。
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        days = int(request.query_params.get('days', 7))
+        top_k = int(request.query_params.get('top_k', 10))
+
+        since = timezone.now() - timezone.timedelta(days=days)
+
+        from django.db.models import Count
+
+        questions_qs = (
+            ChatMessage.objects
+            .filter(role='user', created_at__gte=since)
+            .values('content')
+            .annotate(count=Count('id'))
+            .order_by('-count')[:top_k]
+        )
+
+        results = [
+            {
+                'question': item['content'],
+                'count': item['count'],
+            }
+            for item in questions_qs
+        ]
+
+        return Response(results)

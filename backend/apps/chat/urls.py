@@ -8,6 +8,7 @@ from .views import (
     ConversationDetailView,
     AskView,
     FeedbackView,
+    HotQuestionsView,
 )
 
 router = DefaultRouter()
@@ -27,4 +28,7 @@ urlpatterns = [
 
     # 反馈接口
     path('feedback/', FeedbackView.as_view(), name='chat_feedback'),
+
+    # 热点问题
+    path('hot-questions/', HotQuestionsView.as_view(), name='hot_questions'),
 ]
