@@ -905,19 +905,17 @@ class FileUploadView(APIView):
         file_bytes = uploaded_file.read()
         md5_hash = hashlib.md5(file_bytes).hexdigest()
 
-        # 上传到 OSS（开发环境 OSS 不可用时降级：跳过上传、仍创建 DB 记录）
-        oss_url = ''
-        oss_uploaded = False
-        if oss_client.bucket is not None:
-            try:
-                oss_client.bucket.put_object(oss_key, file_bytes)
-                oss_url = f'https://{oss_client.bucket_name}.{oss_client.endpoint}/{oss_key}'
-                oss_uploaded = True
-                logger.info(f'OSS 上传成功 oss_key={oss_key}, size={len(file_bytes)}')
-            except Exception as e:
-                logger.warning(f'OSS 上传失败（降级跳过）: {e}')
-        if not oss_uploaded:
-            logger.warning('OSS 上传跳过，仅创建数据库记录（本地开发/OSS 不可用）')
+        # 上传到 OSS
+        try:
+            oss_client.bucket.put_object(oss_key, file_bytes)
+            oss_url = f'https://{oss_client.bucket_name}.{oss_client.endpoint}/{oss_key}'
+            logger.info(f'OSS 上传成功 oss_key={oss_key}, size={len(file_bytes)}')
+        except Exception as e:
+            logger.error(f'OSS 文件上传失败 oss_key={oss_key}: {e}')
+            return Response(
+                {'detail': '文件上传到 OSS 失败，请稍后重试', 'code': 'UPLOAD_FAILED'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
         # 创建 KnowledgeDoc 记录
         new_doc = KnowledgeDoc.objects.create(
