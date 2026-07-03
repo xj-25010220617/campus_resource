@@ -33,6 +33,10 @@ class User(AbstractUser):
         College, null=True, blank=True, on_delete=models.SET_NULL,
         verbose_name='所属学院'
     )
+    department = models.ForeignKey(
+        'classify.Department', null=True, blank=True, on_delete=models.SET_NULL,
+        verbose_name='所属部门'
+    )
     phone = models.CharField(max_length=11, blank=True, default='', verbose_name='手机号')
     avatar = models.URLField(blank=True, default='', verbose_name='头像URL')
     sso_uid = models.CharField(
