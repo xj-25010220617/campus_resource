@@ -33,6 +33,7 @@ INSTALLED_APPS = [
     'apps.chat',
     'apps.knowledge',
     'apps.feedback',
+    'apps.faq',
 ]
 
 MIDDLEWARE = [
