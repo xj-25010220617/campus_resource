@@ -477,16 +477,30 @@ def _apply_hard_filters(
     if one_year_ago:
         kd_qs = kd_qs.filter(created_at__gte=one_year_ago)
 
-    # AI 检索时强制只看公开文件；后台管理查询时按角色过滤
-    is_admin_query = role in ('admin', 'super_admin')
+    # AI 检索权限：private 绝不检索；public 按 scope 限缩
+    kd_qs = kd_qs.filter(visibility='public')
+    is_admin_query = role in ('admin', 'college_admin', 'dept_admin', 'super_admin')
     if not is_admin_query:
-        kd_qs = kd_qs.filter(visibility='public')
-    elif role == 'admin':
-        user_college_id = user_context.get('college_id')
+        # 普通用户 AI 检索：scope=school全部 + scope=college本院 + scope=department本部门
+        conditions = Q(scope='school')
+        if user_college_id := user_context.get('college_id'):
+            conditions |= Q(scope='college', college_id=user_college_id)
+        if user_dept_id := user_context.get('department_id'):
+            conditions |= Q(scope='department', department_id=user_dept_id)
+        if user_id:
+            conditions |= Q(uploader_id=user_id)
+        kd_qs = kd_qs.filter(conditions)
+    elif role in ('college_admin', 'admin'):
         kd_qs = kd_qs.filter(
-            Q(visibility='public')
-            | Q(visibility='private', college_id=user_college_id)
-            | Q(visibility='private', uploader_id=user_id),
+            Q(scope='school')
+            | Q(scope='college', college_id=user_context.get('college_id'))
+            | Q(uploader_id=user_id),
+        )
+    elif role == 'dept_admin':
+        kd_qs = kd_qs.filter(
+            Q(scope='school')
+            | Q(scope='department', department_id=user_context.get('department_id'))
+            | Q(uploader_id=user_id),
         )
     # super_admin: 不过滤
 
@@ -551,22 +565,30 @@ def _filter_by_permission(
     # KnowledgeDoc 权限（已在 _apply_hard_filters 中过滤，此处二次兜底）
     if knowledge_ids:
         from django.db.models import Q
-        kd_qs = KnowledgeDoc.objects.filter(id__in=knowledge_ids)
+        kd_qs = KnowledgeDoc.objects.filter(id__in=knowledge_ids, visibility='public')
         if role == 'super_admin':
             allowed_ids.update(-kid for kid in kd_qs.values_list('id', flat=True))
-        elif role == 'admin':
-            kd_qs = kd_qs.filter(
-                Q(visibility='public')
-                | Q(visibility='private', college_id=user_college_id)
-                | Q(visibility='private', uploader_id=user_id),
-            )
-            allowed_ids.update(-kid for kid in kd_qs.values_list('id', flat=True))
+        elif role in ('college_admin', 'admin'):
+            allowed_ids.update(-kid for kid in kd_qs.filter(
+                Q(scope='school')
+                | Q(scope='college', college_id=user_college_id)
+                | Q(uploader_id=user_id),
+            ).values_list('id', flat=True))
+        elif role == 'dept_admin':
+            allowed_ids.update(-kid for kid in kd_qs.filter(
+                Q(scope='school')
+                | Q(scope='department', department_id=user_context.get('department_id'))
+                | Q(uploader_id=user_id),
+            ).values_list('id', flat=True))
         else:
-            kd_qs = kd_qs.filter(
-                Q(visibility='public')
-                | Q(visibility='private', uploader_id=user_id),
-            )
-            allowed_ids.update(-kid for kid in kd_qs.values_list('id', flat=True))
+            conditions = Q(scope='school')
+            if user_college_id:
+                conditions |= Q(scope='college', college_id=user_college_id)
+            if user_context.get('department_id'):
+                conditions |= Q(scope='department', department_id=user_context.get('department_id'))
+            if user_id:
+                conditions |= Q(uploader_id=user_id)
+            allowed_ids.update(-kid for kid in kd_qs.filter(conditions).values_list('id', flat=True))
 
     filtered = [h for h in hits if h.get('doc_id') in allowed_ids]
     return filtered[:5]

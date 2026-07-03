@@ -3,7 +3,17 @@ from django.db import models
 
 
 class KnowledgeDoc(models.Model):
-    """知识文档——系统核心表，存储知识文档元数据、OSS 信息和索引状态"""
+    """知识文档——系统核心表，存储知识文档元数据、OSS 信息和索引状态
+    
+    外键ID对应关系：
+    - college_id: 1=计算机与软件学院, 2=智能科学与工程学院, 3=信息与商务管理学院, 4=数字艺术与设计学院, 
+                  5=外国语学院, 6=健康医疗科技学院, 7=马克思主义学院, 8=通识教育学院, 9=创新创业学院,
+                  10=继续教育学院, 11=国际教育学院, 12=体育教学部, 13=图书馆
+    - department_id: 1=校级领导, 2=党政管理部门, 3=教学管理部门, 4=学生工作部门, 5=科研与服务部门,
+                      6=后勤保障部门, 7=继续教育与国际教育（二级部门见下方注释）
+    - category_id: 1=教学资源, 2=学术资料, 3=管理文件, 4=校园资讯, 5=校园生活, 6=媒体聚焦（二级见下方注释）
+    - discipline_id: 1-31 对应各专业方向（见 Discipline 模型）
+    """
 
     STATUS_CHOICES = [
         ('uploaded', '已上传'),
@@ -35,6 +45,11 @@ class KnowledgeDoc(models.Model):
         ('public', '公开'),
         ('private', '私密'),
     ]
+    SCOPE_CHOICES = [
+        ('school', '全校'),
+        ('college', '学院'),
+        ('department', '部门'),
+    ]
 
     title = models.CharField(max_length=512, verbose_name='文档标题')
     description = models.TextField(default='', verbose_name='文档描述')
@@ -54,6 +69,10 @@ class KnowledgeDoc(models.Model):
         max_length=16, choices=VISIBILITY_CHOICES, default='public',
         db_index=True, verbose_name='可见性',
     )
+    scope = models.CharField(
+        max_length=16, choices=SCOPE_CHOICES, default='college',
+        db_index=True, verbose_name='归属范围',
+    )
     file_size = models.BigIntegerField(default=0, verbose_name='文件大小（字节）')
     md5_hash = models.CharField(
         max_length=32, default='', db_index=True, verbose_name='MD5哈希',
@@ -64,21 +83,28 @@ class KnowledgeDoc(models.Model):
         on_delete=models.SET_NULL,
         null=True, blank=True,
         related_name='knowledge_docs',
-        verbose_name='学科方向',
+        verbose_name='学科方向（id:1=软件工程,2=计算机科学与技术,3=网络工程...）',
     )
     category = models.ForeignKey(
         'classify.Category',
         on_delete=models.SET_NULL,
         null=True, blank=True,
         related_name='knowledge_docs',
-        verbose_name='资源类型',
+        verbose_name='资源类型（一级:1=教学资源,2=学术资料,3=管理文件,4=校园资讯,5=校园生活,6=媒体聚焦；二级见种子数据）',
     )
     college = models.ForeignKey(
         'accounts.College',
         on_delete=models.SET_NULL,
         null=True, blank=True,
         related_name='knowledge_docs',
-        verbose_name='所属学院',
+        verbose_name='所属学院（id:1=计算机与软件学院,2=智能科学与工程学院,3=信息与商务管理学院...）',
+    )
+    department = models.ForeignKey(
+        'classify.Department',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='knowledge_docs',
+        verbose_name='所属部门',
     )
     uploader = models.ForeignKey(
         settings.AUTH_USER_MODEL,
