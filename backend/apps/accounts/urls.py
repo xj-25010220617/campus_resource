@@ -4,6 +4,8 @@ from rest_framework_simplejwt.views import TokenRefreshView
 from rest_framework_simplejwt.views import TokenObtainPairView
 
 from .views import (
+    DingtalkCallbackView,
+    DingtalkQrView,
     LogoutView,
     MeView,
     ChangePasswordView,
@@ -27,4 +29,8 @@ urlpatterns = [
     # SSO（暂未对接，预留接口）
     path('sso/login/', SsoLoginView.as_view(), name='sso_login'),
     path('sso/callback/', SsoCallbackView.as_view(), name='sso_callback'),
+
+    # 钉钉扫码登录
+    path('dingtalk/qr/', DingtalkQrView.as_view(), name='dingtalk_qr'),
+    path('dingtalk/callback/', DingtalkCallbackView.as_view(), name='dingtalk_callback'),
 ] 

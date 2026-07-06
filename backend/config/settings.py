@@ -184,6 +184,12 @@ CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = 'Asia/Shanghai'
 
 # ------------------------------------------------------------------
+# 钉钉扫码登录
+# ------------------------------------------------------------------
+DINGTALK_APP_KEY = config('DINGTALK_APP_KEY', default='')
+DINGTALK_APP_SECRET = config('DINGTALK_APP_SECRET', default='')
+
+# ------------------------------------------------------------------
 # ASR 语音识别（FunASR）
 # ------------------------------------------------------------------
 ASR_MODEL_NAME = 'iic/SenseVoiceSmall'
