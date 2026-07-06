@@ -1,14 +1,13 @@
 import logging
 
 from django.conf import settings
-from django.contrib.auth import authenticate, get_user_model
+from django.contrib.auth import get_user_model
 from django.db import transaction
 from drf_spectacular.utils import extend_schema
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
-from rest_framework_simplejwt.views import TokenObtainPairView
 
 from .serializers import UserSerializer, ChangePasswordSerializer
 
@@ -40,7 +39,7 @@ MOCK_SSO_USERS = {
     'mock_college_admin': {
         'sso_uid': 'sso_10004',
         'username': 'sso_college_admin',
-        'role': 'admin',
+        'role': 'college_admin',
         'first_name': '学院',
         'last_name': '管理员',
         'email': 'sso_college_admin@nsu.edu.cn',
@@ -49,11 +48,11 @@ MOCK_SSO_USERS = {
     'mock_dept_admin': {
         'sso_uid': 'sso_10005',
         'username': 'sso_dept_admin',
-        'role': 'admin',
+        'role': 'dept_admin',
         'first_name': '部门',
         'last_name': '管理员',
         'email': 'sso_dept_admin@nsu.edu.cn',
-        'college_code': 'CS',
+        'department_id': 13,
     },
     'mock_teacher': {
         'sso_uid': 'sso_10002',
@@ -72,43 +71,6 @@ MOCK_SSO_USERS = {
         'email': 'sso_student@nsu.edu.cn',
     },
 }
-
-
-class LoggedTokenObtainPairView(TokenObtainPairView):
-    """JWT 登录（包装 SimpleJWT，写 LoginLog）
-
-    POST /api/auth/login/
-    行为：
-        - 调 TokenObtainPairView.post() 拿到响应
-        - 200 → 写 LoginLog(login_type='jwt', user=响应里的 user, success=True)
-        - 401 → 写 LoginLog(login_type='jwt', success=False, fail_reason='凭证错误')
-    """
-
-    def post(self, request, *args, **kwargs):
-        from apps.admin_panel.utils import write_login_log
-
-        response = super().post(request, *args, **kwargs)
-        success = response.status_code == 200
-        username = request.data.get('username', '') if hasattr(request, 'data') else ''
-
-        if success:
-            user_obj = User.objects.filter(username=username).first() if username else None
-            write_login_log(
-                request,
-                login_type='jwt',
-                success=True,
-                user=user_obj,
-                username=username,
-            )
-        else:
-            write_login_log(
-                request,
-                login_type='jwt',
-                success=False,
-                username=username,
-                fail_reason='凭证错误或账号不存在',
-            )
-        return response
 
 
 @extend_schema(
@@ -242,17 +204,9 @@ class SsoCallbackView(APIView):
 
     def _handle_mock_callback(self, request):
         """Mock 模式回调：根据 code 查找/创建用户并签发 JWT"""
-        from apps.admin_panel.utils import write_login_log
-
         code = request.data.get('code') or request.query_params.get('code')
 
         if not code:
-            write_login_log(
-                request,
-                login_type='sso_mock',
-                success=False,
-                fail_reason='缺少 code 参数',
-            )
             return Response(
                 {'detail': '缺少 code 参数', 'code': 'VALIDATION_ERROR'},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -260,13 +214,6 @@ class SsoCallbackView(APIView):
 
         user_info = MOCK_SSO_USERS.get(code)
         if not user_info:
-            write_login_log(
-                request,
-                login_type='sso_mock',
-                success=False,
-                username=code,
-                fail_reason=f'无效的 SSO 测试码: {code}',
-            )
             return Response(
                 {
                     'detail': f'无效的 SSO 测试码: {code}',
@@ -287,13 +234,6 @@ class SsoCallbackView(APIView):
             code, user.username, created,
         )
 
-        write_login_log(
-            request,
-            login_type='sso_mock',
-            success=True,
-            user=user,
-        )
-
         return Response({
             'access': str(refresh.access_token),
             'refresh': str(refresh),
@@ -305,6 +245,7 @@ class SsoCallbackView(APIView):
     def _get_or_create_sso_user(user_info):
         """根据 sso_uid 查找或创建用户"""
         from apps.accounts.models import College
+        from apps.classify.models import Department
 
         with transaction.atomic():
             user = User.objects.filter(sso_uid=user_info['sso_uid']).first()
@@ -314,32 +255,59 @@ class SsoCallbackView(APIView):
                 user.first_name = user_info.get('first_name', user.first_name)
                 user.last_name = user_info.get('last_name', user.last_name)
                 update_fields = ['email', 'first_name', 'last_name']
-                # 补充 college（如之前未设置）
-                college_code = user_info.get('college_code')
-                if college_code and not user.college_id:
-                    college = College.objects.filter(code=college_code).first()
-                    if college:
-                        user.college = college
-                        update_fields.append('college')
                 user.save(update_fields=update_fields)
                 return user, False
 
-            # 解析 college
+            # 解析 college（college_admin / user 需要）
             college = None
             college_code = user_info.get('college_code')
             if college_code:
                 college = College.objects.filter(code=college_code).first()
 
-            # 创建新用户（SSO 用户无本地密码，用 unusable password）
+            # 解析 department（dept_admin 需要）
+            department = None
+            department_id = user_info.get('department_id')
+            if department_id:
+                department = Department.objects.filter(id=department_id).first()
+
+            role = user_info.get('role', 'user')
+
+            # 创建新用户（SSO 用户无本地密码）
             user = User.objects.create_user(
                 username=user_info['username'],
                 email=user_info.get('email', ''),
                 first_name=user_info.get('first_name', ''),
                 last_name=user_info.get('last_name', ''),
-                role=user_info.get('role', 'user'),
+                role=role,
                 sso_uid=user_info['sso_uid'],
                 college=college,
+                department=department,
             )
             user.set_unusable_password()
             user.save(update_fields=['password'])
             return user, True
+
+
+class LogoutView(APIView):
+    """
+    登出
+
+    POST /api/auth/logout/
+    功能：将 refresh token 加入黑名单，使 refresh 失效
+    参数：
+        - refresh (string, required): 登录时获取的 refresh token
+    返回：{"detail": "已登出"}
+    注意：客户端需同时丢弃本地 access token
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        refresh_token = request.data.get('refresh')
+        if refresh_token:
+            try:
+                token = RefreshToken(refresh_token)
+                token.blacklist()
+                logger.info('Token 已加入黑名单')
+            except Exception:
+                logger.warning('Token 黑名单失败（可能未启用 blacklist app）')
+        return Response({'detail': '已登出'}, status=status.HTTP_200_OK)
