@@ -1,5 +1,3 @@
-import json
-
 from django.conf import settings
 from django.db import models
 
@@ -43,7 +41,8 @@ class FAQItem(models.Model):
         on_delete=models.SET_NULL,
         null=True, blank=True,
         related_name='faq_items',
-        verbose_name='所属学院（NULL=全局）',
+        verbose_name='所属学院',
+        db_comment='所属学院(NULL=全局; 1=计算机,2=智能科学,3=信商管理,4=数字艺术,5=外国语,6=健康医疗,7=高职,8=国际,9=基础,10=马院,11=创业,12=继续教育,13=退役军人)',
     )
     tags = models.JSONField(default=list, blank=True, verbose_name='关键词标签')
     status = models.CharField(
@@ -71,6 +70,7 @@ class FAQItem(models.Model):
         verbose_name = 'FAQ 条目'
         verbose_name_plural = verbose_name
         ordering = ['-frequency', '-created_at']
+        db_table_comment = 'FAQ条目表(NULL=全局; 1=计算机,2=智能科学,3=信商管理,4=数字艺术,5=外国语,6=健康医疗,7=高职,8=国际,9=基础,10=马院,11=创业,12=继续教育,13=退役军人)'
         indexes = [
             models.Index(fields=['status', 'college'], name='idx_faq_status_college'),
         ]

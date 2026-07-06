@@ -21,6 +21,7 @@ class FeedbackQuestion(models.Model):
         null=True, blank=True,
         related_name='feedback_questions',
         verbose_name='所属学院',
+        db_comment='所属学院(1=计算机,2=智能科学,3=信商管理,4=数字艺术,5=外国语,6=健康医疗,7=高职,8=国际,9=基础,10=马院,11=创业,12=继续教育,13=退役军人)',
     )
     status = models.CharField(
         max_length=16, choices=STATUS_CHOICES, default='pending',
@@ -42,6 +43,7 @@ class FeedbackQuestion(models.Model):
         verbose_name = '待回答问题'
         verbose_name_plural = verbose_name
         ordering = ['-created_at']
+        db_table_comment = '待人工回答问题表'
         indexes = [
             models.Index(fields=['status', 'college'], name='idx_fq_status_college'),
         ]

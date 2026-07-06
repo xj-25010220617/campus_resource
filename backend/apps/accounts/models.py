@@ -10,8 +10,16 @@ from django.db import models
 
 class College(models.Model):
     """二级学院（成都东软学院共13个）"""
-    name = models.CharField(max_length=64, unique=True, verbose_name='学院名称')
-    code = models.CharField(max_length=16, unique=True, verbose_name='学院代码')
+    name = models.CharField(
+        max_length=64, unique=True,
+        verbose_name='学院名称',
+        db_comment='学院名称(id:1=计算机与软件,2=智能科学,3=信商管理,4=数字艺术,5=外国语,6=健康医疗,7=高职,8=国际,9=基础,10=马院,11=创业,12=继续教育,13=退役军人)',
+    )
+    code = models.CharField(
+        max_length=16, unique=True,
+        verbose_name='学院代码',
+        db_comment='学院代码(CS/ISE/IBM/DAD/FL/HMT/HVC/IEC/BED/MAR/IEE/CED/VET)',
+    )
     sort_order = models.IntegerField(default=0, verbose_name='排序')
 
     class Meta:
@@ -19,6 +27,7 @@ class College(models.Model):
         verbose_name = '学院'
         verbose_name_plural = verbose_name
         ordering = ['sort_order', 'id']
+        db_table_comment = '二级学院表(id:1=计算机与软件,2=智能科学,3=信商管理,4=数字艺术,5=外国语,6=健康医疗,7=高职,8=国际,9=基础,10=马院,11=创业,12=继续教育,13=退役军人)'
 
     def __str__(self):
         return self.name
@@ -42,12 +51,14 @@ class User(AbstractUser):
         on_delete=models.SET_NULL,
         null=True, blank=True,
         verbose_name='所属学院',
+        db_comment='所属学院(id:1=计算机与软件,2=智能科学,3=信商管理,4=数字艺术,5=外国语,6=健康医疗,7=高职,8=国际,9=基础,10=马院,11=创业,12=继续教育,13=退役军人)',
     )
     department = models.ForeignKey(
         'classify.Department',
         on_delete=models.SET_NULL,
         null=True, blank=True,
         verbose_name='所属部门',
+        db_comment='所属部门(1=校级领导,2=党政,3=教学管理,4=学生工作,5=科研服务,6=后勤,7=继续教育)',
     )
     phone = models.CharField(max_length=11, blank=True, default='', verbose_name='手机号')
     avatar = models.URLField(blank=True, default='', verbose_name='头像URL')
@@ -82,4 +93,3 @@ class User(AbstractUser):
             if not self.college_id:
                 raise ValidationError({'college': '学生必须设置所属学院'})
         # admin（兼容旧角色）不强制要求，保持原行为
-
