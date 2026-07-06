@@ -733,9 +733,11 @@ class TextUploadView(APIView):
         - title (str, required): 文档标题
         - content (str, required): 文本内容
         - description (str, optional): 文档描述
-        - college_id (int, required): 学院 ID
-        - discipline_id (int, required): 学科方向 ID
-        - category_id (int, required): 资源类型 ID（必须是二级分类）
+        - scope (str, default=college): 归属范围（school/college/department）
+        - college_id (int, optional): 学院 ID（默认使用上传者学院ID）
+        - department_id (int, optional): 部门 ID（默认使用上传者部门ID）
+        - discipline_id (int, optional): 学科方向 ID
+        - category_id (int, optional): 资源类型 ID（必须是二级分类）
         - keywords (list[str], optional): 关键词列表
     返回：{"id": <doc.id>, "status": "uploaded", "file_name": "<title>.txt"}
     """
@@ -746,7 +748,16 @@ class TextUploadView(APIView):
         import hashlib
         import uuid
 
-        serializer = TextUploadSerializer(data=request.data)
+        # 填充默认值：学院ID和部门ID默认使用上传者的
+        data = request.data.copy()
+        if 'scope' not in data:
+            data['scope'] = 'college'
+        if 'college_id' not in data or data['college_id'] is None:
+            data['college_id'] = request.user.college_id
+        if 'department_id' not in data or data['department_id'] is None:
+            data['department_id'] = request.user.department_id
+
+        serializer = TextUploadSerializer(data=data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
