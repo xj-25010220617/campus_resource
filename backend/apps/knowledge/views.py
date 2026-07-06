@@ -25,7 +25,7 @@ from rest_framework.views import APIView
 
 from apps.accounts.models import College
 from apps.classify.models import Category, Department, Discipline
-from config.permissions import IsAdminOrSuperAdmin, IsLoginUser
+from config.permissions import CanUploadDocument, IsAdminOrSuperAdmin, IsLoginUser
 from utils.oss import oss_client
 
 from .extractor import extract_freshness_for_doc
@@ -137,7 +137,7 @@ class KnowledgeDocListView(generics.ListAPIView):
         - super_admin：全量
         - college_admin / admin：scope=school + scope=college且本院 + 自己上传的
         - dept_admin：scope=school + scope=department且本部门 + 自己上传的
-        - user：无权限（只能通过 AI 检索）
+        - user：scope=school + scope=college(本院) + scope=department(本部门) + 自己上传的
         """
         if user.role == 'super_admin':
             return queryset
@@ -153,15 +153,23 @@ class KnowledgeDocListView(generics.ListAPIView):
                 | Q(scope='department', department_id=user.department_id)
                 | Q(uploader_id=user.id),
             )
-        return queryset.none()
+        # user（普通用户）：可查看 scope=school + 本院 + 本部门 + 自己上传的文档
+        conditions = Q(scope='school')
+        if user.college_id:
+            conditions |= Q(scope='college', college_id=user.college_id)
+        if user.department_id:
+            conditions |= Q(scope='department', department_id=user.department_id)
+        conditions |= Q(uploader_id=user.id)
+        return queryset.filter(conditions)
 
     @staticmethod
     def _rag_scope_filter(queryset, user_context):
         """AI 检索权限过滤：
         - private 文档绝不检索
-        - scope=school + public：所有人
-        - scope=college + public：本院用户
-        - scope=department + public：本部门用户
+        - super_admin：所有 public 文档
+        - college_admin / admin：scope=school + scope=college(本院) + 自己上传
+        - dept_admin：scope=school + scope=department(本部门) + 自己上传
+        - user：scope=school + scope=college(本院) + scope=department(本部门) + 自己上传
         """
         role = user_context.get('role', 'user')
         user_id = user_context.get('user_id')
@@ -170,6 +178,21 @@ class KnowledgeDocListView(generics.ListAPIView):
         qs = queryset.filter(visibility='public')
         if role == 'super_admin':
             return qs
+        if role in ('college_admin', 'admin'):
+            conditions = Q(scope='school')
+            if college_id:
+                conditions |= Q(scope='college', college_id=college_id)
+            if user_id:
+                conditions |= Q(uploader_id=user_id)
+            return qs.filter(conditions)
+        if role == 'dept_admin':
+            conditions = Q(scope='school')
+            if dept_id:
+                conditions |= Q(scope='department', department_id=dept_id)
+            if user_id:
+                conditions |= Q(uploader_id=user_id)
+            return qs.filter(conditions)
+        # user（普通用户）
         conditions = Q(scope='school')
         if college_id:
             conditions |= Q(scope='college', college_id=college_id)
@@ -579,7 +602,7 @@ class UploadSTSView(APIView):
                 'resource_id': duplicate_doc.id,
             })
 
-        # 获取 STS 临时凭证
+        # 获取 STS 临时凭证（scope 必须由用户传入）
         scope = request.data.get('scope', 'college')
         owner_id = college_id if scope == 'college' else (request.data.get('department_id', 0) if scope == 'department' else 0)
         credentials = oss_client.get_sts_credentials(file_name, scope, owner_id)
@@ -606,15 +629,17 @@ class UploadCallbackView(APIView):
     功能：OSS 前端直传完成后回调，校验 oss_key 安全性、MD5 去重后创建知识文档记录
     参数：
         - oss_key (str, required): OSS 对象 Key
-        - title (str, required): 文档标题
-        - description (str, required): 文档描述
+        - title (str, optional): 文档标题（未提供时 AI 生成）
+        - description (str, optional): 文档描述（未提供时 AI 生成）
         - file_name (str, required): 原始文件名
         - file_size (int, required): 文件大小（字节）
         - file_type (str, required): 文件类型
         - md5 (str, required): 文件 MD5 哈希值
+        - scope (str, required): 归属范围（school/college/department）— 必选
+        - visibility (str, required): 可见性（public/private）— 必选
+        - college_id (int, optional): 所属学院 ID（默认取上传者学院）
         - discipline_id (int, optional): 学科方向 ID
-        - category_id (int, optional): 资源类型 ID
-        - college_id (int, optional): 所属学院 ID（默认取上传者所在学院）
+        - category_id (int, optional): 资源类型 ID（未提供时 AI 推荐）
     返回：
         - 新建成功: {"id": <doc.id>, "status": "uploaded"}
         - 重复文件: {"id": <existing_doc.id>, "status": "<status>", "duplicate": true}
@@ -727,16 +752,17 @@ class UploadCallbackView(APIView):
 
 class TextUploadView(APIView):
     """
-    管理员手动录入文本
+    文本录入接口
 
     POST /api/knowledge/upload/text/
-    功能：管理员手动输入文本内容，后端直传 OSS 并创建知识文档记录。
-          未提供的字段（title/description/category_id/keywords）由 AI 自动填充。
+    功能：用户输入文本内容，后端直传 OSS 并创建知识文档记录。
+          scope 和 visibility 由用户选择；title/description/category_id/keywords 未提供时由 AI 自动填充。
     请求参数：
         - content (str, required): 文本内容
+        - scope (str, required): 归属范围（school/college/department）— 用户选择
+        - visibility (str, required): 可见性（public/private）— 用户选择
         - title (str, optional): 文档标题（未提供时 AI 自动生成）
         - description (str, optional): 文档描述（未提供时 AI 生成）
-        - scope (str, default=college): 归属范围（school/college/department）
         - college_id (int, optional): 学院 ID（默认使用上传者学院ID）
         - department_id (int, optional): 部门 ID（默认使用上传者部门ID）
         - discipline_id (int, optional): 学科方向 ID
@@ -751,10 +777,8 @@ class TextUploadView(APIView):
         import hashlib
         import uuid
 
-        # 填充默认值：学院ID和部门ID默认使用上传者的
+        # 填充默认值：学院ID和部门ID默认使用上传者的（scope 不设默认，由用户选择）
         req_data = request.data.copy()
-        if 'scope' not in req_data:
-            req_data['scope'] = 'college'
         if 'college_id' not in req_data or req_data.get('college_id') in (None, '', 'null'):
             req_data['college_id'] = request.user.college_id
         if 'department_id' not in req_data or req_data.get('department_id') in (None, '', 'null'):
@@ -1026,18 +1050,18 @@ class FileUploadView(APIView):
 
     POST /api/knowledge/upload/file/
     功能：接收前端上传的文件，后端存到 OSS 并创建知识文档记录。
-          未提供的字段（title/description/category_id/keywords）由 AI 自动填充。
+          scope 和 visibility 由用户选择；title/description/category_id/keywords 未提供时由 AI 自动填充。
     请求参数（form-data）：
         - file (file, required): 上传的文件
+        - scope (str, required): 归属范围（school/college/department）— 用户选择
+        - visibility (str, required): 可见性（public/private）— 用户选择
         - title (str, optional): 文档标题（默认使用文件名，AI 可优化）
         - description (str, optional): 文档描述（未提供时 AI 生成）
-        - scope (str, default=college): 归属范围（school/college/department）
         - college_id (int, optional): 学院 ID（默认使用上传者学院ID）
         - department_id (int, optional): 部门 ID（默认使用上传者部门ID）
         - discipline_id (int, optional): 学科方向 ID
         - category_id (int, optional): 资源类型 ID（未提供时 AI 推荐）
         - keywords (str, optional): JSON 数组字符串，如 '["关键词1","关键词2"]'（未提供时 AI 提取）
-        - visibility (str, optional): public/private，默认 public
     返回：{"id": <doc.id>, "status": "uploaded", "file_name": "..."}
     """
     permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
@@ -1052,10 +1076,8 @@ class FileUploadView(APIView):
         import json
         import uuid
 
-        # 填充默认值：scope/college_id/department_id 默认使用上传者的
+        # 填充默认值：学院ID和部门ID默认使用上传者的（scope 不设默认，由用户选择）
         req_data = request.data.copy()
-        if 'scope' not in req_data:
-            req_data['scope'] = 'college'
         if 'college_id' not in req_data or req_data.get('college_id') in (None, '', 'null'):
             req_data['college_id'] = request.user.college_id
         if 'department_id' not in req_data or req_data.get('department_id') in (None, '', 'null'):

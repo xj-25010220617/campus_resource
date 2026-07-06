@@ -63,6 +63,16 @@ class IsLoginUser(permissions.BasePermission):
         )
 
 
+class CanUploadDocument(permissions.BasePermission):
+    """文档上传权限 — 所有登录用户（含普通 user）均可上传"""
+
+    def has_permission(self, request, view):
+        return (
+            request.user
+            and request.user.is_authenticated
+        )
+
+
 class IsAdminOrSuperAdmin(permissions.BasePermission):
     """admin 和 super_admin 可访问，user 不可"""
 
