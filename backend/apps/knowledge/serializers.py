@@ -144,7 +144,8 @@ class UploadCallbackSerializer(serializers.Serializer):
     md5 = serializers.CharField(max_length=32, help_text='文件MD5哈希值')
     scope = serializers.ChoiceField(
         choices=['school', 'college', 'department'],
-        help_text='归属范围（school:全校 / college:学院 / department:部门）— 必选',
+        default='school',
+        help_text='归属范围（school:全校 / college:学院 / department:部门），默认 school',
     )
     college_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属学院ID（默认上传者学院，scope=college时必填）')
     department_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属部门ID（默认上传者部门，scope=department时必填）')
@@ -156,7 +157,8 @@ class UploadCallbackSerializer(serializers.Serializer):
     )
     visibility = serializers.ChoiceField(
         choices=['public', 'private'],
-        help_text='可见性（public:公开 / private:私密）— 必选',
+        default='public',
+        help_text='可见性（public:公开 / private:私密），默认 public',
     )
 
     def validate_file_size(self, value):
@@ -209,7 +211,8 @@ class TextUploadSerializer(serializers.Serializer):
     )
     scope = serializers.ChoiceField(
         choices=['school', 'college', 'department'],
-        help_text='归属范围（school:全校 / college:学院 / department:部门）— 必选',
+        default='school',
+        help_text='归属范围（school:全校 / college:学院 / department:部门），默认 school',
     )
     college_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属学院ID（默认上传者学院，scope=college时必填）')
     department_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属部门ID（默认上传者部门，scope=department时必填）')
@@ -221,7 +224,8 @@ class TextUploadSerializer(serializers.Serializer):
     )
     visibility = serializers.ChoiceField(
         choices=['public', 'private'],
-        help_text='可见性（public:公开 / private:私密）— 必选',
+        default='public',
+        help_text='可见性（public:公开 / private:私密），默认 public',
     )
 
 
@@ -238,7 +242,8 @@ class FileUploadSerializer(serializers.Serializer):
     )
     scope = serializers.ChoiceField(
         choices=['school', 'college', 'department'],
-        help_text='归属范围（school:全校 / college:学院 / department:部门）— 必选',
+        default='school',
+        help_text='归属范围（school:全校 / college:学院 / department:部门），默认 school',
     )
     college_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属学院ID（默认上传者学院，scope=college时必填）')
     department_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属部门ID（默认上传者部门，scope=department时必填）')
@@ -250,7 +255,8 @@ class FileUploadSerializer(serializers.Serializer):
     )
     visibility = serializers.ChoiceField(
         choices=['public', 'private'],
-        help_text='可见性（public:公开 / private:私密）— 必选',
+        default='public',
+        help_text='可见性（public:公开 / private:私密），默认 public',
     )
 
 
