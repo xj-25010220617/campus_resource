@@ -26,7 +26,11 @@ class OSSClient:
     def __init__(self):
         self.access_key_id = settings.OSS_ACCESS_KEY_ID
         self.access_key_secret = settings.OSS_ACCESS_KEY_SECRET
-        self.endpoint = settings.OSS_ENDPOINT
+        raw_endpoint = (settings.OSS_ENDPOINT or '').strip()
+        # 移除 protocol 前缀，用于 URL 拼接
+        self.endpoint = raw_endpoint.replace('https://', '').replace('http://', '')
+        # 保留完整 endpoint（含 protocol），传给 oss2 SDK
+        self._raw_endpoint = raw_endpoint if '://' in raw_endpoint else f'https://{raw_endpoint}'
         self.bucket_name = settings.OSS_BUCKET_NAME
         self._auth = None
         self._bucket = None
@@ -40,7 +44,7 @@ class OSSClient:
     @property
     def bucket(self):
         if self._bucket is None and self.auth:
-            self._bucket = oss2.Bucket(self.auth, self.endpoint, self.bucket_name)
+            self._bucket = oss2.Bucket(self.auth, self._raw_endpoint, self.bucket_name)
         return self._bucket
 
     def _sanitize_filename(self, file_name: str) -> str:

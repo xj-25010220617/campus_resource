@@ -8,6 +8,8 @@ from datetime import datetime, timedelta
 import django_filters
 import requests
 
+import oss2
+
 from django.db import transaction
 from django.db.models import Q
 from django.shortcuts import get_object_or_404

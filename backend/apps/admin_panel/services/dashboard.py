@@ -1,3 +1,4 @@
+from typing import Optional
 """Admin Panel - Dashboard 聚合计算
 
 5 个纯函数对应 5 类日志块，每个函数：
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 # ----------------------------------------------------------------------
 # 时间区间工具
 # ----------------------------------------------------------------------
-def parse_period(period: str | None):
+def parse_period(period: Optional[str]):
     """根据 period 计算 (start, end)，时区 Asia/Shanghai。
 
     - day: 今天 0:00 ~ now

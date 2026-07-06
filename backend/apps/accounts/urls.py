@@ -1,8 +1,10 @@
 from django.urls import path
 from rest_framework_simplejwt.views import TokenRefreshView
 
+from rest_framework_simplejwt.views import TokenObtainPairView
+
 from .views import (
-    LoggedTokenObtainPairView,
+    LogoutView,
     MeView,
     ChangePasswordView,
     SsoLoginView,
@@ -11,9 +13,10 @@ from .views import (
 
 
 urlpatterns = [
-    # JWT 认证（使用包装版，写 LoginLog）
-    path('login/', LoggedTokenObtainPairView.as_view(), name='token_obtain_pair'),
+    # JWT 认证
+    path('login/', TokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('refresh/', TokenRefreshView.as_view(), name='token_refresh'),
+    path('logout/', LogoutView.as_view(), name='auth_logout'),
 
     # 个人信息
     path('me/', MeView.as_view(), name='auth_me'),

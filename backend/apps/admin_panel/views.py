@@ -1,3 +1,4 @@
+from typing import Optional
 """Admin Panel - 视图
 
 分两大块：
@@ -429,7 +430,7 @@ class CurrentUserView(APIView):
 # ======================================================================
 # 二、超管日志管理 — 通用时间区间工具
 # ======================================================================
-def _parse_date_param(value: str | None) -> _datetime.datetime | None:
+def _parse_date_param(value: Optional[str]) -> Optional[_datetime.datetime]:
     """把查询参数 date_from / date_to 解析为带时区的 datetime。"""
     if not value:
         return None
@@ -447,7 +448,7 @@ def _parse_date_param(value: str | None) -> _datetime.datetime | None:
     return timezone.make_aware(dt)
 
 
-def _apply_date_range(qs, date_from: str | None, date_to: str | None):
+def _apply_date_range(qs, date_from: Optional[str], date_to: Optional[str]):
     """对 queryset 应用 date_from / date_to 区间。"""
     start = _parse_date_param(date_from)
     end = _parse_date_param(date_to)
