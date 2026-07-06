@@ -172,8 +172,13 @@ class FAQDraftActionView(generics.GenericAPIView):
 
 class FAQManageListView(generics.ListAPIView):
     """
-    GET /api/faq/items/  (管理端)
+    GET /api/faq/manage/items/  (管理端)
     全部 FAQ 列表（含草稿），管理员用
+
+    支持筛选参数：
+    - search (str): 关键词搜索（匹配问题/答案/标签）
+    - college_id (int): 按学院筛选
+    - category (int): 按分类筛选
     """
     serializer_class = FAQItemListSerializer
     permission_classes = [permissions.IsAuthenticated, IsFAQAdmin]
@@ -181,12 +186,31 @@ class FAQManageListView(generics.ListAPIView):
     def get_queryset(self):
         user = self.request.user
         if user.role == 'super_admin':
-            return FAQItem.objects.all().order_by('-frequency', '-created_at')
+            qs = FAQItem.objects.all()
+        else:
+            q = models.Q(college__isnull=True)
+            if user.college_id:
+                q |= models.Q(college_id=user.college_id)
+            qs = FAQItem.objects.filter(q)
 
-        q = models.Q(college__isnull=True)
-        if user.college_id:
-            q |= models.Q(college_id=user.college_id)
-        return FAQItem.objects.filter(q).order_by('-frequency', '-created_at')
+        # 筛选条件
+        search = self.request.query_params.get('search')
+        college_id = self.request.query_params.get('college_id')
+        category = self.request.query_params.get('category')
+
+        if search:
+            from django.db.models import Q as _Q
+            qs = qs.filter(
+                _Q(question__icontains=search)
+                | _Q(answer__icontains=search)
+                | _Q(tags__icontains=search)
+            )
+        if college_id:
+            qs = qs.filter(college_id=college_id)
+        if category:
+            qs = qs.filter(category_id=category)
+
+        return qs.order_by('-frequency', '-created_at')
 
 
 class FAQManageDeleteView(generics.DestroyAPIView):

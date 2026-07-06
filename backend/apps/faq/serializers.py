@@ -20,7 +20,8 @@ class FAQItemListSerializer(serializers.ModelSerializer):
         model = FAQItem
         fields = [
             'id', 'question', 'answer', 'category', 'category_name',
-            'college', 'college_name', 'tags', 'frequency', 'created_at',
+            'college', 'college_name', 'tags', 'frequency',
+            'status', 'created_at',
         ]
 
 
