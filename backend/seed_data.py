@@ -43,21 +43,27 @@ print(f'Disciplines: {Discipline.objects.count()}')
 # ===========================
 ICON_BASE = 'https://img.alicdn.com/imgextra'
 
-# 清理错误数据：删除 ID > 4 的一级分类及其子分类（之前错误创建的）
-bad_l1_ids = Category.objects.filter(parent=None).exclude(id__in=[1, 2, 3, 4]).values_list('id', flat=True)
-if bad_l1_ids:
-    Category.objects.filter(parent_id__in=bad_l1_ids).delete()
-    Category.objects.filter(id__in=bad_l1_ids).delete()
-    print(f'Cleaned bad L1 categories: {list(bad_l1_ids)}')
+# 清理旧数据：删除不在 1-12 范围内的一级分类及其子分类
+old_l1_ids = Category.objects.filter(parent=None).exclude(id__in=list(range(1, 13))).values_list('id', flat=True)
+if old_l1_ids:
+    Category.objects.filter(parent_id__in=old_l1_ids).delete()
+    Category.objects.filter(id__in=old_l1_ids).delete()
+    print(f'Cleaned old L1 categories: {list(old_l1_ids)}')
 
 # 一级分类（使用 update_or_create 指定 ID）
 l1_data = [
-    (1, '教学资源', f'{ICON_BASE}/teaching.png', 1),
-    (2, '学术资料', f'{ICON_BASE}/academic.png', 2),
-    (3, '管理文件', f'{ICON_BASE}/management.png', 3),
-    (4, '校园资讯', f'{ICON_BASE}/news.png', 4),
-    (5, '校园生活', f'{ICON_BASE}/campus.png', 5),
-    (6, '媒体聚焦', f'{ICON_BASE}/media.png', 6),
+    (1, '行政公文', f'{ICON_BASE}/gov.png', 1),
+    (2, '规章制度', f'{ICON_BASE}/rules.png', 2),
+    (3, '教学建设', f'{ICON_BASE}/teaching.png', 3),
+    (4, '学科建设', f'{ICON_BASE}/discipline.png', 4),
+    (5, '专业建设', f'{ICON_BASE}/major.png', 5),
+    (6, '人事档案', f'{ICON_BASE}/hr.png', 6),
+    (7, '科研学术', f'{ICON_BASE}/research.png', 7),
+    (8, '党群工作', f'{ICON_BASE}/party.png', 8),
+    (9, '财务资产', f'{ICON_BASE}/finance.png', 9),
+    (10, '学生工作', f'{ICON_BASE}/student.png', 10),
+    (11, '上级来文', f'{ICON_BASE}/superior.png', 11),
+    (12, '综合事务', f'{ICON_BASE}/general.png', 12),
 ]
 l1_map = {}  # name → id
 for cid, name, icon, order in l1_data:
@@ -71,21 +77,42 @@ for cid, name, icon, order in l1_data:
 
 # 二级分类
 l2_data = [
-    # 教学资源
-    ('教学课件', '教学资源', 1), ('课程大纲', '教学资源', 2), ('试题库', '教学资源', 3),
-    ('实验指导', '教学资源', 4), ('实习指导', '教学资源', 5), ('教材教辅', '教学资源', 6),
-    # 学术资料
-    ('论文摘要', '学术资料', 1), ('参考文献', '学术资料', 2),
-    ('毕业设计', '学术资料', 3), ('讲座报告', '学术资料', 4),
-    # 管理文件
-    ('规章制度', '管理文件', 1), ('培养方案', '管理文件', 2),
-    ('档案文件', '管理文件', 3), ('政策文件', '管理文件', 4),
-    # 校园资讯
-    ('通知公告', '校园资讯', 1), ('新闻动态', '校园资讯', 2), ('学校要闻', '校园资讯', 3),
-    # 校园生活
-    ('图文东软', '校园生活', 1), ('社团活动', '校园生活', 2), ('东软印记', '校园生活', 3),
-    # 媒体聚焦
-    ('媒体报道', '媒体聚焦', 1), ('校友风采', '媒体聚焦', 2),
+    # 行政公文
+    ('通知公告', '行政公文', 1), ('请示批复', '行政公文', 2),
+    ('工作报告', '行政公文', 3), ('会议纪要', '行政公文', 4),
+    # 规章制度
+    ('教学管理', '规章制度', 1), ('科研管理', '规章制度', 2),
+    ('人事管理制度', '规章制度', 3),
+    # 教学建设
+    ('培养方案', '教学建设', 1), ('课程建设', '教学建设', 2),
+    ('教材建设', '教学建设', 3), ('教学质量', '教学建设', 4),
+    ('实验实训', '教学建设', 5),
+    # 学科建设
+    ('学科规划', '学科建设', 1), ('学位点建设', '学科建设', 2),
+    ('重点学科申报', '学科建设', 3), ('学科评估', '学科建设', 4),
+    # 专业建设
+    ('专业申报', '专业建设', 1), ('专业认证', '专业建设', 2),
+    ('一流专业建设', '专业建设', 3), ('专业评估', '专业建设', 4),
+    # 人事档案
+    ('教师档案', '人事档案', 1), ('职称评聘', '人事档案', 2),
+    ('考核评价', '人事档案', 3), ('人才引进', '人事档案', 4),
+    # 科研学术
+    ('项目申报', '科研学术', 1), ('科研成果', '科研学术', 2),
+    ('学术论文', '科研学术', 3), ('学术会议', '科研学术', 4),
+    # 党群工作
+    ('党务公文', '党群工作', 1), ('组织建设', '党群工作', 2),
+    ('纪检监察', '党群工作', 3), ('工会团委', '党群工作', 4),
+    # 财务资产
+    ('预决算', '财务资产', 1), ('经费管理', '财务资产', 2),
+    ('资产管理', '财务资产', 3), ('审计', '财务资产', 4),
+    # 学生工作
+    ('招生就业', '学生工作', 1), ('奖助管理', '学生工作', 2),
+    ('学生活动', '学生工作', 3), ('学籍', '学生工作', 4),
+    # 上级来文
+    ('教育部文件', '上级来文', 1), ('省厅文件', '上级来文', 2),
+    # 综合事务
+    ('发展规划', '综合事务', 1), ('校园建设', '综合事务', 2),
+    ('信息化', '综合事务', 3), ('安全保卫', '综合事务', 4),
 ]
 for name, parent_name, order in l2_data:
     parent_id = l1_map[parent_name]

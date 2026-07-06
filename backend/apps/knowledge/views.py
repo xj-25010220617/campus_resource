@@ -8,6 +8,8 @@ from datetime import datetime, timedelta
 import django_filters
 import requests
 
+import oss2
+
 from django.db import transaction
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
@@ -728,17 +730,18 @@ class TextUploadView(APIView):
     管理员手动录入文本
 
     POST /api/knowledge/upload/text/
-    功能：管理员手动输入文本内容，后端直传 OSS 并创建知识文档记录
+    功能：管理员手动输入文本内容，后端直传 OSS 并创建知识文档记录。
+          未提供的字段（title/description/category_id/keywords）由 AI 自动填充。
     请求参数：
-        - title (str, required): 文档标题
         - content (str, required): 文本内容
-        - description (str, optional): 文档描述
+        - title (str, optional): 文档标题（未提供时 AI 自动生成）
+        - description (str, optional): 文档描述（未提供时 AI 生成）
         - scope (str, default=college): 归属范围（school/college/department）
         - college_id (int, optional): 学院 ID（默认使用上传者学院ID）
         - department_id (int, optional): 部门 ID（默认使用上传者部门ID）
         - discipline_id (int, optional): 学科方向 ID
-        - category_id (int, optional): 资源类型 ID（必须是二级分类）
-        - keywords (list[str], optional): 关键词列表
+        - category_id (int, optional): 资源类型 ID（未提供时 AI 推荐）
+        - keywords (list[str], optional): 关键词列表（未提供时 AI 提取）
     返回：{"id": <doc.id>, "status": "uploaded", "file_name": "<title>.txt"}
     """
     permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
@@ -749,20 +752,57 @@ class TextUploadView(APIView):
         import uuid
 
         # 填充默认值：学院ID和部门ID默认使用上传者的
-        data = request.data.copy()
-        if 'scope' not in data:
-            data['scope'] = 'college'
-        if 'college_id' not in data or data['college_id'] is None:
-            data['college_id'] = request.user.college_id
-        if 'department_id' not in data or data['department_id'] is None:
-            data['department_id'] = request.user.department_id
+        req_data = request.data.copy()
+        if 'scope' not in req_data:
+            req_data['scope'] = 'college'
+        if 'college_id' not in req_data or req_data.get('college_id') in (None, '', 'null'):
+            req_data['college_id'] = request.user.college_id
+        if 'department_id' not in req_data or req_data.get('department_id') in (None, '', 'null'):
+            req_data['department_id'] = request.user.department_id
 
-        serializer = TextUploadSerializer(data=data)
+        serializer = TextUploadSerializer(data=req_data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
+        content = data['content']
+
         # 校验分类关联数据合法性（复用 UploadCallbackView 的校验逻辑）
         UploadCallbackView._validate_classification(data)
+
+        # AI 自动填充缺失字段
+        user_title = data.get('title', '')
+        user_description = data.get('description', '')
+        user_category_id = data.get('category_id')
+        user_keywords = data.get('keywords', [])
+
+        needs_ai = (
+            not user_title
+            or not user_description
+            or not user_category_id
+            or not user_keywords
+        )
+        if needs_ai:
+            ai_result = _ai_classify(user_title or '', content[:2000])
+            if ai_result:
+                title = user_title or ai_result['title'] or '未命名文档'
+                description = user_description or ai_result['description'] or ''
+                category_id = user_category_id or ai_result['category_id']
+                keywords = user_keywords or ai_result['keywords']
+            else:
+                # AI 不可用降级
+                title = user_title or '未命名文档'
+                description = user_description
+                category_id = user_category_id or None
+                keywords = user_keywords or []
+        else:
+            title = user_title
+            description = user_description
+            category_id = user_category_id
+            keywords = user_keywords
+
+        title = title or '未命名文档'
+        description = description or ''
+        category_id = category_id or None
 
         # 生成 OSS 对象 Key
         now = datetime.now()
@@ -771,7 +811,6 @@ class TextUploadView(APIView):
         oss_key = f'knowledge/{scope}/{owner_id}/{now:%Y-%m}/{uuid.uuid4().hex[:12]}.txt'
 
         # 上传文本到 OSS
-        content = data['content']
         success = oss_client.upload_text(content, oss_key)
         if not success:
             return Response(
@@ -787,12 +826,12 @@ class TextUploadView(APIView):
 
         # 创建 KnowledgeDoc 记录
         new_doc = KnowledgeDoc.objects.create(
-            title=data['title'],
-            description=data.get('description', ''),
+            title=title,
+            description=description,
             source_type='upload',
             oss_key=oss_key,
             oss_url=oss_url,
-            file_name=f'{data["title"]}.txt',
+            file_name=f'{title}.txt',
             file_type='txt',
             file_size=len(content.encode('utf-8')),
             md5_hash=md5_hash,
@@ -800,22 +839,22 @@ class TextUploadView(APIView):
             college_id=data.get('college_id') or request.user.college_id,
             department_id=data.get('department_id') or request.user.department_id,
             discipline_id=data.get('discipline_id'),
-            category_id=data.get('category_id'),
+            category_id=category_id,
             uploader=request.user,
             status='uploaded',
             visibility=data.get('visibility', 'public'),
         )
 
         # 创建关联关键词
-        keywords = data.get('keywords', [])
         for phrase in keywords:
-            Keyword.objects.create(
-                doc=new_doc,
-                phrase=phrase,
-                match_type='fuzzy',
-                weight=1,
-                created_by=request.user,
-            )
+            if isinstance(phrase, str) and phrase.strip():
+                Keyword.objects.create(
+                    doc=new_doc,
+                    phrase=phrase.strip(),
+                    match_type='fuzzy',
+                    weight=1,
+                    created_by=request.user,
+                )
 
         return Response({
             'id': new_doc.id,
@@ -986,20 +1025,26 @@ class FileUploadView(APIView):
     文件直传上传接口（multipart/form-data）
 
     POST /api/knowledge/upload/file/
-    功能：接收前端上传的文件，后端存到 OSS 并创建知识文档记录
+    功能：接收前端上传的文件，后端存到 OSS 并创建知识文档记录。
+          未提供的字段（title/description/category_id/keywords）由 AI 自动填充。
     请求参数（form-data）：
         - file (file, required): 上传的文件
-        - title (str, required): 文档标题
-        - description (str, optional): 文档描述
-        - college_id (int, required): 学院 ID
-        - discipline_id (int, required): 学科方向 ID
-        - category_id (int, required): 资源类型 ID（必须是二级分类）
-        - keywords (str, optional): JSON 数组字符串，如 '["关键词1","关键词2"]'
+        - title (str, optional): 文档标题（默认使用文件名，AI 可优化）
+        - description (str, optional): 文档描述（未提供时 AI 生成）
+        - scope (str, default=college): 归属范围（school/college/department）
+        - college_id (int, optional): 学院 ID（默认使用上传者学院ID）
+        - department_id (int, optional): 部门 ID（默认使用上传者部门ID）
+        - discipline_id (int, optional): 学科方向 ID
+        - category_id (int, optional): 资源类型 ID（未提供时 AI 推荐）
+        - keywords (str, optional): JSON 数组字符串，如 '["关键词1","关键词2"]'（未提供时 AI 提取）
         - visibility (str, optional): public/private，默认 public
     返回：{"id": <doc.id>, "status": "uploaded", "file_name": "..."}
     """
     permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
     parser_classes = [parsers.MultiPartParser, parsers.FormParser]
+
+    # 可提取文本的文件类型
+    TEXT_EXTRACTABLE_TYPES = {'txt', 'md', 'html', 'csv', 'json', 'xml', 'yaml', 'yml'}
 
     def post(self, request):
         """处理文件上传"""
@@ -1007,7 +1052,16 @@ class FileUploadView(APIView):
         import json
         import uuid
 
-        serializer = FileUploadSerializer(data=request.data)
+        # 填充默认值：scope/college_id/department_id 默认使用上传者的
+        req_data = request.data.copy()
+        if 'scope' not in req_data:
+            req_data['scope'] = 'college'
+        if 'college_id' not in req_data or req_data.get('college_id') in (None, '', 'null'):
+            req_data['college_id'] = request.user.college_id
+        if 'department_id' not in req_data or req_data.get('department_id') in (None, '', 'null'):
+            req_data['department_id'] = request.user.department_id
+
+        serializer = FileUploadSerializer(data=req_data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         uploaded_file = data['file']
@@ -1035,36 +1089,82 @@ class FileUploadView(APIView):
 
         # 上传到 OSS
         try:
-            # 检查 OSS 客户端是否已正确初始化
             if not oss_client.bucket:
                 logger.error(f'OSS Bucket 未初始化，请检查 OSS 配置')
                 return Response(
                     {'detail': 'OSS 配置异常，请联系管理员', 'code': 'OSS_CONFIG_ERROR'},
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 )
-            
+
             oss_client.bucket.put_object(oss_key, file_bytes)
             oss_url = f'https://{oss_client.bucket_name}.{oss_client.endpoint}/{oss_key}'
             logger.info(f'OSS 上传成功 oss_key={oss_key}, size={len(file_bytes)}')
         except oss2.exceptions.OssError as e:
-            # OSS 服务端错误（权限、Bucket不存在等）
             logger.error(f'OSS 服务端错误 oss_key={oss_key}: {e}')
             return Response(
                 {'detail': f'OSS 服务错误: {str(e)}', 'code': 'OSS_SERVER_ERROR'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
         except Exception as e:
-            # 其他错误（网络、配置等）
             logger.error(f'OSS 文件上传失败 oss_key={oss_key}: {type(e).__name__}: {e}')
             return Response(
                 {'detail': f'文件上传失败: {str(e)}', 'code': 'UPLOAD_FAILED'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
+        # 确定初始 title：优先用户提供 → 文件名（去扩展名）
+        user_title = data.get('title', '')
+        fallback_title = uploaded_file.name.rsplit('.', 1)[0] if '.' in uploaded_file.name else uploaded_file.name
+        title = user_title or fallback_title
+
+        # 提取文本内容（用于 AI 分析）
+        extracted_text = ''
+        if ext in self.TEXT_EXTRACTABLE_TYPES:
+            try:
+                extracted_text = file_bytes.decode('utf-8', errors='replace')[:4000]
+            except Exception:
+                pass
+
+        # AI 自动填充缺失字段
+        user_description = data.get('description', '')
+        user_category_id = data.get('category_id')
+        raw_keywords = data.get('keywords', '')
+
+        needs_ai = (
+            not user_title
+            or not user_description
+            or not user_category_id
+            or not (isinstance(raw_keywords, str) and raw_keywords.strip())
+        )
+        if needs_ai:
+            ai_result = _ai_classify(title, extracted_text)
+            if ai_result:
+                title = user_title or ai_result['title'] or fallback_title
+                description = user_description or ai_result['description'] or ''
+                category_id = user_category_id or ai_result['category_id']
+                # 关键词：用户提供的优先
+                if isinstance(raw_keywords, str) and raw_keywords.strip():
+                    keywords_list = None  # 稍后解析
+                else:
+                    raw_keywords = ai_result['keywords']
+            else:
+                # AI 不可用降级
+                title = title or fallback_title
+                description = user_description
+                category_id = user_category_id
+        else:
+            description = user_description
+            category_id = user_category_id
+
+        # 二次归一：确保变量有值
+        title = title or fallback_title
+        description = description or ''
+        category_id = category_id or None
+
         # 创建 KnowledgeDoc 记录
         new_doc = KnowledgeDoc.objects.create(
-            title=data['title'],
-            description=data.get('description', ''),
+            title=title,
+            description=description,
             source_type='upload',
             oss_key=oss_key,
             oss_url=oss_url,
@@ -1076,26 +1176,26 @@ class FileUploadView(APIView):
             college_id=data.get('college_id') or request.user.college_id,
             department_id=data.get('department_id') or request.user.department_id,
             discipline_id=data.get('discipline_id'),
-            category_id=data.get('category_id'),
+            category_id=category_id,
             uploader=request.user,
             status='uploaded',
             visibility=data.get('visibility', 'public'),
         )
 
         # 解析并创建关联关键词（兼容 JSON 字符串和列表两种格式）
-        raw_keywords = data.get('keywords', '')
         if isinstance(raw_keywords, str) and raw_keywords.strip():
             try:
                 raw_keywords = json.loads(raw_keywords)
             except (json.JSONDecodeError, TypeError):
                 raw_keywords = []
-        elif not isinstance(raw_keywords, list):
+        if not isinstance(raw_keywords, list):
             raw_keywords = []
         for phrase in raw_keywords:
-            Keyword.objects.create(
-                doc=new_doc, phrase=phrase,
-                match_type='fuzzy', weight=1, created_by=request.user,
-            )
+            if isinstance(phrase, str) and phrase.strip():
+                Keyword.objects.create(
+                    doc=new_doc, phrase=phrase.strip(),
+                    match_type='fuzzy', weight=1, created_by=request.user,
+                )
 
         return Response({
             'id': new_doc.id,
@@ -1104,88 +1204,138 @@ class FileUploadView(APIView):
         })
 
 
+def _ai_classify(title: str = '', content: str = '') -> dict | None:
+    """调用 LLM 进行智能分类，返回包含 title/description/keywords/category_id 等字段的字典。
+
+    供 AIClassifyView、FileUploadView、TextUploadView 复用。
+    失败时返回 None，调用方自行降级处理。
+
+    Args:
+        title: 文档标题（可为空字符串）
+        content: 文本内容片段（可为空字符串）
+
+    Returns:
+        成功: {'title': str, 'description': str, 'keywords': list[str],
+                'category_id': int, 'first_level_name': str, 'second_level_name': str,
+                'confidence': str}
+        失败: None
+    """
+    import json
+    import re
+
+    first_level = list(Category.objects.filter(parent__isnull=True).values('id', 'name'))
+    second_level = list(Category.objects.filter(parent__isnull=False).values(
+        'id', 'name', 'parent__name',
+    ))
+    if not first_level or not second_level:
+        logger.warning('AI 分类失败：分类数据未初始化')
+        return None
+
+    l1_list = ', '.join(c['name'] for c in first_level)
+    l2_list = ', '.join(f"{c['parent__name']}>{c['name']}" for c in second_level)
+
+    prompt = (
+        f"你是校园知识库智能助手。请根据文档信息完成以下任务：\n"
+        f"1. 如果标题为空，根据内容生成一个简洁的文档标题（20字以内）\n"
+        f"2. 如果内容非空，生成一段100-200字的文档描述\n"
+        f"3. 提取5-10个关键词\n"
+        f"4. 推荐最合适的一级和二级分类\n\n"
+        f"一级分类（仅限）：{l1_list}\n"
+        f"二级分类（仅限）：{l2_list}\n\n"
+        f"文档标题：{title or '（未提供，请根据内容生成）'}\n"
+        f"文档内容：{content[:2000] or '（未提供）'}\n\n"
+        f"只返回JSON（不要markdown代码块标记）：\n"
+        f'{{"title":"生成的标题","description":"生成的描述","keywords":["关键词1","关键词2",...],"first_level":"一级分类名","second_level":"二级分类名","confidence":"high|medium|low"}}'
+    )
+
+    try:
+        from utils.llm import llm_client
+        raw = llm_client.chat(
+            messages=[{'role': 'user', 'content': prompt}],
+            temperature=0.0, max_tokens=500,
+        )
+    except Exception as e:
+        logger.error(f'LLM 分类推荐失败: {e}')
+        return None
+
+    if not raw:
+        logger.warning('LLM 分类推荐返回空结果')
+        return None
+
+    try:
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        result = json.loads(match.group(0)) if match else json.loads(raw)
+    except (json.JSONDecodeError, AttributeError):
+        logger.warning(f'LLM 分类解析失败 raw={raw[:200]}')
+        return None
+
+    # 匹配分类
+    l1 = next((c for c in first_level if c['name'] == result.get('first_level', '')), None)
+    l2 = next((c for c in second_level if c['name'] == result.get('second_level', '')), None)
+
+    return {
+        'title': result.get('title', '') or title or '未命名文档',
+        'description': result.get('description', ''),
+        'keywords': result.get('keywords', []),
+        'category_id': l2['id'] if l2 else None,
+        'first_level_name': l1['name'] if l1 else None,
+        'second_level_name': l2['name'] if l2 else None,
+        'confidence': result.get('confidence', 'medium'),
+    }
+
+
 class AIClassifyView(APIView):
     """
     AI 智能分类推荐
 
     POST /api/knowledge/upload/ai-classify/
-    功能：接收文件标题和内容片段，调用 LLM 分析并推荐最匹配的二级分类
+    功能：接收文件标题和内容片段，调用 LLM 分析并返回推荐的分类、标题、描述和关键词
     请求参数：
-        - title (str, required): 文件标题
+        - title (str, optional): 文件标题（为空时 AI 根据内容自动生成）
         - content (str, optional): 文本内容片段（建议前 2000 字）
-    返回：{"first_level": {"id": 1, "name": "教学资源"}, "second_level": {"id": 5, "name": "教学课件"}, "confidence": "high"}
+    返回：
+        {
+            "title": "AI生成的标题",
+            "description": "AI生成的描述",
+            "keywords": ["关键词1", "关键词2", ...],
+            "first_level": {"id": 1, "name": "行政公文"},
+            "second_level": {"id": 5, "name": "通知公告"},
+            "confidence": "high"
+        }
     """
     permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
 
     def post(self, request):
         """AI 分析并推荐分类"""
-        import json
-        import re
-
         serializer = AIClassifySerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
-        title = data['title']
+        title = data.get('title', '')
         content = data.get('content', '')
 
-        first_level = list(Category.objects.filter(parent__isnull=True).values('id', 'name'))
-        second_level = list(Category.objects.filter(parent__isnull=False).values(
-            'id', 'name', 'parent__name',
-        ))
-        if not first_level or not second_level:
+        # 调用公共 AI 分类函数
+        ai_result = _ai_classify(title, content)
+
+        if ai_result is None:
             return Response(
-                {'detail': '分类数据尚未初始化，请联系管理员', 'code': 'NO_CATEGORIES'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-
-        l1_list = ', '.join(c['name'] for c in first_level)
-        l2_list = ', '.join(f"{c['parent__name']}>{c['name']}" for c in second_level)
-
-        prompt = (
-            f"你是校园知识库分类助手。请根据文件信息推荐最合适的一级和二级分类。\n\n"
-            f"一级分类（仅限）：{l1_list}\n"
-            f"二级分类（仅限）：{l2_list}\n\n"
-            f"文件标题：{title}\n"
-            f"文件内容片段：{content[:2000]}\n\n"
-            f"只返回JSON：{{\"first_level\":\"一级名\",\"second_level\":\"二级名\",\"confidence\":\"high|medium|low\"}}"
-        )
-
-        try:
-            from utils.llm import llm_client
-            raw = llm_client.chat(
-                messages=[{'role': 'user', 'content': prompt}],
-                temperature=0.0, max_tokens=150,
-            )
-        except Exception as e:
-            logger.error(f'LLM 分类推荐失败: {e}')
-            return Response(
-                {'detail': 'AI 服务暂时不可用，请手动选择分类', 'code': 'AI_UNAVAILABLE'},
+                {'detail': 'AI 服务暂时不可用，请手动填写信息', 'code': 'AI_UNAVAILABLE'},
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
 
-        if not raw:
-            return Response(
-                {'detail': 'AI 未返回有效结果', 'code': 'EMPTY_RESPONSE'},
-                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            )
-
-        try:
-            match = re.search(r'\{.*\}', raw, re.DOTALL)
-            result = json.loads(match.group(0)) if match else json.loads(raw)
-        except (json.JSONDecodeError, AttributeError):
-            logger.warning(f'LLM 分类解析失败 raw={raw[:200]}')
-            return Response(
-                {'detail': 'AI 结果解析失败，请手动选择分类', 'code': 'PARSE_ERROR'},
-                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            )
-
-        l1 = next((c for c in first_level if c['name'] == result.get('first_level', '')), None)
-        l2 = next((c for c in second_level if c['name'] == result.get('second_level', '')), None)
+        # 获取分类 ID 用于返回
+        first_level = list(Category.objects.filter(parent__isnull=True).values('id', 'name'))
+        l1 = next((c for c in first_level if c['name'] == ai_result.get('first_level_name', '')), None)
 
         return Response({
+            'title': ai_result['title'],
+            'description': ai_result['description'],
+            'keywords': ai_result['keywords'],
             'first_level': {'id': l1['id'], 'name': l1['name']} if l1 else None,
-            'second_level': {'id': l2['id'], 'name': l2['name']} if l2 else None,
-            'confidence': result.get('confidence', 'medium'),
+            'second_level': {
+                'id': ai_result['category_id'],
+                'name': ai_result['second_level_name'],
+            } if ai_result['category_id'] else None,
+            'confidence': ai_result['confidence'],
         })
 
