@@ -1,0 +1,661 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "校园资源管理系统 - 超管日志接口",
+    "description": "本批接口仅 super_admin 可访问，覆盖 admin_login_log / admin_operation_log 的写入，以及 5 类日志（upload / query / sensitive / login / operation）的列表 / 详情 / 统计 / Dashboard 聚合。\n\n修改日期：2026-07-06\n关联文档：docs/前端对接接口文档-Admin-Logs-2026-07-06.md\n\n鉴权方式：所有接口均需 Authorization: Bearer <jwt_token>。登录后从 /api/auth/login/ 获取 access token。",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8000/api",
+      "description": "本地开发"
+    },
+    {
+      "url": "http://rm-bp18t1fwh5xb9cj7hro.mysql.rds.aliyuncs.com:8000/api",
+      "description": "阿里云 RDS（远程）"
+    }
+  ],
+  "tags": [
+    {"name": "超管日志-上传日志", "description": "上传日志列表 / 详情 / 统计"},
+    {"name": "超管日志-查询日志", "description": "RAG 查询日志（含召回、反馈、耗时）"},
+    {"name": "超管日志-敏感内容", "description": "敏感内容日志（涉密词拦截记录）"},
+    {"name": "超管日志-登录日志", "description": "登录审计（JWT / SSO / SSO Mock）"},
+    {"name": "超管日志-操作日志", "description": "超管后台 CRUD 审计"},
+    {"name": "超管日志-聚合", "description": "Dashboard 五类日志聚合"}
+  ],
+  "paths": {
+    "/admin/logs/upload/": {
+      "get": {
+        "tags": ["超管日志-上传日志"],
+        "summary": "上传日志列表",
+        "description": "分页返回所有上传日志（不过滤范围，超管可看全量）",
+        "operationId": "adminListUploadLogs",
+        "parameters": [
+          {"name": "page", "in": "query", "schema": {"type": "integer", "default": 1}, "description": "页码"},
+          {"name": "page_size", "in": "query", "schema": {"type": "integer", "default": 20}, "description": "每页数量"},
+          {"name": "user_id", "in": "query", "schema": {"type": "integer"}, "description": "上传用户 ID"},
+          {"name": "status", "in": "query", "schema": {"type": "string", "enum": ["pending", "success", "failed"]}, "description": "上传状态"},
+          {"name": "college_id", "in": "query", "schema": {"type": "integer"}, "description": "学院 ID"},
+          {"name": "department_id", "in": "query", "schema": {"type": "integer"}, "description": "部门 ID"},
+          {"name": "file_type", "in": "query", "schema": {"type": "string"}, "description": "文件类型：pdf/doc/ppt/xls/image/video/audio/other"},
+          {"name": "date_from", "in": "query", "schema": {"type": "string"}, "description": "起始日期 YYYY-MM-DD 或 ISO"},
+          {"name": "date_to", "in": "query", "schema": {"type": "string"}, "description": "结束日期 YYYY-MM-DD 或 ISO"},
+          {"name": "keyword", "in": "query", "schema": {"type": "string"}, "description": "按 file_name 模糊匹配"}
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "count": {"type": "integer"},
+                    "next": {"type": "string"},
+                    "previous": {"type": "string"},
+                    "results": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {"type": "integer"},
+                          "user": {"type": "integer"},
+                          "user_name": {"type": "string"},
+                          "resource": {"type": "integer"},
+                          "resource_title": {"type": "string"},
+                          "file_name": {"type": "string"},
+                          "file_size": {"type": "integer"},
+                          "file_type": {"type": "string"},
+                          "college": {"type": "integer"},
+                          "college_name": {"type": "string"},
+                          "status": {"type": "string", "enum": ["pending", "success", "failed"]},
+                          "error_message": {"type": "string"},
+                          "ip_address": {"type": "string"},
+                          "user_agent": {"type": "string"},
+                          "created_at": {"type": "string"},
+                          "completed_at": {"type": "string"}
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {"description": "未认证"},
+          "403": {"description": "非 super_admin"}
+        }
+      }
+    },
+    "/admin/logs/upload/{id}/": {
+      "get": {
+        "tags": ["超管日志-上传日志"],
+        "summary": "上传日志详情",
+        "operationId": "adminGetUploadLog",
+        "parameters": [
+          {"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}, "description": "日志 ID"}
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": {"type": "integer"},
+                    "user": {"type": "integer"},
+                    "user_name": {"type": "string"},
+                    "resource": {"type": "integer"},
+                    "resource_title": {"type": "string"},
+                    "file_name": {"type": "string"},
+                    "file_size": {"type": "integer"},
+                    "file_type": {"type": "string"},
+                    "college": {"type": "integer"},
+                    "college_name": {"type": "string"},
+                    "status": {"type": "string", "enum": ["pending", "success", "failed"]},
+                    "error_message": {"type": "string"},
+                    "ip_address": {"type": "string"},
+                    "user_agent": {"type": "string"},
+                    "created_at": {"type": "string"},
+                    "completed_at": {"type": "string"}
+                  }
+                }
+              }
+            }
+          },
+          "401": {"description": "未认证"},
+          "403": {"description": "非 super_admin"},
+          "404": {"description": "记录不存在"}
+        }
+      }
+    },
+    "/admin/logs/upload/stats/": {
+      "get": {
+        "tags": ["超管日志-上传日志"],
+        "summary": "上传日志统计",
+        "operationId": "adminStatsUploadLogs",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "total": {"type": "integer"},
+                    "today": {"type": "integer"},
+                    "this_week": {"type": "integer"},
+                    "this_month": {"type": "integer"},
+                    "by_status": {
+                      "type": "array",
+                      "items": {"type": "object", "properties": {"key": {"type": "string"}, "label": {"type": "string"}, "count": {"type": "integer"}}}
+                    },
+                    "by_file_type": {
+                      "type": "array",
+                      "items": {"type": "object", "properties": {"key": {"type": "string"}, "label": {"type": "string"}, "count": {"type": "integer"}}}
+                    },
+                    "by_college": {
+                      "type": "array",
+                      "items": {"type": "object", "properties": {"key": {"type": "string"}, "label": {"type": "string"}, "count": {"type": "integer"}}}
+                    },
+                    "total_size": {"type": "integer"}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/logs/query/": {
+      "get": {
+        "tags": ["超管日志-查询日志"],
+        "summary": "查询日志列表",
+        "description": "RAG 查询日志（用户提问 + 召回命中 + 反馈）",
+        "operationId": "adminListQueryLogs",
+        "parameters": [
+          {"name": "user_id", "in": "query", "schema": {"type": "integer"}, "description": "用户 ID"},
+          {"name": "user_feedback", "in": "query", "schema": {"type": "string", "enum": ["1", "0", "-1"]}, "description": "用户反馈：1=赞 / 0=踩 / -1=无反馈（前端传字符串）"},
+          {"name": "hit_count_min", "in": "query", "schema": {"type": "integer"}, "description": "召回命中下限（≥N）"},
+          {"name": "date_from", "in": "query", "schema": {"type": "string"}, "description": "YYYY-MM-DD 或 ISO"},
+          {"name": "date_to", "in": "query", "schema": {"type": "string"}, "description": "YYYY-MM-DD 或 ISO"},
+          {"name": "keyword", "in": "query", "schema": {"type": "string"}, "description": "按问题模糊匹配"}
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "count": {"type": "integer"},
+                    "next": {"type": "string"},
+                    "previous": {"type": "string"},
+                    "results": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {"type": "integer"},
+                          "user": {"type": "integer"},
+                          "user_name": {"type": "string"},
+                          "conversation": {"type": "integer"},
+                          "question": {"type": "string"},
+                          "parsed_filters": {"type": "object"},
+                          "hit_count": {"type": "integer"},
+                          "top_doc_ids": {"type": "array", "items": {"type": "integer"}},
+                          "response_ms": {"type": "integer"},
+                          "user_feedback": {"type": "integer"},
+                          "created_at": {"type": "string"}
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/logs/query/{id}/": {
+      "get": {
+        "tags": ["超管日志-查询日志"],
+        "summary": "查询日志详情",
+        "operationId": "adminGetQueryLog",
+        "parameters": [
+          {"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}, "description": "日志 ID"}
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": {"type": "integer"},
+                    "user": {"type": "integer"},
+                    "user_name": {"type": "string"},
+                    "conversation": {"type": "integer"},
+                    "question": {"type": "string"},
+                    "parsed_filters": {"type": "object"},
+                    "hit_count": {"type": "integer"},
+                    "top_doc_ids": {"type": "array", "items": {"type": "integer"}},
+                    "response_ms": {"type": "integer"},
+                    "user_feedback": {"type": "integer"},
+                    "created_at": {"type": "string"}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/logs/query/stats/": {
+      "get": {
+        "tags": ["超管日志-查询日志"],
+        "summary": "查询日志统计",
+        "operationId": "adminStatsQueryLogs",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "total": {"type": "integer"},
+                    "today": {"type": "integer"},
+                    "this_week": {"type": "integer"},
+                    "this_month": {"type": "integer"},
+                    "avg_hit_count": {"type": "number"},
+                    "avg_response_ms": {"type": "integer"},
+                    "like_rate": {"type": "number", "description": "0-1 之间的小数"},
+                    "by_feedback": {
+                      "type": "array",
+                      "items": {"type": "object", "properties": {"key": {"type": "string"}, "label": {"type": "string"}, "count": {"type": "integer"}}}
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/logs/sensitive/": {
+      "get": {
+        "tags": ["超管日志-敏感内容"],
+        "summary": "敏感内容日志列表",
+        "operationId": "adminListSensitiveLogs",
+        "parameters": [
+          {"name": "user_id", "in": "query", "schema": {"type": "integer"}, "description": "用户 ID"},
+          {"name": "date_from", "in": "query", "schema": {"type": "string"}, "description": "YYYY-MM-DD 或 ISO"},
+          {"name": "date_to", "in": "query", "schema": {"type": "string"}, "description": "YYYY-MM-DD 或 ISO"},
+          {"name": "keyword", "in": "query", "schema": {"type": "string"}, "description": "按问题模糊匹配"}
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "count": {"type": "integer"},
+                    "next": {"type": "string"},
+                    "previous": {"type": "string"},
+                    "results": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {"type": "integer"},
+                          "user": {"type": "integer"},
+                          "user_name": {"type": "string"},
+                          "question": {"type": "string"},
+                          "matched_rules": {"type": "array", "items": {"type": "object"}},
+                          "matched_texts": {"type": "array", "items": {"type": "string"}},
+                          "refuse_message": {"type": "string"},
+                          "created_at": {"type": "string"}
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/logs/sensitive/{id}/": {
+      "get": {
+        "tags": ["超管日志-敏感内容"],
+        "summary": "敏感内容日志详情",
+        "operationId": "adminGetSensitiveLog",
+        "parameters": [
+          {"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}, "description": "日志 ID"}
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": {"type": "integer"},
+                    "user": {"type": "integer"},
+                    "user_name": {"type": "string"},
+                    "question": {"type": "string"},
+                    "matched_rules": {"type": "array", "items": {"type": "object"}},
+                    "matched_texts": {"type": "array", "items": {"type": "string"}},
+                    "refuse_message": {"type": "string"},
+                    "created_at": {"type": "string"}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/logs/login/": {
+      "get": {
+        "tags": ["超管日志-登录日志"],
+        "summary": "登录日志列表",
+        "operationId": "adminListLoginLogs",
+        "parameters": [
+          {"name": "user_id", "in": "query", "schema": {"type": "integer"}, "description": "用户 ID"},
+          {"name": "username", "in": "query", "schema": {"type": "string"}, "description": "按用户名模糊匹配"},
+          {"name": "login_type", "in": "query", "schema": {"type": "string", "enum": ["jwt", "sso", "sso_mock"]}, "description": "登录方式"},
+          {"name": "success", "in": "query", "schema": {"type": "boolean"}, "description": "true=成功 false=失败"},
+          {"name": "date_from", "in": "query", "schema": {"type": "string"}, "description": "YYYY-MM-DD 或 ISO"},
+          {"name": "date_to", "in": "query", "schema": {"type": "string"}, "description": "YYYY-MM-DD 或 ISO"}
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "count": {"type": "integer"},
+                    "next": {"type": "string"},
+                    "previous": {"type": "string"},
+                    "results": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {"type": "integer"},
+                          "user": {"type": "integer"},
+                          "user_name": {"type": "string"},
+                          "username": {"type": "string"},
+                          "login_type": {"type": "string", "enum": ["jwt", "sso", "sso_mock"]},
+                          "login_type_display": {"type": "string"},
+                          "success": {"type": "boolean"},
+                          "fail_reason": {"type": "string"},
+                          "ip_address": {"type": "string"},
+                          "user_agent": {"type": "string"},
+                          "created_at": {"type": "string"}
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/logs/login/{id}/": {
+      "get": {
+        "tags": ["超管日志-登录日志"],
+        "summary": "登录日志详情",
+        "operationId": "adminGetLoginLog",
+        "parameters": [
+          {"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}, "description": "日志 ID"}
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": {"type": "integer"},
+                    "user": {"type": "integer"},
+                    "user_name": {"type": "string"},
+                    "username": {"type": "string"},
+                    "login_type": {"type": "string", "enum": ["jwt", "sso", "sso_mock"]},
+                    "login_type_display": {"type": "string"},
+                    "success": {"type": "boolean"},
+                    "fail_reason": {"type": "string"},
+                    "ip_address": {"type": "string"},
+                    "user_agent": {"type": "string"},
+                    "created_at": {"type": "string"}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/logs/login/stats/": {
+      "get": {
+        "tags": ["超管日志-登录日志"],
+        "summary": "登录日志统计",
+        "operationId": "adminStatsLoginLogs",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "total": {"type": "integer"},
+                    "today": {"type": "integer"},
+                    "this_week": {"type": "integer"},
+                    "this_month": {"type": "integer"},
+                    "success_count": {"type": "integer"},
+                    "fail_count": {"type": "integer"},
+                    "by_success": {
+                      "type": "array",
+                      "items": {"type": "object", "properties": {"key": {"type": "string"}, "label": {"type": "string"}, "count": {"type": "integer"}}}
+                    },
+                    "by_type": {
+                      "type": "array",
+                      "items": {"type": "object", "properties": {"key": {"type": "string"}, "label": {"type": "string"}, "count": {"type": "integer"}}}
+                    },
+                    "by_hour": {
+                      "type": "array",
+                      "items": {"type": "object", "properties": {"key": {"type": "string"}, "label": {"type": "string"}, "count": {"type": "integer"}}}
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/logs/operation/": {
+      "get": {
+        "tags": ["超管日志-操作日志"],
+        "summary": "操作日志列表",
+        "operationId": "adminListOperationLogs",
+        "parameters": [
+          {"name": "operator_id", "in": "query", "schema": {"type": "integer"}, "description": "操作人 ID"},
+          {"name": "action", "in": "query", "schema": {"type": "string", "enum": ["create", "update", "delete", "reset_password", "batch_delete", "batch_reset_password"]}, "description": "操作类型"},
+          {"name": "target_type", "in": "query", "schema": {"type": "string", "enum": ["user", "resource", "category"]}, "description": "对象类型"},
+          {"name": "target_id", "in": "query", "schema": {"type": "integer"}, "description": "对象 ID"},
+          {"name": "date_from", "in": "query", "schema": {"type": "string"}, "description": "YYYY-MM-DD 或 ISO"},
+          {"name": "date_to", "in": "query", "schema": {"type": "string"}, "description": "YYYY-MM-DD 或 ISO"}
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "count": {"type": "integer"},
+                    "next": {"type": "string"},
+                    "previous": {"type": "string"},
+                    "results": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {"type": "integer"},
+                          "operator": {"type": "integer"},
+                          "operator_name": {"type": "string"},
+                          "operator_username": {"type": "string"},
+                          "action": {"type": "string", "enum": ["create", "update", "delete", "reset_password", "batch_delete", "batch_reset_password"]},
+                          "action_display": {"type": "string"},
+                          "target_type": {"type": "string", "enum": ["user", "resource", "category"]},
+                          "target_type_display": {"type": "string"},
+                          "target_id": {"type": "integer"},
+                          "target_repr": {"type": "string"},
+                          "after": {"type": "object"},
+                          "ip_address": {"type": "string"},
+                          "user_agent": {"type": "string"},
+                          "created_at": {"type": "string"}
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/logs/operation/{id}/": {
+      "get": {
+        "tags": ["超管日志-操作日志"],
+        "summary": "操作日志详情",
+        "operationId": "adminGetOperationLog",
+        "parameters": [
+          {"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}, "description": "日志 ID"}
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": {"type": "integer"},
+                    "operator": {"type": "integer"},
+                    "operator_name": {"type": "string"},
+                    "operator_username": {"type": "string"},
+                    "action": {"type": "string", "enum": ["create", "update", "delete", "reset_password", "batch_delete", "batch_reset_password"]},
+                    "action_display": {"type": "string"},
+                    "target_type": {"type": "string", "enum": ["user", "resource", "category"]},
+                    "target_type_display": {"type": "string"},
+                    "target_id": {"type": "integer"},
+                    "target_repr": {"type": "string"},
+                    "after": {"type": "object"},
+                    "ip_address": {"type": "string"},
+                    "user_agent": {"type": "string"},
+                    "created_at": {"type": "string"}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/logs/operation/stats/": {
+      "get": {
+        "tags": ["超管日志-操作日志"],
+        "summary": "操作日志统计",
+        "operationId": "adminStatsOperationLogs",
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "total": {"type": "integer"},
+                    "today": {"type": "integer"},
+                    "this_week": {"type": "integer"},
+                    "this_month": {"type": "integer"},
+                    "by_action": {
+                      "type": "array",
+                      "items": {"type": "object", "properties": {"key": {"type": "string"}, "label": {"type": "string"}, "count": {"type": "integer"}}}
+                    },
+                    "by_target_type": {
+                      "type": "array",
+                      "items": {"type": "object", "properties": {"key": {"type": "string"}, "label": {"type": "string"}, "count": {"type": "integer"}}}
+                    },
+                    "top_operators": {
+                      "type": "array",
+                      "items": {"type": "object", "properties": {"key": {"type": "string"}, "label": {"type": "string"}, "count": {"type": "integer"}}}
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/logs/dashboard/": {
+      "get": {
+        "tags": ["超管日志-聚合"],
+        "summary": "Dashboard 聚合",
+        "description": "返回 5 类日志在 period 区间的聚合统计，5 块各自 try/except 隔离失败（失败的块返回 {error: ...}）。",
+        "operationId": "adminLogsDashboard",
+        "parameters": [
+          {"name": "period", "in": "query", "schema": {"type": "string", "enum": ["day", "week", "month"], "default": "day"}, "description": "day=今天 / week=本周 / month=本月"}
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "period": {"type": "string", "enum": ["day", "week", "month"]},
+                    "start_at": {"type": "string"},
+                    "end_at": {"type": "string"},
+                    "blocks": {
+                      "type": "object",
+                      "properties": {
+                        "upload": {"type": "object"},
+                        "query": {"type": "object"},
+                        "sensitive": {"type": "object"},
+                        "login": {"type": "object"},
+                        "operation": {"type": "object"}
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

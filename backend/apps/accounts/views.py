@@ -1,13 +1,14 @@
 import logging
 
 from django.conf import settings
-from django.contrib.auth import get_user_model
+from django.contrib.auth import authenticate, get_user_model
 from django.db import transaction
 from drf_spectacular.utils import extend_schema
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.views import TokenObtainPairView
 
 from .serializers import UserSerializer, ChangePasswordSerializer
 
@@ -71,6 +72,43 @@ MOCK_SSO_USERS = {
         'email': 'sso_student@nsu.edu.cn',
     },
 }
+
+
+class LoggedTokenObtainPairView(TokenObtainPairView):
+    """JWT 登录（包装 SimpleJWT，写 LoginLog）
+
+    POST /api/auth/login/
+    行为：
+        - 调 TokenObtainPairView.post() 拿到响应
+        - 200 → 写 LoginLog(login_type='jwt', user=响应里的 user, success=True)
+        - 401 → 写 LoginLog(login_type='jwt', success=False, fail_reason='凭证错误')
+    """
+
+    def post(self, request, *args, **kwargs):
+        from apps.admin_panel.utils import write_login_log
+
+        response = super().post(request, *args, **kwargs)
+        success = response.status_code == 200
+        username = request.data.get('username', '') if hasattr(request, 'data') else ''
+
+        if success:
+            user_obj = User.objects.filter(username=username).first() if username else None
+            write_login_log(
+                request,
+                login_type='jwt',
+                success=True,
+                user=user_obj,
+                username=username,
+            )
+        else:
+            write_login_log(
+                request,
+                login_type='jwt',
+                success=False,
+                username=username,
+                fail_reason='凭证错误或账号不存在',
+            )
+        return response
 
 
 @extend_schema(
@@ -204,9 +242,17 @@ class SsoCallbackView(APIView):
 
     def _handle_mock_callback(self, request):
         """Mock 模式回调：根据 code 查找/创建用户并签发 JWT"""
+        from apps.admin_panel.utils import write_login_log
+
         code = request.data.get('code') or request.query_params.get('code')
 
         if not code:
+            write_login_log(
+                request,
+                login_type='sso_mock',
+                success=False,
+                fail_reason='缺少 code 参数',
+            )
             return Response(
                 {'detail': '缺少 code 参数', 'code': 'VALIDATION_ERROR'},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -214,6 +260,13 @@ class SsoCallbackView(APIView):
 
         user_info = MOCK_SSO_USERS.get(code)
         if not user_info:
+            write_login_log(
+                request,
+                login_type='sso_mock',
+                success=False,
+                username=code,
+                fail_reason=f'无效的 SSO 测试码: {code}',
+            )
             return Response(
                 {
                     'detail': f'无效的 SSO 测试码: {code}',
@@ -232,6 +285,13 @@ class SsoCallbackView(APIView):
         logger.info(
             'SSO Mock 登录: code=%s user=%s created=%s',
             code, user.username, created,
+        )
+
+        write_login_log(
+            request,
+            login_type='sso_mock',
+            success=True,
+            user=user,
         )
 
         return Response({
