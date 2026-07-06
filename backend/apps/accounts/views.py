@@ -36,6 +36,24 @@ MOCK_SSO_USERS = {
         'last_name': '管理员',
         'email': 'sso_admin@nsu.edu.cn',
     },
+    'mock_college_admin': {
+        'sso_uid': 'sso_10004',
+        'username': 'sso_college_admin',
+        'role': 'admin',
+        'first_name': '学院',
+        'last_name': '管理员',
+        'email': 'sso_college_admin@nsu.edu.cn',
+        'college_code': 'CS',
+    },
+    'mock_dept_admin': {
+        'sso_uid': 'sso_10005',
+        'username': 'sso_dept_admin',
+        'role': 'admin',
+        'first_name': '部门',
+        'last_name': '管理员',
+        'email': 'sso_dept_admin@nsu.edu.cn',
+        'college_code': 'CS',
+    },
     'mock_teacher': {
         'sso_uid': 'sso_10002',
         'username': 'sso_teacher',
@@ -226,6 +244,8 @@ class SsoCallbackView(APIView):
     @staticmethod
     def _get_or_create_sso_user(user_info):
         """根据 sso_uid 查找或创建用户"""
+        from apps.accounts.models import College
+
         with transaction.atomic():
             user = User.objects.filter(sso_uid=user_info['sso_uid']).first()
             if user:
@@ -233,8 +253,22 @@ class SsoCallbackView(APIView):
                 user.email = user_info.get('email', user.email)
                 user.first_name = user_info.get('first_name', user.first_name)
                 user.last_name = user_info.get('last_name', user.last_name)
-                user.save(update_fields=['email', 'first_name', 'last_name'])
+                update_fields = ['email', 'first_name', 'last_name']
+                # 补充 college（如之前未设置）
+                college_code = user_info.get('college_code')
+                if college_code and not user.college_id:
+                    college = College.objects.filter(code=college_code).first()
+                    if college:
+                        user.college = college
+                        update_fields.append('college')
+                user.save(update_fields=update_fields)
                 return user, False
+
+            # 解析 college
+            college = None
+            college_code = user_info.get('college_code')
+            if college_code:
+                college = College.objects.filter(code=college_code).first()
 
             # 创建新用户（SSO 用户无本地密码，用 unusable password）
             user = User.objects.create_user(
@@ -244,6 +278,7 @@ class SsoCallbackView(APIView):
                 last_name=user_info.get('last_name', ''),
                 role=user_info.get('role', 'user'),
                 sso_uid=user_info['sso_uid'],
+                college=college,
             )
             user.set_unusable_password()
             user.save(update_fields=['password'])
