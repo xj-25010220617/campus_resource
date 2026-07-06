@@ -40,13 +40,20 @@ def extract_freshness_task(self, doc_id: int):
 
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=120, ignore_result=True)
-def crawl_neusoft_website_task(self, max_pages: int = 100, uploader_id: int = 1):
+def crawl_neusoft_website_task(
+    self, max_pages: int = 100,
+    uploader_id: int = 1,
+    college_id: int = 1,
+    discipline_id: int = None,
+):
     """
     爬取成都东软学院官网并索引到知识库。
 
     Args:
         max_pages: 本次爬取最大页数
         uploader_id: 上传者用户 ID
+        college_id: 所属学院 ID（爬取的内容归入该学院）
+        discipline_id: 学科方向 ID（可选，默认自动推断）
     """
     from utils.crawler import crawl_and_index
 
@@ -54,6 +61,8 @@ def crawl_neusoft_website_task(self, max_pages: int = 100, uploader_id: int = 1)
         saved = crawl_and_index(
             max_pages=max_pages,
             uploader_id=uploader_id,
+            college_id=college_id,
+            discipline_id=discipline_id,
         )
         logger.info(f'官网爬取任务完成: 保存 {saved} 篇文档')
         return saved

@@ -79,7 +79,34 @@ REQUEST_TIMEOUT = 15
 
 
 # ------------------------------------------------------------------
-# 工具函数
+# URL 路径 → 分类 ID 映射（用于自动分类官网内容）
+# ------------------------------------------------------------------
+# 根据爬取的栏目路径，自动匹配到系统中已有的二级分类
+_SECTION_CATEGORY_MAP = {
+    "/html/984/": 41,   # 通知公告 → 行政公文>通知公告
+    "/html/977/": 23,   # 校园时讯 → 学科建设>学校要闻
+    "/html/978/": 27,   # 媒体聚焦 → 人事档案>媒体报道
+    "/html/985/": 41,   # 活动预告 → 行政公文>通知公告
+    "/html/1008/": 44,  # 学校概况 → 行政公文>会议纪要（综合信息）
+    "/html/1078/": 50,  # 人才培养 → 教学建设>教学质量
+    "/html/1011/": 50,  # 办学特色 → 教学建设>教学质量
+    "/html/1052/": 76,  # 招生就业 → 学生工作>招生就业
+    "/html/1075/": 58,  # 一流专业 → 专业建设>一流专业建设
+    "/html/1076/": 78,  # 创业学院 → 学生工作>学生活动
+    "/html/1037/": 78,  # 校园活动 → 学生工作>学生活动
+    "/html/1038/": 25,  # 社团建设 → 专业建设>社团活动
+    "/html/951/": 44,   # 发展历程 → 行政公文>会议纪要
+    "/html/1066/": 77,  # 学生意见反馈 → 学生工作>奖助管理
+    "/html/840/": 24,   # DNUI影像 → 专业建设>图文东软
+}
+
+
+def _get_category_id_for_url(url: str) -> int:
+    """根据 URL 自动匹配分类 ID。"""
+    for path, cat_id in _SECTION_CATEGORY_MAP.items():
+        if path in url:
+            return cat_id
+    return 41  # 默认：通知公告
 # ------------------------------------------------------------------
 def _normalize_url(href: str, base: str) -> Optional[str]:
     """将相对路径转为绝对 URL，并过滤非法链接。"""
@@ -344,13 +371,18 @@ def save_page_as_knowledge_doc(
     page_data: dict,
     uploader_id: int = 1,
     college_id: int = 1,
+    discipline_id: int = None,
 ) -> Optional[int]:
     """将爬取的页面保存为 KnowledgeDoc 并触发异步索引。
+
+    自动根据 URL 路径匹配分类（通知公告→行政公文/通知公告，校园时讯→学科建设/学校要闻等），
+    文本内容上传到 OSS 后走标准索引流程。
 
     Args:
         page_data: crawl_page() 返回的字典
         uploader_id: 上传者用户 ID（默认 admin）
         college_id: 所属学院 ID
+        discipline_id: 学科方向 ID（可选，默认从上传者所在学院推断）
 
     Returns:
         KnowledgeDoc.id，失败返回 None
@@ -395,23 +427,63 @@ def save_page_as_knowledge_doc(
             logger.error("无法找到上传者用户")
             return None
 
-    # 创建 KnowledgeDoc
+    # 自动匹配分类
+    category_id = _get_category_id_for_url(url)
+
+    # 如果未指定 discipline_id，尝试从上传者所在学院推断第一个学科方向
+    if discipline_id is None and college_id:
+        from apps.classify.models import Discipline
+        first = Discipline.objects.filter(
+            knowledge_docs__college_id=college_id
+        ).order_by("id").first()
+        if first:
+            discipline_id = first.id
+            logger.debug(f"自动推断 discipline_id={discipline_id}（college_id={college_id}）")
+
+    # 上传内容到 OSS（索引任务需要从 OSS 读取文本）
+    import uuid
+    from datetime import datetime
+    from utils.oss import oss_client
+
+    now = datetime.now()
+    safe_filename = f"crawl_{uuid.uuid4().hex[:12]}.txt"
+    oss_key = f"knowledge/website/0/{now:%Y-%m}/{safe_filename}"
+
+    upload_success = oss_client.upload_text(content, oss_key)
+    if not upload_success:
+        logger.error(f"OSS 上传失败，跳过保存: {title}")
+        return None
+
+    oss_url = (
+        f"https://{oss_client.bucket_name}.{oss_client.endpoint}/{oss_key}"
+        if oss_client.bucket_name and oss_client.endpoint
+        else ""
+    )
+
+    # 创建 KnowledgeDoc（使用系统的分类体系）
     doc = KnowledgeDoc.objects.create(
         title=title[:512],
         description=title[:200],
         source_type="website",
         source_url=url,
-        file_type="html",
+        file_type="txt",
         file_size=len(content.encode("utf-8")),
         md5_hash=content_hash,
+        oss_key=oss_key,
+        oss_url=oss_url,
         visibility="public",
         scope="school",
         uploader=uploader,
         college_id=college_id,
+        discipline_id=discipline_id,
+        category_id=category_id,
         status="uploaded",
     )
 
-    logger.info(f"已创建 KnowledgeDoc: id={doc.id}, title={title[:50]}")
+    logger.info(
+        f"已创建 KnowledgeDoc: id={doc.id}, title={title[:40]}, "
+        f"category_id={category_id}, college_id={college_id}"
+    )
 
     # 触发异步索引
     try:
@@ -428,8 +500,15 @@ def crawl_and_index(
     max_pages: int = 50,
     uploader_id: int = 1,
     college_id: int = 1,
+    discipline_id: int = None,
 ) -> int:
     """全站爬取并自动索引到知识库。
+
+    Args:
+        max_pages: 本次爬取最大页数
+        uploader_id: 上传者用户 ID
+        college_id: 所属学院 ID
+        discipline_id: 学科方向 ID（可选，默认自动推断）
 
     Returns:
         成功保存的文档数
@@ -439,7 +518,12 @@ def crawl_and_index(
 
     saved = 0
     for page in pages:
-        doc_id = save_page_as_knowledge_doc(page, uploader_id, college_id)
+        doc_id = save_page_as_knowledge_doc(
+            page,
+            uploader_id=uploader_id,
+            college_id=college_id,
+            discipline_id=discipline_id,
+        )
         if doc_id:
             saved += 1
 
