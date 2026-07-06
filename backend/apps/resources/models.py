@@ -3,17 +3,7 @@ from django.conf import settings
 
 
 class Resource(models.Model):
-    """资源（核心表）
-    
-    外键ID对应关系：
-    - college_id: 1=计算机与软件学院, 2=智能科学与工程学院, 3=信息与商务管理学院, 4=数字艺术与设计学院,
-                  5=外国语学院, 6=健康医疗科技学院, 7=马克思主义学院, 8=通识教育学院, 9=创新创业学院,
-                  10=继续教育学院, 11=国际教育学院, 12=体育教学部, 13=图书馆
-    - department_id: 1=校级领导, 2=党政管理部门, 3=教学管理部门, 4=学生工作部门, 5=科研与服务部门,
-                      6=后勤保障部门, 7=继续教育与国际教育
-    - category_id: 1=教学资源, 2=学术资料, 3=管理文件, 4=校园资讯, 5=校园生活, 6=媒体聚焦
-    - discipline_id: 1-31 对应各专业方向
-    """
+    """资源（核心表）"""
     STATUS_CHOICES = [
         ('draft', '草稿'),
         ('pending', '待审核'),
@@ -58,9 +48,12 @@ class Resource(models.Model):
         on_delete=models.SET_NULL,
         null=True, blank=True,
         verbose_name='学科方向',
+        db_comment='学科方向(1=软件工程,2=计算机,3=网络,4=物联网,5=网安,6=集成电路,7=大数据中外,8=大数据管理,9=机器人,10=信息工程,11=智能科学,12=数据科学,13=AI,14=信管,15=供应链,16=人力,17=电商,18=财务,19=数媒技术,20=数媒艺术,21=艺术与科技,22=VR,23=工业设计,24=视觉传达,25=动画,26=英语,27=商务英语,28=日语,29=公共外语,30=留学生,31=智能医学,32=医学信息,33=医学影像,34=健康服务,35=数字动画,36=软件技术,37=AI技术,38=医养照护)',
     )
     category = models.ForeignKey(
-        'classify.Category', on_delete=models.PROTECT, verbose_name='资源类型'
+        'classify.Category', on_delete=models.PROTECT,
+        verbose_name='资源类型',
+        db_comment='资源类型(1=教学课件,2=试题库,3=实验指导,4=规章制度,5=培养方案,6=论文摘要,7=参考资料,8=官网公告,9=新闻动态)',
     )
 
     # 状态与归属
@@ -77,10 +70,13 @@ class Resource(models.Model):
         on_delete=models.SET_NULL,
         null=True, blank=True,
         verbose_name='所属学院',
+        db_comment='所属学院(1=计算机,2=智能科学,3=信商管理,4=数字艺术,5=外国语,6=健康医疗,7=高职,8=国际,9=基础,10=马院,11=创业,12=继续教育,13=退役军人)',
     )
     department = models.ForeignKey(
         'classify.Department', on_delete=models.SET_NULL,
-        null=True, blank=True, verbose_name='所属部门',
+        null=True, blank=True,
+        verbose_name='所属部门',
+        db_comment='所属部门(1=校级领导,2=党政,3=教学管理,4=学生工作,5=科研服务,6=后勤,7=继续教育)',
     )
     scope = models.CharField(
         max_length=16, choices=SCOPE_CHOICES, default='college',
@@ -144,6 +140,7 @@ class Resource(models.Model):
         verbose_name = '资源'
         verbose_name_plural = verbose_name
         ordering = ['-created_at']
+        db_table_comment = '资源表(外键说明: college_id=学院, department_id=部门, category_id=资源类型, discipline_id=学科方向)'
         indexes = [
             models.Index(fields=['discipline', 'college'], name='idx_res_disc_college'),
             models.Index(fields=['status', 'created_at'], name='idx_res_status_created'),
@@ -191,6 +188,7 @@ class Chunk(models.Model):
         verbose_name_plural = verbose_name
         ordering = ['resource_id', 'chunk_index']
         unique_together = ['resource', 'chunk_index']
+        db_table_comment = '文档分块表(用于RAG向量化)'
         indexes = [
             models.Index(fields=['resource', 'chunk_index'], name='idx_chunk_res_index'),
             models.Index(fields=['vector_id'], name='idx_chunk_vector'),
@@ -245,13 +243,15 @@ class UploadLog(models.Model):
     file_size = models.BigIntegerField(verbose_name='文件大小（字节）')
     file_type = models.CharField(max_length=16, verbose_name='文件类型')
     college = models.ForeignKey(
-        'accounts.College', on_delete=models.PROTECT, 
-        verbose_name='所属学院（id:1=计算机与软件学院,2=智能科学与工程学院...）'
+        'accounts.College', on_delete=models.PROTECT,
+        verbose_name='所属学院',
+        db_comment='所属学院(1=计算机,2=智能科学,3=信商管理,4=数字艺术,5=外国语,6=健康医疗,7=高职,8=国际,9=基础,10=马院,11=创业,12=继续教育,13=退役军人)',
     )
     department = models.ForeignKey(
         'classify.Department', on_delete=models.SET_NULL,
-        null=True, blank=True, 
-        verbose_name='所属部门（一级:1=校级领导,2=党政管理部门,3=教学管理部门...）',
+        null=True, blank=True,
+        verbose_name='所属部门',
+        db_comment='所属部门(1=校级领导,2=党政,3=教学管理,4=学生工作,5=科研服务,6=后勤,7=继续教育)',
     )
 
     status = models.CharField(
@@ -271,6 +271,7 @@ class UploadLog(models.Model):
         verbose_name = '上传日志'
         verbose_name_plural = verbose_name
         ordering = ['-created_at']
+        db_table_comment = '上传日志表'
         indexes = [
             models.Index(fields=['user', 'created_at'], name='idx_ulog_user_created'),
             models.Index(fields=['status', 'created_at'], name='idx_ulog_status_created'),

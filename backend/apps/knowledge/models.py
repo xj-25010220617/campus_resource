@@ -3,18 +3,7 @@ from django.db import models
 
 
 class KnowledgeDoc(models.Model):
-    """知识文档——系统核心表，存储知识文档元数据、OSS 信息和索引状态
-    
-    外键ID对应关系：
-    - college_id: 1=计算机与软件学院, 2=智能科学与工程学院, 3=信息与商务管理学院, 4=数字艺术与设计学院, 
-                  5=外国语学院, 6=健康医疗科技学院, 7=马克思主义学院, 8=通识教育学院, 9=创新创业学院,
-                  10=继续教育学院, 11=国际教育学院, 12=体育教学部, 13=图书馆
-    - department_id: 1=校级领导, 2=党政管理部门, 3=教学管理部门, 4=学生工作部门, 5=科研与服务部门,
-                      6=后勤保障部门, 7=继续教育与国际教育（二级部门见下方注释）
-    - category_id: 1=教学资源, 2=学术资料, 3=管理文件, 4=校园资讯, 5=校园生活, 6=媒体聚焦（二级见下方注释）
-    - discipline_id: 1-31 对应各专业方向（见 Discipline 模型）
-    """
-
+    """知识文档——系统核心表，存储知识文档元数据、OSS 信息和索引状态"""
     STATUS_CHOICES = [
         ('uploaded', '已上传'),
         ('parsing', '解析中'),
@@ -83,21 +72,24 @@ class KnowledgeDoc(models.Model):
         on_delete=models.SET_NULL,
         null=True, blank=True,
         related_name='knowledge_docs',
-        verbose_name='学科方向（id:1=软件工程,2=计算机科学与技术,3=网络工程...）',
+        verbose_name='学科方向',
+        db_comment='学科方向(1=软件工程,2=计算机,3=网络,4=物联网,5=网安,6=集成电路,7=大数据中外,8=大数据管理,9=机器人,10=信息工程,11=智能科学,12=数据科学,13=AI,14=信管,15=供应链,16=人力,17=电商,18=财务,19=数媒技术,20=数媒艺术,21=艺术与科技,22=VR,23=工业设计,24=视觉传达,25=动画,26=英语,27=商务英语,28=日语,29=公共外语,30=留学生,31=智能医学,32=医学信息,33=医学影像,34=健康服务,35=数字动画,36=软件技术,37=AI技术,38=医养照护)',
     )
     category = models.ForeignKey(
         'classify.Category',
         on_delete=models.SET_NULL,
         null=True, blank=True,
         related_name='knowledge_docs',
-        verbose_name='资源类型（一级:1=教学资源,2=学术资料,3=管理文件,4=校园资讯,5=校园生活,6=媒体聚焦；二级见种子数据）',
+        verbose_name='资源类型',
+        db_comment='资源类型(1=教学课件,2=试题库,3=实验指导,4=规章制度,5=培养方案,6=论文摘要,7=参考资料,8=官网公告,9=新闻动态)',
     )
     college = models.ForeignKey(
         'accounts.College',
         on_delete=models.SET_NULL,
         null=True, blank=True,
         related_name='knowledge_docs',
-        verbose_name='所属学院（id:1=计算机与软件学院,2=智能科学与工程学院,3=信息与商务管理学院...）',
+        verbose_name='所属学院',
+        db_comment='所属学院(1=计算机,2=智能科学,3=信商管理,4=数字艺术,5=外国语,6=健康医疗,7=高职,8=国际,9=基础,10=马院,11=创业,12=继续教育,13=退役军人)',
     )
     department = models.ForeignKey(
         'classify.Department',
@@ -105,6 +97,7 @@ class KnowledgeDoc(models.Model):
         null=True, blank=True,
         related_name='knowledge_docs',
         verbose_name='所属部门',
+        db_comment='所属部门(1=校级领导,2=党政,3=教学管理,4=学生工作,5=科研服务,6=后勤,7=继续教育)',
     )
     uploader = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -134,6 +127,7 @@ class KnowledgeDoc(models.Model):
         verbose_name = '知识文档'
         verbose_name_plural = verbose_name
         ordering = ['-created_at']
+        db_table_comment = '知识文档表(外键说明: college_id=学院, department_id=部门, category_id=资源类型, discipline_id=学科方向)'
 
     def __str__(self):
         return self.title
@@ -141,7 +135,6 @@ class KnowledgeDoc(models.Model):
 
 class Keyword(models.Model):
     """关键词——上传员为文档添加的关键词，权重越高检索命中越优先"""
-
     MATCH_TYPE_CHOICES = [
         ('exact', '精确匹配'),
         ('fuzzy', '模糊匹配'),
@@ -184,7 +177,6 @@ class Keyword(models.Model):
 
 class DocChunk(models.Model):
     """文档切片——文档解析分块后的文本片段，向量存 Milvus，MySQL 存引用"""
-
     doc = models.ForeignKey(
         KnowledgeDoc,
         on_delete=models.CASCADE,
