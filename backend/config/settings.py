@@ -207,3 +207,10 @@ FAQ_CLUSTER_THRESHOLD = 0.85
 FAQ_DEDUP_THRESHOLD = 0.90
 # 日志采集天数
 FAQ_ANALYSIS_DAYS = 7
+
+# ------------------------------------------------------------------
+# 官网爬虫配置
+# ------------------------------------------------------------------
+NEUSOFT_WEBSITE_URL = config('NEUSOFT_WEBSITE_URL', default='https://www.neusoft.edu.cn')
+CRAWLER_MAX_PAGES = config('CRAWLER_MAX_PAGES', default=200, cast=int)
+CRAWLER_CRAWL_DELAY = config('CRAWLER_CRAWL_DELAY', default=0.5, cast=float)

@@ -32,6 +32,16 @@ app.conf.beat_schedule = {
         'task': 'apps.faq.tasks.generate_faq_weekly',
         'schedule': crontab(hour=3, minute=0, day_of_week=1),  # 每周一 03:00
     },
+    'crawl-neusoft-website-daily': {
+        'task': 'apps.knowledge.tasks.crawl_neusoft_website_task',
+        'schedule': crontab(hour=4, minute=0),  # 每天 04:00
+        'kwargs': {'max_pages': 100, 'uploader_id': 1},
+    },
+    'crawl-neusoft-website-weekly-full': {
+        'task': 'apps.knowledge.tasks.crawl_neusoft_website_task',
+        'schedule': crontab(hour=5, minute=0, day_of_week=0),  # 每周日 05:00
+        'kwargs': {'max_pages': 300, 'uploader_id': 1},
+    },
 }
 
 

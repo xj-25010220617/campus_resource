@@ -4,6 +4,7 @@
 """
 import logging
 from datetime import datetime, timedelta
+from typing import Optional
 
 import django_filters
 import requests
@@ -1226,7 +1227,7 @@ class FileUploadView(APIView):
         })
 
 
-def _ai_classify(title: str = '', content: str = '') -> dict | None:
+def _ai_classify(title: str = '', content: str = '') -> Optional[dict]:
     """调用 LLM 进行智能分类，返回包含 title/description/keywords/category_id 等字段的字典。
 
     供 AIClassifyView、FileUploadView、TextUploadView 复用。

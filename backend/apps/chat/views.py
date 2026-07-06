@@ -294,6 +294,12 @@ class AskView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # 0.5 意图路由：判断问题类型（文件管理查询 / 常规 RAG）
+        from utils.query_router import route_question
+        from utils.data_query import execute_query, build_data_query_prompt
+        route = route_question(question, user)
+        is_data_query = route['type'] == 'data_query'
+
         # 1. 获取或新建会话
         if conversation_id:
             conversation = get_object_or_404(
@@ -309,6 +315,12 @@ class AskView(APIView):
         ChatMessage.objects.create(
             conversation=conversation, role='user', content=question,
         )
+
+        # 文件管理查询路由
+        if is_data_query:
+            return self._handle_data_query(
+                question, user, conversation, route,
+            )
 
         # 3. 获取历史消息（用于多轮对话上下文）
         history = list(
@@ -407,6 +419,58 @@ class AskView(APIView):
                     QueryLog.objects.filter(id=query_log.id).update(response_ms=elapsed_ms)
                 except Exception:
                     logger.warning('回填 response_ms 失败 query_log.id=%d', query_log.id)
+
+        response = StreamingHttpResponse(
+            event_stream(),
+            content_type='text/event-stream',
+        )
+        response['Cache-Control'] = 'no-cache'
+        response['X-Accel-Buffering'] = 'no'
+        response['Access-Control-Allow-Origin'] = '*'
+        return response
+
+    def _handle_data_query(self, question, user, conversation, route):
+        """处理文件管理类查询：查询数据库 → LLM 格式化 → SSE 流式输出。"""
+        from utils.data_query import execute_query, build_data_query_prompt
+        from utils.sse import _format_sse
+
+        # 执行查询
+        query_result = execute_query(route, user)
+
+        # 构造 Prompt
+        messages = build_data_query_prompt(question, query_result)
+
+        # 创建 AI 消息占位
+        assistant_msg = ChatMessage.objects.create(
+            conversation=conversation, role='assistant',
+            content='',
+        )
+
+        # SSE 流式响应
+        def event_stream():
+            try:
+                yield _format_sse('start', {
+                    'conversation_id': conversation.id,
+                    'message_id': assistant_msg.id,
+                })
+
+                collected = []
+                for token in llm_client.chat_stream(messages, temperature=0.3, max_tokens=1024):
+                    if token:
+                        collected.append(token)
+                        yield _format_sse('token', {'content': token})
+
+                full_answer = ''.join(collected)
+                if full_answer:
+                    ChatMessage.objects.filter(id=assistant_msg.id).update(
+                        content=full_answer,
+                    )
+
+                yield _format_sse('done', {'message_id': assistant_msg.id})
+
+            except Exception as e:
+                logger.error(f'数据查询 SSE 流输出失败: {e}')
+                yield _format_sse('error', f'查询失败: {e}')
 
         response = StreamingHttpResponse(
             event_stream(),
