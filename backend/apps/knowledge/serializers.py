@@ -194,7 +194,10 @@ class KeywordCreateSerializer(serializers.Serializer):
 class TextUploadSerializer(serializers.Serializer):
     """管理员手动录入文本请求参数"""
 
-    title = serializers.CharField(max_length=512, help_text='文档标题')
+    title = serializers.CharField(
+        max_length=512, required=False, default='',
+        help_text='文档标题（可选，未提供时由 AI 自动生成）',
+    )
     content = serializers.CharField(help_text='文本内容')
     description = serializers.CharField(
         default='', allow_blank=True, help_text='文档描述（可选）',
@@ -221,13 +224,17 @@ class FileUploadSerializer(serializers.Serializer):
     """文件上传请求参数（multipart/form-data）"""
 
     file = serializers.FileField(help_text='上传的文件')
-    title = serializers.CharField(max_length=512, help_text='文档标题')
+    title = serializers.CharField(
+        max_length=512, required=False, default='',
+        help_text='文档标题（可选，默认使用文件名，或由 AI 自动生成）',
+    )
     description = serializers.CharField(
         default='', allow_blank=True, help_text='文档描述（可选）',
     )
     scope = serializers.ChoiceField(
         choices=['school', 'college', 'department'],
-        help_text='归属范围（school:全校 / college:学院 / department:部门）',
+        default='college',
+        help_text='归属范围（school:全校 / college:学院 / department:部门），默认 college',
     )
     college_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属学院ID（scope=college时必填）')
     department_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属部门ID（scope=department时必填）')
@@ -246,7 +253,10 @@ class FileUploadSerializer(serializers.Serializer):
 class AIClassifySerializer(serializers.Serializer):
     """AI 智能分类推荐请求参数"""
 
-    title = serializers.CharField(max_length=512, help_text='文件标题')
+    title = serializers.CharField(
+        max_length=512, required=False, default='',
+        help_text='文件标题（可选，为空时 AI 根据内容生成）',
+    )
     content = serializers.CharField(
         default='', allow_blank=True, help_text='文本内容片段（可选，建议前 2000 字）',
     )
