@@ -39,7 +39,7 @@ MOCK_SSO_USERS = {
     'mock_college_admin': {
         'sso_uid': 'sso_10004',
         'username': 'sso_college_admin',
-        'role': 'admin',
+        'role': 'college_admin',
         'first_name': '学院',
         'last_name': '管理员',
         'email': 'sso_college_admin@nsu.edu.cn',
@@ -48,11 +48,11 @@ MOCK_SSO_USERS = {
     'mock_dept_admin': {
         'sso_uid': 'sso_10005',
         'username': 'sso_dept_admin',
-        'role': 'admin',
+        'role': 'dept_admin',
         'first_name': '部门',
         'last_name': '管理员',
         'email': 'sso_dept_admin@nsu.edu.cn',
-        'college_code': 'CS',
+        'department_id': 13,
     },
     'mock_teacher': {
         'sso_uid': 'sso_10002',
@@ -245,6 +245,7 @@ class SsoCallbackView(APIView):
     def _get_or_create_sso_user(user_info):
         """根据 sso_uid 查找或创建用户"""
         from apps.accounts.models import College
+        from apps.classify.models import Department
 
         with transaction.atomic():
             user = User.objects.filter(sso_uid=user_info['sso_uid']).first()
@@ -254,31 +255,33 @@ class SsoCallbackView(APIView):
                 user.first_name = user_info.get('first_name', user.first_name)
                 user.last_name = user_info.get('last_name', user.last_name)
                 update_fields = ['email', 'first_name', 'last_name']
-                # 补充 college（如之前未设置）
-                college_code = user_info.get('college_code')
-                if college_code and not user.college_id:
-                    college = College.objects.filter(code=college_code).first()
-                    if college:
-                        user.college = college
-                        update_fields.append('college')
                 user.save(update_fields=update_fields)
                 return user, False
 
-            # 解析 college
+            # 解析 college（college_admin / user 需要）
             college = None
             college_code = user_info.get('college_code')
             if college_code:
                 college = College.objects.filter(code=college_code).first()
 
-            # 创建新用户（SSO 用户无本地密码，用 unusable password）
+            # 解析 department（dept_admin 需要）
+            department = None
+            department_id = user_info.get('department_id')
+            if department_id:
+                department = Department.objects.filter(id=department_id).first()
+
+            role = user_info.get('role', 'user')
+
+            # 创建新用户（SSO 用户无本地密码）
             user = User.objects.create_user(
                 username=user_info['username'],
                 email=user_info.get('email', ''),
                 first_name=user_info.get('first_name', ''),
                 last_name=user_info.get('last_name', ''),
-                role=user_info.get('role', 'user'),
+                role=role,
                 sso_uid=user_info['sso_uid'],
                 college=college,
+                department=department,
             )
             user.set_unusable_password()
             user.save(update_fields=['password'])
