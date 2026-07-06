@@ -9,6 +9,7 @@
 - 失败时 logger.error，但不阻断主流程
 """
 import logging
+from typing import Optional
 
 from .models import LoginLog, OperationLog
 
@@ -16,7 +17,7 @@ from .models import LoginLog, OperationLog
 logger = logging.getLogger(__name__)
 
 
-def get_client_ip(request) -> str | None:
+def get_client_ip(request) -> Optional[str]:
     """从 request 提取客户端 IP（优先取 X-Forwarded-For 第一项）"""
     xff = request.META.get('HTTP_X_FORWARDED_FOR', '')
     if xff:
@@ -37,7 +38,7 @@ def write_login_log(
     user=None,
     username: str = '',
     fail_reason: str = '',
-) -> LoginLog | None:
+) -> Optional[LoginLog]:
     """写入一条登录日志；失败仅记录，不抛异常。
 
     Args:
@@ -77,10 +78,10 @@ def write_operation_log(
     action: str,
     target_type: str,
     instance=None,
-    target_id: int | None = None,
+    target_id: Optional[int] = None,
     target_repr: str = '',
     after=None,
-) -> OperationLog | None:
+) -> Optional[OperationLog]:
     """写入一条操作日志；失败仅记录，不抛异常。
 
     Args:
