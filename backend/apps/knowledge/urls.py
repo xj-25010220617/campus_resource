@@ -8,6 +8,7 @@ from .views import (
     KeywordDeleteView,
     KeywordListView,
     KeywordUpdateView,
+    KnowledgeDocBatchDeleteView,
     KnowledgeDocDeleteView,
     KnowledgeDocDetailView,
     KnowledgeDocDownloadView,
@@ -30,6 +31,7 @@ urlpatterns = [
     # 文档
     path('docs/', KnowledgeDocListView.as_view(), name='knowledge_doc_list'),
     path('docs/<int:pk>/', KnowledgeDocDetailView.as_view(), name='knowledge_doc_detail'),
+    path('docs/batch/', KnowledgeDocBatchDeleteView.as_view(), name='knowledge_doc_batch_delete'),
     path('docs/<int:pk>/delete/', KnowledgeDocDeleteView.as_view(), name='knowledge_doc_delete'),
     path('docs/<int:pk>/download/', KnowledgeDocDownloadView.as_view(), name='knowledge_doc_download'),
 

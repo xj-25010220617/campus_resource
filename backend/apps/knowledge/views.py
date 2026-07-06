@@ -23,7 +23,7 @@ from rest_framework.views import APIView
 
 from apps.accounts.models import College
 from apps.classify.models import Category, Department, Discipline
-from config.permissions import IsAdminOrSuperAdmin, IsLoginUser, IsOwnerOrReadOnly
+from config.permissions import IsAdminOrSuperAdmin, IsLoginUser
 from utils.oss import oss_client
 
 from .extractor import extract_freshness_for_doc
@@ -256,23 +256,16 @@ class KnowledgeDocDeleteView(generics.DestroyAPIView):
         - Milvus 向量暂不同步删除（TODO，甲同学完成后集成）
         - OSS 删除失败不阻塞 MySQL 删除（OSS 文件可后续清理）
     """
-    permission_classes = [permissions.IsAuthenticated, IsOwnerOrReadOnly]
+    permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        return KnowledgeDoc.objects.all()
+        return self._filter_deletable(KnowledgeDoc.objects.all(), self.request.user)
 
     def perform_destroy(self, instance):
-        # 1. 删除 OSS 文件（含容错，失败不阻塞数据库删除）
         if instance.oss_key:
             deleted = oss_client.delete(instance.oss_key)
             if not deleted:
                 logger.warning(f'OSS 文件删除失败 oss_key={instance.oss_key}，跳过')
-
-        # 2. 删除 MySQL 记录
-        #    CASCADE 自动级联：KnowledgeDoc → Keyword + DocChunk
-        #    TODO: 同步删除 Milvus 向量（甲同学完成后集成）
-        #    from utils.milvus import milvus_client
-        #    milvus_client.delete_by_doc_id(instance.id)
         with transaction.atomic():
             instance.delete()
 
@@ -280,6 +273,74 @@ class KnowledgeDocDeleteView(generics.DestroyAPIView):
         instance = self.get_object()
         self.perform_destroy(instance)
         return Response({'detail': '删除成功'})
+
+    @staticmethod
+    def _filter_deletable(queryset, user):
+        """按角色过滤可删除的文档"""
+        if user.role == 'super_admin':
+            return queryset
+        if user.role in ('college_admin', 'admin'):
+            return queryset.filter(
+                Q(scope='school')
+                | Q(scope='college', college_id=user.college_id)
+                | Q(uploader_id=user.id),
+            )
+        if user.role == 'dept_admin':
+            return queryset.filter(
+                Q(scope='school')
+                | Q(scope='department', department_id=user.department_id)
+                | Q(uploader_id=user.id),
+            )
+        return queryset.none()
+
+
+class KnowledgeDocBatchDeleteView(APIView):
+    """
+    批量删除知识文档
+
+    DELETE /api/knowledge/docs/batch/
+    功能：批量删除文档，逐条删 OSS + MySQL，统计成功/失败
+    请求参数（JSON body）：
+        - ids (list[int], required): 要删除的文档 ID 列表，最多 100 条
+    权限规则：同 KnowledgeDocDeleteView
+    返回：{"deleted": N, "failed": N, "total": N, "errors": [{id, detail}, ...]}
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def delete(self, request):
+        from .serializers import BatchDeleteSerializer
+        serializer = BatchDeleteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        ids = serializer.validated_data['ids']
+
+        deletable_qs = KnowledgeDocDeleteView._filter_deletable(
+            KnowledgeDoc.objects.filter(id__in=ids), request.user,
+        )
+        deletable = list(deletable_qs)
+        deletable_ids = {d.id for d in deletable}
+
+        deleted, failed, errors = 0, 0, []
+        for doc_id in ids:
+            if doc_id not in deletable_ids:
+                failed += 1
+                errors.append({'id': doc_id, 'detail': '无权限删除此文档'})
+                continue
+            try:
+                doc = next(d for d in deletable if d.id == doc_id)
+                if doc.oss_key:
+                    oss_client.delete(doc.oss_key)
+                with transaction.atomic():
+                    doc.delete()
+                deleted += 1
+            except Exception as e:
+                failed += 1
+                errors.append({'id': doc_id, 'detail': str(e)})
+                logger.error(f'批量删除失败 id={doc_id}: {e}')
+
+        return Response({
+            'deleted': deleted, 'failed': failed,
+            'total': len(ids), 'errors': errors,
+        })
 
 
 @extend_schema(

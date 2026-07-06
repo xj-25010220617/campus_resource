@@ -250,3 +250,11 @@ class AIClassifySerializer(serializers.Serializer):
     content = serializers.CharField(
         default='', allow_blank=True, help_text='文本内容片段（可选，建议前 2000 字）',
     )
+
+
+class BatchDeleteSerializer(serializers.Serializer):
+    """批量删除请求参数"""
+    ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1), min_length=1, max_length=100,
+        help_text='要删除的文档 ID 列表，最多 100 条',
+    )
