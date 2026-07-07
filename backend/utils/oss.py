@@ -47,7 +47,6 @@ class OSSClient:
             self._bucket = oss2.Bucket(
                 self.auth, self._raw_endpoint, self.bucket_name,
                 connect_timeout=5,
-                read_timeout=30,
                 app_name='campus-resource',
             )
         return self._bucket
