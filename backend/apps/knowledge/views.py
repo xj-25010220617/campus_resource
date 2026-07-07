@@ -901,6 +901,9 @@ class TextUploadView(APIView):
             'id': new_doc.id,
             'status': new_doc.status,
             'file_name': new_doc.file_name,
+            'title': new_doc.title,
+            'description': new_doc.description,
+            'keywords': keywords,
         })
 
 
@@ -1091,11 +1094,15 @@ class FileUploadView(APIView):
 
     # 可提取文本的文件类型
     TEXT_EXTRACTABLE_TYPES = {'txt', 'md', 'html', 'csv', 'json', 'xml', 'yaml', 'yml'}
+    # 可用解析器提取文本的文档类型
+    DOCUMENT_EXTRACTABLE_TYPES = {'pdf', 'doc', 'docx', 'ppt', 'pptx', 'xls', 'xlsx'}
 
     def post(self, request):
         """处理文件上传"""
         import hashlib
         import json
+        import os
+        import tempfile
         import uuid
 
         # 填充默认值：学院ID和部门ID默认使用上传者的
@@ -1175,6 +1182,28 @@ class FileUploadView(APIView):
                 extracted_text = file_bytes.decode('utf-8', errors='replace')[:4000]
             except Exception:
                 pass
+        elif ext in self.DOCUMENT_EXTRACTABLE_TYPES:
+            try:
+                from apps.knowledge.extractor import _EXTRACTORS
+                parser = _EXTRACTORS.get(ext)
+                if parser:
+                    fd, tmp_path = tempfile.mkstemp(suffix=f'.{ext}')
+                    os.close(fd)
+                    try:
+                        with open(tmp_path, 'wb') as f:
+                            f.write(file_bytes)
+                        parsed = parser(tmp_path)
+                        if parsed:
+                            extracted_text = parsed[:4000]
+                    except Exception as e:
+                        logger.warning(f'文档文本提取失败 ({ext}): {e}')
+                    finally:
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
+            except ImportError:
+                logger.warning('无法导入文档解析器，跳过文档文本提取')
 
         # 判断用户是否显式传了 visibility（检查原始请求，排除序列化器默认值）
         user_provided_visibility = 'visibility' in request.data
@@ -1271,10 +1300,17 @@ class FileUploadView(APIView):
                     match_type='fuzzy', weight=1, created_by=request.user,
                 )
 
+        # 确保 raw_keywords 始终是列表（给前端返回用）
+        if not isinstance(raw_keywords, list):
+            raw_keywords = []
+
         return Response({
             'id': new_doc.id,
             'status': new_doc.status,
             'file_name': new_doc.file_name,
+            'title': new_doc.title,
+            'description': new_doc.description,
+            'keywords': raw_keywords,
         })
 
 
