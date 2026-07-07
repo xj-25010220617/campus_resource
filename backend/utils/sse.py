@@ -12,6 +12,8 @@ import logging
 
 from django.http import StreamingHttpResponse
 
+from utils.error_codes import ErrorCode
+
 logger = logging.getLogger(__name__)
 
 
@@ -245,10 +247,10 @@ def build_references_events(
     return {'references_detail': detail}
 
 
-def build_error_sse(message: str, code: str = 'error'):
+def build_error_sse(message: str, code: ErrorCode = ErrorCode.SSE_ERROR):
     """构造错误 SSE 响应"""
     def generator():
-        yield _format_sse('error', {'message': message, 'code': code})
+        yield _format_sse('error', {'message': message, 'code': code.value if isinstance(code, ErrorCode) else code})
 
     response = StreamingHttpResponse(
         generator(),

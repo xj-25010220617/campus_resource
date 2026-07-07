@@ -1,41 +1,104 @@
-"""Admin Panel - 用户管理视图"""
-from django.contrib.auth import get_user_model
-from rest_framework import permissions, status, viewsets
-from rest_framework.response import Response
+from typing import Optional
+"""Admin Panel - 视图
 
+分两大块：
+- 用户管理（既有）：UserAdminViewSet + BatchReset/BatchDelete + College/Dept + CurrentUser
+- 超管日志管理（新增）：10 个 List/Detail + 4 个 stats + 1 个 dashboard
+
+代码规范（CONVENTIONS §7）：
+- 日志管理一律使用 generics.ListAPIView / RetrieveAPIView
+- URL 注册用 .as_view()，不引入 Router
+"""
+import datetime as _datetime
+
+from django.contrib.auth import get_user_model
+from django.utils import timezone
+from django.utils.dateparse import parse_datetime
+
+from rest_framework import generics, permissions, status, viewsets
+from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from apps.accounts.models import College
+from apps.chat.models import QueryLog, SensitiveLog
+from apps.classify.models import Department
+from apps.classify.serializers import DepartmentSerializer
+from apps.resources.models import UploadLog
+
+from config.permissions import IsSuperAdmin
+
+from .mixins import OperationLogMixin
+from .models import LoginLog, OperationLog
+from .permissions import (
+    IsAnyAdmin,
+    assert_can_manage_user,
+    manage_scope_label,
+    scope_users,
+)
 from .serializers import (
+    AdminLoginLogSerializer,
+    AdminOperationLogSerializer,
+    AdminQueryLogSerializer,
+    AdminSensitiveLogSerializer,
+    AdminUploadLogSerializer,
+    BatchResetPasswordSerializer,
+    CollegeSerializer,
+    LoginLogStatsSerializer,
+    OperationLogStatsSerializer,
+    QueryLogStatsSerializer,
+    ResetPasswordSerializer,
+    UploadLogStatsSerializer,
     UserAdminSerializer,
     UserCreateSerializer,
     UserUpdateSerializer,
 )
+from .services import dashboard as dashboard_svc
+from .utils import write_operation_log
 
 
 User = get_user_model()
 
 
+# ======================================================================
+# 一、用户管理（既有，未改动 CRUD 行为）
+# ======================================================================
 class IsAdminOrSuperAdmin(permissions.BasePermission):
-    """管理员或超级管理员权限"""
+    """所有管理员角色权限：super_admin、college_admin、dept_admin、admin（兼容旧角色）"""
 
     def has_permission(self, request, view):
-        return (
-            request.user
-            and request.user.is_authenticated
-            and request.user.role in ('admin', 'super_admin')
-        )
+        u = request.user
+        return bool(u and u.is_authenticated and u.role in ('super_admin', 'college_admin', 'dept_admin', 'admin'))
 
 
-class UserAdminViewSet(viewsets.ModelViewSet):
+class UserAdminViewSet(OperationLogMixin, viewsets.ModelViewSet):
     """
-    管理后台用户管理接口
+    管理后台用户管理接口（含操作日志埋点）
 
     GET    /api/admin/users/              - 用户列表
     POST   /api/admin/users/             - 新建用户
     GET    /api/admin/users/{id}/        - 用户详情
     PUT    /api/admin/users/{id}/        - 编辑用户
     DELETE /api/admin/users/{id}/        - 删除用户
+
+    权限：
+    - super_admin：管理所有用户（不含同级 super_admin）
+    - admin / college_admin：管理本学院 role=user（学生）
+    - dept_admin：管理本部门所有用户（员工）
+
+    操作日志（OperationLog.target_type='user'）：
+    - POST /api/admin/users/                  → action=create
+    - PUT/PATCH /api/admin/users/{id}/        → action=update
+    - DELETE /api/admin/users/{id}/           → action=delete
+    - POST /api/admin/users/{id}/reset_password/  → action=reset_password
+    - POST /api/admin/users/batch_reset_password/  → action=batch_reset_password
+    - POST /api/admin/users/batch_delete/     → action=batch_delete
     """
-    queryset = User.objects.select_related('college').all()
-    permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
+    queryset = User.objects.select_related('college', 'department').all()
+    permission_classes = [permissions.IsAuthenticated, IsAnyAdmin]
+    log_target_type = 'user'
+    log_serializer_class = UserAdminSerializer
 
     def get_serializer_class(self):
         if self.action == 'create':
@@ -45,36 +108,47 @@ class UserAdminViewSet(viewsets.ModelViewSet):
         return UserAdminSerializer
 
     def get_queryset(self):
-        queryset = super().get_queryset()
+        qs = super().get_queryset()
         request_user = self.request.user
 
-        # admin 只能看到普通用户，super_admin 可以看到所有
-        if request_user.role == 'admin':
-            queryset = queryset.filter(role='user')
-        elif request_user.role == 'super_admin':
-            # 排除其他 super_admin（不能管理同级的 super_admin）
-            queryset = queryset.exclude(role='super_admin')
+        qs = scope_users(qs, request_user)
 
-        # 支持过滤参数（跳过空值，避免 Apifox/Postman 遗留空参数行干扰）
+        if request_user.role == 'super_admin':
+            qs = qs.exclude(role='super_admin')
+
         role = self.request.query_params.get('role')
         if role:
-            queryset = queryset.filter(role=role)
+            qs = qs.filter(role=role)
 
         college_id = self.request.query_params.get('college_id')
         if college_id:
-            queryset = queryset.filter(college_id=college_id)
+            qs = qs.filter(college_id=college_id)
+
+        department_id = self.request.query_params.get('department_id')
+        if department_id:
+            qs = qs.filter(department_id=department_id)
 
         is_active = self.request.query_params.get('is_active')
         if is_active and is_active.lower() in ('true', 'false'):
-            queryset = queryset.filter(is_active=is_active.lower() == 'true')
+            qs = qs.filter(is_active=is_active.lower() == 'true')
 
         search = self.request.query_params.get('search')
         if search:
-            queryset = queryset.filter(username__icontains=search)
+            qs = qs.filter(username__icontains=search)
 
-        return queryset.order_by('-date_joined')
+        return qs.order_by('-date_joined')
 
     def perform_create(self, serializer):
+        u = self.request.user
+        data = serializer.validated_data
+        if u.role in ('admin', 'college_admin'):
+            data['role'] = 'user'
+            data['college_id'] = u.college_id
+            data['department'] = None
+        elif u.role == 'dept_admin':
+            data['department_id'] = u.department_id
+            data['college'] = None
+            data.setdefault('role', 'user')
         serializer.save()
 
     def create(self, request, *args, **kwargs):
@@ -84,48 +158,768 @@ class UserAdminViewSet(viewsets.ModelViewSet):
         self.perform_create(serializer)
         output = UserAdminSerializer(serializer.instance)
         headers = self.get_success_headers(output.data)
+        # 显式写日志（确保 after 快照基于完整输出）
+        write_operation_log(
+            request,
+            action='create',
+            target_type='user',
+            instance=serializer.instance,
+            after=output.data,
+        )
         return Response(output.data, status=status.HTTP_201_CREATED, headers=headers)
 
     def perform_update(self, serializer):
-        # 防止编辑时越权
-        instance = serializer.instance
-        request_user = self.request.user
-
-        # admin 不能修改其他 admin 或 super_admin
-        if request_user.role == 'admin' and instance.role != 'user':
-            raise PermissionError('无权修改此用户')
+        assert_can_manage_user(serializer.instance, self.request.user)
         serializer.save()
 
     def update(self, request, *args, **kwargs):
-        """更新用户（整量）：用详情序列化器重新输出，保证响应字段完整。"""
+        """更新用户（整量）：用详情序列化器重新输出。"""
         partial = kwargs.pop('partial', False)
         instance = self.get_object()
         serializer = self.get_serializer(instance, data=request.data, partial=partial)
         serializer.is_valid(raise_exception=True)
         self.perform_update(serializer)
         output = UserAdminSerializer(serializer.instance)
+        write_operation_log(
+            request,
+            action='update',
+            target_type='user',
+            instance=serializer.instance,
+            after=output.data,
+        )
         return Response(output.data)
 
     def partial_update(self, request, *args, **kwargs):
-        """更新用户（局部）：同上，调用 update 时传入 partial=True。"""
+        """更新用户（局部）：同上。"""
         kwargs['partial'] = True
         return self.update(request, *args, **kwargs)
 
     def perform_destroy(self, instance):
         request_user = self.request.user
-
-        # 不能删除自己
         if instance.id == request_user.id:
-            raise PermissionError('不能删除自己')
-
-        # admin 只能删除普通用户
-        if request_user.role == 'admin' and instance.role != 'user':
-            raise PermissionError('无权删除此用户')
-
+            raise PermissionDenied('不能删除自己')
+        assert_can_manage_user(instance, request_user)
         instance.delete()
 
     def destroy(self, request, *args, **kwargs):
-        try:
-            return super().destroy(request, *args, **kwargs)
-        except PermissionError as e:
-            return Response({'detail': str(e)}, status=status.HTTP_403_FORBIDDEN)
+        instance = self.get_object()
+        self.perform_destroy(instance)
+        write_operation_log(
+            request,
+            action='delete',
+            target_type='user',
+            instance=instance,
+        )
+        return Response({'detail': '删除成功'}, status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=True, methods=['post'], url_path='reset_password')
+    def reset_password(self, request, pk=None):
+        """重置单个用户密码。
+
+        POST /api/admin/users/{id}/reset_password/
+        """
+        user = self.get_object()
+        request_user = request.user
+
+        if user.id == request_user.id:
+            return Response(
+                {'detail': '不能重置自己的密码'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        assert_can_manage_user(user, request_user)
+
+        serializer = ResetPasswordSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user.set_password(serializer.validated_data['new_password'])
+        user.save(update_fields=['password'])
+
+        write_operation_log(
+            request,
+            action='reset_password',
+            target_type='user',
+            instance=user,
+        )
+        return Response({'detail': '密码重置成功'})
+
+
+class BatchResetPasswordView(generics.GenericAPIView):
+    """
+    批量重置用户密码接口
+
+    POST /api/admin/users/batch_reset_password/
+    """
+    permission_classes = [permissions.IsAuthenticated, IsAnyAdmin]
+    serializer_class = BatchResetPasswordSerializer
+
+    def post(self, request):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        user_ids = serializer.validated_data['user_ids']
+        new_password = serializer.validated_data['new_password']
+        request_user = request.user
+
+        success_count = 0
+        fail_count = 0
+        fail_reasons = []
+
+        users = User.objects.filter(id__in=user_ids).select_related('college', 'department')
+        found_ids = set(users.values_list('id', flat=True))
+
+        for uid in user_ids:
+            if uid not in found_ids:
+                fail_count += 1
+                fail_reasons.append({'id': uid, 'reason': '用户不存在'})
+
+        for user in users:
+            if user.id == request_user.id:
+                fail_count += 1
+                fail_reasons.append({'id': user.id, 'username': user.username, 'reason': '不能重置自己'})
+                continue
+
+            try:
+                assert_can_manage_user(user, request_user)
+            except PermissionDenied as e:
+                fail_count += 1
+                fail_reasons.append({'id': user.id, 'username': user.username, 'reason': str(e)})
+                continue
+
+            user.set_password(new_password)
+            user.save(update_fields=['password'])
+            success_count += 1
+
+        # 写操作日志
+        write_operation_log(
+            request,
+            action='batch_reset_password',
+            target_type='user',
+            target_repr=f'批量重置 {success_count} 个用户',
+        )
+
+        return Response({
+            'detail': f'批量重置完成：成功 {success_count} 个，失败 {fail_count} 个',
+            'success_count': success_count,
+            'fail_count': fail_count,
+            'fail_reasons': fail_reasons if fail_reasons else None,
+        })
+
+
+class BatchDeleteUsersView(generics.GenericAPIView):
+    """
+    批量删除用户账号接口
+
+    POST /api/admin/users/batch_delete/
+    """
+    permission_classes = [permissions.IsAuthenticated, IsAnyAdmin]
+
+    def post(self, request):
+        user_ids = request.data.get('user_ids', [])
+        request_user = request.user
+
+        if not user_ids:
+            return Response({'detail': '请提供用户ID列表'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if len(user_ids) > 100:
+            return Response({'detail': '一次最多删除100个用户'}, status=status.HTTP_400_BAD_REQUEST)
+
+        success_count = 0
+        fail_count = 0
+        fail_reasons = []
+
+        users = User.objects.filter(id__in=user_ids).select_related('college', 'department')
+        found_ids = set(users.values_list('id', flat=True))
+
+        for uid in user_ids:
+            if uid not in found_ids:
+                fail_count += 1
+                fail_reasons.append({'id': uid, 'reason': '用户不存在'})
+
+        for user in users:
+            if user.id == request_user.id:
+                fail_count += 1
+                fail_reasons.append({'id': user.id, 'username': user.username, 'reason': '不能删除自己'})
+                continue
+
+            try:
+                assert_can_manage_user(user, request_user)
+            except PermissionDenied as e:
+                fail_count += 1
+                fail_reasons.append({'id': user.id, 'username': user.username, 'reason': str(e)})
+                continue
+
+            user.delete()
+            success_count += 1
+
+        write_operation_log(
+            request,
+            action='batch_delete',
+            target_type='user',
+            target_repr=f'批量删除 {success_count} 个用户',
+        )
+
+        return Response({
+            'detail': f'批量删除完成：成功 {success_count} 个，失败 {fail_count} 个',
+            'success_count': success_count,
+            'fail_count': fail_count,
+            'fail_reasons': fail_reasons if fail_reasons else None,
+        })
+
+
+class CollegeListView(generics.ListAPIView):
+    """学院列表查询接口
+
+    GET /api/admin/colleges/
+    """
+    permission_classes = [permissions.IsAuthenticated, IsAnyAdmin]
+    queryset = College.objects.all()
+    serializer_class = CollegeSerializer
+
+
+class DepartmentListView(generics.ListAPIView):
+    """部门列表查询接口
+
+    GET /api/admin/departments/
+    权限：仅管理员
+    请求参数：
+        - college_id (int, optional): 按所属学院筛选
+    """
+    permission_classes = [permissions.IsAuthenticated, IsAnyAdmin]
+    serializer_class = DepartmentSerializer
+
+    def get_queryset(self):
+        qs = Department.objects.all().order_by('sort_order', 'id')
+        college_id = self.request.query_params.get('college_id')
+        if college_id:
+            qs = qs.filter(college_id=college_id)
+        return qs
+
+
+class CurrentUserView(APIView):
+    """当前管理员信息
+
+    GET /api/admin/me/
+    返回当前登录用户的归属和权限范围
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        u = request.user
+        return Response({
+            'id': u.id,
+            'username': u.username,
+            'email': u.email,
+            'role': u.role,
+            'role_display': u.get_role_display(),
+            'is_staff': u.is_staff,
+            'is_superuser': u.is_superuser,
+            'college_id': u.college_id,
+            'college_name': u.college.name if u.college_id else None,
+            'department_id': u.department_id,
+            'department_name': u.department.name if u.department_id else None,
+            'permissions': {
+                'manage_users': u.role in {'super_admin', 'college_admin',
+                                           'dept_admin', 'admin'},
+                'manage_resources': u.role in {'super_admin', 'college_admin',
+                                               'dept_admin', 'admin'},
+                'manage_scope': manage_scope_label(u),
+            },
+        })
+
+
+# ======================================================================
+# 二、超管日志管理 — 通用时间区间工具
+# ======================================================================
+def _parse_date_param(value: Optional[str]) -> Optional[_datetime.datetime]:
+    """把查询参数 date_from / date_to 解析为带时区的 datetime。"""
+    if not value:
+        return None
+    if 'T' in value:
+        dt = parse_datetime(value)
+        if dt is None:
+            return None
+        if timezone.is_naive(dt):
+            dt = timezone.make_aware(dt)
+        return dt
+    try:
+        dt = _datetime.datetime.strptime(value, '%Y-%m-%d')
+    except ValueError:
+        return None
+    return timezone.make_aware(dt)
+
+
+def _apply_date_range(qs, date_from: Optional[str], date_to: Optional[str]):
+    """对 queryset 应用 date_from / date_to 区间。"""
+    start = _parse_date_param(date_from)
+    end = _parse_date_param(date_to)
+    if start:
+        qs = qs.filter(created_at__gte=start)
+    if end:
+        if 'T' not in (date_to or ''):
+            end = end.replace(hour=23, minute=59, second=59, microsecond=999999)
+        qs = qs.filter(created_at__lte=end)
+    return qs
+
+
+# ======================================================================
+# 三、超管日志管理 — 5 类日志的 List / Detail
+# 全部使用 ListAPIView / RetrieveAPIView（规范 §7：不用 ViewSet/Router）
+# 权限：IsAuthenticated + IsSuperAdmin
+# ======================================================================
+# ----- 1. UploadLog -----
+class AdminUploadLogListView(generics.ListAPIView):
+    """上传日志列表 - 超管
+
+    GET /api/admin/logs/upload/
+    过滤：user_id / status / college_id / department_id / file_type /
+          date_from (YYYY-MM-DD or ISO) / date_to / keyword (file_name)
+    返回：分页的上传日志列表
+    """
+    permission_classes = [permissions.IsAuthenticated, IsSuperAdmin]
+    serializer_class = AdminUploadLogSerializer
+
+    def get_queryset(self):
+        qs = UploadLog.objects.select_related(
+            'user', 'college', 'department', 'resource',
+        )
+        for key in ('user_id', 'status', 'college_id', 'department_id', 'file_type'):
+            value = self.request.query_params.get(key)
+            if value:
+                qs = qs.filter(**{key: value})
+        qs = _apply_date_range(
+            qs,
+            self.request.query_params.get('date_from'),
+            self.request.query_params.get('date_to'),
+        )
+        keyword = self.request.query_params.get('keyword')
+        if keyword:
+            qs = qs.filter(file_name__icontains=keyword)
+        return qs.order_by('-created_at')
+
+
+class AdminUploadLogDetailView(generics.RetrieveAPIView):
+    """上传日志详情 - 超管
+
+    GET /api/admin/logs/upload/{id}/
+    """
+    permission_classes = [permissions.IsAuthenticated, IsSuperAdmin]
+    serializer_class = AdminUploadLogSerializer
+    queryset = UploadLog.objects.select_related(
+        'user', 'college', 'department', 'resource',
+    )
+
+
+# ----- 2. QueryLog -----
+class AdminQueryLogListView(generics.ListAPIView):
+    """查询日志列表 - 超管
+
+    GET /api/admin/logs/query/
+    过滤：user_id / user_feedback (-1/0/1) / hit_count_min /
+          date_from / date_to / keyword (question)
+    返回：分页的查询日志列表
+    """
+    permission_classes = [permissions.IsAuthenticated, IsSuperAdmin]
+    serializer_class = AdminQueryLogSerializer
+
+    def get_queryset(self):
+        qs = QueryLog.objects.select_related('user', 'conversation')
+        user_id = self.request.query_params.get('user_id')
+        if user_id:
+            qs = qs.filter(user_id=user_id)
+        feedback = self.request.query_params.get('user_feedback')
+        if feedback is not None and feedback != '':
+            try:
+                qs = qs.filter(user_feedback=int(feedback))
+            except (TypeError, ValueError):
+                pass
+        hit_min = self.request.query_params.get('hit_count_min')
+        if hit_min is not None and hit_min != '':
+            try:
+                qs = qs.filter(hit_count__gte=int(hit_min))
+            except (TypeError, ValueError):
+                pass
+        qs = _apply_date_range(
+            qs,
+            self.request.query_params.get('date_from'),
+            self.request.query_params.get('date_to'),
+        )
+        keyword = self.request.query_params.get('keyword')
+        if keyword:
+            qs = qs.filter(question__icontains=keyword)
+        return qs.order_by('-created_at')
+
+
+class AdminQueryLogDetailView(generics.RetrieveAPIView):
+    """查询日志详情 - 超管
+
+    GET /api/admin/logs/query/{id}/
+    """
+    permission_classes = [permissions.IsAuthenticated, IsSuperAdmin]
+    serializer_class = AdminQueryLogSerializer
+    queryset = QueryLog.objects.select_related('user', 'conversation')
+
+
+# ----- 3. SensitiveLog -----
+class AdminSensitiveLogListView(generics.ListAPIView):
+    """敏感内容日志列表 - 超管
+
+    GET /api/admin/logs/sensitive/
+    过滤：user_id / date_from / date_to / keyword (question)
+    """
+    permission_classes = [permissions.IsAuthenticated, IsSuperAdmin]
+    serializer_class = AdminSensitiveLogSerializer
+
+    def get_queryset(self):
+        qs = SensitiveLog.objects.select_related('user')
+        user_id = self.request.query_params.get('user_id')
+        if user_id:
+            qs = qs.filter(user_id=user_id)
+        qs = _apply_date_range(
+            qs,
+            self.request.query_params.get('date_from'),
+            self.request.query_params.get('date_to'),
+        )
+        keyword = self.request.query_params.get('keyword')
+        if keyword:
+            qs = qs.filter(question__icontains=keyword)
+        return qs.order_by('-created_at')
+
+
+class AdminSensitiveLogDetailView(generics.RetrieveAPIView):
+    """敏感内容日志详情 - 超管
+
+    GET /api/admin/logs/sensitive/{id}/
+    """
+    permission_classes = [permissions.IsAuthenticated, IsSuperAdmin]
+    serializer_class = AdminSensitiveLogSerializer
+    queryset = SensitiveLog.objects.select_related('user')
+
+
+# ----- 4. LoginLog -----
+class AdminLoginLogListView(generics.ListAPIView):
+    """登录日志列表 - 超管
+
+    GET /api/admin/logs/login/
+    过滤：user_id / username / login_type / success (true/false) /
+          date_from / date_to
+    """
+    permission_classes = [permissions.IsAuthenticated, IsSuperAdmin]
+    serializer_class = AdminLoginLogSerializer
+
+    def get_queryset(self):
+        qs = LoginLog.objects.select_related('user')
+        user_id = self.request.query_params.get('user_id')
+        if user_id:
+            qs = qs.filter(user_id=user_id)
+        username = self.request.query_params.get('username')
+        if username:
+            qs = qs.filter(username__icontains=username)
+        login_type = self.request.query_params.get('login_type')
+        if login_type:
+            qs = qs.filter(login_type=login_type)
+        success = self.request.query_params.get('success')
+        if success is not None and success != '':
+            qs = qs.filter(success=success.lower() == 'true')
+        qs = _apply_date_range(
+            qs,
+            self.request.query_params.get('date_from'),
+            self.request.query_params.get('date_to'),
+        )
+        return qs.order_by('-created_at')
+
+
+class AdminLoginLogDetailView(generics.RetrieveAPIView):
+    """登录日志详情 - 超管
+
+    GET /api/admin/logs/login/{id}/
+    """
+    permission_classes = [permissions.IsAuthenticated, IsSuperAdmin]
+    serializer_class = AdminLoginLogSerializer
+    queryset = LoginLog.objects.select_related('user')
+
+
+# ----- 5. OperationLog -----
+class AdminOperationLogListView(generics.ListAPIView):
+    """操作日志列表 - 超管
+
+    GET /api/admin/logs/operation/
+    过滤：operator_id / action / target_type / target_id /
+          date_from / date_to
+    """
+    permission_classes = [permissions.IsAuthenticated, IsSuperAdmin]
+    serializer_class = AdminOperationLogSerializer
+
+    def get_queryset(self):
+        qs = OperationLog.objects.select_related('operator')
+        operator_id = self.request.query_params.get('operator_id')
+        if operator_id:
+            qs = qs.filter(operator_id=operator_id)
+        action = self.request.query_params.get('action')
+        if action:
+            qs = qs.filter(action=action)
+        target_type = self.request.query_params.get('target_type')
+        if target_type:
+            qs = qs.filter(target_type=target_type)
+        target_id = self.request.query_params.get('target_id')
+        if target_id:
+            qs = qs.filter(target_id=target_id)
+        qs = _apply_date_range(
+            qs,
+            self.request.query_params.get('date_from'),
+            self.request.query_params.get('date_to'),
+        )
+        return qs.order_by('-created_at')
+
+
+class AdminOperationLogDetailView(generics.RetrieveAPIView):
+    """操作日志详情 - 超管
+
+    GET /api/admin/logs/operation/{id}/
+    """
+    permission_classes = [permissions.IsAuthenticated, IsSuperAdmin]
+    serializer_class = AdminOperationLogSerializer
+    queryset = OperationLog.objects.select_related('operator')
+
+
+# ======================================================================
+# 四、统计接口（每类日志 1 个 stats，已复用 4 类；sensitive 不另设 stats）
+# ======================================================================
+class _PeriodCounterHelper:
+    """公共：统计 today / week / month 计数"""
+
+    @staticmethod
+    def get_counters(model, now: _datetime.datetime):
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        week_start = today_start - _datetime.timedelta(days=now.weekday())
+        month_start = today_start.replace(day=1)
+        return {
+            'total': model.objects.count(),
+            'today': model.objects.filter(created_at__gte=today_start).count(),
+            'this_week': model.objects.filter(created_at__gte=week_start).count(),
+            'this_month': model.objects.filter(created_at__gte=month_start).count(),
+        }
+
+
+class UploadLogStatsView(APIView):
+    """上传日志统计 - 超管
+
+    GET /api/admin/logs/upload/stats/
+    返回：total/today/this_week/this_month + 按 status/file_type/college 分组 + total_size
+    """
+    permission_classes = [permissions.IsAuthenticated, IsSuperAdmin]
+
+    def get(self, request):
+        now = timezone.now()
+        base = _PeriodCounterHelper.get_counters(UploadLog, now)
+        qs = UploadLog.objects.all()
+
+        from django.db.models import Count, Sum
+        by_status = [
+            {
+                'key': (row['status'] or 'unknown'),
+                'label': row['status'] or '未知',
+                'count': row['count'],
+            }
+            for row in qs.values('status').annotate(count=Count('id'))
+        ]
+        by_file_type = [
+            {
+                'key': (row['file_type'] or 'unknown'),
+                'label': row['file_type'] or '未知',
+                'count': row['count'],
+            }
+            for row in qs.values('file_type').annotate(count=Count('id'))
+        ]
+        by_college_rows = (
+            qs.values('college__id', 'college__name')
+            .annotate(count=Count('id'))
+            .order_by('-count')[:10]
+        )
+        by_college = [
+            {
+                'key': str(row['college__id']) if row['college__id'] else 'none',
+                'label': row['college__name'] or '未分类',
+                'count': row['count'],
+            }
+            for row in by_college_rows
+        ]
+        total_size = qs.aggregate(s=Sum('file_size'))['s'] or 0
+
+        data = {**base, 'by_status': by_status,
+                'by_file_type': by_file_type, 'by_college': by_college,
+                'total_size': total_size}
+        return Response(UploadLogStatsSerializer(data).data)
+
+
+class QueryLogStatsView(APIView):
+    """查询日志统计 - 超管
+
+    GET /api/admin/logs/query/stats/
+    返回：total/today/this_week/this_month + avg_hit_count / avg_response_ms / like_rate / by_feedback
+    """
+    permission_classes = [permissions.IsAuthenticated, IsSuperAdmin]
+
+    def get(self, request):
+        now = timezone.now()
+        base = _PeriodCounterHelper.get_counters(QueryLog, now)
+        qs = QueryLog.objects.all()
+
+        from django.db.models import Avg, Count, Q
+        agg = qs.aggregate(
+            avg_hit=Avg('hit_count'),
+            avg_ms=Avg('response_ms'),
+            likes=Count('id', filter=Q(user_feedback=1)),
+        )
+        total = base['total']
+        like_rate = (agg['likes'] / total) if total else 0
+
+        feedback_label_map = {1: '赞', 0: '踩', -1: '无反馈'}
+        by_feedback = [
+            {
+                'key': str(row['user_feedback']),
+                'label': feedback_label_map.get(row['user_feedback'], '未知'),
+                'count': row['count'],
+            }
+            for row in qs.values('user_feedback').annotate(count=Count('id')).order_by('user_feedback')
+        ]
+
+        data = {**base,
+                'avg_hit_count': round(agg['avg_hit'] or 0, 2),
+                'avg_response_ms': int(agg['avg_ms'] or 0),
+                'like_rate': round(like_rate, 4),
+                'by_feedback': by_feedback}
+        return Response(QueryLogStatsSerializer(data).data)
+
+
+class LoginLogStatsView(APIView):
+    """登录日志统计 - 超管
+
+    GET /api/admin/logs/login/stats/
+    返回：total/today/this_week/this_month + success/fail + by_success/by_type/by_hour
+    """
+    permission_classes = [permissions.IsAuthenticated, IsSuperAdmin]
+
+    def get(self, request):
+        now = timezone.now()
+        base = _PeriodCounterHelper.get_counters(LoginLog, now)
+        qs = LoginLog.objects.all()
+
+        from django.db.models import Count
+        from django.db.models.functions import ExtractHour
+
+        success_count = qs.filter(success=True).count()
+        fail_count = qs.filter(success=False).count()
+        by_success = [
+            {'key': 'true' if row['success'] else 'false',
+             'label': '成功' if row['success'] else '失败',
+             'count': row['count']}
+            for row in qs.values('success').annotate(count=Count('id'))
+        ]
+        type_label_map = {'jwt': '账号密码', 'sso': 'SSO', 'sso_mock': 'SSO Mock'}
+        by_type = [
+            {'key': row['login_type'] or 'unknown',
+             'label': type_label_map.get(row['login_type'], row['login_type'] or '未知'),
+             'count': row['count']}
+            for row in qs.values('login_type').annotate(count=Count('id'))
+        ]
+        by_hour = [
+            {'key': str(row['hour']),
+             'label': f'{row["hour"]:02d}:00',
+             'count': row['count']}
+            for row in qs.annotate(hour=ExtractHour('created_at'))
+            .values('hour').annotate(count=Count('id'))
+            .order_by('hour')
+        ]
+
+        data = {**base,
+                'success_count': success_count,
+                'fail_count': fail_count,
+                'by_success': by_success,
+                'by_type': by_type,
+                'by_hour': by_hour}
+        return Response(LoginLogStatsSerializer(data).data)
+
+
+class OperationLogStatsView(APIView):
+    """操作日志统计 - 超管
+
+    GET /api/admin/logs/operation/stats/
+    返回：total/today/this_week/this_month + by_action / by_target_type / top_operators
+    """
+    permission_classes = [permissions.IsAuthenticated, IsSuperAdmin]
+
+    def get(self, request):
+        now = timezone.now()
+        base = _PeriodCounterHelper.get_counters(OperationLog, now)
+        qs = OperationLog.objects.all()
+
+        from django.db.models import Count
+        action_label_map = {
+            'create': '新建', 'update': '编辑', 'delete': '删除',
+            'reset_password': '重置密码',
+            'batch_delete': '批量删除', 'batch_reset_password': '批量重置密码',
+        }
+        by_action = [
+            {'key': row['action'],
+             'label': action_label_map.get(row['action'], row['action']),
+             'count': row['count']}
+            for row in qs.values('action').annotate(count=Count('id'))
+        ]
+        target_label_map = {'user': '用户', 'resource': '资源', 'category': '分类'}
+        by_target_type = [
+            {'key': row['target_type'],
+             'label': target_label_map.get(row['target_type'], row['target_type']),
+             'count': row['count']}
+            for row in qs.values('target_type').annotate(count=Count('id'))
+        ]
+        top_operators_rows = (
+            qs.values('operator_id', 'operator_username')
+            .annotate(count=Count('id'))
+            .order_by('-count')[:10]
+        )
+        top_operators = [
+            {'key': str(row['operator_id']) if row['operator_id'] else 'anonymous',
+             'label': row['operator_username'] or '匿名',
+             'count': row['count']}
+            for row in top_operators_rows
+        ]
+
+        data = {**base,
+                'by_action': by_action,
+                'by_target_type': by_target_type,
+                'top_operators': top_operators}
+        return Response(OperationLogStatsSerializer(data).data)
+
+
+# ======================================================================
+# 五、Dashboard 聚合接口
+# ======================================================================
+class LogsDashboardView(APIView):
+    """超管日志仪表盘聚合接口
+
+    GET /api/admin/logs/dashboard/?period=day|week|month
+    - period 缺省 day
+    - 时间区间基于 Asia/Shanghai（settings.TIME_ZONE）
+    - 5 个块各自 try/except 隔离失败（块计算放 services/dashboard.py）
+    - view 不接 try/except（遵循规范 §9）
+    """
+    permission_classes = [permissions.IsAuthenticated, IsSuperAdmin]
+
+    def get(self, request):
+        period = request.query_params.get('period', 'day')
+        start, end = dashboard_svc.parse_period(period)
+
+        blocks = {
+            'upload': dashboard_svc.compute_upload_block(start, end),
+            'query': dashboard_svc.compute_query_block(start, end),
+            'sensitive': dashboard_svc.compute_sensitive_block(start, end),
+            'login': dashboard_svc.compute_login_block(start, end),
+            'operation': dashboard_svc.compute_operation_block(start, end),
+        }
+
+        return Response({
+            'period': period,
+            'start_at': start.isoformat(),
+            'end_at': end.isoformat(),
+            'blocks': blocks,
+        })

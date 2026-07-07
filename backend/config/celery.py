@@ -2,11 +2,13 @@
 Celery 异步任务配置
 - 文档索引任务 index_document（上传后自动触发，核心链路）
 - 定时同步任务（二期：官网爬虫、图书馆摘要）
+- FAQ 自动生成（每周一 03:00）
 """
 import logging
 import os
 
 from celery import Celery
+from celery.schedules import crontab
 
 logger = logging.getLogger(__name__)
 
@@ -23,14 +25,24 @@ app.autodiscover_tasks()
 
 
 # ------------------------------------------------------------------
-# 定时任务配置（在 settings.py 中添加 CELERY_BEAT_SCHEDULE）
+# 定时任务配置
 # ------------------------------------------------------------------
-# CELERY_BEAT_SCHEDULE = {
-#     'sync-website-daily': {
-#         'task': 'tasks.sync_website.sync_website_task',
-#         'schedule': crontab(hour=3, minute=0),  # 每天凌晨3点
-#     },
-# }
+app.conf.beat_schedule = {
+    'generate-faq-weekly': {
+        'task': 'apps.faq.tasks.generate_faq_weekly',
+        'schedule': crontab(hour=3, minute=0, day_of_week=1),  # 每周一 03:00
+    },
+    'crawl-neusoft-website-daily': {
+        'task': 'apps.knowledge.tasks.crawl_neusoft_website_task',
+        'schedule': crontab(hour=4, minute=0),  # 每天 04:00
+        'kwargs': {'max_pages': 100, 'uploader_id': 1},
+    },
+    'crawl-neusoft-website-weekly-full': {
+        'task': 'apps.knowledge.tasks.crawl_neusoft_website_task',
+        'schedule': crontab(hour=5, minute=0, day_of_week=0),  # 每周日 05:00
+        'kwargs': {'max_pages': 300, 'uploader_id': 1},
+    },
+}
 
 
 @app.task(bind=True, ignore_result=True)

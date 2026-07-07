@@ -4,7 +4,6 @@ from django.db import models
 
 class KnowledgeDoc(models.Model):
     """知识文档——系统核心表，存储知识文档元数据、OSS 信息和索引状态"""
-
     STATUS_CHOICES = [
         ('uploaded', '已上传'),
         ('parsing', '解析中'),
@@ -35,6 +34,11 @@ class KnowledgeDoc(models.Model):
         ('public', '公开'),
         ('private', '私密'),
     ]
+    SCOPE_CHOICES = [
+        ('school', '全校'),
+        ('college', '学院'),
+        ('department', '部门'),
+    ]
 
     title = models.CharField(max_length=512, verbose_name='文档标题')
     description = models.TextField(default='', verbose_name='文档描述')
@@ -54,6 +58,10 @@ class KnowledgeDoc(models.Model):
         max_length=16, choices=VISIBILITY_CHOICES, default='public',
         db_index=True, verbose_name='可见性',
     )
+    scope = models.CharField(
+        max_length=16, choices=SCOPE_CHOICES, default='college',
+        db_index=True, verbose_name='归属范围',
+    )
     file_size = models.BigIntegerField(default=0, verbose_name='文件大小（字节）')
     md5_hash = models.CharField(
         max_length=32, default='', db_index=True, verbose_name='MD5哈希',
@@ -65,6 +73,7 @@ class KnowledgeDoc(models.Model):
         null=True, blank=True,
         related_name='knowledge_docs',
         verbose_name='学科方向',
+        db_comment='学科方向(1=软件工程,2=计算机,3=网络,4=物联网,5=网安,6=集成电路,7=大数据中外,8=大数据管理,9=机器人,10=信息工程,11=智能科学,12=数据科学,13=AI,14=信管,15=供应链,16=人力,17=电商,18=财务,19=数媒技术,20=数媒艺术,21=艺术与科技,22=VR,23=工业设计,24=视觉传达,25=动画,26=英语,27=商务英语,28=日语,29=公共外语,30=留学生,31=智能医学,32=医学信息,33=医学影像,34=健康服务,35=数字动画,36=软件技术,37=AI技术,38=医养照护)',
     )
     category = models.ForeignKey(
         'classify.Category',
@@ -72,6 +81,7 @@ class KnowledgeDoc(models.Model):
         null=True, blank=True,
         related_name='knowledge_docs',
         verbose_name='资源类型',
+        db_comment='资源类型(1=教学课件,2=试题库,3=实验指导,4=规章制度,5=培养方案,6=论文摘要,7=参考资料,8=官网公告,9=新闻动态)',
     )
     college = models.ForeignKey(
         'accounts.College',
@@ -79,6 +89,15 @@ class KnowledgeDoc(models.Model):
         null=True, blank=True,
         related_name='knowledge_docs',
         verbose_name='所属学院',
+        db_comment='所属学院(1=计算机,2=智能科学,3=信商管理,4=数字艺术,5=外国语,6=健康医疗,7=高职,8=国际,9=基础,10=马院,11=创业,12=继续教育,13=退役军人)',
+    )
+    department = models.ForeignKey(
+        'classify.Department',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='knowledge_docs',
+        verbose_name='所属部门',
+        db_comment='所属部门(1=校级领导,2=党政,3=教学管理,4=学生工作,5=科研服务,6=后勤,7=继续教育)',
     )
     uploader = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -108,6 +127,7 @@ class KnowledgeDoc(models.Model):
         verbose_name = '知识文档'
         verbose_name_plural = verbose_name
         ordering = ['-created_at']
+        db_table_comment = '知识文档表(外键说明: college_id=学院, department_id=部门, category_id=资源类型, discipline_id=学科方向)'
 
     def __str__(self):
         return self.title
@@ -115,7 +135,6 @@ class KnowledgeDoc(models.Model):
 
 class Keyword(models.Model):
     """关键词——上传员为文档添加的关键词，权重越高检索命中越优先"""
-
     MATCH_TYPE_CHOICES = [
         ('exact', '精确匹配'),
         ('fuzzy', '模糊匹配'),
@@ -158,7 +177,6 @@ class Keyword(models.Model):
 
 class DocChunk(models.Model):
     """文档切片——文档解析分块后的文本片段，向量存 Milvus，MySQL 存引用"""
-
     doc = models.ForeignKey(
         KnowledgeDoc,
         on_delete=models.CASCADE,

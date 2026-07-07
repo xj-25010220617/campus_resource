@@ -63,14 +63,24 @@ class IsLoginUser(permissions.BasePermission):
         )
 
 
-class IsAdminOrSuperAdmin(permissions.BasePermission):
-    """admin 和 super_admin 可访问，user 不可"""
+class CanUploadDocument(permissions.BasePermission):
+    """文档上传权限 — 所有登录用户（含普通 user）均可上传"""
 
     def has_permission(self, request, view):
         return (
             request.user
             and request.user.is_authenticated
-            and request.user.role in ('admin', 'super_admin')
+        )
+
+
+class IsAdminOrSuperAdmin(permissions.BasePermission):
+    """所有管理员角色可访问：super_admin、college_admin、dept_admin、admin；user 不可"""
+
+    def has_permission(self, request, view):
+        return (
+            request.user
+            and request.user.is_authenticated
+            and request.user.role in ('super_admin', 'college_admin', 'dept_admin', 'admin')
         )
 
 
@@ -118,3 +128,34 @@ class CanManageUsers(permissions.BasePermission):
             return obj.role == 'user'
 
         return False
+
+
+class IsCollegeAdmin(permissions.BasePermission):
+    """
+    学院管理员权限 — super_admin 或 college_admin 可访问。
+    学院管理员的操作范围限定在本学院内。
+    """
+
+    def has_permission(self, request, view):
+        return (
+            request.user
+            and request.user.is_authenticated
+            and request.user.role in ('super_admin', 'college_admin')
+        )
+
+
+class IsFAQAdmin(permissions.BasePermission):
+    """
+    FAQ 管理员权限 — super_admin / college_admin / dept_admin 可访问。
+    不同角色有不同数据范围：
+    - super_admin: 全部
+    - college_admin: 所属学院的 FAQ
+    - dept_admin: 所属部门的学院范围内 FAQ
+    """
+
+    def has_permission(self, request, view):
+        return (
+            request.user
+            and request.user.is_authenticated
+            and request.user.role in ('super_admin', 'college_admin', 'dept_admin', 'admin')
+        )

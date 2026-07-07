@@ -3,10 +3,13 @@ import logging
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import transaction
+from drf_spectacular.utils import extend_schema
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
+
+from utils.error_codes import ErrorCode
 
 from .serializers import UserSerializer, ChangePasswordSerializer
 
@@ -19,6 +22,14 @@ User = get_user_model()
 # code → 自动创建/查找的用户信息
 # ------------------------------------------------------------------
 MOCK_SSO_USERS = {
+    'mock_super_admin': {
+        'sso_uid': 'sso_10000',
+        'username': 'sso_super_admin',
+        'role': 'super_admin',
+        'first_name': 'SSO',
+        'last_name': '超级管理员',
+        'email': 'sso_super_admin@nsu.edu.cn',
+    },
     'mock_admin': {
         'sso_uid': 'sso_10001',
         'username': 'sso_admin',
@@ -26,6 +37,24 @@ MOCK_SSO_USERS = {
         'first_name': 'SSO',
         'last_name': '管理员',
         'email': 'sso_admin@nsu.edu.cn',
+    },
+    'mock_college_admin': {
+        'sso_uid': 'sso_10004',
+        'username': 'sso_college_admin',
+        'role': 'college_admin',
+        'first_name': '学院',
+        'last_name': '管理员',
+        'email': 'sso_college_admin@nsu.edu.cn',
+        'college_code': 'CS',
+    },
+    'mock_dept_admin': {
+        'sso_uid': 'sso_10005',
+        'username': 'sso_dept_admin',
+        'role': 'dept_admin',
+        'first_name': '部门',
+        'last_name': '管理员',
+        'email': 'sso_dept_admin@nsu.edu.cn',
+        'department_id': 13,
     },
     'mock_teacher': {
         'sso_uid': 'sso_10002',
@@ -46,6 +75,12 @@ MOCK_SSO_USERS = {
 }
 
 
+@extend_schema(
+    summary='当前用户信息',
+    description='获取当前登录用户的个人信息，或更新个人资料',
+    tags=['用户管理'],
+    operation_id='当前用户信息',
+)
 class MeView(generics.RetrieveUpdateAPIView):
     """
     当前登录用户信息
@@ -175,7 +210,7 @@ class SsoCallbackView(APIView):
 
         if not code:
             return Response(
-                {'detail': '缺少 code 参数', 'code': 'VALIDATION_ERROR'},
+                {'detail': '缺少 code 参数', 'code': ErrorCode.VALIDATION_ERROR.value},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -185,7 +220,7 @@ class SsoCallbackView(APIView):
                 {
                     'detail': f'无效的 SSO 测试码: {code}',
                     'available_codes': list(MOCK_SSO_USERS.keys()),
-                    'code': 'INVALID_SSO_CODE',
+                    'code': ErrorCode.INVALID_SSO_CODE.value,
                 },
                 status=status.HTTP_401_UNAUTHORIZED,
             )
@@ -211,6 +246,9 @@ class SsoCallbackView(APIView):
     @staticmethod
     def _get_or_create_sso_user(user_info):
         """根据 sso_uid 查找或创建用户"""
+        from apps.accounts.models import College
+        from apps.classify.models import Department
+
         with transaction.atomic():
             user = User.objects.filter(sso_uid=user_info['sso_uid']).first()
             if user:
@@ -218,17 +256,210 @@ class SsoCallbackView(APIView):
                 user.email = user_info.get('email', user.email)
                 user.first_name = user_info.get('first_name', user.first_name)
                 user.last_name = user_info.get('last_name', user.last_name)
-                user.save(update_fields=['email', 'first_name', 'last_name'])
+                update_fields = ['email', 'first_name', 'last_name']
+                user.save(update_fields=update_fields)
                 return user, False
 
-            # 创建新用户（SSO 用户无本地密码，用 unusable password）
+            # 解析 college（college_admin / user 需要）
+            college = None
+            college_code = user_info.get('college_code')
+            if college_code:
+                college = College.objects.filter(code=college_code).first()
+
+            # 解析 department（dept_admin 需要）
+            department = None
+            department_id = user_info.get('department_id')
+            if department_id:
+                department = Department.objects.filter(id=department_id).first()
+
+            role = user_info.get('role', 'user')
+
+            # 创建新用户（SSO 用户无本地密码）
             user = User.objects.create_user(
                 username=user_info['username'],
                 email=user_info.get('email', ''),
                 first_name=user_info.get('first_name', ''),
                 last_name=user_info.get('last_name', ''),
-                role=user_info.get('role', 'user'),
+                role=role,
                 sso_uid=user_info['sso_uid'],
+                college=college,
+                department=department,
+            )
+            user.set_unusable_password()
+            user.save(update_fields=['password'])
+            return user, True
+
+
+class LogoutView(APIView):
+    """
+    登出
+
+    POST /api/auth/logout/
+    功能：将 refresh token 加入黑名单，使 refresh 失效
+    参数：
+        - refresh (string, required): 登录时获取的 refresh token
+    返回：{"detail": "已登出"}
+    注意：客户端需同时丢弃本地 access token
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        refresh_token = request.data.get('refresh')
+        if refresh_token:
+            try:
+                token = RefreshToken(refresh_token)
+                token.blacklist()
+                logger.info('Token 已加入黑名单')
+            except Exception:
+                logger.warning('Token 黑名单失败（可能未启用 blacklist app）')
+        return Response({'detail': '已登出'}, status=status.HTTP_200_OK)
+
+
+class DingtalkQrView(APIView):
+    """
+    钉钉扫码登录 — 获取扫码地址
+
+    GET /api/auth/dingtalk/qr/
+    功能：返回钉钉 OAuth 授权 URL，前端生成二维码供用户扫码
+    返回：{"auth_url": "https://login.dingtalk.com/oauth2/auth?...", "qr_url": "..."}
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        app_key = getattr(settings, 'DINGTALK_APP_KEY', '')
+        redirect_uri = request.build_absolute_uri('/api/auth/dingtalk/callback/')
+
+        if not app_key:
+            return Response(
+                {
+                    'detail': '钉钉登录未配置，请在 .env 中设置 DINGTALK_APP_KEY 和 DINGTALK_APP_SECRET',
+                    'config_hint': '打开钉钉开放平台 → 创建应用 → 获取 AppKey 和 AppSecret',
+                },
+                status=status.HTTP_501_NOT_IMPLEMENTED,
+            )
+
+        auth_url = (
+            'https://login.dingtalk.com/oauth2/auth'
+            f'?redirect_uri={redirect_uri}'
+            '&response_type=code'
+            f'&client_id={app_key}'
+            '&scope=openid%20corpid'
+            '&state=dingtalk_login'
+            '&prompt=consent'
+        )
+        return Response({
+            'auth_url': auth_url,
+            'usage': '前端将此 URL 生成二维码，用户用钉钉扫码后在钉钉内确认登录',
+        })
+
+
+class DingtalkCallbackView(APIView):
+    """
+    钉钉扫码登录 — 回调
+
+    POST /api/auth/dingtalk/callback/
+    功能：接收前端传来的 authCode，调用钉钉 API 换取用户信息，签发 JWT
+    参数：
+        - authCode (string, required): 钉钉扫码后回调的授权码
+    返回：{"access": "...", "refresh": "...", "user": {...}}
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        auth_code = request.data.get('authCode') or request.data.get('code')
+
+        if not auth_code:
+            return Response(
+                {'detail': '缺少 authCode 参数', 'code': ErrorCode.VALIDATION_ERROR.value},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # 调用钉钉 API 换取用户信息
+        user_info = self._get_dingtalk_user(auth_code)
+        if not user_info:
+            return Response(
+                {'detail': '钉钉授权失败，请重新扫码', 'code': ErrorCode.DINGTALK_AUTH_FAILED.value},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        # 查找或创建本地用户
+        user, created = self._get_or_create_user(user_info)
+
+        refresh = RefreshToken.for_user(user)
+        logger.info(
+            '钉钉扫码登录: union_id=%s user=%s created=%s',
+            user_info.get('union_id'), user.username, created,
+        )
+        return Response({
+            'access': str(refresh.access_token),
+            'refresh': str(refresh),
+            'user': UserSerializer(user).data,
+            'created': created,
+        }, status=status.HTTP_200_OK)
+
+    def _get_dingtalk_user(self, auth_code):
+        """调用钉钉 OpenAPI 换取用户信息"""
+        import requests
+
+        app_key = getattr(settings, 'DINGTALK_APP_KEY', '')
+        app_secret = getattr(settings, 'DINGTALK_APP_SECRET', '')
+
+        try:
+            # 步骤1：authCode → accessToken
+            token_resp = requests.post(
+                'https://api.dingtalk.com/v1.0/oauth2/userAccessToken',
+                json={
+                    'clientId': app_key,
+                    'clientSecret': app_secret,
+                    'code': auth_code,
+                    'grantType': 'authorization_code',
+                },
+                timeout=10,
+            )
+            token_data = token_resp.json()
+            access_token = token_data.get('accessToken')
+            if not access_token:
+                logger.error('钉钉获取 accessToken 失败: %s', token_data)
+                return None
+
+            # 步骤2：accessToken → 用户信息
+            user_resp = requests.get(
+                'https://api.dingtalk.com/v1.0/contact/users/me',
+                headers={'x-acs-dingtalk-access-token': access_token},
+                timeout=10,
+            )
+            user_data = user_resp.json()
+            logger.info('钉钉用户信息: nick=%s unionId=%s', user_data.get('nick'), user_data.get('unionId'))
+            return user_data
+
+        except Exception as e:
+            logger.error('钉钉 API 调用失败: %s', e)
+            return None
+
+    @staticmethod
+    def _get_or_create_user(user_info):
+        """根据钉钉 unionId 查找或创建本地用户"""
+        union_id = user_info.get('unionId', '')
+        nick = user_info.get('nick', '')
+        email = user_info.get('email', '')
+        mobile = user_info.get('mobile', '')
+
+        with transaction.atomic():
+            user = User.objects.filter(sso_uid=union_id).first()
+            if user:
+                user.email = email or user.email
+                user.phone = mobile or user.phone
+                user.save(update_fields=['email', 'phone'])
+                return user, False
+
+            user = User.objects.create_user(
+                username=f'dd_{nick}' if nick else f'dd_{union_id[:12]}',
+                email=email,
+                first_name=nick,
+                last_name='',
+                phone=mobile,
+                role='user',
+                sso_uid=union_id,
             )
             user.set_unusable_password()
             user.save(update_fields=['password'])

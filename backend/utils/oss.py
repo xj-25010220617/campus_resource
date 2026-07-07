@@ -26,7 +26,11 @@ class OSSClient:
     def __init__(self):
         self.access_key_id = settings.OSS_ACCESS_KEY_ID
         self.access_key_secret = settings.OSS_ACCESS_KEY_SECRET
-        self.endpoint = settings.OSS_ENDPOINT
+        raw_endpoint = (settings.OSS_ENDPOINT or '').strip()
+        # 移除 protocol 前缀，用于 URL 拼接
+        self.endpoint = raw_endpoint.replace('https://', '').replace('http://', '')
+        # 保留完整 endpoint（含 protocol），传给 oss2 SDK
+        self._raw_endpoint = raw_endpoint if '://' in raw_endpoint else f'https://{raw_endpoint}'
         self.bucket_name = settings.OSS_BUCKET_NAME
         self._auth = None
         self._bucket = None
@@ -40,7 +44,7 @@ class OSSClient:
     @property
     def bucket(self):
         if self._bucket is None and self.auth:
-            self._bucket = oss2.Bucket(self.auth, self.endpoint, self.bucket_name)
+            self._bucket = oss2.Bucket(self.auth, self._raw_endpoint, self.bucket_name)
         return self._bucket
 
     def _sanitize_filename(self, file_name: str) -> str:
@@ -49,24 +53,27 @@ class OSSClient:
         safe_name = ''.join(c if c.isalnum() or c in '._-' else '_' for c in name)
         return f'{safe_name}.{ext}' if dot else safe_name
 
-    def _generate_oss_key(self, file_name: str, college_id: int = 0) -> str:
+    def _generate_oss_key(self, file_name: str, scope: str = 'college',
+                          owner_id: int = 0) -> str:
         """
         生成 OSS 对象 Key。
-        格式: knowledge/{college_id}/{YYYY-MM}/{uuid}.{ext}
+        格式: knowledge/{scope}/{owner_id}/{YYYY-MM}/{uuid}.{ext}
 
         Args:
             file_name: 原始文件名
-            college_id: 学院 ID（0 表示未分配学院）
+            scope: 归属范围（school/college/department）
+            owner_id: 归属对象 ID（college_id 或 department_id，school 时为 0）
         """
         ext = file_name.rsplit('.', 1)[-1].lower() if '.' in file_name else 'bin'
         now = datetime.now()
         safe_name = self._sanitize_filename(file_name)
-        return f'knowledge/{college_id}/{now:%Y-%m}/{_uuid.uuid4().hex[:12]}.{ext}'
+        return f'knowledge/{scope}/{owner_id}/{now:%Y-%m}/{_uuid.uuid4().hex[:12]}.{ext}'
 
     # ------------------------------------------------------------------
     # STS 临时凭证（前端直传 OSS）
     # ------------------------------------------------------------------
-    def get_sts_credentials(self, file_name: str, college_id: int = 0) -> dict:
+    def get_sts_credentials(self, file_name: str, scope: str = 'college',
+                            owner_id: int = 0) -> dict:
         """
         获取 STS 临时凭证，供前端直传 OSS。
         返回:
@@ -75,9 +82,10 @@ class OSSClient:
 
         Args:
             file_name: 原始文件名
-            college_id: 学院 ID
+            scope: 归属范围（school/college/department）
+            owner_id: 归属对象 ID
         """
-        oss_key = self._generate_oss_key(file_name, college_id)
+        oss_key = self._generate_oss_key(file_name, scope, owner_id)
 
         if not self.access_key_id:
             # 本地开发：返回签名直传 URL（有效期 300 秒）

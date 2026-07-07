@@ -1,8 +1,11 @@
 import logging
+import time
 
 from django.http import StreamingHttpResponse
 from django.shortcuts import get_object_or_404
-from rest_framework import generics, permissions, status
+from django.utils import timezone
+from drf_spectacular.utils import extend_schema
+from rest_framework import generics, parsers, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -12,22 +15,27 @@ from apps.knowledge.models import KnowledgeDoc
 
 from utils import rag
 from utils.llm import llm_client
+from utils.sensitive_filter import check_sensitive
 from utils.sse import _format_sse, build_references_events
+from utils.error_codes import ErrorCode
+from apps.classify.utils.query_parser import parse as parse_query
 
-from .models import Conversation, ChatMessage, QueryLog
+from .models import Conversation, ChatMessage, QueryLog, SensitiveLog
 from .serializers import (
-    ConversationSerializer,
-    ConversationListSerializer,
-    ChatMessageSerializer,
-    AskSerializer,
-    FeedbackSerializer,
-    MessageRateSerializer,
+    AskSerializer, ChatMessageSerializer, ConversationListSerializer,
+    ConversationSerializer, FeedbackSerializer, MessageRateSerializer,
+    VoiceAskSerializer,
 )
 
 
 logger = logging.getLogger(__name__)
 
 
+@extend_schema(
+    summary='会话管理',
+    description='会话管理接口，支持列表、创建、详情、编辑、删除',
+    tags=['AI对话'],
+)
 class ConversationViewSet(ModelViewSet):
     """
     会话 ViewSet
@@ -53,6 +61,11 @@ class ConversationViewSet(ModelViewSet):
         serializer.save(user=self.request.user)
 
 
+@extend_schema(
+    summary='消息管理',
+    description='消息反馈和引用来源查看',
+    tags=['AI对话'],
+)
 class MessageViewSet(ModelViewSet):
     """
     消息 ViewSet（用于消息反馈和引用来源查看）
@@ -169,6 +182,12 @@ class MessageViewSet(ModelViewSet):
         return Response(data)
 
 
+@extend_schema(
+    summary='会话列表',
+    description='返回当前用户的会话列表',
+    tags=['AI对话'],
+    operation_id='会话列表',
+)
 class ConversationListView(generics.ListAPIView):
     """
     会话列表（兼容旧接口）
@@ -183,6 +202,12 @@ class ConversationListView(generics.ListAPIView):
         return Conversation.objects.filter(user=self.request.user).order_by('-updated_at')
 
 
+@extend_schema(
+    summary='会话详情',
+    description='返回指定会话的完整消息列表',
+    tags=['AI对话'],
+    operation_id='会话详情',
+)
 class ConversationDetailView(generics.RetrieveAPIView):
     """
     会话详情（兼容旧接口）
@@ -197,6 +222,12 @@ class ConversationDetailView(generics.RetrieveAPIView):
         return Conversation.objects.filter(user=self.request.user).prefetch_related('messages')
 
 
+@extend_schema(
+    summary='AI问答',
+    description='AI问答接口，流式输出回答结果',
+    tags=['AI对话'],
+    operation_id='AI问答',
+)
 class AskView(APIView):
     """
     AI 问答接口（流式输出）
@@ -235,6 +266,40 @@ class AskView(APIView):
         question = serializer.validated_data['question']
         conversation_id = serializer.validated_data.get('conversation_id')
         user = request.user
+        user_context = {
+            'user_id': user.id,
+            'role': getattr(user, 'role', 'user'),
+            'college_id': getattr(user, 'college_id', None),
+        }
+
+        # 0. 敏感内容检查
+        sensitive_result = check_sensitive(question)
+        if sensitive_result.is_sensitive:
+            logger.warning(
+                '敏感内容拦截: user=%s question=%s... rules=%s',
+                user.username, question[:60], sensitive_result.matched_rules,
+            )
+            SensitiveLog.objects.create(
+                user=user,
+                question=question,
+                matched_rules=sensitive_result.matched_rules,
+                matched_texts=sensitive_result.matched_texts,
+                refuse_message=sensitive_result.refuse_message,
+            )
+            return Response(
+                {
+                    'detail': sensitive_result.refuse_message,
+                    'code': ErrorCode.SENSITIVE_CONTENT.value,
+                    'matched_rules': sensitive_result.matched_rules,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # 0.5 意图路由：判断问题类型（文件管理查询 / 常规 RAG）
+        from utils.query_router import route_question
+        from utils.data_query import execute_query, build_data_query_prompt
+        route = route_question(question, user)
+        is_data_query = route['type'] == 'data_query'
 
         # 1. 获取或新建会话
         if conversation_id:
@@ -252,6 +317,12 @@ class AskView(APIView):
             conversation=conversation, role='user', content=question,
         )
 
+        # 文件管理查询路由
+        if is_data_query:
+            return self._handle_data_query(
+                question, user, conversation, route,
+            )
+
         # 3. 获取历史消息（用于多轮对话上下文）
         history = list(
             conversation.messages
@@ -260,13 +331,28 @@ class AskView(APIView):
             .values('role', 'content')
         )
 
-        # 4. RAG 检索
-        user_context = {
-            'user_id': user.id,
-            'role': user.role,
-            'college_id': user.college_id,
-        }
-        results = rag.retrieve(question, user_context=user_context)
+        # 3.1 问题解析（LLM 抽取硬过滤条件，失败走规则回退）
+        parsed = parse_query(question, user_context)
+        logger.debug(f'parsed_filters: {parsed}')
+
+        # 3.2 RAG 检索（新版：硬过滤 + 双路召回 + 权限校验）
+        results = rag.retrieve(
+            question=question,
+            user_context=user_context,
+            parsed_filters=parsed,
+        )
+
+        # 3.3 写 query_log（预创建，response_ms 在流结束后回填）
+        start_ts = time.time()
+        query_log = QueryLog.objects.create(
+            user=user,
+            conversation=conversation,
+            question=question,
+            parsed_filters=parsed,
+            hit_count=len(results),
+            top_doc_ids=[r['doc_id'] for r in results],
+            response_ms=0,
+        )
 
         # 5. 构造 Prompt（含历史上下文）
         messages = rag.build_rag_prompt(question, results, history=history)
@@ -284,47 +370,108 @@ class AskView(APIView):
 
         # 7. SSE 流式响应
         def event_stream():
-            """生成 SSE 事件流"""
-            # start 事件
-            yield _format_sse('start', {
-                'conversation_id': conversation.id,
-                'message_id': assistant_msg.id,
-            })
+            """生成 SSE 事件流（finally 保证 query_log 回填）"""
+            try:
+                # start 事件
+                yield _format_sse('start', {
+                    'conversation_id': conversation.id,
+                    'message_id': assistant_msg.id,
+                })
 
-            # 流式生成
-            collected_tokens = []
-            stream = llm_client.chat_stream(messages)
-            for token in stream:
-                if token:
-                    collected_tokens.append(token)
-                    yield _format_sse('token', {'content': token})
+                # 流式生成
+                collected_tokens = []
+                stream = llm_client.chat_stream(messages)
+                for token in stream:
+                    if token:
+                        collected_tokens.append(token)
+                        yield _format_sse('token', {'content': token})
 
-            full_answer = ''.join(collected_tokens)
+                full_answer = ''.join(collected_tokens)
 
-            # 保存 AI 回答（流结束后写库）
-            if full_answer:
-                ChatMessage.objects.filter(id=assistant_msg.id).update(
-                    content=full_answer,
-                )
-                logger.info(
-                    'AI 回答完成 msg_id=%d conv_id=%d tokens=%d',
-                    assistant_msg.id, conversation.id, len(collected_tokens),
-                )
+                # 保存 AI 回答（流结束后写库）
+                if full_answer:
+                    ChatMessage.objects.filter(id=assistant_msg.id).update(
+                        content=full_answer,
+                    )
+                    logger.info(
+                        'AI 回答完成 msg_id=%d conv_id=%d tokens=%d',
+                        assistant_msg.id, conversation.id, len(collected_tokens),
+                    )
 
-            # 生成相关推荐（调用 LLM 生成 3 个相关问题）
-            suggested = rag.generate_suggested_questions(question, full_answer)
-            if suggested:
-                yield _format_sse('suggested', suggested)
+                # 生成相关推荐（调用 LLM 生成 3 个相关问题）
+                suggested = rag.generate_suggested_questions(question, full_answer)
+                if suggested:
+                    yield _format_sse('suggested', suggested)
 
-            # 引用溯源
-            refs = build_references_events(results, user.role, user.id)
-            if 'references' in refs:
-                yield _format_sse('references', refs['references'])
-            if 'references_detail' in refs and is_authorized:
-                yield _format_sse('references_detail', refs['references_detail'])
+                # 引用溯源
+                refs = build_references_events(results, user.role, user.id)
+                if 'references' in refs:
+                    yield _format_sse('references', refs['references'])
+                if 'references_detail' in refs and is_authorized:
+                    yield _format_sse('references_detail', refs['references_detail'])
 
-            # done 事件
-            yield _format_sse('done', {'message_id': assistant_msg.id})
+                # done 事件
+                yield _format_sse('done', {'message_id': assistant_msg.id})
+
+            finally:
+                # 保证流中断时 response_ms 也能回填（客户端断连、Django 回收 generator 时触发）
+                elapsed_ms = int((time.time() - start_ts) * 1000)
+                try:
+                    QueryLog.objects.filter(id=query_log.id).update(response_ms=elapsed_ms)
+                except Exception:
+                    logger.warning('回填 response_ms 失败 query_log.id=%d', query_log.id)
+
+        response = StreamingHttpResponse(
+            event_stream(),
+            content_type='text/event-stream',
+        )
+        response['Cache-Control'] = 'no-cache'
+        response['X-Accel-Buffering'] = 'no'
+        response['Access-Control-Allow-Origin'] = '*'
+        return response
+
+    def _handle_data_query(self, question, user, conversation, route):
+        """处理文件管理类查询：查询数据库 → LLM 格式化 → SSE 流式输出。"""
+        from utils.data_query import execute_query, build_data_query_prompt
+        from utils.sse import _format_sse
+
+        # 执行查询
+        query_result = execute_query(route, user)
+
+        # 构造 Prompt
+        messages = build_data_query_prompt(question, query_result)
+
+        # 创建 AI 消息占位
+        assistant_msg = ChatMessage.objects.create(
+            conversation=conversation, role='assistant',
+            content='',
+        )
+
+        # SSE 流式响应
+        def event_stream():
+            try:
+                yield _format_sse('start', {
+                    'conversation_id': conversation.id,
+                    'message_id': assistant_msg.id,
+                })
+
+                collected = []
+                for token in llm_client.chat_stream(messages, temperature=0.3, max_tokens=1024):
+                    if token:
+                        collected.append(token)
+                        yield _format_sse('token', {'content': token})
+
+                full_answer = ''.join(collected)
+                if full_answer:
+                    ChatMessage.objects.filter(id=assistant_msg.id).update(
+                        content=full_answer,
+                    )
+
+                yield _format_sse('done', {'message_id': assistant_msg.id})
+
+            except Exception as e:
+                logger.error(f'数据查询 SSE 流输出失败: {e}')
+                yield _format_sse('error', f'查询失败: {e}')
 
         response = StreamingHttpResponse(
             event_stream(),
@@ -341,7 +488,7 @@ class FeedbackView(generics.CreateAPIView):
     问答反馈接口（兼容旧接口）
 
     POST /api/chat/feedback/
-    功能：用户根据点赞/点踩，写入 query_log
+    功能：用户根据点赞/点踩，写入 query_log.user_feedback
     参数：
         - message_id (int, required): 消息ID
         - feedback (int, required): 1=赞 / 0=踩
@@ -349,3 +496,182 @@ class FeedbackView(generics.CreateAPIView):
     """
     serializer_class = FeedbackSerializer
     permission_classes = [permissions.IsAuthenticated]
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        message_id = serializer.validated_data['message_id']
+        feedback = serializer.validated_data['feedback']
+        user = request.user
+
+        # 找到消息，验证所有权
+        msg = get_object_or_404(
+            ChatMessage, id=message_id, conversation__user=user,
+        )
+
+        # 找到该会话最近一条 QueryLog，回填 user_feedback
+        QueryLog.objects.filter(
+            conversation=msg.conversation,
+            user=user,
+        ).order_by('-created_at').first()
+
+        # 用 update 而非 save，避免触发 save() 逻辑
+        updated = QueryLog.objects.filter(
+            conversation=msg.conversation,
+            user=user,
+        ).order_by('-created_at').update(user_feedback=feedback)
+
+        if not updated:
+            logger.warning('FeedbackView: 未找到对应 QueryLog msg_id=%d user_id=%d', message_id, user.id)
+
+        return Response(
+            {'detail': '反馈已记录'},
+            status=status.HTTP_200_OK,
+        )
+
+
+class VoiceAskView(APIView):
+    """
+    语音问答接口
+
+    POST /api/chat/voice-ask/
+    功能：接收音频文件 → FunASR 语音转文字 → RAG 检索 → LLM 流式 SSE 回答
+    请求参数（form-data）：
+        - audio_file (file, required): 音频文件，支持 WAV/MP3/PCM，最大 10MB
+        - conversation_id (int, optional): 会话 ID，不传则新建
+    返回：SSE 流式响应（text/event-stream）
+    错误：
+        - 400: 文件无效
+        - 500: 语音识别失败
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    parser_classes = [parsers.MultiPartParser, parsers.FormParser]
+
+    def post(self, request):
+        """处理语音问答"""
+        from utils.asr import speech_to_text
+
+        serializer = VoiceAskSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        # 读取音频文件
+        audio_file = data['audio_file']
+        if audio_file.size > 10 * 1024 * 1024:
+            return Response(
+                {'detail': '音频文件不能超过 10MB', 'code': ErrorCode.FILE_TOO_LARGE.value},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        audio_data = audio_file.read()
+
+        # 语音 → 文字
+        text = speech_to_text(audio_data, audio_file.name.rsplit('.', 1)[-1] if '.' in audio_file.name else 'wav')
+        if not text:
+            from utils.asr import _model_error
+            detail = '语音识别失败，请确认音频清晰且包含中文语音'
+            if _model_error:
+                detail = f'语音识别失败: {_model_error}'
+            return Response(
+                {'detail': detail, 'code': ErrorCode.ASR_FAILED.value},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        # 复用 AskView 的 RAG 检索 + LLM 流式逻辑
+        return self._stream_answer(text, request.user, data.get('conversation_id'))
+
+    def _stream_answer(self, question: str, user, conversation_id):
+        """RAG 检索 + LLM 流式 SSE，复用 AskView 核心逻辑"""
+        from django.http import StreamingHttpResponse
+        from utils.sse import _format_sse, build_references_events
+
+        user_context = {
+            'user_id': user.id, 'role': user.role,
+            'college_id': user.college_id, 'department_id': user.department_id,
+        }
+        parsed = parse_query(question, user_context)
+        hits = rag.retrieve(
+            question=question, user_context=user_context,
+            parsed_filters=parsed, top_k=rag.RAG_TOP_K,
+            min_score=rag.RAG_SCORE_THRESHOLD,
+        )
+        messages = rag.build_rag_prompt(question, hits)
+        sensitive_hit = any(check_sensitive(m.get('content', '')) for m in messages)
+
+        # 处理或创建会话
+        if conversation_id:
+            conv = get_object_or_404(Conversation, id=conversation_id, user=user)
+        else:
+            conv = Conversation.objects.create(user=user, title=question[:50])
+        ChatMessage.objects.create(conversation=conv, role='user', content=question)
+
+        # 写查询日志
+        log = QueryLog.objects.create(
+            user=user, question=question, parsed_filters=parsed,
+            hit_count=len(hits), top_doc_ids=[h['doc_id'] for h in hits],
+            conversation=conv,
+        )
+
+        ai_msg_ref = [None]  # mutable holder, set after stream
+
+        def generate():
+            full_answer = ''
+            t0 = time.time()
+            try:
+                for chunk in llm_client.chat_stream(messages):
+                    full_answer += chunk
+                    yield _format_sse('msg', chunk)
+                ai_msg = ChatMessage.objects.create(
+                    conversation=conv, role='assistant', content=full_answer,
+                    references={'hits': hits, 'sensitive': sensitive_hit},
+                )
+                ai_msg_ref[0] = ai_msg
+                log.response_ms = int((time.time() - t0) * 1000)
+                log.save()
+                yield _format_sse('done', {'message_id': ai_msg.id})
+                yield build_references_events(hits, rag.RAG_REFERENCE_THRESHOLD)
+            except Exception as e:
+                logger.error(f'LLM 流式输出失败: {e}')
+                yield _format_sse('error', f'回答生成失败: {e}')
+
+        response = StreamingHttpResponse(generate(), content_type='text/event-stream')
+        response['Cache-Control'] = 'no-cache'
+        response['X-Accel-Buffering'] = 'no'
+        response['X-Message-Id'] = str(log.id)
+        return response
+class HotQuestionsView(APIView):
+    """
+    热点问题广场 — "大家都在问"
+
+    GET /api/chat/hot-questions/?days=7&top_k=10
+
+    实时统计近期用户高频提问，按提问次数降序排列。
+    适合展示在智能问答主界面。
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        days = int(request.query_params.get('days', 7))
+        top_k = int(request.query_params.get('top_k', 10))
+
+        since = timezone.now() - timezone.timedelta(days=days)
+
+        from django.db.models import Count
+
+        questions_qs = (
+            ChatMessage.objects
+            .filter(role='user', created_at__gte=since)
+            .values('content')
+            .annotate(count=Count('id'))
+            .order_by('-count')[:top_k]
+        )
+
+        results = [
+            {
+                'question': item['content'],
+                'count': item['count'],
+            }
+            for item in questions_qs
+        ]
+
+        return Response(results)

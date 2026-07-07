@@ -1,11 +1,14 @@
 from django.urls import path
 
 from .views import (
+    AIClassifyView,
     ExtractFreshnessView,
+    FileUploadView,
     KeywordCreateView,
     KeywordDeleteView,
     KeywordListView,
     KeywordUpdateView,
+    KnowledgeDocBatchDeleteView,
     KnowledgeDocDeleteView,
     KnowledgeDocDetailView,
     KnowledgeDocDownloadView,
@@ -19,13 +22,17 @@ from .views import (
 
 urlpatterns = [
     # 上传
+    path('upload/file/', FileUploadView.as_view(), name='upload_file'),
     path('upload/text/', TextUploadView.as_view(), name='upload_text'),
     path('upload/sts/', UploadSTSView.as_view(), name='upload_sts'),
+    path('upload/ai-classify/', AIClassifyView.as_view(), name='upload_ai_classify'),
+    path('upload/classify/', AIClassifyView.as_view(), name='upload_classify'),
     path('upload/callback/', UploadCallbackView.as_view(), name='upload_callback'),
 
     # 文档
     path('docs/', KnowledgeDocListView.as_view(), name='knowledge_doc_list'),
     path('docs/<int:pk>/', KnowledgeDocDetailView.as_view(), name='knowledge_doc_detail'),
+    path('docs/batch/', KnowledgeDocBatchDeleteView.as_view(), name='knowledge_doc_batch_delete'),
     path('docs/<int:pk>/delete/', KnowledgeDocDeleteView.as_view(), name='knowledge_doc_delete'),
     path('docs/<int:pk>/download/', KnowledgeDocDownloadView.as_view(), name='knowledge_doc_download'),
 

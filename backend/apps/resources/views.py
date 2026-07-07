@@ -1,23 +1,37 @@
 """Resources - 资源列表与上传日志视图"""
-from django.db.models import Count, Sum, Q
+import datetime as _datetime
+
+from django.db.models import Count, Sum
 from django.db.models.functions import Cast
 from django.db.models import TextField
 from django.utils import timezone
-from rest_framework import generics, viewsets, status
+from django.utils.dateparse import parse_datetime
+
+from rest_framework import generics, permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
+
+from drf_spectacular.utils import extend_schema
 
 from apps.classify.models import Category
+from apps.admin_panel.permissions import IsAnyAdmin, scope_upload_logs, scope_resources_for_browse
 from config.permissions import IsAdminOrSuperAdmin
+
 from .models import Resource, UploadLog
 from .serializers import (
     ResourceListSerializer,
     UploadLogSerializer,
     UploadLogStatsSerializer,
+    UploadLogCompleteSerializer,
 )
 
 
+@extend_schema(
+    summary='资源列表',
+    description='分页返回已发布资源列表，支持按学院、学科、分类、关键词筛选',
+    tags=['资源管理'],
+    operation_id='资源列表',
+)
 class ResourceListView(generics.ListAPIView):
     """
     资源列表接口
@@ -31,18 +45,25 @@ class ResourceListView(generics.ListAPIView):
         - discipline_id (int, optional): 按学科方向ID精确筛选
         - category_id (int, optional): 按资源类型筛选，一级分类自动包含其下所有二级分类
         - keyword (str, optional): 按关键词模糊匹配
-    权限规则：所有登录用户均可查看资源列表
+    权限规则：
+        - super_admin：全校已发布资源
+        - admin / college_admin：本学院已发布资源（department IS NULL）
+        - dept_admin：本部门已发布资源（college IS NULL）
+        - user（普通用户）：什么都看不到，只能通过 /api/chat/ask/ AI 检索
     返回：DRF 分页包装后的资源列表，每条包含 id / title / description / file_type / file_size /
           uploader_name / college_name / discipline_name / category_name（完整路径）/
           category_icon / keywords / status / visibility / view_count / download_count / created_at
     """
     serializer_class = ResourceListSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
         queryset = Resource.objects.select_related(
             'college', 'discipline', 'category', 'uploader',
         ).all()
+
+        # 范围过滤：user 直接 qs.none()，其余按本学院/本部门只返回 status='published' 的资源
+        queryset = scope_resources_for_browse(queryset, self.request.user)
 
         # 学院筛选
         college_id = self.request.query_params.get('college_id')
@@ -79,88 +100,189 @@ class ResourceListView(generics.ListAPIView):
         return queryset.order_by('-created_at')
 
 
+@extend_schema(
+    summary='上传日志',
+    description='上传日志管理，支持查看和统计功能',
+    tags=['资源管理'],
+)
 class UploadLogViewSet(viewsets.ReadOnlyModelViewSet):
-    """上传日志 ViewSet（只读）"""
-    queryset = UploadLog.objects.select_related('user', 'college', 'resource')
+    """上传日志 ViewSet（只读）
+
+    GET /api/resources/upload-logs/
+    功能：分页返回上传日志列表，支持按状态/文件类型/学院/部门/用户/时间筛选
+    Query 参数：
+        - start_date / end_date: 时间范围（ISO 或 YYYY-MM-DD）
+        - user_id: 上传用户 ID
+        - college_id: 学院 ID
+        - department_id: 部门 ID
+        - status: 上传状态
+        - file_type: 文件类型
+    权限：
+        - super_admin：平台全部
+        - college_admin / admin：本学院日志
+        - dept_admin：本部门日志
+        - 其他：无权限
+    """
+    queryset = UploadLog.objects.select_related(
+        'user', 'college', 'department', 'resource',
+    )
     serializer_class = UploadLogSerializer
-    permission_classes = [IsAuthenticated, IsAdminOrSuperAdmin]
-    filterset_fields = ['status', 'file_type', 'college']
+    permission_classes = [permissions.IsAuthenticated, IsAnyAdmin]
+    filterset_fields = ['status', 'file_type', 'college', 'department']
     search_fields = ['file_name', 'user__username']
     ordering_fields = ['created_at', 'file_size']
 
     def get_queryset(self):
         queryset = super().get_queryset()
-        # 按时间范围过滤
+        # 范围过滤（按当前用户角色限定可见日志范围）
+        queryset = scope_upload_logs(queryset, self.request.user)
+
         start_date = self.request.query_params.get('start_date')
         end_date = self.request.query_params.get('end_date')
         if start_date:
-            queryset = queryset.filter(created_at__gte=start_date)
+            start = (
+                parse_datetime(start_date) if 'T' in start_date
+                else timezone.make_aware(
+                    _datetime.datetime.strptime(start_date, '%Y-%m-%d')
+                )
+            )
+            queryset = queryset.filter(created_at__gte=start)
         if end_date:
-            queryset = queryset.filter(created_at__lte=end_date)
-        # 按用户过滤
+            end = (
+                parse_datetime(end_date) if 'T' in end_date
+                else timezone.make_aware(
+                    _datetime.datetime.strptime(end_date, '%Y-%m-%d').replace(
+                        hour=23, minute=59, second=59,
+                    )
+                )
+            )
+            queryset = queryset.filter(created_at__lte=end)
         user_id = self.request.query_params.get('user_id')
         if user_id:
             queryset = queryset.filter(user_id=user_id)
+        college_id = self.request.query_params.get('college_id')
+        if college_id:
+            queryset = queryset.filter(college_id=college_id)
+        department_id = self.request.query_params.get('department_id')
+        if department_id:
+            queryset = queryset.filter(department_id=department_id)
         return queryset
 
     @action(detail=False, methods=['get'])
     def stats(self, request):
-        """上传统计"""
-        queryset = self.get_queryset()
+        """上传统计
 
-        # 基础统计
+        Query 参数:
+            - start_date / end_date: 时间范围（ISO 格式或 YYYY-MM-DD）
+            - user_id: 上传用户 ID
+            - college_id: 学院 ID
+            - group_by: 逗号分隔的子集，仅返回指定的分组，
+              可选值: status / file_type / college / user / all（默认 all）
+        """
+        queryset = self.get_queryset()
+        group_by_raw = request.query_params.get('group_by', 'all')
+        allowed = {'status', 'file_type', 'college', 'user', 'all'}
+        group_by = {
+            g.strip() for g in group_by_raw.split(',') if g.strip()
+        } & allowed
+        if not group_by or 'all' in group_by:
+            group_by = {'status', 'file_type', 'college', 'user'}
+
         total_count = queryset.count()
         success_count = queryset.filter(status='success').count()
         failed_count = queryset.filter(status='failed').count()
         total_size = queryset.aggregate(s=Sum('file_size'))['s'] or 0
-
-        # 按状态统计
-        by_status = dict(
-            queryset.values('status')
-            .annotate(count=Count('id'))
-            .values_list('status', 'count')
-        )
-
-        # 按文件类型统计
-        by_file_type = {}
-        for ft, label in UploadLog.FILE_TYPE_CHOICES:
-            count = queryset.filter(file_type=ft).count()
-            if count > 0:
-                by_file_type[ft] = {'label': label, 'count': count}
-
-        # 按学院统计
-        by_college = list(
-            queryset.values('college__id', 'college__name')
-            .annotate(count=Count('id'), total_size=Sum('file_size'))
-            .order_by('-count')[:20]
-        )
-        by_college = [
-            {'id': c['college__id'], 'name': c['college__name'],
-             'count': c['count'], 'total_size': c['total_size']}
-            for c in by_college
-        ]
-
-        # 按用户统计（TOP 10）
-        by_user = list(
-            queryset.values('user__id', 'user__username')
-            .annotate(count=Count('id'), total_size=Sum('file_size'))
-            .order_by('-count')[:10]
-        )
-        by_user = [
-            {'id': u['user__id'], 'username': u['user__username'],
-             'count': u['count'], 'total_size': u['total_size']}
-            for u in by_user
-        ]
 
         data = {
             'total_count': total_count,
             'success_count': success_count,
             'failed_count': failed_count,
             'total_size': total_size,
-            'by_status': by_status,
-            'by_file_type': by_file_type,
-            'by_college': by_college,
-            'by_user': by_user,
         }
+
+        if 'status' in group_by:
+            data['by_status'] = dict(
+                queryset.values('status')
+                .annotate(count=Count('id'))
+                .values_list('status', 'count')
+            )
+        else:
+            data['by_status'] = {}
+
+        if 'file_type' in group_by:
+            by_file_type_qs = queryset.values('file_type').annotate(count=Count('id'))
+            data['by_file_type'] = {
+                item['file_type'] or 'unknown': {
+                    'label': item['file_type'] or '未知',
+                    'count': item['count'],
+                }
+                for item in by_file_type_qs
+            }
+        else:
+            data['by_file_type'] = {}
+
+        if 'college' in group_by:
+            by_college_qs = list(
+                queryset.values('college__id', 'college__name')
+                .annotate(count=Count('id'), total_size=Sum('file_size'))
+                .order_by('-count')[:20]
+            )
+            data['by_college'] = [
+                {'id': c['college__id'], 'name': c['college__name'],
+                 'count': c['count'], 'total_size': c['total_size']}
+                for c in by_college_qs
+            ]
+        else:
+            data['by_college'] = []
+
+        if 'user' in group_by:
+            by_user_qs = list(
+                queryset.values('user__id', 'user__username')
+                .annotate(count=Count('id'), total_size=Sum('file_size'))
+                .order_by('-count')[:10]
+            )
+            data['by_user'] = [
+                {'id': u['user__id'], 'username': u['user__username'],
+                 'count': u['count'], 'total_size': u['total_size']}
+                for u in by_user_qs
+            ]
+        else:
+            data['by_user'] = []
+
         serializer = UploadLogStatsSerializer(data)
         return Response(serializer.data)
+
+    @action(detail=True, methods=['patch'], url_path='complete')
+    def complete(self, request, pk=None):
+        """更新上传日志状态（内部接口）
+
+        PATCH /api/resources/upload-log/{id}/complete/
+
+        请求体:
+            - status: str, 必填，success 或 failed
+            - resource_id: int, success 时必填，关联的资源ID
+            - error_message: str, failed 时必填，错误信息
+
+        响应:
+            - 200: 更新成功
+            - 400: 参数校验失败
+            - 404: 上传日志不存在
+        """
+        upload_log = self.get_object()
+        serializer = UploadLogCompleteSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        validated_data = serializer.validated_data
+        upload_log.status = validated_data['status']
+        upload_log.completed_at = timezone.now()
+
+        if validated_data['status'] == 'success':
+            upload_log.resource_id = validated_data['resource_id']
+            upload_log.error_message = ''
+        else:
+            upload_log.resource = None
+            upload_log.error_message = validated_data['error_message']
+
+        upload_log.save()
+        return Response(UploadLogSerializer(upload_log).data)
