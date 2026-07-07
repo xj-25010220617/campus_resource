@@ -597,13 +597,6 @@ class VoiceAskView(APIView):
             'college_id': user.college_id, 'department_id': user.department_id,
         }
         parsed = parse_query(question, user_context)
-        hits = rag.retrieve(
-            question=question, user_context=user_context,
-            parsed_filters=parsed, top_k=rag.RAG_TOP_K,
-            min_score=rag.RAG_SCORE_THRESHOLD,
-        )
-        messages = rag.build_rag_prompt(question, hits)
-        sensitive_hit = any(check_sensitive(m.get('content', '')) for m in messages)
 
         # 处理或创建会话
         if conversation_id:
@@ -612,10 +605,10 @@ class VoiceAskView(APIView):
             conv = Conversation.objects.create(user=user, title=question[:50])
         ChatMessage.objects.create(conversation=conv, role='user', content=question)
 
-        # 写查询日志
+        # 写查询日志（先创建，hits 在 generate() 内 RAG 检索后回填）
         log = QueryLog.objects.create(
             user=user, question=question, parsed_filters=parsed,
-            hit_count=len(hits), top_doc_ids=[h['doc_id'] for h in hits],
+            hit_count=0, top_doc_ids=[],
             conversation=conv,
         )
 
@@ -625,9 +618,23 @@ class VoiceAskView(APIView):
             full_answer = ''
             t0 = time.time()
             try:
-                # 先推送 ASR 识别结果（语音转文字）
+                # 1. 推送 ASR 识别结果（语音转文字）
                 yield _format_sse('asr_text', {'text': question})
-                # LLM 流式输出
+
+                # 2. RAG 检索（在 asr_text 推送之后执行）
+                hits = rag.retrieve(
+                    question=question, user_context=user_context,
+                    parsed_filters=parsed, top_k=rag.RAG_TOP_K,
+                    min_score=rag.RAG_SCORE_THRESHOLD,
+                )
+                messages = rag.build_rag_prompt(question, hits)
+                sensitive_hit = any(check_sensitive(m.get('content', '')) for m in messages)
+
+                # 更新查询日志的 hits 信息
+                log.hit_count = len(hits)
+                log.top_doc_ids = [h['doc_id'] for h in hits]
+
+                # 3. LLM 流式输出
                 for chunk in llm_client.chat_stream(messages):
                     full_answer += chunk
                     yield _format_sse('token', {'content': chunk})
