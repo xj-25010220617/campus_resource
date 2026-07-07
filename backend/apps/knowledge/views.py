@@ -1007,7 +1007,9 @@ class ExtractFreshnessView(APIView):
         - admin: 仅可对自己上传的文档触发
     返回：
         - 202 Accepted: {"task_id": "...", "status": "queued", "doc_id": <int>}
+          （Celery 可用时返回；celery 入队失败/未安装时自动降级为同步执行，返回 200）
         - 200 OK: 单个对象 {freshness_date, confidence, source_excerpt, raw_response}
+          （async=false 显式同步 OR Celery 不可用自动降级）
     错误码：
         - 401 UNAUTHORIZED: 未登录
         - 403 PERMISSION_DENIED: 越权触发
@@ -1015,6 +1017,9 @@ class ExtractFreshnessView(APIView):
     注意：
         - 图片/视频/音频类型无法抽取文本，confidence='none'
         - 失败时 freshness_date 留空，前端可再次手动触发
+        - celery 未安装（本地开发）时 utils.shared_task_compat 会自动同步执行任务，
+          接口仍返回 200 而非 500；部署到生产前请确保 requirements.txt 中的 celery 已安装
+          且 worker 正常运行
     """
     permission_classes = [IsLoginUser]
 

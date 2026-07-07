@@ -2,16 +2,17 @@
 知识库异步任务
 - extract_freshness_task：上传完成后异步提取发布日期
 - index_document_task：上传完成后异步索引入库（分块 → Embedding → Milvus）
+- crawl_neusoft_website_task：定时爬取官网
 
 设计要点：
 - 上传主链路不阻塞；Celery 失败重试 2 次
 - 失败时 doc.freshness_date 留空，前端可手动触发重试
 - 索引失败时 doc.status 保持 'failed'，可手动重试
+- Celery 未安装时（本地开发）自动降级为同步执行，视图层不需要写 try/except
 """
 import logging
 
-from celery import shared_task
-from django.utils import timezone
+from utils.shared_task_compat import shared_task
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,8 @@ def index_document_task(self, doc_id: int):
         - 任意异常 → 自动重试 2 次
         - 最终失败 → doc.status = 'failed'
     """
+    from django.utils import timezone
+
     from apps.knowledge.extractor import extract_text_from_oss
     from apps.knowledge.models import DocChunk, KnowledgeDoc
     from apps.knowledge.utils import chunk_document
