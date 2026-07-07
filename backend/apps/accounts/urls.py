@@ -1,11 +1,10 @@
 from django.urls import path
 from rest_framework_simplejwt.views import TokenRefreshView
 
-from rest_framework_simplejwt.views import TokenObtainPairView
-
 from .views import (
     DingtalkCallbackView,
     DingtalkQrView,
+    LoggedTokenObtainPairView,
     LogoutView,
     MeView,
     ChangePasswordView,
@@ -16,7 +15,7 @@ from .views import (
 
 urlpatterns = [
     # JWT 认证
-    path('login/', TokenObtainPairView.as_view(), name='token_obtain_pair'),
+    path('login/', LoggedTokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('refresh/', TokenRefreshView.as_view(), name='token_refresh'),
     path('logout/', LogoutView.as_view(), name='auth_logout'),
 
@@ -33,4 +32,4 @@ urlpatterns = [
     # 钉钉扫码登录
     path('dingtalk/qr/', DingtalkQrView.as_view(), name='dingtalk_qr'),
     path('dingtalk/callback/', DingtalkCallbackView.as_view(), name='dingtalk_callback'),
-] 
+]
