@@ -131,27 +131,34 @@ class UploadCallbackSerializer(serializers.Serializer):
     """OSS上传完成回调请求参数"""
 
     oss_key = serializers.CharField(max_length=512, help_text='OSS对象Key')
-    title = serializers.CharField(max_length=512, help_text='文档标题')
-    description = serializers.CharField(default='', allow_blank=True, help_text='文档描述')
+    title = serializers.CharField(
+        max_length=512, required=False, default='',
+        help_text='文档标题（可选，未提供时由 AI 生成）',
+    )
+    description = serializers.CharField(
+        default='', allow_blank=True, help_text='文档描述（可选，未提供时 AI 生成）',
+    )
     file_name = serializers.CharField(max_length=256, help_text='原始文件名')
     file_size = serializers.IntegerField(min_value=0, help_text='文件大小（字节）')
     file_type = serializers.CharField(max_length=16, help_text='文件类型（pdf/doc/ppt/xls/image/video/audio/md/txt/html/other）')
     md5 = serializers.CharField(max_length=32, help_text='文件MD5哈希值')
     scope = serializers.ChoiceField(
         choices=['school', 'college', 'department'],
-        help_text='归属范围（school:全校 / college:学院 / department:部门）',
+        default='school',
+        help_text='归属范围（school:全校 / college:学院 / department:部门），默认 school',
     )
-    college_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属学院ID（scope=college时必填）')
-    department_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属部门ID（scope=department时必填）')
+    college_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属学院ID（默认上传者学院，scope=college时必填）')
+    department_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属部门ID（默认上传者部门，scope=department时必填）')
     discipline_id = serializers.IntegerField(required=False, allow_null=True, help_text='学科方向ID（可选）')
-    category_id = serializers.IntegerField(required=False, allow_null=True, help_text='资源类型ID（可选，须为二级分类）')
+    category_id = serializers.IntegerField(required=False, allow_null=True, help_text='资源类型ID（可选，未提供时 AI 推荐）')
     keywords = serializers.ListField(
         child=serializers.CharField(), required=False, default=list,
-        help_text='关键词列表（可选）',
+        help_text='关键词列表（可选，未提供时 AI 提取）',
     )
-    visibility = serializers.CharField(
-        max_length=16, default='public',
-        help_text='可见性（public:公开 / private:私密）',
+    visibility = serializers.ChoiceField(
+        choices=['public', 'private'],
+        default='public',
+        help_text='可见性（public:公开 / private:私密），默认 public',
     )
 
     def validate_file_size(self, value):
@@ -200,23 +207,25 @@ class TextUploadSerializer(serializers.Serializer):
     )
     content = serializers.CharField(help_text='文本内容')
     description = serializers.CharField(
-        default='', allow_blank=True, help_text='文档描述（可选）',
+        default='', allow_blank=True, help_text='文档描述（可选，未提供时 AI 生成）',
     )
     scope = serializers.ChoiceField(
         choices=['school', 'college', 'department'],
-        help_text='归属范围（school:全校 / college:学院 / department:部门）',
+        default='school',
+        help_text='归属范围（school:全校 / college:学院 / department:部门），默认 school',
     )
-    college_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属学院ID（scope=college时必填）')
-    department_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属部门ID（scope=department时必填）')
+    college_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属学院ID（默认上传者学院，scope=college时必填）')
+    department_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属部门ID（默认上传者部门，scope=department时必填）')
     discipline_id = serializers.IntegerField(required=False, allow_null=True, help_text='学科方向ID（可选）')
-    category_id = serializers.IntegerField(required=False, allow_null=True, help_text='资源类型ID（可选，须为二级分类）')
+    category_id = serializers.IntegerField(required=False, allow_null=True, help_text='资源类型ID（可选，未提供时 AI 推荐）')
     keywords = serializers.ListField(
         child=serializers.CharField(), required=False, default=list,
-        help_text='关键词列表（可选）',
+        help_text='关键词列表（可选，未提供时 AI 提取）',
     )
-    visibility = serializers.CharField(
-        max_length=16, default='public',
-        help_text='可见性（public:公开 / private:私密）',
+    visibility = serializers.ChoiceField(
+        choices=['public', 'private'],
+        default='public',
+        help_text='可见性（public:公开 / private:私密），默认 public',
     )
 
 
@@ -229,24 +238,25 @@ class FileUploadSerializer(serializers.Serializer):
         help_text='文档标题（可选，默认使用文件名，或由 AI 自动生成）',
     )
     description = serializers.CharField(
-        default='', allow_blank=True, help_text='文档描述（可选）',
+        default='', allow_blank=True, help_text='文档描述（可选，未提供时 AI 生成）',
     )
     scope = serializers.ChoiceField(
         choices=['school', 'college', 'department'],
-        default='college',
-        help_text='归属范围（school:全校 / college:学院 / department:部门），默认 college',
+        default='school',
+        help_text='归属范围（school:全校 / college:学院 / department:部门），默认 school',
     )
-    college_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属学院ID（scope=college时必填）')
-    department_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属部门ID（scope=department时必填）')
+    college_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属学院ID（默认上传者学院，scope=college时必填）')
+    department_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属部门ID（默认上传者部门，scope=department时必填）')
     discipline_id = serializers.IntegerField(required=False, allow_null=True, help_text='学科方向ID（可选）')
-    category_id = serializers.IntegerField(required=False, allow_null=True, help_text='资源类型ID（可选，须为二级分类）')
+    category_id = serializers.IntegerField(required=False, allow_null=True, help_text='资源类型ID（可选，未提供时 AI 推荐）')
     keywords = serializers.CharField(
         default='', allow_blank=True,
-        help_text='关键词 JSON 数组，如 ["关键词1","关键词2"]（可选）',
+        help_text='关键词 JSON 数组，如 ["关键词1","关键词2"]（可选，未提供时 AI 提取）',
     )
-    visibility = serializers.CharField(
-        max_length=16, default='public',
-        help_text='可见性（public:公开 / private:私密）',
+    visibility = serializers.ChoiceField(
+        choices=['public', 'private'],
+        default='public',
+        help_text='可见性（public:公开 / private:私密），默认 public',
     )
 
 

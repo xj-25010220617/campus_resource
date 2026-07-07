@@ -63,14 +63,24 @@ class IsLoginUser(permissions.BasePermission):
         )
 
 
-class IsAdminOrSuperAdmin(permissions.BasePermission):
-    """admin 和 super_admin 可访问，user 不可"""
+class CanUploadDocument(permissions.BasePermission):
+    """文档上传权限 — 所有登录用户（含普通 user）均可上传"""
 
     def has_permission(self, request, view):
         return (
             request.user
             and request.user.is_authenticated
-            and request.user.role in ('admin', 'super_admin')
+        )
+
+
+class IsAdminOrSuperAdmin(permissions.BasePermission):
+    """所有管理员角色可访问：super_admin、college_admin、dept_admin、admin；user 不可"""
+
+    def has_permission(self, request, view):
+        return (
+            request.user
+            and request.user.is_authenticated
+            and request.user.role in ('super_admin', 'college_admin', 'dept_admin', 'admin')
         )
 
 

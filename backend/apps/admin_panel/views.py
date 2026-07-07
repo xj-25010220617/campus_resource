@@ -65,11 +65,11 @@ User = get_user_model()
 # 一、用户管理（既有，未改动 CRUD 行为）
 # ======================================================================
 class IsAdminOrSuperAdmin(permissions.BasePermission):
-    """管理员或超级管理员权限（兼容旧角色 admin）"""
+    """所有管理员角色权限：super_admin、college_admin、dept_admin、admin（兼容旧角色）"""
 
     def has_permission(self, request, view):
         u = request.user
-        return bool(u and u.is_authenticated and u.role in ('admin', 'super_admin'))
+        return bool(u and u.is_authenticated and u.role in ('super_admin', 'college_admin', 'dept_admin', 'admin'))
 
 
 class UserAdminViewSet(OperationLogMixin, viewsets.ModelViewSet):

@@ -562,7 +562,7 @@ def _filter_by_permission(
             elif d['visibility'] == 'restricted' and (role in ('super_admin', 'admin') or d['uploader_id'] == user_id):
                 allowed_ids.add(d['id'])
 
-    # KnowledgeDoc 权限（已在 _apply_hard_filters 中过滤，此处二次兜底）
+    # KnowledgeDoc 权限（与 KnowledgeDocListView._rag_scope_filter 保持一致）
     if knowledge_ids:
         from django.db.models import Q
         kd_qs = KnowledgeDoc.objects.filter(id__in=knowledge_ids, visibility='public')
@@ -581,6 +581,7 @@ def _filter_by_permission(
                 | Q(uploader_id=user_id),
             ).values_list('id', flat=True))
         else:
+            # user（普通用户）：scope=school + scope=college(本院) + scope=department(本部门) + 自己上传
             conditions = Q(scope='school')
             if user_college_id:
                 conditions |= Q(scope='college', college_id=user_college_id)
