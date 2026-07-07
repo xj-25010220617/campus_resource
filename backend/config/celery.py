@@ -55,7 +55,7 @@ def debug_task(self):
 # 文档异步索引任务
 # 设计文档第 13.2 节③：上传完成 → Celery → 下载→解析→分块→Embedding→Milvus→更新状态
 # ------------------------------------------------------------------
-@app.task(bind=True, max_retries=3, default_retry_delay=60)
+@app.task(bind=True, max_retries=3, default_retry_delay=60, autoretry_for=(ConnectionError, TimeoutError, OSError))
 def index_document(self, doc_id: int):
     """
     异步索引文档到 Milvus。
@@ -106,8 +106,8 @@ def index_document(self, doc_id: int):
         if not download_url:
             raise RuntimeError(f'无法生成下载 URL: oss_key={doc.oss_key}')
 
-        import requests
-        resp = requests.get(download_url, timeout=120)
+        from utils.http_client import ExternalClient
+        resp = ExternalClient.get('oss_download', download_url)
         resp.raise_for_status()
         with open(tmp_path, 'wb') as f:
             f.write(resp.content)

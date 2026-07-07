@@ -36,34 +36,40 @@ def sse_response(generator, extra_events: dict = None):
     """
 
     def event_stream():
-        # 1. start 事件
-        if extra_events and extra_events.get('start'):
-            yield _format_sse('start', extra_events['start'])
+        try:
+            # 1. start 事件
+            if extra_events and extra_events.get('start'):
+                yield _format_sse('start', extra_events['start'])
 
-        # 2. 逐 token 转发
-        for token in generator:
-            if token:
-                yield _format_sse('token', {'content': token})
+            # 2. 逐 token 转发
+            for token in generator:
+                if token:
+                    yield _format_sse('token', {'content': token})
 
-        # 3. references（普通用户）
-        if extra_events and extra_events.get('references'):
-            yield _format_sse('references', extra_events['references'])
+            # 3. references（普通用户）
+            if extra_events and extra_events.get('references'):
+                yield _format_sse('references', extra_events['references'])
 
-        # 4. references_detail（admin/super_admin 可看完整引用）
-        if extra_events and extra_events.get('references_detail'):
-            yield _format_sse('references_detail', extra_events['references_detail'])
+            # 4. references_detail（admin/super_admin 可看完整引用）
+            if extra_events and extra_events.get('references_detail'):
+                yield _format_sse('references_detail', extra_events['references_detail'])
 
-        # 5. suggested_questions
-        if extra_events and extra_events.get('suggested'):
-            yield _format_sse('suggested', extra_events['suggested'])
+            # 5. suggested_questions
+            if extra_events and extra_events.get('suggested'):
+                yield _format_sse('suggested', extra_events['suggested'])
 
-        # 6. confidence
-        if extra_events and extra_events.get('confidence'):
-            yield _format_sse('confidence', extra_events['confidence'])
+            # 6. confidence
+            if extra_events and extra_events.get('confidence'):
+                yield _format_sse('confidence', extra_events['confidence'])
 
-        # 7. done 事件
-        done_data = extra_events.get('done', {}) if extra_events else {}
-        yield _format_sse('done', done_data)
+            # 7. done 事件
+            done_data = extra_events.get('done', {}) if extra_events else {}
+            yield _format_sse('done', done_data)
+        except GeneratorExit:
+            raise
+        except Exception as e:
+            logger.error(f'SSE 流异常: {e}')
+            yield _format_sse('error', {'message': '回答生成失败，请重试', 'code': ErrorCode.SSE_ERROR.value})
 
     response = StreamingHttpResponse(
         event_stream(),
@@ -89,34 +95,40 @@ async def sse_response_async(async_generator, extra_events: dict = None):
         extra_events: 同 sse_response
     """
     async def event_stream():
-        # 1. start 事件
-        if extra_events and extra_events.get('start'):
-            yield _format_sse('start', extra_events['start'])
+        try:
+            # 1. start 事件
+            if extra_events and extra_events.get('start'):
+                yield _format_sse('start', extra_events['start'])
 
-        # 2. 逐 token 转发
-        async for token in async_generator:
-            if token:
-                yield _format_sse('token', {'content': token})
+            # 2. 逐 token 转发
+            async for token in async_generator:
+                if token:
+                    yield _format_sse('token', {'content': token})
 
-        # 3. references
-        if extra_events and extra_events.get('references'):
-            yield _format_sse('references', extra_events['references'])
+            # 3. references
+            if extra_events and extra_events.get('references'):
+                yield _format_sse('references', extra_events['references'])
 
-        # 4. references_detail
-        if extra_events and extra_events.get('references_detail'):
-            yield _format_sse('references_detail', extra_events['references_detail'])
+            # 4. references_detail
+            if extra_events and extra_events.get('references_detail'):
+                yield _format_sse('references_detail', extra_events['references_detail'])
 
-        # 5. suggested
-        if extra_events and extra_events.get('suggested'):
-            yield _format_sse('suggested', extra_events['suggested'])
+            # 5. suggested
+            if extra_events and extra_events.get('suggested'):
+                yield _format_sse('suggested', extra_events['suggested'])
 
-        # 6. confidence
-        if extra_events and extra_events.get('confidence'):
-            yield _format_sse('confidence', extra_events['confidence'])
+            # 6. confidence
+            if extra_events and extra_events.get('confidence'):
+                yield _format_sse('confidence', extra_events['confidence'])
 
-        # 7. done
-        done_data = extra_events.get('done', {}) if extra_events else {}
-        yield _format_sse('done', done_data)
+            # 7. done
+            done_data = extra_events.get('done', {}) if extra_events else {}
+            yield _format_sse('done', done_data)
+        except GeneratorExit:
+            raise
+        except Exception as e:
+            logger.error(f'SSE 异步流异常: {e}')
+            yield _format_sse('error', {'message': '回答生成失败，请重试', 'code': ErrorCode.SSE_ERROR.value})
 
     response = StreamingHttpResponse(
         event_stream(),

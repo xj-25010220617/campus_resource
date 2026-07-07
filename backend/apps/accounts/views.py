@@ -421,13 +421,17 @@ class DingtalkQrView(APIView):
                 status=status.HTTP_501_NOT_IMPLEMENTED,
             )
 
+        import uuid
+        from urllib.parse import quote
+
+        state = uuid.uuid4().hex
         auth_url = (
             'https://login.dingtalk.com/oauth2/auth'
-            f'?redirect_uri={redirect_uri}'
+            f'?redirect_uri={quote(redirect_uri, safe="")}'
             '&response_type=code'
             f'&client_id={app_key}'
-            '&scope=openid%20corpid'
-            '&state=dingtalk_login'
+            '&scope=openid'
+            f'&state={state}'
             '&prompt=consent'
         )
         return Response({
@@ -503,14 +507,15 @@ class DingtalkCallbackView(APIView):
 
     def _get_dingtalk_user(self, auth_code):
         """调用钉钉 OpenAPI 换取用户信息"""
-        import requests
+        from utils.http_client import ExternalClient
 
         app_key = getattr(settings, 'DINGTALK_APP_KEY', '')
         app_secret = getattr(settings, 'DINGTALK_APP_SECRET', '')
 
         try:
             # 步骤1：authCode → accessToken
-            token_resp = requests.post(
+            token_resp = ExternalClient.post(
+                'dingtalk',
                 'https://api.dingtalk.com/v1.0/oauth2/userAccessToken',
                 json={
                     'clientId': app_key,
@@ -518,7 +523,6 @@ class DingtalkCallbackView(APIView):
                     'code': auth_code,
                     'grantType': 'authorization_code',
                 },
-                timeout=10,
             )
             token_data = token_resp.json()
             access_token = token_data.get('accessToken')
@@ -527,10 +531,10 @@ class DingtalkCallbackView(APIView):
                 return None
 
             # 步骤2：accessToken → 用户信息
-            user_resp = requests.get(
+            user_resp = ExternalClient.get(
+                'dingtalk',
                 'https://api.dingtalk.com/v1.0/contact/users/me',
                 headers={'x-acs-dingtalk-access-token': access_token},
-                timeout=10,
             )
             user_data = user_resp.json()
             logger.info('钉钉用户信息: nick=%s unionId=%s', user_data.get('nick'), user_data.get('unionId'))
@@ -568,3 +572,148 @@ class DingtalkCallbackView(APIView):
             user.set_unusable_password()
             user.save(update_fields=['password'])
             return user, True
+
+
+class DingtalkRedirectView(APIView):
+    """
+    钉钉扫码回调 — 直接返回 Token 页面
+
+    GET /api/auth/dingtalk/redirect/
+    功能：钉钉扫码后跳转到此接口，后端换 token 并返回 HTML 页面，
+          页面自动存 token 到 localStorage 并跳转前端首页。
+    参数：
+        - code (string, required): 钉钉授权码
+        - frontend_url (string, optional): 登录成功后跳转的前端地址
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        import requests
+
+        auth_code = request.query_params.get('code')
+        if not auth_code:
+            return Response(
+                {'detail': '缺少 code 参数'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # 调用钉钉 API 换取用户信息
+        app_key = getattr(settings, 'DINGTALK_APP_KEY', '')
+        app_secret = getattr(settings, 'DINGTALK_APP_SECRET', '')
+        try:
+            token_resp = requests.post(
+                'https://api.dingtalk.com/v1.0/oauth2/userAccessToken',
+                json={
+                    'clientId': app_key, 'clientSecret': app_secret,
+                    'code': auth_code, 'grantType': 'authorization_code',
+                },
+                timeout=10,
+            )
+            token_data = token_resp.json()
+            access_token = token_data.get('accessToken')
+            if not access_token:
+                logger.error('钉钉获取 accessToken 失败: %s', token_data)
+                return Response(
+                    {'detail': '钉钉授权失败，请重新扫码'},
+                    status=status.HTTP_401_UNAUTHORIZED,
+                )
+            user_resp = requests.get(
+                'https://api.dingtalk.com/v1.0/contact/users/me',
+                headers={'x-acs-dingtalk-access-token': access_token},
+                timeout=10,
+            )
+            user_data = user_resp.json()
+        except Exception as e:
+            logger.error('钉钉 API 调用失败: %s', e)
+            return Response(
+                {'detail': '钉钉服务异常，请稍后重试'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        # 查找或创建本地用户
+        user, created = self._find_or_create(user_data)
+        refresh = RefreshToken.for_user(user)
+
+        logger.info(
+            '钉钉扫码登录: union_id=%s user=%s created=%s',
+            user_data.get('unionId'), user.username, created,
+        )
+
+        frontend_url = request.query_params.get(
+            'frontend_url',
+            getattr(settings, 'FRONTEND_URL', 'http://localhost:5173'),
+        )
+
+        return self._html_page(
+            access=str(refresh.access_token),
+            refresh=str(refresh),
+            user=UserSerializer(user).data,
+            frontend_url=frontend_url,
+        )
+
+    @staticmethod
+    def _find_or_create(user_data):
+        union_id = user_data.get('unionId', '')
+        nick = user_data.get('nick', '')
+        email = user_data.get('email', '')
+        mobile = user_data.get('mobile', '')
+        with transaction.atomic():
+            user = User.objects.filter(sso_uid=union_id).first()
+            if user:
+                user.email = email or user.email
+                user.phone = mobile or user.phone
+                user.save(update_fields=['email', 'phone'])
+                return user, False
+            user = User.objects.create_user(
+                username=f'dd_{nick}' if nick else f'dd_{union_id[:12]}',
+                email=email, first_name=nick, last_name='',
+                phone=mobile, role='user', sso_uid=union_id,
+            )
+            user.set_unusable_password()
+            user.save(update_fields=['password'])
+            return user, True
+
+    @staticmethod
+    def _html_page(access, refresh, user, frontend_url):
+        import json
+
+        user_json = json.dumps(user, ensure_ascii=False)
+        html = f'''<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>钉钉登录 - 成都东软学院</title>
+<style>
+  body {{ font-family: -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #f5f5f5; }}
+  .card {{ background: white; border-radius: 12px; padding: 40px; text-align: center; box-shadow: 0 2px 20px rgba(0,0,0,0.1); }}
+  .spinner {{ width: 40px; height: 40px; border: 3px solid #e0e0e0; border-top-color: #1890ff; border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 20px; }}
+  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+  .check {{ color: #52c41a; font-size: 48px; display: none; }}
+  p {{ color: #666; margin: 16px 0; }}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="spinner" id="spin"></div>
+  <div class="check" id="ok">&#10003;</div>
+  <p id="msg">正在登录...</p>
+</div>
+<script>
+(function() {{
+  try {{
+    localStorage.setItem("access_token", "{access}");
+    localStorage.setItem("refresh_token", "{refresh}");
+    localStorage.setItem("user", '{user_json}');
+    document.getElementById("spin").style.display = "none";
+    document.getElementById("ok").style.display = "block";
+    document.getElementById("msg").innerText = "登录成功，即将跳转...";
+    setTimeout(function() {{ window.location.href = "{frontend_url}"; }}, 800);
+  }} catch(e) {{
+    document.getElementById("msg").innerText = "登录失败: " + e.message;
+  }}
+}})();
+</script>
+</body>
+</html>'''
+        return Response(html, content_type='text/html; charset=utf-8')

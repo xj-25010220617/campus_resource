@@ -973,12 +973,14 @@ class KnowledgeDocPreviewView(APIView):
 
     def _text_preview(self, doc, file_type):
         """从 OSS 下载文本内容并直接返回"""
+        from utils.http_client import ExternalClient
+
         download_url = oss_client.get_download_url(doc.oss_key, expires=60)
         try:
-            resp = requests.get(download_url, timeout=10)
+            resp = ExternalClient.get('oss_download', download_url)
             resp.raise_for_status()
             text_content = resp.text
-        except requests.RequestException as e:
+        except Exception as e:
             logger.error(f'预览文本下载失败 oss_key={doc.oss_key}: {e}')
             text_content = ''
         return Response({
