@@ -74,13 +74,13 @@ class CanUploadDocument(permissions.BasePermission):
 
 
 class IsAdminOrSuperAdmin(permissions.BasePermission):
-    """admin 和 super_admin 可访问，user 不可"""
+    """所有管理员角色可访问：super_admin、college_admin、dept_admin、admin；user 不可"""
 
     def has_permission(self, request, view):
         return (
             request.user
             and request.user.is_authenticated
-            and request.user.role in ('admin', 'super_admin')
+            and request.user.role in ('super_admin', 'college_admin', 'dept_admin', 'admin')
         )
 
 

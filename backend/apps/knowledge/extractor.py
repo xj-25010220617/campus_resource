@@ -323,5 +323,10 @@ def extract_freshness_for_doc(doc_id: int) -> Optional[FreshnessResult]:
 
 def _save_result(doc, result: FreshnessResult) -> None:
     """把结果写回 doc.freshness_date，保留人工值"""
-    doc.freshness_date = result.freshness_date
+    # 将字符串日期转换为 date 对象
+    if result.freshness_date:
+        from datetime import datetime
+        doc.freshness_date = datetime.strptime(result.freshness_date, '%Y-%m-%d').date()
+    else:
+        doc.freshness_date = None
     doc.save(update_fields=['freshness_date', 'updated_at'])
