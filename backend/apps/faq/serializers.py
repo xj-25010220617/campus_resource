@@ -1,6 +1,6 @@
 from rest_framework import serializers
 
-from .models import FAQCategory, FAQItem
+from .models import FAQCategory, FAQGenerationLog, FAQItem
 
 
 class FAQCategorySerializer(serializers.ModelSerializer):
@@ -62,3 +62,22 @@ class FAQItemDraftSerializer(serializers.ModelSerializer):
 class FAQItemPublishSerializer(serializers.Serializer):
     """发布/驳回操作序列化器（管理端）"""
     action = serializers.ChoiceField(choices=['publish', 'reject'])
+
+
+class FAQGenerationLogSerializer(serializers.ModelSerializer):
+    """FAQ 生成日志序列化器（管理端）"""
+    duration_seconds = serializers.SerializerMethodField()
+
+    class Meta:
+        model = FAQGenerationLog
+        fields = [
+            'id', 'status',
+            'total_questions', 'clusters_found', 'drafts_generated',
+            'error_message',
+            'started_at', 'completed_at', 'duration_seconds',
+        ]
+
+    def get_duration_seconds(self, obj):
+        if obj.completed_at and obj.started_at:
+            return int((obj.completed_at - obj.started_at).total_seconds())
+        return None

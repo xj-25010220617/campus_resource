@@ -77,6 +77,7 @@ class LLMClient:
                         'model': LLM_EMBED_MODEL,
                         'input': texts,
                     },
+                    timeout=10,
                 )
                 resp.raise_for_status()
                 data = resp.json()

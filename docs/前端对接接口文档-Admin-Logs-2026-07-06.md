@@ -449,10 +449,7 @@ GET /api/admin/logs/operation/stats/
     {"key": "resource", "label": "资源", "count": 0},
     {"key": "category", "label": "分类", "count": 0}
   ],
-  "top_operators": [
-    {"key": "1", "label": "admin",       "count": 70},
-    {"key": "2", "label": "super_admin", "count": 16}
-  ]
+  "top_operators": [70, 16]
 }
 ```
 

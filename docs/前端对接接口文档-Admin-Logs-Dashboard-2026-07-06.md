@@ -114,7 +114,7 @@
 | `total` | integer | 区间内操作日志总条数 |
 | `by_action` | `[{key, label, count}]` | 按动作分组（create/update/delete/...） |
 | `by_target_type` | `[{key, label, count}]` | 按目标类型分组（user/resource/category/...） |
-| `top_operators` | `[{key, label, count}]` | 操作者 Top 10 |
+| `top_operators` | `[integer]` | Top 10 操作次数列表（仅数值，无用户信息） |
 
 ### 4.6 `blocks.online`（**实时**，不受 period 影响）
 
@@ -300,10 +300,7 @@ print("在线:", data["blocks"]["online"]["online_users"])
         { "key": "resource", "label": "资源", "count": 0 },
         { "key": "category", "label": "分类", "count": 0 }
       ],
-      "top_operators": [
-        { "key": "1", "label": "admin", "count": 3 },
-        { "key": "2", "label": "root",  "count": 1 }
-      ]
+      "top_operators": [3, 1]
     },
     "online": {
       "online_users": 12,

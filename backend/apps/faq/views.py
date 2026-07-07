@@ -7,9 +7,10 @@ from rest_framework.response import Response
 
 from config.permissions import IsFAQAdmin, IsSuperAdmin
 
-from .models import FAQCategory, FAQItem
+from .models import FAQCategory, FAQGenerationLog, FAQItem
 from .serializers import (
     FAQCategorySerializer,
+    FAQGenerationLogSerializer,
     FAQItemListSerializer,
     FAQItemDetailSerializer,
     FAQItemDraftSerializer,
@@ -215,8 +216,12 @@ class FAQManageListView(generics.ListAPIView):
 
 class FAQManageDeleteView(generics.DestroyAPIView):
     """
-    DELETE /api/faq/items/{id}/
     删除 FAQ
+
+    DELETE /api/faq/manage/items/{id}/
+    功能：物理删除指定 FAQ；非 super_admin 仅能删除本学院或全局 FAQ
+    权限：IsFAQAdmin（按 college 范围过滤可见集）
+    返回：204 No Content
     """
     permission_classes = [permissions.IsAuthenticated, IsFAQAdmin]
 
@@ -228,3 +233,89 @@ class FAQManageDeleteView(generics.DestroyAPIView):
         if user.college_id:
             q |= models.Q(college_id=user.college_id)
         return FAQItem.objects.filter(q)
+
+
+class FAQGenerationLogListView(generics.ListAPIView):
+    """
+    GET /api/faq/generation-logs/
+    FAQ 自动生成日志列表
+
+    权限：IsFAQAdmin（super_admin / college_admin / dept_admin / admin）
+    按 started_at 倒序，分页由 settings.DEFAULT_PAGINATION_CLASS 控制
+    支持 status 过滤：?status=running|completed|failed
+    """
+    serializer_class = FAQGenerationLogSerializer
+    permission_classes = [permissions.IsAuthenticated, IsFAQAdmin]
+
+    def get_queryset(self):
+        qs = FAQGenerationLog.objects.all().order_by('-started_at')
+        status_filter = self.request.query_params.get('status')
+        if status_filter in ('running', 'completed', 'failed'):
+            qs = qs.filter(status=status_filter)
+        return qs
+
+
+class FAQGenerationLogDetailView(generics.RetrieveAPIView):
+    """
+    GET /api/faq/generation-logs/{id}/
+    单条 FAQ 生成日志详情（含各阶段计数与耗时）。
+
+    配合 POST /api/faq/generate/ 触发后轮询此接口即可获知进度：
+    - status=running  → 进行中
+    - status=completed → 成功，可查看 drafts_generated
+    - status=failed    → 失败，error_message 有堆栈
+    """
+    queryset = FAQGenerationLog.objects.all()
+    serializer_class = FAQGenerationLogSerializer
+    permission_classes = [permissions.IsAuthenticated, IsFAQAdmin]
+    lookup_field = 'pk'
+
+
+class FAQGenerateTriggerView(generics.GenericAPIView):
+    """
+    手动触发 FAQ 自动生成任务
+
+    POST /api/faq/generate/
+    功能：立即投递一次 FAQ 生成管道（采集 → 向量聚类 → LLM 草稿）到 Celery 异步执行。
+          仅 super_admin 可触发。已有未超时 running 任务时返回 409，避免重复堆积。
+    权限：super_admin
+    返回：
+        - 200 + {log_id, status, task_id, message}：已创建 running 日志并投递任务
+        - 200 + {log_id, status, task_id: null}：Celery 不可用时降级同步执行
+        - 409 + {detail, code}：已有 FAQ 生成任务正在进行
+    """
+    permission_classes = [permissions.IsAuthenticated, IsSuperAdmin]
+
+    def post(self, request, *args, **kwargs):
+        # 防重叠：与 Celery 任务内部逻辑保持一致——running 且未超 2 小时则拒绝
+        from datetime import timedelta
+
+        running_log = FAQGenerationLog.objects.filter(status='running').first()
+        if running_log and running_log.started_at \
+                and running_log.started_at > timezone.now() - timedelta(hours=2):
+            return Response(
+                {
+                    'detail': f'已有 FAQ 生成任务正在进行（log_id={running_log.id}），请稍后再试',
+                    'code': 'FAQ_GENERATION_RUNNING',
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        log = FAQGenerationLog.objects.create(status='running')
+        logger.info('手动触发 FAQ 生成（log_id=%d, operator=%s）', log.id, request.user.username)
+
+        # 遵循 CONVENTIONS §9：视图层不写 try/except，由 safe_delay 捕获并降级
+        from utils.celery_dispatcher import safe_delay
+        from .tasks import generate_faq_weekly
+
+        async_result = safe_delay(generate_faq_weekly)
+
+        return Response(
+            {
+                'log_id': log.id,
+                'status': log.status,
+                'task_id': getattr(async_result, 'id', None),
+                'message': 'FAQ 生成任务已投递，可通过 GET /api/faq/generation-logs/{id}/ 查看进度',
+            },
+            status=status.HTTP_200_OK,
+        )

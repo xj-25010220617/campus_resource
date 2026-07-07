@@ -244,14 +244,7 @@ def compute_operation_block(start: datetime, end: datetime) -> dict:
             .annotate(count=Count('id'))
             .order_by('-count')[:10]
         )
-        top_operators = [
-            {
-                'key': str(row['operator_id']) if row['operator_id'] else 'anonymous',
-                'label': row['operator_username'] or '匿名',
-                'count': row['count'],
-            }
-            for row in top_operators_rows
-        ]
+        top_operators = [row['count'] for row in top_operators_rows]
         return {
             'total': total,
             'by_action': by_action,

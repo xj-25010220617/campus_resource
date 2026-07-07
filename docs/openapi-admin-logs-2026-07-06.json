@@ -609,7 +609,7 @@
                     },
                     "top_operators": {
                       "type": "array",
-                      "items": {"type": "object", "properties": {"key": {"type": "string"}, "label": {"type": "string"}, "count": {"type": "integer"}}}
+                      "items": {"type": "integer"}
                     }
                   }
                 }
