@@ -625,6 +625,9 @@ class VoiceAskView(APIView):
             full_answer = ''
             t0 = time.time()
             try:
+                # 先推送 ASR 识别结果（语音转文字）
+                yield _format_sse('asr_text', {'text': question})
+                # LLM 流式输出
                 for chunk in llm_client.chat_stream(messages):
                     full_answer += chunk
                     yield _format_sse('token', {'content': chunk})
