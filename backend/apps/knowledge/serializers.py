@@ -192,6 +192,15 @@ class KeywordCreateSerializer(serializers.Serializer):
     )
 
 
+def _sanitize_content(value: str) -> str:
+    """清理文本内容中的控制字符，防止 JSON 解析错误"""
+    # 移除不可见的控制字符（保留换行符和制表符）
+    import re
+    # 移除 ASCII 控制字符（0x00-0x1F），但保留换行符(0x0A)、回车符(0x0D)、制表符(0x09)
+    cleaned = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', value)
+    return cleaned
+
+
 class TextUploadSerializer(serializers.Serializer):
     """管理员手动录入文本请求参数"""
 
@@ -199,7 +208,7 @@ class TextUploadSerializer(serializers.Serializer):
         max_length=512, required=False, default='',
         help_text='文档标题（可选，未提供时由 AI 自动生成）',
     )
-    content = serializers.CharField(help_text='文本内容')
+    content = serializers.CharField(help_text='文本内容', validators=[_sanitize_content])
     description = serializers.CharField(
         default='', allow_blank=True, help_text='文档描述（可选，未提供时 AI 生成）',
     )

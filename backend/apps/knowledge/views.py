@@ -30,6 +30,7 @@ from apps.resources.models import UploadLog
 from config.permissions import CanUploadDocument, IsAdminOrSuperAdmin, IsLoginUser
 from utils.oss import oss_client
 from utils.error_codes import ErrorCode
+from utils.parsers import CleanJSONParser
 
 from .extractor import extract_freshness_for_doc
 from .models import Keyword, KnowledgeDoc
@@ -774,6 +775,7 @@ class TextUploadView(APIView):
     返回：{"id": <doc.id>, "status": "uploaded", "file_name": "<title>.txt"}
     """
     permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
+    parser_classes = [CleanJSONParser]
 
     def post(self, request):
         """处理文本录入请求"""
