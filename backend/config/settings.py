@@ -99,6 +99,10 @@ AUTH_PASSWORD_VALIDATORS = [
 # Custom User model
 AUTH_USER_MODEL = 'accounts.User'
 
+# 文件上传大小限制
+DATA_UPLOAD_MAX_MEMORY_SIZE = 100 * 1024 * 1024  # 100MB
+FILE_UPLOAD_MAX_MEMORY_SIZE = 100 * 1024 * 1024  # 100MB
+
 # Internationalization
 LANGUAGE_CODE = 'zh-hans'
 TIME_ZONE = 'Asia/Shanghai'

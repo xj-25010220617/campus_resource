@@ -4,6 +4,7 @@ from rest_framework_simplejwt.views import TokenRefreshView
 from .views import (
     DingtalkCallbackView,
     DingtalkQrView,
+    DingtalkRedirectView,
     LoggedTokenObtainPairView,
     LogoutView,
     MeView,
@@ -32,4 +33,5 @@ urlpatterns = [
     # 钉钉扫码登录
     path('dingtalk/qr/', DingtalkQrView.as_view(), name='dingtalk_qr'),
     path('dingtalk/callback/', DingtalkCallbackView.as_view(), name='dingtalk_callback'),
+    path('dingtalk/redirect/', DingtalkRedirectView.as_view(), name='dingtalk_redirect'),
 ]
