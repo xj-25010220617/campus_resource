@@ -1276,6 +1276,210 @@ class FileUploadView(APIView):
         })
 
 
+class BatchFileUploadView(APIView):
+    """
+    多文件批量上传接口（multipart/form-data）
+
+    POST /api/knowledge/upload/batch/
+    功能：一次性上传多个文件，每个文件独立调用 AI 自动生成标题/描述/关键词，
+          文档归属根据上传者角色自动确定。
+    请求参数（form-data）：
+        - files (file[], required): 上传的文件列表（支持拖拽多选）
+        - visibility (str, default=public): 所有文件的统一可见性（public/private）
+    权限规则：IsAdminOrSuperAdmin，仅管理员及以上可上传
+    返回：
+        {
+            "success": [{id, file_name, status, title, description, visibility, file_type, file_size}, ...],
+            "failed": [{file_name, error}, ...],
+            "total_count": N,
+            "success_count": N,
+            "failed_count": N
+        }
+    注意：
+        - 单个文件失败不影响其他文件处理
+        - 每个文件独立调用 AI，结果不会搞混
+        - 返回顺序与上传顺序一致
+    """
+    permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
+    parser_classes = [parsers.MultiPartParser, parsers.FormParser]
+
+    # 可提取文本的文件类型
+    TEXT_EXTRACTABLE_TYPES = {'txt', 'md', 'html', 'csv', 'json', 'xml', 'yaml', 'yml'}
+
+    def post(self, request):
+        """处理多文件批量上传"""
+        import hashlib
+        import json
+        import uuid
+
+        # 1. 获取文件列表
+        files = request.FILES.getlist('files')
+        if not files:
+            return Response(
+                {'detail': '请至少上传一个文件', 'code': ErrorCode.VALIDATION_ERROR.value},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # 2. 获取统一的可见性设置
+        visibility = request.data.get('visibility', 'public')
+        if visibility not in ('public', 'private'):
+            visibility = 'public'
+
+        # 3. 根据上传者角色确定文档归属
+        user = request.user
+        if user.role == 'super_admin':
+            doc_college_id = None
+            doc_department_id = None
+            oss_scope = 'school'
+            owner_id = 0
+        elif user.role == 'dept_admin' and user.department_id:
+            doc_college_id = user.college_id
+            doc_department_id = user.department_id
+            oss_scope = 'department'
+            owner_id = user.department_id
+        else:
+            doc_college_id = user.college_id
+            doc_department_id = user.department_id
+            oss_scope = 'college'
+            owner_id = user.college_id or 0
+
+        # 4. 逐个处理文件
+        success_results = []
+        failed_results = []
+
+        for uploaded_file in files:
+            file_name = uploaded_file.name
+            try:
+                # 4a. 校验文件类型
+                ext = file_name.rsplit('.', 1)[-1].lower() if '.' in file_name else 'other'
+                if ext not in ALLOWED_FILE_TYPES:
+                    failed_results.append({
+                        'file_name': file_name,
+                        'error': f'不支持的文件类型 ".{ext}"',
+                    })
+                    continue
+
+                # 4b. 生成 OSS 对象 Key 并上传
+                now = datetime.now()
+                safe_filename = f'{uuid.uuid4().hex[:12]}.{ext}'
+                oss_key = f'knowledge/{oss_scope}/{owner_id}/{now:%Y-%m}/{safe_filename}'
+
+                # 读取文件二进制内容 + 计算 MD5
+                file_bytes = uploaded_file.read()
+                md5_hash = hashlib.md5(file_bytes).hexdigest()
+
+                # 上传到 OSS
+                if not oss_client.bucket:
+                    logger.error('OSS Bucket 未初始化，批量上传中止')
+                    return Response(
+                        {'detail': 'OSS 配置异常，请联系管理员', 'code': ErrorCode.OSS_CONFIG_ERROR.value},
+                        status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    )
+
+                try:
+                    oss_client.bucket.put_object(oss_key, file_bytes)
+                    oss_url = f'https://{oss_client.bucket_name}.{oss_client.endpoint}/{oss_key}'
+                    logger.info(f'批量上传 OSS 成功 oss_key={oss_key}, size={len(file_bytes)}')
+                except oss2.exceptions.OssError as e:
+                    logger.error(f'OSS 服务端错误 oss_key={oss_key}: {e}')
+                    failed_results.append({
+                        'file_name': file_name,
+                        'error': f'OSS 服务错误: {str(e)}',
+                    })
+                    continue
+
+                # 4c. 提取文本内容用于 AI 分析
+                extracted_text = ''
+                if ext in self.TEXT_EXTRACTABLE_TYPES:
+                    try:
+                        extracted_text = file_bytes.decode('utf-8', errors='replace')[:4000]
+                    except Exception:
+                        pass
+
+                # 4d. AI 自动生成标题、描述、关键词
+                fallback_title = file_name.rsplit('.', 1)[0] if '.' in file_name else file_name
+                ai_result = _ai_classify(fallback_title, extracted_text)
+                if ai_result:
+                    title = ai_result.get('title') or fallback_title
+                    description = ai_result.get('description') or ''
+                    raw_keywords = ai_result.get('keywords', [])
+                else:
+                    # AI 不可用降级：使用文件名作为标题
+                    title = fallback_title
+                    description = ''
+                    raw_keywords = []
+
+                # 4e. 创建 KnowledgeDoc 记录
+                new_doc = KnowledgeDoc.objects.create(
+                    title=title,
+                    description=description,
+                    source_type='upload',
+                    oss_key=oss_key,
+                    oss_url=oss_url,
+                    file_name=file_name,
+                    file_type=ext,
+                    file_size=uploaded_file.size,
+                    md5_hash=md5_hash,
+                    college_id=doc_college_id,
+                    department_id=doc_department_id,
+                    uploader=user,
+                    status='uploaded',
+                    visibility=visibility,
+                )
+
+                # 4f. 创建关键词
+                for phrase in raw_keywords:
+                    if isinstance(phrase, str) and phrase.strip():
+                        Keyword.objects.create(
+                            doc=new_doc, phrase=phrase.strip(),
+                            match_type='fuzzy', weight=1, created_by=user,
+                        )
+
+                # 4g. 创建上传日志
+                try:
+                    UploadLog.objects.create(
+                        user=user,
+                        file_name=file_name,
+                        file_size=uploaded_file.size,
+                        file_type=ext,
+                        college_id=doc_college_id,
+                        department_id=doc_department_id,
+                        status='success',
+                        ip_address=request.META.get('REMOTE_ADDR'),
+                        user_agent=request.META.get('HTTP_USER_AGENT', '')[:512],
+                    )
+                except Exception as e:
+                    logger.error(f'批量上传创建日志失败 file={file_name}: {e}')
+
+                # 4h. 记录成功
+                success_results.append({
+                    'id': new_doc.id,
+                    'file_name': new_doc.file_name,
+                    'status': new_doc.status,
+                    'title': new_doc.title,
+                    'description': description,
+                    'visibility': new_doc.visibility,
+                    'file_type': new_doc.file_type,
+                    'file_size': new_doc.file_size,
+                })
+
+            except Exception as e:
+                logger.error(f'批量上传文件处理失败 file={file_name}: {type(e).__name__}: {e}')
+                failed_results.append({
+                    'file_name': file_name,
+                    'error': str(e),
+                })
+
+        # 5. 返回汇总结果
+        return Response({
+            'success': success_results,
+            'failed': failed_results,
+            'total_count': len(files),
+            'success_count': len(success_results),
+            'failed_count': len(failed_results),
+        })
+
+
 def _ai_classify(title: str = '', content: str = '') -> Optional[dict]:
     """调用 LLM 智能分析文档，返回 title/description/keywords/visibility。
 
