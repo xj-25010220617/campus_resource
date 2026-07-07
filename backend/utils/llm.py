@@ -11,6 +11,8 @@ from typing import AsyncGenerator, Generator, List, Optional
 import requests
 from django.conf import settings
 
+from .http_client import ExternalClient
+
 logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------
@@ -67,14 +69,14 @@ class LLMClient:
         last_error = None
         for attempt in range(MAX_RETRIES):
             try:
-                resp = requests.post(
+                resp = ExternalClient.post(
+                    'deepseek_embed',
                     f'{self.base_url}/v1/embeddings',
                     headers=self.headers,
                     json={
                         'model': LLM_EMBED_MODEL,
                         'input': texts,
                     },
-                    timeout=30,
                 )
                 resp.raise_for_status()
                 data = resp.json()
@@ -143,7 +145,8 @@ class LLMClient:
         last_error = None
         for attempt in range(MAX_RETRIES):
             try:
-                resp = requests.post(
+                resp = ExternalClient.post(
+                    'deepseek_chat',
                     f'{self.base_url}/v1/chat/completions',
                     headers=self.headers,
                     json={
@@ -153,7 +156,6 @@ class LLMClient:
                         'max_tokens': max_tokens,
                         'stream': False,
                     },
-                    timeout=60,
                 )
                 resp.raise_for_status()
                 data = resp.json()
@@ -200,7 +202,8 @@ class LLMClient:
         last_error = None
         for attempt in range(MAX_RETRIES):
             try:
-                resp = requests.post(
+                resp = ExternalClient.post(
+                    'deepseek_stream',
                     f'{self.base_url}/v1/chat/completions',
                     headers=self.headers,
                     json={
@@ -210,7 +213,6 @@ class LLMClient:
                         'max_tokens': max_tokens,
                         'stream': True,
                     },
-                    timeout=120,
                     stream=True,
                 )
                 resp.raise_for_status()

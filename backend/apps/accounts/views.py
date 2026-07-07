@@ -403,14 +403,15 @@ class DingtalkCallbackView(APIView):
 
     def _get_dingtalk_user(self, auth_code):
         """调用钉钉 OpenAPI 换取用户信息"""
-        import requests
+        from utils.http_client import ExternalClient
 
         app_key = getattr(settings, 'DINGTALK_APP_KEY', '')
         app_secret = getattr(settings, 'DINGTALK_APP_SECRET', '')
 
         try:
             # 步骤1：authCode → accessToken
-            token_resp = requests.post(
+            token_resp = ExternalClient.post(
+                'dingtalk',
                 'https://api.dingtalk.com/v1.0/oauth2/userAccessToken',
                 json={
                     'clientId': app_key,
@@ -418,7 +419,6 @@ class DingtalkCallbackView(APIView):
                     'code': auth_code,
                     'grantType': 'authorization_code',
                 },
-                timeout=10,
             )
             token_data = token_resp.json()
             access_token = token_data.get('accessToken')
@@ -427,10 +427,10 @@ class DingtalkCallbackView(APIView):
                 return None
 
             # 步骤2：accessToken → 用户信息
-            user_resp = requests.get(
+            user_resp = ExternalClient.get(
+                'dingtalk',
                 'https://api.dingtalk.com/v1.0/contact/users/me',
                 headers={'x-acs-dingtalk-access-token': access_token},
-                timeout=10,
             )
             user_data = user_resp.json()
             logger.info('钉钉用户信息: nick=%s unionId=%s', user_data.get('nick'), user_data.get('unionId'))

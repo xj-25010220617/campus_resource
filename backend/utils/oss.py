@@ -44,7 +44,12 @@ class OSSClient:
     @property
     def bucket(self):
         if self._bucket is None and self.auth:
-            self._bucket = oss2.Bucket(self.auth, self._raw_endpoint, self.bucket_name)
+            self._bucket = oss2.Bucket(
+                self.auth, self._raw_endpoint, self.bucket_name,
+                connect_timeout=5,
+                read_timeout=30,
+                app_name='campus-resource',
+            )
         return self._bucket
 
     def _sanitize_filename(self, file_name: str) -> str:
@@ -132,7 +137,11 @@ class OSSClient:
         """生成带签名的下载 URL，默认有效期 300 秒"""
         if not self.bucket:
             return ''
-        return self.bucket.sign_url('GET', oss_key, expires)
+        try:
+            return self.bucket.sign_url('GET', oss_key, expires)
+        except Exception as e:
+            logger.error(f'生成下载 URL 失败 oss_key={oss_key}: {e}')
+            return ''
 
     def get_preview_url(self, oss_key: str, expires: int = 3600) -> str:
         """
