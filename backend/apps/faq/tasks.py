@@ -12,8 +12,10 @@ FAQ 自动生成 — Celery 定时任务
 import logging
 from datetime import timedelta
 
-from celery import shared_task
+from django.conf import settings
 from django.utils import timezone
+
+from utils.shared_task_compat import shared_task
 
 from apps.chat.models import ChatMessage
 from utils.llm import llm_client
@@ -131,60 +133,94 @@ def generate_faq_weekly(self):
         drafts_created = 0
         dedup_threshold = getattr(settings, 'FAQ_DEDUP_THRESHOLD', 0.90)
 
-        for cluster in high_freq_clusters:
-            try:
-                # 跳过与已有 FAQ 过度相似的问题
-                representative = cluster.questions[0][:200]
-                existing = FAQItem.objects.filter(
-                    status__in=['draft', 'published'],
-                ).order_by('-created_at')[:50]
+        try:
+            # 一次性取出已有 FAQ 草稿/已发布，用于去重比较
+            existing_qs = FAQItem.objects.filter(
+                status__in=['draft', 'published'],
+            ).exclude(question='').order_by('-created_at')[:50]
+            existing_questions = [e.question[:200] for e in existing_qs]
+            # 批量嵌入已有 FAQ（一次 HTTP 请求，最坏 100s 兜底）
+            existing_vectors = []
+            if existing_questions:
+                try:
+                    existing_vectors = llm_client.embed(existing_questions) or []
+                except Exception as e:
+                    logger.warning('批量嵌入已有 FAQ 失败，跳过去重：%s', e)
+                    existing_vectors = []
 
-                # 向量相似度比较
-                cluster_vector = llm_client.embed_one(representative)
-                should_skip = False
-                for exist in existing:
-                    if not exist.question:
+            for cluster in high_freq_clusters:
+                try:
+                    representative = cluster.questions[0][:200]
+
+                    # 批量嵌入：1 个代表问题 + N 个已有 FAQ 一起请求
+                    # 但每次只嵌入一个簇的代表问题，再复用 existing_vectors 做比较
+                    cluster_vectors = []
+                    try:
+                        cluster_vectors = llm_client.embed([representative]) or []
+                    except Exception as e:
+                        logger.warning('簇代表问题嵌入失败，跳过该簇: %s', e)
                         continue
-                    exist_vector = llm_client.embed_one(exist.question[:200])
-                    if cosine_similarity(cluster_vector, exist_vector) >= dedup_threshold:
-                        should_skip = True
-                        logger.info('跳过已存在的 FAQ: %s（相似度 >= %.2f）', representative[:40], dedup_threshold)
-                        break
+                    if not cluster_vectors:
+                        continue
+                    cluster_vector = cluster_vectors[0]
 
-                if should_skip:
+                    # 与已有 FAQ 比相似度（复用已批量算好的向量）
+                    should_skip = False
+                    for exist_vec in existing_vectors:
+                        if cosine_similarity(cluster_vector, exist_vec) >= dedup_threshold:
+                            should_skip = True
+                            logger.info(
+                                '跳过已存在的 FAQ: %s（相似度 >= %.2f）',
+                                representative[:40], dedup_threshold,
+                            )
+                            break
+
+                    if should_skip:
+                        continue
+
+                    # 调用 LLM 生成
+                    result = generate_faq_draft(cluster)
+                    if not result:
+                        logger.warning('LLM 生成失败，跳过该簇')
+                        continue
+
+                    # 保存为草稿
+                    FAQItem.objects.create(
+                        question=result['question'][:500],
+                        answer=result['answer'],
+                        tags=result.get('tags', []),
+                        college_id=result.get('college_id'),
+                        status='draft',
+                        frequency=round((cluster.size / total_questions) * 100, 2),
+                        variant_count=cluster.size,
+                        source_period_start=since,
+                        source_period_end=timezone.now(),
+                    )
+                    drafts_created += 1
+                    logger.info('生成 FAQ 草稿: %s', result['question'][:40])
+
+                except Exception as e:
+                    logger.error(f'处理问题簇时出错: {e}')
                     continue
-
-                # 调用 LLM 生成
-                result = generate_faq_draft(cluster)
-                if not result:
-                    logger.warning('LLM 生成失败，跳过该簇')
-                    continue
-
-                # 保存为草稿
-                FAQItem.objects.create(
-                    question=result['question'][:500],
-                    answer=result['answer'],
-                    tags=result.get('tags', []),
-                    college_id=result.get('college_id'),
-                    status='draft',
-                    frequency=round((cluster.size / total_questions) * 100, 2),
-                    variant_count=cluster.size,
-                    source_period_start=since,
-                    source_period_end=timezone.now(),
+        finally:
+            # 无论阶段 4 是否成功，强制收尾日志为终态
+            # 避免之前那样 "running 永远卡住" 的问题（log_id=1/3 都是这种情况）
+            if log.status == 'running':
+                log.drafts_generated = drafts_created
+                log.completed_at = timezone.now()
+                if drafts_created > 0:
+                    log.status = 'completed'
+                else:
+                    log.status = 'completed'  # 即使 0 草稿也视为完成（无崩溃）
+                    if not log.error_message:
+                        log.error_message = '已完成阶段 1-3，阶段 4 未产出草稿（可能 LLM 调用全部降级到 Mock）'
+                log.save(update_fields=[
+                    'status', 'drafts_generated', 'completed_at', 'error_message',
+                ])
+                logger.info(
+                    'FAQ 生成最终状态: log_id=%d status=%s drafts=%d',
+                    log.id, log.status, drafts_created,
                 )
-                drafts_created += 1
-                logger.info('生成 FAQ 草稿: %s', result['question'][:40])
-
-            except Exception as e:
-                logger.error(f'处理问题簇时出错: {e}')
-                continue
-
-        # 完成
-        log.status = 'completed'
-        log.drafts_generated = drafts_created
-        log.completed_at = timezone.now()
-        log.save(update_fields=['status', 'drafts_generated', 'completed_at'])
-        logger.info('FAQ 自动生成完成: 生成 %d 条草稿', drafts_created)
 
     except Exception as e:
         logger.error(f'FAQ 自动生成失败: {e}')
