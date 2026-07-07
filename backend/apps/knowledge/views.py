@@ -29,6 +29,7 @@ from apps.classify.models import Department, Discipline
 from apps.resources.models import UploadLog
 from config.permissions import CanUploadDocument, IsAdminOrSuperAdmin, IsLoginUser
 from utils.oss import oss_client
+from utils.error_codes import ErrorCode
 
 from .extractor import extract_freshness_for_doc
 from .models import Keyword, KnowledgeDoc
@@ -467,7 +468,7 @@ class KeywordCreateView(APIView):
         # 同一文档内 phrase 唯一性校验
         if Keyword.objects.filter(doc=doc, phrase=data['phrase']).exists():
             return Response(
-                {'detail': f'关键词 "{data["phrase"]}" 已存在于此文档中', 'code': 'CONFLICT'},
+                {'detail': f'关键词 "{data["phrase"]}" 已存在于此文档中', 'code': ErrorCode.CONFLICT.value},
                 status=status.HTTP_409_CONFLICT,
             )
 
@@ -830,7 +831,7 @@ class TextUploadView(APIView):
         success = oss_client.upload_text(content, oss_key)
         if not success:
             return Response(
-                {'detail': '文本上传到 OSS 失败，请稍后重试', 'code': 'UPLOAD_FAILED'},
+                {'detail': '文本上传到 OSS 失败，请稍后重试', 'code': ErrorCode.UPLOAD_FAILED.value},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
@@ -985,7 +986,9 @@ class ExtractFreshnessView(APIView):
         - admin: 仅可对自己上传的文档触发
     返回：
         - 202 Accepted: {"task_id": "...", "status": "queued", "doc_id": <int>}
+          （Celery 可用时返回；celery 入队失败/未安装时自动降级为同步执行，返回 200）
         - 200 OK: 单个对象 {freshness_date, confidence, source_excerpt, raw_response}
+          （async=false 显式同步 OR Celery 不可用自动降级）
     错误码：
         - 401 UNAUTHORIZED: 未登录
         - 403 PERMISSION_DENIED: 越权触发
@@ -993,6 +996,9 @@ class ExtractFreshnessView(APIView):
     注意：
         - 图片/视频/音频类型无法抽取文本，confidence='none'
         - 失败时 freshness_date 留空，前端可再次手动触发
+        - celery 未安装（本地开发）时 utils.shared_task_compat 会自动同步执行任务，
+          接口仍返回 200 而非 500；部署到生产前请确保 requirements.txt 中的 celery 已安装
+          且 worker 正常运行
     """
     permission_classes = [IsLoginUser]
 
@@ -1023,7 +1029,7 @@ class ExtractFreshnessView(APIView):
         result = extract_freshness_for_doc(doc.id)
         if result is None:
             return Response(
-                {'detail': '文档不存在', 'code': 'NOT_FOUND'},
+                {'detail': '文档不存在', 'code': ErrorCode.NOT_FOUND.value},
                 status=status.HTTP_404_NOT_FOUND,
             )
         # 200 返回单个对象（按 CONVENTIONS.md 第 8 节："返回单个对象"）
@@ -1104,7 +1110,7 @@ class FileUploadView(APIView):
             if not oss_client.bucket:
                 logger.error(f'OSS Bucket 未初始化，请检查 OSS 配置')
                 return Response(
-                    {'detail': 'OSS 配置异常，请联系管理员', 'code': 'OSS_CONFIG_ERROR'},
+                    {'detail': 'OSS 配置异常，请联系管理员', 'code': ErrorCode.OSS_CONFIG_ERROR.value},
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 )
 
@@ -1114,13 +1120,13 @@ class FileUploadView(APIView):
         except oss2.exceptions.OssError as e:
             logger.error(f'OSS 服务端错误 oss_key={oss_key}: {e}')
             return Response(
-                {'detail': f'OSS 服务错误: {str(e)}', 'code': 'OSS_SERVER_ERROR'},
+                {'detail': f'OSS 服务错误: {str(e)}', 'code': ErrorCode.OSS_SERVER_ERROR.value},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
         except Exception as e:
             logger.error(f'OSS 文件上传失败 oss_key={oss_key}: {type(e).__name__}: {e}')
             return Response(
-                {'detail': f'文件上传失败: {str(e)}', 'code': 'UPLOAD_FAILED'},
+                {'detail': f'文件上传失败: {str(e)}', 'code': ErrorCode.UPLOAD_FAILED.value},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
@@ -1345,7 +1351,7 @@ class AIClassifyView(APIView):
 
         if ai_result is None:
             return Response(
-                {'detail': 'AI 服务暂时不可用，请手动填写信息', 'code': 'AI_UNAVAILABLE'},
+                {'detail': 'AI 服务暂时不可用，请手动填写信息', 'code': ErrorCode.AI_UNAVAILABLE.value},
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
 

@@ -9,6 +9,8 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
+from utils.error_codes import ErrorCode
+
 from .serializers import UserSerializer, ChangePasswordSerializer
 
 
@@ -208,7 +210,7 @@ class SsoCallbackView(APIView):
 
         if not code:
             return Response(
-                {'detail': '缺少 code 参数', 'code': 'VALIDATION_ERROR'},
+                {'detail': '缺少 code 参数', 'code': ErrorCode.VALIDATION_ERROR.value},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -218,7 +220,7 @@ class SsoCallbackView(APIView):
                 {
                     'detail': f'无效的 SSO 测试码: {code}',
                     'available_codes': list(MOCK_SSO_USERS.keys()),
-                    'code': 'INVALID_SSO_CODE',
+                    'code': ErrorCode.INVALID_SSO_CODE.value,
                 },
                 status=status.HTTP_401_UNAUTHORIZED,
             )
@@ -325,7 +327,11 @@ class DingtalkQrView(APIView):
 
     def get(self, request):
         app_key = getattr(settings, 'DINGTALK_APP_KEY', '')
-        redirect_uri = request.build_absolute_uri('/api/auth/dingtalk/callback/')
+        # 优先用前端传的回调地址（手机扫码后跳回前端页面），否则用后端地址
+        redirect_uri = (
+            request.query_params.get('redirect_uri')
+            or request.build_absolute_uri('/api/auth/dingtalk/callback/')
+        )
 
         if not app_key:
             return Response(
@@ -368,7 +374,7 @@ class DingtalkCallbackView(APIView):
 
         if not auth_code:
             return Response(
-                {'detail': '缺少 authCode 参数', 'code': 'VALIDATION_ERROR'},
+                {'detail': '缺少 authCode 参数', 'code': ErrorCode.VALIDATION_ERROR.value},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -376,7 +382,7 @@ class DingtalkCallbackView(APIView):
         user_info = self._get_dingtalk_user(auth_code)
         if not user_info:
             return Response(
-                {'detail': '钉钉授权失败，请重新扫码', 'code': 'DINGTALK_AUTH_FAILED'},
+                {'detail': '钉钉授权失败，请重新扫码', 'code': ErrorCode.DINGTALK_AUTH_FAILED.value},
                 status=status.HTTP_401_UNAUTHORIZED,
             )
 

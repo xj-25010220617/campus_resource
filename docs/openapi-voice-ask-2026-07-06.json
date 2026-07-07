@@ -1,0 +1,153 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "校园资源管理系统 - 语音问答接口",
+    "description": "POST /api/chat/voice-ask/ — 接收音频文件 → FunASR 语音转文字 → RAG 检索 → LLM 流式 SSE 回答。\n\n修改日期：2026-07-06\n关联文档：docs/前端对接接口文档-语音问答-2026-07-06.md\n\n鉴权方式：需 Authorization: Bearer <jwt_token>（IsAuthenticated）。",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8000/api",
+      "description": "本地开发"
+    },
+    {
+      "url": "http://rm-bp18t1fwh5xb9cj7hro.mysql.rds.aliyuncs.com:8000/api",
+      "description": "阿里云 RDS（远程）"
+    }
+  ],
+  "tags": [
+    {"name": "AI对话-语音问答", "description": "音频文件 → 语音识别 → RAG → LLM 流式回答"}
+  ],
+  "paths": {
+    "/chat/voice-ask/": {
+      "post": {
+        "tags": ["AI对话-语音问答"],
+        "summary": "语音问答",
+        "description": "接收音频文件 → FunASR 语音转文字 → RAG 检索 → LLM 流式 SSE 回答。与 POST /chat/ask/ 的区别仅在于输入为音频而非文字。",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "audio_file": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "音频文件，支持 WAV/MP3/M4A/AAC/OGG/FLAC/PCM，最大 10MB"
+                  },
+                  "conversation_id": {
+                    "type": "integer",
+                    "description": "会话ID，不传则新建",
+                    "nullable": true
+                  }
+                },
+                "required": ["audio_file"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "SSE 流式响应（text/event-stream）",
+            "headers": {
+              "Content-Type": {
+                "schema": {"type": "string"},
+                "example": "text/event-stream"
+              },
+              "Cache-Control": {
+                "schema": {"type": "string"},
+                "example": "no-cache"
+              },
+              "X-Accel-Buffering": {
+                "schema": {"type": "string"},
+                "example": "no"
+              },
+              "X-Message-Id": {
+                "schema": {"type": "integer"},
+                "description": "QueryLog ID，可用于后续反馈",
+                "example": "123"
+              }
+            },
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string",
+                  "example": "event: msg\ndata: {\"content\": \"这是\"}\n\nevent: msg\ndata: {\"content\": \"AI 的\"}\n\nevent: done\ndata: {\"message_id\": 456}\n\nevent: references\ndata: {\"count\": 2, \"summary\": \"参考了2份文档\"}\n"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "参数校验失败或文件过大",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "detail": {"type": "string", "example": "音频文件不能超过 10MB"},
+                    "code": {"type": "string", "example": "FILE_TOO_LARGE"}
+                  }
+                },
+                "examples": {
+                  "file_too_large": {
+                    "summary": "文件超过 10MB",
+                    "value": {
+                      "detail": "音频文件不能超过 10MB",
+                      "code": "FILE_TOO_LARGE"
+                    }
+                  },
+                  "validation_error": {
+                    "summary": "参数校验失败",
+                    "value": {
+                      "audio_file": ["该字段为必填项"]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "语音识别失败或 LLM 生成异常",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "detail": {"type": "string"},
+                    "code": {"type": "string"}
+                  }
+                },
+                "examples": {
+                  "asr_failed": {
+                    "summary": "语音识别失败",
+                    "value": {
+                      "detail": "语音识别失败，请确认音频清晰且包含中文语音",
+                      "code": "ASR_FAILED"
+                    }
+                  },
+                  "asr_model_error": {
+                    "summary": "FunASR 模型加载失败",
+                    "value": {
+                      "detail": "语音识别失败: 依赖缺失: No module named 'funasr'",
+                      "code": "ASR_FAILED"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    }
+  },
+  "security": [{"BearerAuth": []}]
+}

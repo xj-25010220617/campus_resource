@@ -12,3 +12,8 @@ librosa
 soundfile
 beautifulsoup4>=4.12.0
 lxml>=5.0.0
+# 异步任务（可选）
+# - 生产/定时任务场景需要 celery + redis 作为 broker
+# - 本地开发不安装也能跑，utils.shared_task_compat 会自动降级为同步执行
+celery>=5.3.0
+redis>=5.0.0
