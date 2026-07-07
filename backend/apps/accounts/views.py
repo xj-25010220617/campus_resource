@@ -421,13 +421,17 @@ class DingtalkQrView(APIView):
                 status=status.HTTP_501_NOT_IMPLEMENTED,
             )
 
+        import uuid
+        from urllib.parse import quote
+
+        state = uuid.uuid4().hex
         auth_url = (
             'https://login.dingtalk.com/oauth2/auth'
-            f'?redirect_uri={redirect_uri}'
+            f'?redirect_uri={quote(redirect_uri, safe="")}'
             '&response_type=code'
             f'&client_id={app_key}'
-            '&scope=openid%20corpid'
-            '&state=dingtalk_login'
+            '&scope=openid'
+            f'&state={state}'
             '&prompt=consent'
         )
         return Response({
