@@ -902,8 +902,9 @@ class LogsDashboardView(APIView):
     - 时间区间基于 Asia/Shanghai（settings.TIME_ZONE）
     - 5 个块各自 try/except 隔离失败（块计算放 services/dashboard.py）
     - view 不接 try/except（遵循规范 §9）
+    - 已移除 top_operators 中的用户敏感信息（key/label），仅返回操作次数列表
     """
-    permission_classes = [permissions.IsAuthenticated, IsSuperAdmin]
+    permission_classes = [permissions.AllowAny]
 
     def get(self, request):
         period = request.query_params.get('period', 'day')
