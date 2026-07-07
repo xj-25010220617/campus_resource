@@ -39,3 +39,6 @@ celerybeat-schedule
 .DS_Store
 Thumbs.db
 natapp.exe
+ngrok.exe
+qr_test.png
+test_page.html

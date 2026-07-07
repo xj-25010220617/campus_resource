@@ -3,6 +3,7 @@ import logging
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import transaction
+from django.http import HttpResponse
 from drf_spectacular.utils import extend_schema
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
@@ -409,7 +410,7 @@ class DingtalkQrView(APIView):
         # 优先用前端传的回调地址（手机扫码后跳回前端页面），否则用后端地址
         redirect_uri = (
             request.query_params.get('redirect_uri')
-            or request.build_absolute_uri('/api/auth/dingtalk/callback/')
+            or request.build_absolute_uri('/api/auth/dingtalk/redirect/')
         )
 
         if not app_key:
@@ -588,7 +589,7 @@ class DingtalkRedirectView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def get(self, request):
-        import requests
+        from utils.http_client import ExternalClient
 
         auth_code = request.query_params.get('code')
         if not auth_code:
@@ -601,13 +602,13 @@ class DingtalkRedirectView(APIView):
         app_key = getattr(settings, 'DINGTALK_APP_KEY', '')
         app_secret = getattr(settings, 'DINGTALK_APP_SECRET', '')
         try:
-            token_resp = requests.post(
+            token_resp = ExternalClient.post(
+                'dingtalk',
                 'https://api.dingtalk.com/v1.0/oauth2/userAccessToken',
                 json={
                     'clientId': app_key, 'clientSecret': app_secret,
                     'code': auth_code, 'grantType': 'authorization_code',
                 },
-                timeout=10,
             )
             token_data = token_resp.json()
             access_token = token_data.get('accessToken')
@@ -617,10 +618,10 @@ class DingtalkRedirectView(APIView):
                     {'detail': '钉钉授权失败，请重新扫码'},
                     status=status.HTTP_401_UNAUTHORIZED,
                 )
-            user_resp = requests.get(
+            user_resp = ExternalClient.get(
+                'dingtalk',
                 'https://api.dingtalk.com/v1.0/contact/users/me',
                 headers={'x-acs-dingtalk-access-token': access_token},
-                timeout=10,
             )
             user_data = user_resp.json()
         except Exception as e:
@@ -745,4 +746,4 @@ function goBack() {
         html = template.replace('__USER_JSON__', user_json_safe)
         html = html.replace('__ACCESS__', access)
         html = html.replace('__REFRESH__', refresh)
-        return Response(html, content_type='text/html; charset=utf-8')
+        return HttpResponse(html, content_type='text/html; charset=utf-8')
