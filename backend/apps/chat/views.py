@@ -17,6 +17,7 @@ from utils import rag
 from utils.llm import llm_client
 from utils.sensitive_filter import check_sensitive
 from utils.sse import _format_sse, build_references_events
+from utils.error_codes import ErrorCode
 from apps.classify.utils.query_parser import parse as parse_query
 
 from .models import Conversation, ChatMessage, QueryLog, SensitiveLog
@@ -288,7 +289,7 @@ class AskView(APIView):
             return Response(
                 {
                     'detail': sensitive_result.refuse_message,
-                    'code': 'SENSITIVE_CONTENT',
+                    'code': ErrorCode.SENSITIVE_CONTENT.value,
                     'matched_rules': sensitive_result.matched_rules,
                 },
                 status=status.HTTP_400_BAD_REQUEST,
@@ -559,7 +560,7 @@ class VoiceAskView(APIView):
         audio_file = data['audio_file']
         if audio_file.size > 10 * 1024 * 1024:
             return Response(
-                {'detail': '音频文件不能超过 10MB', 'code': 'FILE_TOO_LARGE'},
+                {'detail': '音频文件不能超过 10MB', 'code': ErrorCode.FILE_TOO_LARGE.value},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         audio_data = audio_file.read()
@@ -572,7 +573,7 @@ class VoiceAskView(APIView):
             if _model_error:
                 detail = f'语音识别失败: {_model_error}'
             return Response(
-                {'detail': detail, 'code': 'ASR_FAILED'},
+                {'detail': detail, 'code': ErrorCode.ASR_FAILED.value},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 

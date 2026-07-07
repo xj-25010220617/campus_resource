@@ -27,6 +27,7 @@ from apps.accounts.models import College
 from apps.classify.models import Category, Department, Discipline
 from config.permissions import IsAdminOrSuperAdmin, IsLoginUser
 from utils.oss import oss_client
+from utils.error_codes import ErrorCode
 
 from .extractor import extract_freshness_for_doc
 from .models import Keyword, KnowledgeDoc
@@ -445,7 +446,7 @@ class KeywordCreateView(APIView):
         # 同一文档内 phrase 唯一性校验
         if Keyword.objects.filter(doc=doc, phrase=data['phrase']).exists():
             return Response(
-                {'detail': f'关键词 "{data["phrase"]}" 已存在于此文档中', 'code': 'CONFLICT'},
+                {'detail': f'关键词 "{data["phrase"]}" 已存在于此文档中', 'code': ErrorCode.CONFLICT.value},
                 status=status.HTTP_409_CONFLICT,
             )
 
@@ -814,7 +815,7 @@ class TextUploadView(APIView):
         success = oss_client.upload_text(content, oss_key)
         if not success:
             return Response(
-                {'detail': '文本上传到 OSS 失败，请稍后重试', 'code': 'UPLOAD_FAILED'},
+                {'detail': '文本上传到 OSS 失败，请稍后重试', 'code': ErrorCode.UPLOAD_FAILED.value},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
@@ -1008,7 +1009,7 @@ class ExtractFreshnessView(APIView):
         result = extract_freshness_for_doc(doc.id)
         if result is None:
             return Response(
-                {'detail': '文档不存在', 'code': 'NOT_FOUND'},
+                {'detail': '文档不存在', 'code': ErrorCode.NOT_FOUND.value},
                 status=status.HTTP_404_NOT_FOUND,
             )
         # 200 返回单个对象（按 CONVENTIONS.md 第 8 节："返回单个对象"）
@@ -1092,7 +1093,7 @@ class FileUploadView(APIView):
             if not oss_client.bucket:
                 logger.error(f'OSS Bucket 未初始化，请检查 OSS 配置')
                 return Response(
-                    {'detail': 'OSS 配置异常，请联系管理员', 'code': 'OSS_CONFIG_ERROR'},
+                    {'detail': 'OSS 配置异常，请联系管理员', 'code': ErrorCode.OSS_CONFIG_ERROR.value},
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 )
 
@@ -1102,13 +1103,13 @@ class FileUploadView(APIView):
         except oss2.exceptions.OssError as e:
             logger.error(f'OSS 服务端错误 oss_key={oss_key}: {e}')
             return Response(
-                {'detail': f'OSS 服务错误: {str(e)}', 'code': 'OSS_SERVER_ERROR'},
+                {'detail': f'OSS 服务错误: {str(e)}', 'code': ErrorCode.OSS_SERVER_ERROR.value},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
         except Exception as e:
             logger.error(f'OSS 文件上传失败 oss_key={oss_key}: {type(e).__name__}: {e}')
             return Response(
-                {'detail': f'文件上传失败: {str(e)}', 'code': 'UPLOAD_FAILED'},
+                {'detail': f'文件上传失败: {str(e)}', 'code': ErrorCode.UPLOAD_FAILED.value},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
@@ -1319,7 +1320,7 @@ class AIClassifyView(APIView):
 
         if ai_result is None:
             return Response(
-                {'detail': 'AI 服务暂时不可用，请手动填写信息', 'code': 'AI_UNAVAILABLE'},
+                {'detail': 'AI 服务暂时不可用，请手动填写信息', 'code': ErrorCode.AI_UNAVAILABLE.value},
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
 
