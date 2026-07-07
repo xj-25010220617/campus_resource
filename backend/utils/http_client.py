@@ -119,7 +119,7 @@ class ExternalClient:
         return TIMEOUT_PROFILES.get(service)
 
     @staticmethod
-    async def async_request(service: str, method: str, url: str, **kwargs) -> httpx.Response:
+    async def async_request(service: str, method: str, url: str, **kwargs) -> "httpx.Response":
         if not HAS_HTTPX:
             raise ImportError('httpx 未安装，请安装: pip install httpx')
 
@@ -147,7 +147,7 @@ class ExternalClient:
             raise
 
     @staticmethod
-    async def async_post(service: str, url: str, **kwargs) -> httpx.Response:
+    async def async_post(service: str, url: str, **kwargs) -> "httpx.Response":
         return await ExternalClient.async_request(service, 'POST', url, **kwargs)
 
     @staticmethod
