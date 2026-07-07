@@ -8,7 +8,9 @@ from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.views import TokenObtainPairView
 
+from apps.admin_panel.utils import write_login_log
 from utils.error_codes import ErrorCode
 
 from .serializers import UserSerializer, ChangePasswordSerializer
@@ -16,6 +18,62 @@ from .serializers import UserSerializer, ChangePasswordSerializer
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
+
+
+class LoggedTokenObtainPairView(TokenObtainPairView):
+    """
+    JWT 登录接口（带审计日志埋点）
+
+    POST /api/auth/login/
+    功能：账号密码登录，签发 access / refresh；同步写入 admin_login_log
+          （成功：login_type=jwt / success=true / user=当前用户；
+           失败：login_type=jwt / success=false / fail_reason=异常描述）
+    参数：
+        - username (string, required): 登录用户名
+        - password (string, required): 密码
+    返回：{"access": "...", "refresh": "..."}
+    """
+
+    def post(self, request, *args, **kwargs):
+        try:
+            response = super().post(request, *args, **kwargs)
+        except Exception as exc:
+            write_login_log(
+                request,
+                login_type='jwt',
+                success=False,
+                fail_reason=str(exc) or '凭证错误或账号不存在',
+            )
+            raise
+
+        if response.status_code == status.HTTP_200_OK:
+            username = (request.data.get('username') or '').strip()
+            user = User.objects.filter(username=username).first() if username else None
+            write_login_log(
+                request,
+                login_type='jwt',
+                success=True,
+                user=user,
+                username=username,
+            )
+        else:
+            write_login_log(
+                request,
+                login_type='jwt',
+                success=False,
+                username=(request.data.get('username') or ''),
+                fail_reason=_extract_jwt_fail_reason(response.data),
+            )
+        return response
+
+
+def _extract_jwt_fail_reason(data) -> str:
+    """从 SimpleJWT 错误响应中提取失败原因文本"""
+    detail = (data or {}).get('detail') if isinstance(data, dict) else None
+    if detail:
+        return str(detail)
+    return '凭证错误或账号不存在'
+
 
 # ------------------------------------------------------------------
 # Mock SSO 用户映射（仅开发测试用，正式对接后删除）
@@ -209,6 +267,12 @@ class SsoCallbackView(APIView):
         code = request.data.get('code') or request.query_params.get('code')
 
         if not code:
+            write_login_log(
+                request,
+                login_type='sso_mock',
+                success=False,
+                fail_reason='缺少 code 参数',
+            )
             return Response(
                 {'detail': '缺少 code 参数', 'code': ErrorCode.VALIDATION_ERROR.value},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -216,6 +280,13 @@ class SsoCallbackView(APIView):
 
         user_info = MOCK_SSO_USERS.get(code)
         if not user_info:
+            write_login_log(
+                request,
+                login_type='sso_mock',
+                success=False,
+                username=code,
+                fail_reason=f'无效的 SSO 测试码: {code}',
+            )
             return Response(
                 {
                     'detail': f'无效的 SSO 测试码: {code}',
@@ -234,6 +305,14 @@ class SsoCallbackView(APIView):
         logger.info(
             'SSO Mock 登录: code=%s user=%s created=%s',
             code, user.username, created,
+        )
+
+        write_login_log(
+            request,
+            login_type='sso_mock',
+            success=True,
+            user=user,
+            username=user.username,
         )
 
         return Response({
@@ -373,6 +452,12 @@ class DingtalkCallbackView(APIView):
         auth_code = request.data.get('authCode') or request.data.get('code')
 
         if not auth_code:
+            write_login_log(
+                request,
+                login_type='sso',
+                success=False,
+                fail_reason='缺少 authCode 参数',
+            )
             return Response(
                 {'detail': '缺少 authCode 参数', 'code': ErrorCode.VALIDATION_ERROR.value},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -381,6 +466,12 @@ class DingtalkCallbackView(APIView):
         # 调用钉钉 API 换取用户信息
         user_info = self._get_dingtalk_user(auth_code)
         if not user_info:
+            write_login_log(
+                request,
+                login_type='sso',
+                success=False,
+                fail_reason='钉钉授权失败，请重新扫码',
+            )
             return Response(
                 {'detail': '钉钉授权失败，请重新扫码', 'code': ErrorCode.DINGTALK_AUTH_FAILED.value},
                 status=status.HTTP_401_UNAUTHORIZED,
@@ -394,6 +485,15 @@ class DingtalkCallbackView(APIView):
             '钉钉扫码登录: union_id=%s user=%s created=%s',
             user_info.get('union_id'), user.username, created,
         )
+
+        write_login_log(
+            request,
+            login_type='sso',
+            success=True,
+            user=user,
+            username=user.username,
+        )
+
         return Response({
             'access': str(refresh.access_token),
             'refresh': str(refresh),

@@ -62,3 +62,33 @@ COMMENT='管理后台登录行为审计日志（由 Django model managed=False �
 
 > ⚠️ **注意**：因为使用 `managed=False`，**`python manage.py makemigrations` 不会生成此表的 migration 文件**。
 > 若误操作，本表需要走回滚 SQL 后重建。
+
+---
+
+## 变更 #1：补齐登录埋点触发点
+
+> **变更类型**：文档修正（与代码一致化）
+> **变更日期**：2026-07-07
+> **变更人员**：后端
+> **变更原因**：首版文档列出的 `LoggedTokenObtainPairView` 与 `SsoCallbackView._handle_mock_callback` 埋点并未实际实现，三个登录入口（JWT / SSO Mock / 钉钉）均无任何 `write_login_log` 调用，导致表里始终为空。本批次将三类登录的成功 / 失败分支全部埋点。
+> **影响范围**：无表结构变更；新增 3 条应用层调用，不会影响主登录流程（`write_login_log` 内部 try/except + logger.error 降级）。
+> **回滚方案**：回滚本次代码即可，无需 SQL 回滚。
+
+### 5.1 实际触发点（与首版文档不一致，以本节为准）
+
+| 入口 | URL | 文件 | 触发分支 |
+|------|-----|------|---------|
+| JWT 登录 | `POST /api/auth/login/` | `apps/accounts/views.py::LoggedTokenObtainPairView.post` | 成功 / 失败 |
+| SSO Mock | `POST /api/auth/sso/callback/` | `apps/accounts/views.py::SsoCallbackView._handle_mock_callback` | 缺 code / 无效 code / 成功 |
+| 钉钉扫码 | `POST /api/auth/dingtalk/callback/` | `apps/accounts/views.py::DingtalkCallbackView.post` | 缺 authCode / 钉钉 API 失败 / 成功 |
+
+### 5.2 fail_reason 文案约定
+
+| login_type | 场景 | fail_reason |
+|------------|------|-------------|
+| jwt | 用户名/密码错 | SimpleJWT `detail` 原文（如 "No active account found with the given credentials"） |
+| jwt | 未知异常 | 异常 `str(exc)` |
+| sso_mock | 缺 code | `缺少 code 参数` |
+| sso_mock | 无效 code | `无效的 SSO 测试码: {code}` |
+| sso | 缺 authCode | `缺少 authCode 参数` |
+| sso | 钉钉 API 失败 | `钉钉授权失败，请重新扫码` |
