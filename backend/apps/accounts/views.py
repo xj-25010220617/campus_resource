@@ -678,41 +678,60 @@ class DingtalkRedirectView(APIView):
         import json
 
         user_json = json.dumps(user, ensure_ascii=False)
+
+        # 用 <script type="application/json"> 传数据 — 不拼进 JS 字符串，彻底避免转义问题
         html = f'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>钉钉登录 - 成都东软学院</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>钉钉登录</title>
 <style>
-  body {{ font-family: -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #f5f5f5; }}
-  .card {{ background: white; border-radius: 12px; padding: 40px; text-align: center; box-shadow: 0 2px 20px rgba(0,0,0,0.1); }}
-  .spinner {{ width: 40px; height: 40px; border: 3px solid #e0e0e0; border-top-color: #1890ff; border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 20px; }}
-  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
-  .check {{ color: #52c41a; font-size: 48px; display: none; }}
-  p {{ color: #666; margin: 16px 0; }}
+  *{{margin:0;padding:0;box-sizing:border-box}}
+  body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;min-height:-webkit-fill-available;background:#f0f2f5;padding:20px}}
+  .card{{background:#fff;border-radius:16px;padding:36px 28px 28px;text-align:center;box-shadow:0 4px 24px rgba(0,0,0,0.08);max-width:320px;width:100%}}
+  .check{{width:64px;height:64px;border-radius:50%;background:#f6ffed;display:flex;align-items:center;justify-content:center;margin:0 auto 20px}}
+  .check svg{{width:36px;height:36px}}
+  h2{{font-size:20px;color:#1a1a1a;margin-bottom:6px;font-weight:600}}
+  .uname{{font-size:14px;color:#8c8c8c;margin-bottom:20px}}
+  .btn{{display:block;width:100%;padding:13px 0;background:#1890ff;color:#fff;border:none;border-radius:8px;font-size:16px;letter-spacing:1px;cursor:pointer;-webkit-appearance:none}}
+  .btn:active{{background:#096dd9}}
+  .tip{{font-size:12px;color:#bfbfbf;margin-top:14px;display:none}}
+  .err{{color:#ff4d4f;font-size:14px;margin-top:12px}}
 </style>
 </head>
 <body>
 <div class="card">
-  <div class="spinner" id="spin"></div>
-  <div class="check" id="ok">&#10003;</div>
-  <p id="msg">正在登录...</p>
+  <div class="check">
+    <svg viewBox="0 0 24 24" fill="none" stroke="#52c41a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+  </div>
+  <h2>登录成功</h2>
+  <p class="uname" id="uname"></p>
+  <button class="btn" onclick="goBack()">返回应用</button>
+  <p class="tip" id="tip">请手动切换回应用</p>
+  <p class="err" id="err"></p>
 </div>
+
+<script type="application/json" id="user-json">{user_json}</script>
 <script>
-(function() {{
-  try {{
-    localStorage.setItem("access_token", "{access}");
-    localStorage.setItem("refresh_token", "{refresh}");
-    localStorage.setItem("user", '{user_json}');
-    document.getElementById("spin").style.display = "none";
-    document.getElementById("ok").style.display = "block";
-    document.getElementById("msg").innerText = "登录成功，即将跳转...";
-    setTimeout(function() {{ window.location.href = "{frontend_url}"; }}, 800);
-  }} catch(e) {{
-    document.getElementById("msg").innerText = "登录失败: " + e.message;
-  }}
-}})();
+var userEl = document.getElementById('user-json');
+var userStr = userEl.textContent || userEl.innerText || '';
+try {{
+  localStorage.setItem('access_token', '{access}');
+  localStorage.setItem('refresh_token', '{refresh}');
+  localStorage.setItem('user', userStr);
+  var u = JSON.parse(userStr);
+  document.getElementById('uname').innerText = (u.last_name || '') + (u.first_name || u.username || '');
+}} catch(e) {{
+  document.getElementById('err').innerText = '登录异常，请重新扫码';
+  document.getElementById('uname').innerText = '';
+}}
+
+function goBack() {{
+  try {{ window.close(); }} catch(_) {{}}
+  document.getElementById('tip').style.display = 'block';
+  setTimeout(function(){{ document.getElementById('tip').style.display = 'none'; }}, 3000);
+}}
 </script>
 </body>
 </html>'''
