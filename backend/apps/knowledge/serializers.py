@@ -142,13 +142,8 @@ class UploadCallbackSerializer(serializers.Serializer):
     file_size = serializers.IntegerField(min_value=0, help_text='文件大小（字节）')
     file_type = serializers.CharField(max_length=16, help_text='文件类型（pdf/doc/ppt/xls/image/video/audio/md/txt/html/other）')
     md5 = serializers.CharField(max_length=32, help_text='文件MD5哈希值')
-    scope = serializers.ChoiceField(
-        choices=['school', 'college', 'department'],
-        default='school',
-        help_text='归属范围（school:全校 / college:学院 / department:部门），默认 school',
-    )
-    college_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属学院ID（默认上传者学院，scope=college时必填）')
-    department_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属部门ID（默认上传者部门，scope=department时必填）')
+    college_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属学院ID（默认取上传者学院）')
+    department_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属部门ID（默认取上传者部门）')
     discipline_id = serializers.IntegerField(required=False, allow_null=True, help_text='学科方向ID（可选）')
     keywords = serializers.ListField(
         child=serializers.CharField(), required=False, default=list,
@@ -208,13 +203,8 @@ class TextUploadSerializer(serializers.Serializer):
     description = serializers.CharField(
         default='', allow_blank=True, help_text='文档描述（可选，未提供时 AI 生成）',
     )
-    scope = serializers.ChoiceField(
-        choices=['school', 'college', 'department'],
-        default='school',
-        help_text='归属范围（school:全校 / college:学院 / department:部门），默认 school',
-    )
-    college_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属学院ID（默认上传者学院，scope=college时必填）')
-    department_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属部门ID（默认上传者部门，scope=department时必填）')
+    college_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属学院ID（默认取上传者学院）')
+    department_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属部门ID（默认取上传者部门）')
     discipline_id = serializers.IntegerField(required=False, allow_null=True, help_text='学科方向ID（可选）')
     keywords = serializers.ListField(
         child=serializers.CharField(), required=False, default=list,
@@ -238,13 +228,8 @@ class FileUploadSerializer(serializers.Serializer):
     description = serializers.CharField(
         default='', allow_blank=True, help_text='文档描述（可选，未提供时 AI 生成）',
     )
-    scope = serializers.ChoiceField(
-        choices=['school', 'college', 'department'],
-        default='school',
-        help_text='归属范围（school:全校 / college:学院 / department:部门），默认 school',
-    )
-    college_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属学院ID（默认上传者学院，scope=college时必填）')
-    department_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属部门ID（默认上传者部门，scope=department时必填）')
+    college_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属学院ID（默认取上传者学院）')
+    department_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属部门ID（默认取上传者部门）')
     discipline_id = serializers.IntegerField(required=False, allow_null=True, help_text='学科方向ID（可选）')
     keywords = serializers.CharField(
         default='', allow_blank=True,

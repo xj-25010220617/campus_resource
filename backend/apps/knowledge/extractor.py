@@ -128,6 +128,8 @@ def extract_text_from_oss(oss_key: str, file_type: str) -> str:
     """
     从 OSS 下载文件并抽取文本。
     """
+    from utils.http_client import ExternalClient
+
     if not oss_key:
         return ''
 
@@ -142,7 +144,7 @@ def extract_text_from_oss(oss_key: str, file_type: str) -> str:
     fd, tmp_path = tempfile.mkstemp(suffix=suffix)
     os.close(fd)
     try:
-        resp = requests.get(download_url, timeout=120)
+        resp = ExternalClient.get('oss_download', download_url)
         resp.raise_for_status()
         with open(tmp_path, 'wb') as f:
             f.write(resp.content)

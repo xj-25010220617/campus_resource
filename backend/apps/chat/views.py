@@ -413,6 +413,11 @@ class AskView(APIView):
                 # done 事件
                 yield _format_sse('done', {'message_id': assistant_msg.id})
 
+            except GeneratorExit:
+                raise
+            except Exception as e:
+                logger.error(f'SSE 流异常: {e}')
+                yield _format_sse('error', {'message': '回答生成失败，请重试', 'code': ErrorCode.SSE_ERROR.value})
             finally:
                 # 保证流中断时 response_ms 也能回填（客户端断连、Django 回收 generator 时触发）
                 elapsed_ms = int((time.time() - start_ts) * 1000)
@@ -469,9 +474,11 @@ class AskView(APIView):
 
                 yield _format_sse('done', {'message_id': assistant_msg.id})
 
+            except GeneratorExit:
+                raise
             except Exception as e:
                 logger.error(f'数据查询 SSE 流输出失败: {e}')
-                yield _format_sse('error', f'查询失败: {e}')
+                yield _format_sse('error', {'message': '查询失败，请重试', 'code': ErrorCode.SSE_ERROR.value})
 
         response = StreamingHttpResponse(
             event_stream(),
@@ -620,7 +627,7 @@ class VoiceAskView(APIView):
             try:
                 for chunk in llm_client.chat_stream(messages):
                     full_answer += chunk
-                    yield _format_sse('msg', chunk)
+                    yield _format_sse('token', {'content': chunk})
                 ai_msg = ChatMessage.objects.create(
                     conversation=conv, role='assistant', content=full_answer,
                     references={'hits': hits, 'sensitive': sensitive_hit},
@@ -629,10 +636,19 @@ class VoiceAskView(APIView):
                 log.response_ms = int((time.time() - t0) * 1000)
                 log.save()
                 yield _format_sse('done', {'message_id': ai_msg.id})
-                yield build_references_events(hits, rag.RAG_REFERENCE_THRESHOLD)
+                refs = build_references_events(hits, user.role, user.id)
+                if 'references' in refs:
+                    yield _format_sse('references', refs['references'])
+            except GeneratorExit:
+                raise
             except Exception as e:
                 logger.error(f'LLM 流式输出失败: {e}')
-                yield _format_sse('error', f'回答生成失败: {e}')
+                log.response_ms = int((time.time() - t0) * 1000)
+                try:
+                    log.save()
+                except Exception:
+                    pass
+                yield _format_sse('error', {'message': '回答生成失败，请重试', 'code': ErrorCode.SSE_ERROR.value})
 
         response = StreamingHttpResponse(generate(), content_type='text/event-stream')
         response['Cache-Control'] = 'no-cache'
