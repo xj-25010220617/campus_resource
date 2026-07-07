@@ -327,7 +327,11 @@ class DingtalkQrView(APIView):
 
     def get(self, request):
         app_key = getattr(settings, 'DINGTALK_APP_KEY', '')
-        redirect_uri = request.build_absolute_uri('/api/auth/dingtalk/callback/')
+        # 优先用前端传的回调地址（手机扫码后跳回前端页面），否则用后端地址
+        redirect_uri = (
+            request.query_params.get('redirect_uri')
+            or request.build_absolute_uri('/api/auth/dingtalk/callback/')
+        )
 
         if not app_key:
             return Response(
