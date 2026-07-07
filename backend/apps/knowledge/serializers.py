@@ -150,7 +150,6 @@ class UploadCallbackSerializer(serializers.Serializer):
     college_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属学院ID（默认上传者学院，scope=college时必填）')
     department_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属部门ID（默认上传者部门，scope=department时必填）')
     discipline_id = serializers.IntegerField(required=False, allow_null=True, help_text='学科方向ID（可选）')
-    category_id = serializers.IntegerField(required=False, allow_null=True, help_text='资源类型ID（可选，未提供时 AI 推荐）')
     keywords = serializers.ListField(
         child=serializers.CharField(), required=False, default=list,
         help_text='关键词列表（可选，未提供时 AI 提取）',
@@ -217,7 +216,6 @@ class TextUploadSerializer(serializers.Serializer):
     college_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属学院ID（默认上传者学院，scope=college时必填）')
     department_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属部门ID（默认上传者部门，scope=department时必填）')
     discipline_id = serializers.IntegerField(required=False, allow_null=True, help_text='学科方向ID（可选）')
-    category_id = serializers.IntegerField(required=False, allow_null=True, help_text='资源类型ID（可选，未提供时 AI 推荐）')
     keywords = serializers.ListField(
         child=serializers.CharField(), required=False, default=list,
         help_text='关键词列表（可选，未提供时 AI 提取）',
@@ -248,7 +246,6 @@ class FileUploadSerializer(serializers.Serializer):
     college_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属学院ID（默认上传者学院，scope=college时必填）')
     department_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属部门ID（默认上传者部门，scope=department时必填）')
     discipline_id = serializers.IntegerField(required=False, allow_null=True, help_text='学科方向ID（可选）')
-    category_id = serializers.IntegerField(required=False, allow_null=True, help_text='资源类型ID（可选，未提供时 AI 推荐）')
     keywords = serializers.CharField(
         default='', allow_blank=True,
         help_text='关键词 JSON 数组，如 ["关键词1","关键词2"]（可选，未提供时 AI 提取）',

@@ -127,7 +127,7 @@ class KnowledgeDoc(models.Model):
         verbose_name = '知识文档'
         verbose_name_plural = verbose_name
         ordering = ['-created_at']
-        db_table_comment = '知识文档表(外键说明: college_id=学院, department_id=部门, category_id=资源类型, discipline_id=学科方向)'
+        db_table_comment = '知识文档表(外键说明: college_id=学院, department_id=部门, discipline_id=学科方向; category_id 已废弃保留)'
 
     def __str__(self):
         return self.title

@@ -184,7 +184,7 @@
 
 ---
 
-### 2.3 资源类型列表（树形）
+### 2.3 资源类型列表（树形）⚠️ 已废弃
 
 | 项目 | 内容 |
 |------|------|
@@ -390,7 +390,7 @@
 |------|------|
 | **接口路径** | `/api/knowledge/upload/callback/` |
 | **请求方式** | `POST` |
-| **请求参数** | `oss_key`, `title`, `description`, `file_name`, `file_size`, `file_type`, `md5`, `discipline_id`, `category_id`, `college_id` |
+| **请求参数** | `oss_key`, `title`, `description`, `file_name`, `file_size`, `file_type`, `md5`, `discipline_id`, `college_id`, `scope`, `visibility`, `keywords` |
 | **请求参数类型** | 见下表 (JSON body) |
 | **是否必须传入** | 带 * 必填，其余选填 |
 | **返回参数** | `{id, status}` |
@@ -407,8 +407,10 @@
 | `file_type` | string | * | pdf/doc/ppt/xls/image/video/audio/md/txt/html/other |
 | `md5` | string | * | MD5 哈希 |
 | `discipline_id` | int | | 学科方向 ID |
-| `category_id` | int | | 资源类型 ID |
 | `college_id` | int | | 所属学院 ID（默认取上传者学院） |
+| `scope` | string | | 归属范围（school/college/department），默认 school |
+| `visibility` | string | | 可见性（public/private），默认 public |
+| `keywords` | array[string] | | 关键词列表 |
 
 | 返回字段 | 类型 | 说明 |
 |----------|------|------|
@@ -423,7 +425,7 @@
 |------|------|
 | **接口路径** | `/api/knowledge/docs/` |
 | **请求方式** | `GET` |
-| **请求参数** | `page`, `page_size`, `search`, `college_id`, `discipline_id`, `category_id`, `file_type`, `status`, `source_type` |
+| **请求参数** | `page`, `page_size`, `search`, `college_id`, `discipline_id`, `file_type`, `status`, `source_type` |
 | **请求参数类型** | 全为 query string |
 | **是否必须传入** | 否（全部可选） |
 | **返回参数** | `{count, next, previous, results: [{id, title, file_type, file_size, status, college_name, discipline_name, uploader_name, chunk_count, created_at}]}` |
@@ -441,7 +443,7 @@
 | **请求参数** | 无（路径参数 `id`） |
 | **请求参数类型** | `id`: int (path) |
 | **是否必须传入** | 是 |
-| **返回参数** | `{id, title, description, file_type, file_size, file_name, status, source_type, source_url, oss_key, oss_url, college, discipline, category, uploader, chunk_count, page_count, is_sensitive, freshness_date, created_at, updated_at, indexed_at}` |
+| **返回参数** | `{id, title, description, file_type, file_size, file_name, status, source_type, source_url, oss_key, oss_url, college, discipline, uploader, chunk_count, page_count, is_sensitive, freshness_date, created_at, updated_at, indexed_at}` |
 | **返回参数类型** | `object` |
 | **备注** | admin 只能查看自己上传的文档详情 |
 
@@ -453,7 +455,7 @@
 |------|------|
 | **接口路径** | `/api/knowledge/docs/{id}/` |
 | **请求方式** | `PUT` |
-| **请求参数** | `title`, `description`, `discipline_id`, `category_id`, `freshness_date` |
+| **请求参数** | `title`, `description`, `discipline_id`, `freshness_date` |
 | **请求参数类型** | 见下表 (JSON body) |
 | **是否必须传入** | 否（按需传入） |
 | **返回参数** | 同 4.4 |
@@ -465,7 +467,6 @@
 | `title` | string | | 文档标题 |
 | `description` | string | | 文档描述 |
 | `discipline_id` | int | | 学科方向 ID |
-| `category_id` | int | | 资源类型 ID |
 | `freshness_date` | string(date) | | 内容截止日期 |
 
 ---

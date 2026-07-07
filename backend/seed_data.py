@@ -1,8 +1,11 @@
-"""种子数据：学科方向 + 资源分类。运行方式：python manage.py shell -c \"exec(open('seed_data.py', encoding='utf-8').read())\""""
+"""种子数据：学科方向 + 部门。运行方式：python manage.py shell -c \"exec(open('seed_data.py', encoding='utf-8').read())\"
+
+注意：资源分类（Category）系统已移除，不再初始化分类数据。
+"""
 import sys
 sys.stdout.reconfigure(encoding='utf-8')
 
-from apps.classify.models import Discipline, Category, Department
+from apps.classify.models import Discipline, Department
 
 # ===========================
 # 一、学科方向（discipline）
@@ -39,93 +42,7 @@ for name, cat, order in disciplines:
 print(f'Disciplines: {Discipline.objects.count()}')
 
 # ===========================
-# 二、资源分类（category）—— 两级树形
-# ===========================
-ICON_BASE = 'https://img.alicdn.com/imgextra'
-
-# 清理旧数据：删除不在 1-12 范围内的一级分类及其子分类
-old_l1_ids = Category.objects.filter(parent=None).exclude(id__in=list(range(1, 13))).values_list('id', flat=True)
-if old_l1_ids:
-    Category.objects.filter(parent_id__in=old_l1_ids).delete()
-    Category.objects.filter(id__in=old_l1_ids).delete()
-    print(f'Cleaned old L1 categories: {list(old_l1_ids)}')
-
-# 一级分类（使用 update_or_create 指定 ID）
-l1_data = [
-    (1, '行政公文', f'{ICON_BASE}/gov.png', 1),
-    (2, '规章制度', f'{ICON_BASE}/rules.png', 2),
-    (3, '教学建设', f'{ICON_BASE}/teaching.png', 3),
-    (4, '学科建设', f'{ICON_BASE}/discipline.png', 4),
-    (5, '专业建设', f'{ICON_BASE}/major.png', 5),
-    (6, '人事档案', f'{ICON_BASE}/hr.png', 6),
-    (7, '科研学术', f'{ICON_BASE}/research.png', 7),
-    (8, '党群工作', f'{ICON_BASE}/party.png', 8),
-    (9, '财务资产', f'{ICON_BASE}/finance.png', 9),
-    (10, '学生工作', f'{ICON_BASE}/student.png', 10),
-    (11, '上级来文', f'{ICON_BASE}/superior.png', 11),
-    (12, '综合事务', f'{ICON_BASE}/general.png', 12),
-]
-l1_map = {}  # name → id
-for cid, name, icon, order in l1_data:
-    obj, created = Category.objects.update_or_create(
-        id=cid,
-        defaults={'name': name, 'icon': icon, 'sort_order': order, 'parent': None},
-    )
-    l1_map[name] = obj.id
-    status = '[NEW]' if created else '[UPD]'
-    print(f'  {status} L1: {obj.name} (id={obj.id})')
-
-# 二级分类
-l2_data = [
-    # 行政公文
-    ('通知公告', '行政公文', 1), ('请示批复', '行政公文', 2),
-    ('工作报告', '行政公文', 3), ('会议纪要', '行政公文', 4),
-    # 规章制度
-    ('教学管理', '规章制度', 1), ('科研管理', '规章制度', 2),
-    ('人事管理制度', '规章制度', 3),
-    # 教学建设
-    ('培养方案', '教学建设', 1), ('课程建设', '教学建设', 2),
-    ('教材建设', '教学建设', 3), ('教学质量', '教学建设', 4),
-    ('实验实训', '教学建设', 5),
-    # 学科建设
-    ('学科规划', '学科建设', 1), ('学位点建设', '学科建设', 2),
-    ('重点学科申报', '学科建设', 3), ('学科评估', '学科建设', 4),
-    # 专业建设
-    ('专业申报', '专业建设', 1), ('专业认证', '专业建设', 2),
-    ('一流专业建设', '专业建设', 3), ('专业评估', '专业建设', 4),
-    # 人事档案
-    ('教师档案', '人事档案', 1), ('职称评聘', '人事档案', 2),
-    ('考核评价', '人事档案', 3), ('人才引进', '人事档案', 4),
-    # 科研学术
-    ('项目申报', '科研学术', 1), ('科研成果', '科研学术', 2),
-    ('学术论文', '科研学术', 3), ('学术会议', '科研学术', 4),
-    # 党群工作
-    ('党务公文', '党群工作', 1), ('组织建设', '党群工作', 2),
-    ('纪检监察', '党群工作', 3), ('工会团委', '党群工作', 4),
-    # 财务资产
-    ('预决算', '财务资产', 1), ('经费管理', '财务资产', 2),
-    ('资产管理', '财务资产', 3), ('审计', '财务资产', 4),
-    # 学生工作
-    ('招生就业', '学生工作', 1), ('奖助管理', '学生工作', 2),
-    ('学生活动', '学生工作', 3), ('学籍', '学生工作', 4),
-    # 上级来文
-    ('教育部文件', '上级来文', 1), ('省厅文件', '上级来文', 2),
-    # 综合事务
-    ('发展规划', '综合事务', 1), ('校园建设', '综合事务', 2),
-    ('信息化', '综合事务', 3), ('安全保卫', '综合事务', 4),
-]
-for name, parent_name, order in l2_data:
-    parent_id = l1_map[parent_name]
-    obj, created = Category.objects.get_or_create(
-        name=name, parent_id=parent_id,
-        defaults={'sort_order': order},
-    )
-    status = '[NEW]' if created else '[OK]'
-    print(f'  {status} L2: {obj.name} (parent={parent_name})')
-print(f'Categories: {Category.objects.count()}')
-
-# ===========================
-# 三、部门（department）—— 两级树形
+# 二、部门（department）—— 两级树形
 # ===========================
 
 # 一级部门

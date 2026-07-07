@@ -25,7 +25,8 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.accounts.models import College
-from apps.classify.models import Category, Department, Discipline
+from apps.classify.models import Department, Discipline
+from apps.resources.models import UploadLog
 from config.permissions import CanUploadDocument, IsAdminOrSuperAdmin, IsLoginUser
 from utils.oss import oss_client
 
@@ -52,7 +53,6 @@ class KnowledgeDocFilter(django_filters.FilterSet):
     """知识文档多条件精确过滤器"""
     college_id = django_filters.NumberFilter(field_name='college_id')
     discipline_id = django_filters.NumberFilter(field_name='discipline_id')
-    category_id = django_filters.NumberFilter(field_name='category_id')
     file_type = django_filters.CharFilter(field_name='file_type')
     status = django_filters.CharFilter(field_name='status')
     source_type = django_filters.CharFilter(field_name='source_type')
@@ -61,7 +61,7 @@ class KnowledgeDocFilter(django_filters.FilterSet):
     class Meta:
         model = KnowledgeDoc
         fields = [
-            'college_id', 'discipline_id', 'category_id',
+            'college_id', 'discipline_id',
             'file_type', 'status', 'source_type', 'days_back',
         ]
 
@@ -91,7 +91,6 @@ class KnowledgeDocListView(generics.ListAPIView):
         - search (str, optional): 关键词搜索，模糊匹配文档标题（title）和描述（description）
         - college_id (int, optional): 按学院ID精确筛选
         - discipline_id (int, optional): 按学科方向ID精确筛选
-        - category_id (int, optional): 按资源类型ID精确筛选
         - file_type (str, optional): 按文件类型精确筛选（pdf/doc/ppt/xls/image/video/audio/md/txt/html/other）
         - status (str, optional): 按状态精确筛选（uploaded/parsing/chunking/embedding/indexed/failed）
         - source_type (str, optional): 按来源类型精确筛选（upload/website/library）
@@ -223,7 +222,6 @@ class KnowledgeDocDetailView(generics.RetrieveUpdateAPIView):
         - title (str, optional): 文档标题
         - description (str, optional): 文档描述
         - discipline_id (int, optional): 学科方向 ID
-        - category_id (int, optional): 资源类型 ID
         - freshness_date (str, optional): 内容截止日期（格式 YYYY-MM-DD）
     权限规则：
         - super_admin（超级管理员）: 可查看/编辑平台全部文档
@@ -232,7 +230,7 @@ class KnowledgeDocDetailView(generics.RetrieveUpdateAPIView):
     返回：
         - GET: 文档完整对象，包含 id / title / description / source_type / source_url /
           oss_key / oss_url / file_name / file_type / file_size / md5_hash / page_count /
-          discipline / discipline_name / category / category_name /
+          discipline / discipline_name /
           college / college_name / uploader / uploader_name /
           status / chunk_count / is_sensitive / sensitive_checked /
           freshness_date / created_at / updated_at / indexed_at
@@ -244,7 +242,7 @@ class KnowledgeDocDetailView(generics.RetrieveUpdateAPIView):
     def get_queryset(self):
         user = self.request.user
         queryset = KnowledgeDoc.objects.select_related(
-            'college', 'discipline', 'category', 'uploader',
+            'college', 'discipline', 'uploader',
         ).all()
         return KnowledgeDocListView._admin_scope_filter(queryset, user)
 
@@ -640,7 +638,6 @@ class UploadCallbackView(APIView):
         - visibility (str, default=public): 可见性（public/private）
         - college_id (int, optional): 所属学院 ID（默认取上传者学院）
         - discipline_id (int, optional): 学科方向 ID
-        - category_id (int, optional): 资源类型 ID（未提供时 AI 推荐）
     返回：
         - 新建成功: {"id": <doc.id>, "status": "uploaded"}
         - 重复文件: {"id": <existing_doc.id>, "status": "<status>", "duplicate": true}
@@ -684,7 +681,6 @@ class UploadCallbackView(APIView):
             college_id=data.get('college_id') or request.user.college_id,
             department_id=data.get('department_id') or request.user.department_id,
             discipline_id=data.get('discipline_id'),
-            category_id=data.get('category_id'),
             visibility=data.get('visibility', 'public'),
         )
 
@@ -716,7 +712,7 @@ class UploadCallbackView(APIView):
 
     @staticmethod
     def _validate_classification(data: dict) -> None:
-        """校验 scope 对应的归属对象存在；category_id 可选，有值时必须为二级分类"""
+        """校验 scope 对应的归属对象存在"""
         scope = data.get('scope', 'college')
         if scope == 'college':
             if not data.get('college_id'):
@@ -729,15 +725,6 @@ class UploadCallbackView(APIView):
             if not Department.objects.filter(id=data['department_id']).exists():
                 raise ValidationError({'department_id': '部门不存在'})
         # scope=school 不需要额外校验
-
-        # category_id 可选，有值时校验为二级分类
-        if data.get('category_id'):
-            try:
-                category = Category.objects.get(id=data['category_id'])
-            except Category.DoesNotExist:
-                raise ValidationError({'category_id': '资源类型不存在'})
-            if category.parent is None:
-                raise ValidationError({'category_id': '必须是二级分类，不能选择一级分类'})
 
     @staticmethod
     def _validate_oss_key(oss_key: str) -> None:
@@ -757,7 +744,7 @@ class TextUploadView(APIView):
 
     POST /api/knowledge/upload/text/
     功能：用户输入文本内容，后端直传 OSS 并创建知识文档记录。
-          scope 和 visibility 由用户选择；title/description/category_id/keywords 未提供时由 AI 自动填充。
+          scope 和 visibility 由用户选择；title/description/keywords 未提供时由 AI 自动填充。
     请求参数：
         - content (str, required): 文本内容
         - scope (str, default=school): 归属范围（school/college/department）
@@ -767,7 +754,6 @@ class TextUploadView(APIView):
         - college_id (int, optional): 学院 ID（默认使用上传者学院ID）
         - department_id (int, optional): 部门 ID（默认使用上传者部门ID）
         - discipline_id (int, optional): 学科方向 ID
-        - category_id (int, optional): 资源类型 ID（未提供时 AI 推荐）
         - keywords (list[str], optional): 关键词列表（未提供时 AI 提取）
     返回：{"id": <doc.id>, "status": "uploaded", "file_name": "<title>.txt"}
     """
@@ -801,13 +787,11 @@ class TextUploadView(APIView):
         # AI 自动填充缺失字段
         user_title = data.get('title', '')
         user_description = data.get('description', '')
-        user_category_id = data.get('category_id')
         user_keywords = data.get('keywords', [])
 
         needs_ai = (
             not user_title
             or not user_description
-            or not user_category_id
             or not user_keywords
             or not user_provided_scope
             or not user_provided_visibility
@@ -817,7 +801,6 @@ class TextUploadView(APIView):
             if ai_result:
                 title = user_title or ai_result['title'] or '未命名文档'
                 description = user_description or ai_result['description'] or ''
-                category_id = user_category_id or ai_result['category_id']
                 keywords = user_keywords or ai_result['keywords']
                 scope = data['scope'] if user_provided_scope else ai_result['scope']
                 visibility = data['visibility'] if user_provided_visibility else ai_result['visibility']
@@ -825,21 +808,18 @@ class TextUploadView(APIView):
                 # AI 不可用降级
                 title = user_title or '未命名文档'
                 description = user_description
-                category_id = user_category_id or None
                 keywords = user_keywords or []
                 scope = data['scope']
                 visibility = data['visibility']
         else:
             title = user_title
             description = user_description
-            category_id = user_category_id
             keywords = user_keywords
             scope = data['scope']
             visibility = data['visibility']
 
         title = title or '未命名文档'
         description = description or ''
-        category_id = category_id or None
 
         # 生成 OSS 对象 Key
         now = datetime.now()
@@ -875,7 +855,6 @@ class TextUploadView(APIView):
             college_id=data.get('college_id') or request.user.college_id,
             department_id=data.get('department_id') or request.user.department_id,
             discipline_id=data.get('discipline_id'),
-            category_id=category_id,
             uploader=request.user,
             status='uploaded',
             visibility=visibility,
@@ -1062,7 +1041,7 @@ class FileUploadView(APIView):
 
     POST /api/knowledge/upload/file/
     功能：接收前端上传的文件，后端存到 OSS 并创建知识文档记录。
-          scope 和 visibility 由用户选择；title/description/category_id/keywords 未提供时由 AI 自动填充。
+          scope 和 visibility 由用户选择；title/description/keywords 未提供时由 AI 自动填充。
     请求参数（form-data）：
         - file (file, required): 上传的文件
         - scope (str, default=school): 归属范围（school/college/department）
@@ -1072,7 +1051,6 @@ class FileUploadView(APIView):
         - college_id (int, optional): 学院 ID（默认使用上传者学院ID）
         - department_id (int, optional): 部门 ID（默认使用上传者部门ID）
         - discipline_id (int, optional): 学科方向 ID
-        - category_id (int, optional): 资源类型 ID（未提供时 AI 推荐）
         - keywords (str, optional): JSON 数组字符串，如 '["关键词1","关键词2"]'（未提供时 AI 提取）
     返回：{"id": <doc.id>, "status": "uploaded", "file_name": "..."}
     """
@@ -1165,13 +1143,11 @@ class FileUploadView(APIView):
 
         # AI 自动填充缺失字段
         user_description = data.get('description', '')
-        user_category_id = data.get('category_id')
         raw_keywords = data.get('keywords', '')
 
         needs_ai = (
             not user_title
             or not user_description
-            or not user_category_id
             or not (isinstance(raw_keywords, str) and raw_keywords.strip())
             or not user_provided_scope
             or not user_provided_visibility
@@ -1181,31 +1157,27 @@ class FileUploadView(APIView):
             if ai_result:
                 title = user_title or ai_result['title'] or fallback_title
                 description = user_description or ai_result['description'] or ''
-                category_id = user_category_id or ai_result['category_id']
                 scope = data['scope'] if user_provided_scope else ai_result['scope']
                 visibility = data['visibility'] if user_provided_visibility else ai_result['visibility']
                 # 关键词：用户提供的优先
                 if isinstance(raw_keywords, str) and raw_keywords.strip():
-                    keywords_list = None  # 稍后解析
+                    pass  # 稍后解析用户提供的关键词
                 else:
                     raw_keywords = ai_result['keywords']
             else:
                 # AI 不可用降级
                 title = title or fallback_title
                 description = user_description
-                category_id = user_category_id
                 scope = data['scope']
                 visibility = data['visibility']
         else:
             description = user_description
-            category_id = user_category_id
             scope = data['scope']
             visibility = data['visibility']
 
         # 二次归一：确保变量有值
         title = title or fallback_title
         description = description or ''
-        category_id = category_id or None
 
         # 创建 KnowledgeDoc 记录
         new_doc = KnowledgeDoc.objects.create(
@@ -1222,11 +1194,26 @@ class FileUploadView(APIView):
             college_id=data.get('college_id') or request.user.college_id,
             department_id=data.get('department_id') or request.user.department_id,
             discipline_id=data.get('discipline_id'),
-            category_id=category_id,
             uploader=request.user,
             status='uploaded',
             visibility=visibility,
         )
+
+        # 创建上传日志记录
+        try:
+            UploadLog.objects.create(
+                user=request.user,
+                file_name=uploaded_file.name,
+                file_size=uploaded_file.size,
+                file_type=ext,
+                college_id=data.get('college_id') or request.user.college_id,
+                department_id=data.get('department_id') or request.user.department_id,
+                status='success',
+                ip_address=request.META.get('REMOTE_ADDR'),
+                user_agent=request.META.get('HTTP_USER_AGENT', '')[:512],
+            )
+        except Exception as e:
+            logger.error(f'创建上传日志失败: {e}')
 
         # 解析并创建关联关键词（兼容 JSON 字符串和列表两种格式）
         if isinstance(raw_keywords, str) and raw_keywords.strip():
@@ -1251,7 +1238,7 @@ class FileUploadView(APIView):
 
 
 def _ai_classify(title: str = '', content: str = '') -> Optional[dict]:
-    """调用 LLM 进行智能分类，返回包含 title/description/keywords/category_id/scope/visibility 等字段。
+    """调用 LLM 智能分析文档，返回 title/description/keywords/scope/visibility。
 
     供 AIClassifyView、FileUploadView、TextUploadView 复用。
     失败时返回 None，调用方自行降级处理。
@@ -1262,41 +1249,26 @@ def _ai_classify(title: str = '', content: str = '') -> Optional[dict]:
 
     Returns:
         成功: {'title': str, 'description': str, 'keywords': list[str],
-                'category_id': int, 'first_level_name': str, 'second_level_name': str,
                 'scope': str, 'visibility': str, 'confidence': str}
         失败: None
     """
     import json
     import re
 
-    first_level = list(Category.objects.filter(parent__isnull=True).values('id', 'name'))
-    second_level = list(Category.objects.filter(parent__isnull=False).values(
-        'id', 'name', 'parent__name',
-    ))
-    if not first_level or not second_level:
-        logger.warning('AI 分类失败：分类数据未初始化')
-        return None
-
-    l1_list = ', '.join(c['name'] for c in first_level)
-    l2_list = ', '.join(f"{c['parent__name']}>{c['name']}" for c in second_level)
-
     prompt = (
         f"你是校园知识库智能助手。请根据文档信息完成以下任务：\n"
         f"1. 如果标题为空，根据内容生成一个简洁的文档标题（20字以内）\n"
         f"2. 如果内容非空，生成一段100-200字的文档描述\n"
         f"3. 提取5-10个关键词\n"
-        f"4. 推荐最合适的一级和二级分类\n"
-        f"5. 推荐归属范围（scope）和可见性（visibility）：\n"
+        f"4. 推荐归属范围（scope）和可见性（visibility）：\n"
         f"   - scope: school=全校公开 / college=学院内部 / department=部门内部\n"
         f"     （行政公文、规章制度、全校性通知→school；学院事务→college；部门内部→department）\n"
         f"   - visibility: public=公开 / private=私密\n"
         f"     （一般文档→public；涉及人事、财务、敏感信息→private）\n\n"
-        f"一级分类（仅限）：{l1_list}\n"
-        f"二级分类（仅限）：{l2_list}\n\n"
         f"文档标题：{title or '（未提供，请根据内容生成）'}\n"
         f"文档内容：{content[:2000] or '（未提供）'}\n\n"
         f"只返回JSON（不要markdown代码块标记）：\n"
-        f'{{"title":"生成的标题","description":"生成的描述","keywords":["关键词1","关键词2",...],"first_level":"一级分类名","second_level":"二级分类名","scope":"school|college|department","visibility":"public|private","confidence":"high|medium|low"}}'
+        f'{{"title":"生成的标题","description":"生成的描述","keywords":["关键词1","关键词2",...],"scope":"school|college|department","visibility":"public|private","confidence":"high|medium|low"}}'
     )
 
     try:
@@ -1306,23 +1278,19 @@ def _ai_classify(title: str = '', content: str = '') -> Optional[dict]:
             temperature=0.0, max_tokens=500,
         )
     except Exception as e:
-        logger.error(f'LLM 分类推荐失败: {e}')
+        logger.error(f'LLM 分析失败: {e}')
         return None
 
     if not raw:
-        logger.warning('LLM 分类推荐返回空结果')
+        logger.warning('LLM 分析返回空结果')
         return None
 
     try:
         match = re.search(r'\{.*\}', raw, re.DOTALL)
         result = json.loads(match.group(0)) if match else json.loads(raw)
     except (json.JSONDecodeError, AttributeError):
-        logger.warning(f'LLM 分类解析失败 raw={raw[:200]}')
+        logger.warning(f'LLM 分析解析失败 raw={raw[:200]}')
         return None
-
-    # 匹配分类
-    l1 = next((c for c in first_level if c['name'] == result.get('first_level', '')), None)
-    l2 = next((c for c in second_level if c['name'] == result.get('second_level', '')), None)
 
     # 校验 AI 返回的 scope/visibility 是否在合法范围内
     ai_scope = result.get('scope', 'school')
@@ -1336,9 +1304,6 @@ def _ai_classify(title: str = '', content: str = '') -> Optional[dict]:
         'title': result.get('title', '') or title or '未命名文档',
         'description': result.get('description', ''),
         'keywords': result.get('keywords', []),
-        'category_id': l2['id'] if l2 else None,
-        'first_level_name': l1['name'] if l1 else None,
-        'second_level_name': l2['name'] if l2 else None,
         'scope': ai_scope,
         'visibility': ai_visibility,
         'confidence': result.get('confidence', 'medium'),
@@ -1347,10 +1312,10 @@ def _ai_classify(title: str = '', content: str = '') -> Optional[dict]:
 
 class AIClassifyView(APIView):
     """
-    AI 智能分类推荐
+    AI 智能分析推荐
 
     POST /api/knowledge/upload/ai-classify/
-    功能：接收文件标题和内容片段，调用 LLM 分析并返回推荐的分类、标题、描述和关键词
+    功能：接收文件标题和内容片段，调用 LLM 分析并返回推荐的标题、描述和关键词
     请求参数：
         - title (str, optional): 文件标题（为空时 AI 根据内容自动生成）
         - content (str, optional): 文本内容片段（建议前 2000 字）
@@ -1359,15 +1324,15 @@ class AIClassifyView(APIView):
             "title": "AI生成的标题",
             "description": "AI生成的描述",
             "keywords": ["关键词1", "关键词2", ...],
-            "first_level": {"id": 1, "name": "行政公文"},
-            "second_level": {"id": 5, "name": "通知公告"},
+            "scope": "school",
+            "visibility": "public",
             "confidence": "high"
         }
     """
     permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
 
     def post(self, request):
-        """AI 分析并推荐分类"""
+        """AI 分析文档并推荐元数据"""
         serializer = AIClassifySerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
@@ -1375,7 +1340,7 @@ class AIClassifyView(APIView):
         title = data.get('title', '')
         content = data.get('content', '')
 
-        # 调用公共 AI 分类函数
+        # 调用公共 AI 分析函数
         ai_result = _ai_classify(title, content)
 
         if ai_result is None:
@@ -1384,19 +1349,10 @@ class AIClassifyView(APIView):
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
 
-        # 获取分类 ID 用于返回
-        first_level = list(Category.objects.filter(parent__isnull=True).values('id', 'name'))
-        l1 = next((c for c in first_level if c['name'] == ai_result.get('first_level_name', '')), None)
-
         return Response({
             'title': ai_result['title'],
             'description': ai_result['description'],
             'keywords': ai_result['keywords'],
-            'first_level': {'id': l1['id'], 'name': l1['name']} if l1 else None,
-            'second_level': {
-                'id': ai_result['category_id'],
-                'name': ai_result['second_level_name'],
-            } if ai_result['category_id'] else None,
             'scope': ai_result['scope'],
             'visibility': ai_result['visibility'],
             'confidence': ai_result['confidence'],

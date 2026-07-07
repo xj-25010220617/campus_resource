@@ -20,13 +20,13 @@
 | `PUT /api/auth/me/` | 更新个人资料（手机/头像） |
 | `POST /api/auth/change-password/` | 用户自己修改密码（需旧密码） |
 
-## 二、分类查询
+## 二、基础数据查询
 
 | 接口 | 用途 |
 |------|------|
 | `GET /api/colleges/` | 学院列表（13个二级学院） |
 | `GET /api/disciplines/` | 学科方向列表（可按门类筛选） |
-| `GET /api/categories/` | 资源类型列表（两级树形） |
+| `GET /api/categories/` | ⚠️ 已废弃：资源类型列表（资源分类系统已移除） |
 
 ## 三、智能问答（核心）
 
