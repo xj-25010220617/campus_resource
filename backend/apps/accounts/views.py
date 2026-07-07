@@ -678,26 +678,27 @@ class DingtalkRedirectView(APIView):
         import json
 
         user_json = json.dumps(user, ensure_ascii=False)
+        # 防止 JSON 中的 </ 提前关闭 <script> 标签
+        user_json_safe = user_json.replace('</', '<\\/')
 
-        # 用 <script type="application/json"> 传数据 — 不拼进 JS 字符串，彻底避免转义问题
-        html = f'''<!DOCTYPE html>
+        template = '''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>钉钉登录</title>
 <style>
-  *{{margin:0;padding:0;box-sizing:border-box}}
-  body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;min-height:-webkit-fill-available;background:#f0f2f5;padding:20px}}
-  .card{{background:#fff;border-radius:16px;padding:36px 28px 28px;text-align:center;box-shadow:0 4px 24px rgba(0,0,0,0.08);max-width:320px;width:100%}}
-  .check{{width:64px;height:64px;border-radius:50%;background:#f6ffed;display:flex;align-items:center;justify-content:center;margin:0 auto 20px}}
-  .check svg{{width:36px;height:36px}}
-  h2{{font-size:20px;color:#1a1a1a;margin-bottom:6px;font-weight:600}}
-  .uname{{font-size:14px;color:#8c8c8c;margin-bottom:20px}}
-  .btn{{display:block;width:100%;padding:13px 0;background:#1890ff;color:#fff;border:none;border-radius:8px;font-size:16px;letter-spacing:1px;cursor:pointer;-webkit-appearance:none}}
-  .btn:active{{background:#096dd9}}
-  .tip{{font-size:12px;color:#bfbfbf;margin-top:14px;display:none}}
-  .err{{color:#ff4d4f;font-size:14px;margin-top:12px}}
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;min-height:-webkit-fill-available;background:#f0f2f5;padding:20px}
+  .card{background:#fff;border-radius:16px;padding:36px 28px 28px;text-align:center;box-shadow:0 4px 24px rgba(0,0,0,0.08);max-width:320px;width:100%}
+  .check{width:64px;height:64px;border-radius:50%;background:#f6ffed;display:flex;align-items:center;justify-content:center;margin:0 auto 20px}
+  .check svg{width:36px;height:36px}
+  h2{font-size:20px;color:#1a1a1a;margin-bottom:6px;font-weight:600}
+  .uname{font-size:14px;color:#8c8c8c;margin-bottom:20px}
+  .btn{display:block;width:100%;padding:13px 0;background:#1890ff;color:#fff;border:none;border-radius:8px;font-size:16px;letter-spacing:1px;cursor:pointer;-webkit-appearance:none}
+  .btn:active{background:#096dd9}
+  .tip{font-size:12px;color:#bfbfbf;margin-top:14px;display:none}
+  .err{color:#ff4d4f;font-size:14px;margin-top:12px}
 </style>
 </head>
 <body>
@@ -712,27 +713,36 @@ class DingtalkRedirectView(APIView):
   <p class="err" id="err"></p>
 </div>
 
-<script type="application/json" id="user-json">{user_json}</script>
+<script type="application/json" id="user-json">__USER_JSON__</script>
 <script>
-var userEl = document.getElementById('user-json');
-var userStr = userEl.textContent || userEl.innerText || '';
-try {{
-  localStorage.setItem('access_token', '{access}');
-  localStorage.setItem('refresh_token', '{refresh}');
-  localStorage.setItem('user', userStr);
-  var u = JSON.parse(userStr);
-  document.getElementById('uname').innerText = (u.last_name || '') + (u.first_name || u.username || '');
-}} catch(e) {{
-  document.getElementById('err').innerText = '登录异常，请重新扫码';
-  document.getElementById('uname').innerText = '';
-}}
+// 先把 token 存好 — 这一步独立于 JSON 解析，确保不出错
+localStorage.setItem("access_token", "__ACCESS__");
+localStorage.setItem("refresh_token", "__REFRESH__");
 
-function goBack() {{
-  try {{ window.close(); }} catch(_) {{}}
-  document.getElementById('tip').style.display = 'block';
-  setTimeout(function(){{ document.getElementById('tip').style.display = 'none'; }}, 3000);
-}}
+(function(){
+  var el = document.getElementById("user-json");
+  var jsonStr = el.textContent || el.innerText || "";
+  try {
+    var user = JSON.parse(jsonStr);
+    localStorage.setItem("user", jsonStr);
+    var name = (user.last_name || "") + (user.first_name || user.username || "");
+    document.getElementById("uname").innerText = name;
+    document.title = name + " - 登录成功";
+  } catch(e) {
+    document.getElementById("err").innerText = "登录成功，请返回应用";
+  }
+})();
+
+function goBack() {
+  try { window.close(); } catch(_) {}
+  var tip = document.getElementById("tip");
+  tip.style.display = "block";
+  setTimeout(function(){ tip.style.display = "none"; }, 3000);
+}
 </script>
 </body>
 </html>'''
+        html = template.replace('__USER_JSON__', user_json_safe)
+        html = html.replace('__ACCESS__', access)
+        html = html.replace('__REFRESH__', refresh)
         return Response(html, content_type='text/html; charset=utf-8')
