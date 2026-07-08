@@ -610,14 +610,46 @@ class VoiceAskView(APIView):
         audio_data = audio_file.read()
 
         # 语音 → 文字
-        text = speech_to_text(audio_data, audio_file.name.rsplit('.', 1)[-1] if '.' in audio_file.name else 'wav')
+        audio_fmt = audio_file.name.rsplit('.', 1)[-1] if '.' in audio_file.name else 'wav'
+        text, asr_error = speech_to_text(audio_data, audio_fmt)
         if not text:
-            from utils.asr import _model_error
-            detail = '语音识别失败，请确认音频清晰且包含中文语音'
-            if _model_error:
-                detail = f'语音识别失败: {_model_error}'
+            # 映射 asr_error.error_type → 对应 ErrorCode
+            asr_code_map = {
+                'PYDUB_NOT_INSTALLED': ErrorCode.ASR_PYDUB_NOT_INSTALLED,
+                'FFMPEG_NOT_FOUND': ErrorCode.ASR_FFMPEG_NOT_FOUND,
+                'FORMAT_CONVERT_FAILED': ErrorCode.ASR_FORMAT_CONVERT_FAILED,
+                'AUDIO_TOO_SMALL': ErrorCode.ASR_AUDIO_TOO_SMALL,
+                'AUDIO_TOO_LARGE': ErrorCode.ASR_AUDIO_TOO_LARGE,
+                'AUDIO_CONVERT_FAILED': ErrorCode.ASR_AUDIO_CONVERT_FAILED,
+                'ASR_MODEL_NOT_LOADED': ErrorCode.ASR_MODEL_NOT_LOADED,
+                'ASR_EMPTY_RESULT': ErrorCode.ASR_EMPTY_RESULT,
+                'ASR_NO_TEXT_EXTRACTED': ErrorCode.ASR_NO_TEXT_EXTRACTED,
+                'ASR_UNKNOWN_ERROR': ErrorCode.ASR_UNKNOWN_ERROR,
+            }
+            error_code = asr_code_map.get(
+                asr_error.get('error_type'), ErrorCode.ASR_FAILED,
+            ) if asr_error else ErrorCode.ASR_FAILED
+
+            # 构建详细错误响应（含错误阶段、类型、建议、完整处理日志）
+            error_response = {
+                'detail': asr_error['detail'] if asr_error else '语音识别失败，请确认音频清晰且包含中文语音',
+                'code': error_code.value,
+            }
+            if asr_error:
+                error_response['asr_error'] = {
+                    'stage': asr_error.get('stage'),
+                    'error_type': asr_error.get('error_type'),
+                    'suggestion': asr_error.get('suggestion'),
+                    'error_log': asr_error.get('error_log', []),
+                }
+            logger.warning(
+                '语音识别失败: stage=%s type=%s detail=%s',
+                asr_error.get('stage') if asr_error else 'unknown',
+                asr_error.get('error_type') if asr_error else 'unknown',
+                asr_error.get('detail') if asr_error else 'unknown',
+            )
             return Response(
-                {'detail': detail, 'code': ErrorCode.ASR_FAILED.value},
+                error_response,
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 

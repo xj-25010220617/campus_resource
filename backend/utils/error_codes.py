@@ -25,7 +25,27 @@ class ErrorCode(str, Enum):
     FILE_TOO_LARGE = 'FILE_TOO_LARGE'
     """语音文件超过 10MB 限制"""
     ASR_FAILED = 'ASR_FAILED'
-    """语音识别（ASR）转文字失败"""
+    """语音识别（ASR）转文字失败（通用）"""
+    ASR_PYDUB_NOT_INSTALLED = 'ASR_PYDUB_NOT_INSTALLED'
+    """pydub 库未安装，无法处理浏览器原生音频格式"""
+    ASR_FORMAT_CONVERT_FAILED = 'ASR_FORMAT_CONVERT_FAILED'
+    """音频格式转码失败（文件损坏或编码不兼容）"""
+    ASR_FFMPEG_NOT_FOUND = 'ASR_FFMPEG_NOT_FOUND'
+    """ffmpeg 未安装或不在 PATH 中，无法转码浏览器原生音频格式"""
+    ASR_AUDIO_TOO_SMALL = 'ASR_AUDIO_TOO_SMALL'
+    """音频文件过小，可能为空文件或录音时长过短"""
+    ASR_AUDIO_TOO_LARGE = 'ASR_AUDIO_TOO_LARGE'
+    """音频文件超过大小限制"""
+    ASR_AUDIO_CONVERT_FAILED = 'ASR_AUDIO_CONVERT_FAILED'
+    """音频转 WAV 16kHz 失败"""
+    ASR_MODEL_NOT_LOADED = 'ASR_MODEL_NOT_LOADED'
+    """ASR 模型加载失败（依赖缺失或下载失败）"""
+    ASR_EMPTY_RESULT = 'ASR_EMPTY_RESULT'
+    """ASR 模型返回空结果（无有效语音或噪音过大）"""
+    ASR_NO_TEXT_EXTRACTED = 'ASR_NO_TEXT_EXTRACTED'
+    """从识别结果中未提取到有效文字（无中文或发音不清）"""
+    ASR_UNKNOWN_ERROR = 'ASR_UNKNOWN_ERROR'
+    """ASR 过程发生未知异常"""
 
     # ── Knowledge / 知识文档 ───────────────────────────────────
     CONFLICT = 'CONFLICT'
