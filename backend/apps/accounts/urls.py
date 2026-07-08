@@ -5,6 +5,7 @@ from .views import (
     DingtalkCallbackView,
     DingtalkQrView,
     DingtalkRedirectView,
+    DingtalkStatusView,
     LoggedTokenObtainPairView,
     LogoutView,
     MeView,
@@ -34,4 +35,5 @@ urlpatterns = [
     path('dingtalk/qr/', DingtalkQrView.as_view(), name='dingtalk_qr'),
     path('dingtalk/callback/', DingtalkCallbackView.as_view(), name='dingtalk_callback'),
     path('dingtalk/redirect/', DingtalkRedirectView.as_view(), name='dingtalk_redirect'),
+    path('dingtalk/status/', DingtalkStatusView.as_view(), name='dingtalk_status'),
 ]

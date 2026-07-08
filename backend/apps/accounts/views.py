@@ -20,6 +20,48 @@ from .serializers import UserSerializer, ChangePasswordSerializer
 logger = logging.getLogger(__name__)
 User = get_user_model()
 
+# ------------------------------------------------------------------
+# 钉钉扫码登录 — 状态缓存（电脑端轮询用）
+# 手机扫码成功后 token 存到手机 localStorage，电脑端拿不到。
+# 所以后端在 state 下暂存 token，电脑每秒轮询 /api/auth/dingtalk/status/ 取回。
+# ------------------------------------------------------------------
+import time as _time
+from threading import Lock as _Lock
+
+_dingtalk_states: dict = {}     # {state: {access, refresh, user, expires_at}}
+_dingtalk_states_lock = _Lock()
+_DINGTALK_STATE_TTL = 120        # state 有效期 2 分钟
+
+
+def _save_dingtalk_state(state: str, access: str, refresh: str, user: dict):
+    """扫码成功后暂存 token，供电脑端轮询获取"""
+    with _dingtalk_states_lock:
+        now = _time.time()
+        _dingtalk_states[state] = {
+            'access': access,
+            'refresh': refresh,
+            'user': user,
+            'expires_at': now + _DINGTALK_STATE_TTL,
+        }
+        # 顺带清理过期 state
+        expired = [k for k, v in _dingtalk_states.items() if v['expires_at'] < now]
+        for k in expired:
+            del _dingtalk_states[k]
+
+
+def _pop_dingtalk_state(state: str) -> dict:
+    """轮询登录状态 — 取一次就删，防止重复用"""
+    with _dingtalk_states_lock:
+        data = _dingtalk_states.pop(state, None)
+        if data and data['expires_at'] > _time.time():
+            return {
+                'status': 'completed',
+                'access': data['access'],
+                'refresh': data['refresh'],
+                'user': data['user'],
+            }
+    return {'status': 'pending'}
+
 
 class LoggedTokenObtainPairView(TokenObtainPairView):
     """
@@ -640,6 +682,16 @@ class DingtalkRedirectView(APIView):
             user_data.get('unionId'), user.username, created,
         )
 
+        # 把 token 暂存到 state 缓存，电脑端通过轮询 /api/auth/dingtalk/status/ 获取
+        login_state = request.query_params.get('state', '')
+        if login_state:
+            _save_dingtalk_state(
+                state=login_state,
+                access=str(refresh.access_token),
+                refresh=str(refresh),
+                user=UserSerializer(user).data,
+            )
+
         frontend_url = request.query_params.get(
             'frontend_url',
             getattr(settings, 'FRONTEND_URL', 'http://localhost:5173'),
@@ -747,3 +799,29 @@ function goBack() {
         html = html.replace('__ACCESS__', access)
         html = html.replace('__REFRESH__', refresh)
         return HttpResponse(html, content_type='text/html; charset=utf-8')
+
+
+class DingtalkStatusView(APIView):
+    """
+    钉钉扫码登录 — 轮询登录状态
+
+    GET /api/auth/dingtalk/status/?state=xxx
+    功能：电脑端生成二维码后，每秒轮询此接口检测手机是否扫码成功。
+    参数：
+        - state (string, required): 二维码中的 state 值
+    返回：
+        - 未扫码: {"status": "pending"}
+        - 已扫码: {"status": "completed", "access": "...", "refresh": "...", "user": {...}}
+    注意：每个 state 只能成功取一次，取后即删。
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        state = request.query_params.get('state', '').strip()
+        if not state:
+            return Response(
+                {'status': 'error', 'detail': '缺少 state 参数'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        result = _pop_dingtalk_state(state)
+        return Response(result, status=status.HTTP_200_OK)
