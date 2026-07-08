@@ -81,6 +81,10 @@ class ExternalClient:
             logger.error(f'服务熔断: {service} 不可用，快速失败')
             raise requests.RequestException(f'服务熔断: {service} 当前不可用')
 
+        # 钉钉 API 是国内服务，不走系统代理（否则代理挂了登录直接 500）
+        if service == 'dingtalk':
+            kwargs.setdefault('proxies', {'http': None, 'https': None})
+
         timeout_profile = TIMEOUT_PROFILES.get(service)
         if timeout_profile:
             kwargs.setdefault('timeout', (timeout_profile.connect, timeout_profile.read))

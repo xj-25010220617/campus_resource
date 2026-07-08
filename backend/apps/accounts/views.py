@@ -3,6 +3,7 @@ import logging
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import transaction
+from django.http import HttpResponse
 from drf_spectacular.utils import extend_schema
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
@@ -18,6 +19,39 @@ from .serializers import UserSerializer, ChangePasswordSerializer
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
+
+# ------------------------------------------------------------------
+# 钉钉扫码登录 — 状态缓存（电脑端轮询用）
+# 手机扫码成功后 token 存到手机 localStorage，电脑端拿不到。
+# 所以后端在 state 下暂存 token，电脑每秒轮询 /api/auth/dingtalk/status/ 取回。
+# ------------------------------------------------------------------
+from django.core.cache import cache
+
+DINGTALK_STATE_TTL = 120  # state 有效期 2 分钟
+
+
+def _save_dingtalk_state(state: str, access: str, refresh: str, user: dict):
+    """扫码成功后暂存 token，供电脑端轮询获取"""
+    cache.set(f'dd_state_{state}', {
+        'access': access,
+        'refresh': refresh,
+        'user': user,
+    }, timeout=DINGTALK_STATE_TTL)
+
+
+def _pop_dingtalk_state(state: str) -> dict:
+    """轮询登录状态 — 取一次就删，防止重复用"""
+    key = f'dd_state_{state}'
+    data = cache.get(key)
+    if data:
+        cache.delete(key)
+        return {
+            'status': 'completed',
+            'access': data['access'],
+            'refresh': data['refresh'],
+            'user': data['user'],
+        }
+    return {'status': 'pending'}
 
 
 class LoggedTokenObtainPairView(TokenObtainPairView):
@@ -409,7 +443,7 @@ class DingtalkQrView(APIView):
         # 优先用前端传的回调地址（手机扫码后跳回前端页面），否则用后端地址
         redirect_uri = (
             request.query_params.get('redirect_uri')
-            or request.build_absolute_uri('/api/auth/dingtalk/callback/')
+            or request.build_absolute_uri('/api/auth/dingtalk/redirect/')
         )
 
         if not app_key:
@@ -588,7 +622,7 @@ class DingtalkRedirectView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def get(self, request):
-        import requests
+        from utils.http_client import ExternalClient
 
         auth_code = request.query_params.get('code')
         if not auth_code:
@@ -601,13 +635,13 @@ class DingtalkRedirectView(APIView):
         app_key = getattr(settings, 'DINGTALK_APP_KEY', '')
         app_secret = getattr(settings, 'DINGTALK_APP_SECRET', '')
         try:
-            token_resp = requests.post(
+            token_resp = ExternalClient.post(
+                'dingtalk',
                 'https://api.dingtalk.com/v1.0/oauth2/userAccessToken',
                 json={
                     'clientId': app_key, 'clientSecret': app_secret,
                     'code': auth_code, 'grantType': 'authorization_code',
                 },
-                timeout=10,
             )
             token_data = token_resp.json()
             access_token = token_data.get('accessToken')
@@ -617,10 +651,10 @@ class DingtalkRedirectView(APIView):
                     {'detail': '钉钉授权失败，请重新扫码'},
                     status=status.HTTP_401_UNAUTHORIZED,
                 )
-            user_resp = requests.get(
+            user_resp = ExternalClient.get(
+                'dingtalk',
                 'https://api.dingtalk.com/v1.0/contact/users/me',
                 headers={'x-acs-dingtalk-access-token': access_token},
-                timeout=10,
             )
             user_data = user_resp.json()
         except Exception as e:
@@ -638,6 +672,16 @@ class DingtalkRedirectView(APIView):
             '钉钉扫码登录: union_id=%s user=%s created=%s',
             user_data.get('unionId'), user.username, created,
         )
+
+        # 把 token 暂存到 state 缓存，电脑端通过轮询 /api/auth/dingtalk/status/ 获取
+        login_state = request.query_params.get('state', '')
+        if login_state:
+            _save_dingtalk_state(
+                state=login_state,
+                access=str(refresh.access_token),
+                refresh=str(refresh),
+                user=UserSerializer(user).data,
+            )
 
         frontend_url = request.query_params.get(
             'frontend_url',
@@ -678,42 +722,97 @@ class DingtalkRedirectView(APIView):
         import json
 
         user_json = json.dumps(user, ensure_ascii=False)
-        html = f'''<!DOCTYPE html>
+        # 防止 JSON 中的 </ 提前关闭 <script> 标签
+        user_json_safe = user_json.replace('</', '<\\/')
+
+        template = '''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>钉钉登录 - 成都东软学院</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>钉钉登录</title>
 <style>
-  body {{ font-family: -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #f5f5f5; }}
-  .card {{ background: white; border-radius: 12px; padding: 40px; text-align: center; box-shadow: 0 2px 20px rgba(0,0,0,0.1); }}
-  .spinner {{ width: 40px; height: 40px; border: 3px solid #e0e0e0; border-top-color: #1890ff; border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 20px; }}
-  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
-  .check {{ color: #52c41a; font-size: 48px; display: none; }}
-  p {{ color: #666; margin: 16px 0; }}
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;min-height:-webkit-fill-available;background:#f0f2f5;padding:20px}
+  .card{background:#fff;border-radius:16px;padding:36px 28px 28px;text-align:center;box-shadow:0 4px 24px rgba(0,0,0,0.08);max-width:320px;width:100%}
+  .check{width:64px;height:64px;border-radius:50%;background:#f6ffed;display:flex;align-items:center;justify-content:center;margin:0 auto 20px}
+  .check svg{width:36px;height:36px}
+  h2{font-size:20px;color:#1a1a1a;margin-bottom:6px;font-weight:600}
+  .uname{font-size:14px;color:#8c8c8c;margin-bottom:20px}
+  .btn{display:block;width:100%;padding:13px 0;background:#1890ff;color:#fff;border:none;border-radius:8px;font-size:16px;letter-spacing:1px;cursor:pointer;-webkit-appearance:none}
+  .btn:active{background:#096dd9}
+  .tip{font-size:12px;color:#bfbfbf;margin-top:14px;display:none}
+  .err{color:#ff4d4f;font-size:14px;margin-top:12px}
 </style>
 </head>
 <body>
 <div class="card">
-  <div class="spinner" id="spin"></div>
-  <div class="check" id="ok">&#10003;</div>
-  <p id="msg">正在登录...</p>
+  <div class="check">
+    <svg viewBox="0 0 24 24" fill="none" stroke="#52c41a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+  </div>
+  <h2>登录成功</h2>
+  <p class="uname" id="uname"></p>
+  <button class="btn" onclick="goBack()">返回应用</button>
+  <p class="tip" id="tip">请手动切换回应用</p>
+  <p class="err" id="err"></p>
 </div>
+
+<script type="application/json" id="user-json">__USER_JSON__</script>
 <script>
-(function() {{
-  try {{
-    localStorage.setItem("access_token", "{access}");
-    localStorage.setItem("refresh_token", "{refresh}");
-    localStorage.setItem("user", '{user_json}');
-    document.getElementById("spin").style.display = "none";
-    document.getElementById("ok").style.display = "block";
-    document.getElementById("msg").innerText = "登录成功，即将跳转...";
-    setTimeout(function() {{ window.location.href = "{frontend_url}"; }}, 800);
-  }} catch(e) {{
-    document.getElementById("msg").innerText = "登录失败: " + e.message;
-  }}
-}})();
+// 先把 token 存好 — 这一步独立于 JSON 解析，确保不出错
+localStorage.setItem("access_token", "__ACCESS__");
+localStorage.setItem("refresh_token", "__REFRESH__");
+
+(function(){
+  var el = document.getElementById("user-json");
+  var jsonStr = el.textContent || el.innerText || "";
+  try {
+    var user = JSON.parse(jsonStr);
+    localStorage.setItem("user", jsonStr);
+    var name = (user.last_name || "") + (user.first_name || user.username || "");
+    document.getElementById("uname").innerText = name;
+    document.title = name + " - 登录成功";
+  } catch(e) {
+    document.getElementById("err").innerText = "登录成功，请返回应用";
+  }
+})();
+
+function goBack() {
+  try { window.close(); } catch(_) {}
+  var tip = document.getElementById("tip");
+  tip.style.display = "block";
+  setTimeout(function(){ tip.style.display = "none"; }, 3000);
+}
 </script>
 </body>
 </html>'''
-        return Response(html, content_type='text/html; charset=utf-8')
+        html = template.replace('__USER_JSON__', user_json_safe)
+        html = html.replace('__ACCESS__', access)
+        html = html.replace('__REFRESH__', refresh)
+        return HttpResponse(html, content_type='text/html; charset=utf-8')
+
+
+class DingtalkStatusView(APIView):
+    """
+    钉钉扫码登录 — 轮询登录状态
+
+    GET /api/auth/dingtalk/status/?state=xxx
+    功能：电脑端生成二维码后，每秒轮询此接口检测手机是否扫码成功。
+    参数：
+        - state (string, required): 二维码中的 state 值
+    返回：
+        - 未扫码: {"status": "pending"}
+        - 已扫码: {"status": "completed", "access": "...", "refresh": "...", "user": {...}}
+    注意：每个 state 只能成功取一次，取后即删。
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        state = request.query_params.get('state', '').strip()
+        if not state:
+            return Response(
+                {'status': 'error', 'detail': '缺少 state 参数'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        result = _pop_dingtalk_state(state)
+        return Response(result, status=status.HTTP_200_OK)

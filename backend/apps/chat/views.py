@@ -23,8 +23,8 @@ from apps.classify.utils.query_parser import parse as parse_query
 from .models import Conversation, ChatMessage, QueryLog, SensitiveLog
 from .serializers import (
     AskSerializer, ChatMessageSerializer, ConversationListSerializer,
-    ConversationSerializer, FeedbackSerializer, MessageRateSerializer,
-    VoiceAskSerializer,
+    ConversationRenameSerializer, ConversationSerializer,
+    FeedbackSerializer, MessageRateSerializer, VoiceAskSerializer,
 )
 
 
@@ -49,16 +49,37 @@ class ConversationViewSet(ModelViewSet):
     serializer_class = ConversationSerializer
     permission_classes = [permissions.IsAuthenticated]
 
+    def get_permissions(self):
+        """create 允许匿名访问，其他操作需要登录"""
+        if self.action == 'create':
+            return [permissions.AllowAny()]
+        return [permissions.IsAuthenticated()]
+
     def get_queryset(self):
+        if self.request.user.is_anonymous:
+            return Conversation.objects.none()
         return Conversation.objects.filter(user=self.request.user).prefetch_related('messages')
 
     def get_serializer_class(self):
         if self.action == 'list':
             return ConversationListSerializer
+        if self.action == 'partial_update':
+            return ConversationRenameSerializer
         return ConversationSerializer
 
     def perform_create(self, serializer):
-        serializer.save(user=self.request.user)
+        serializer.save(user=self.request.user if self.request.user.is_authenticated else None)
+
+    def partial_update(self, request, *args, **kwargs):
+        """
+        PATCH /api/chat/conversations/{id}/
+        重命名会话，仅返回 id、title、created_at、updated_at
+        """
+        instance = self.get_object()
+        serializer = ConversationRenameSerializer(instance, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+        return Response(serializer.data)
 
 
 @extend_schema(
@@ -257,7 +278,7 @@ class AskView(APIView):
         - 前端用 EventSource 或 fetch + ReadableStream 消费
         - 捕获 error 事件处理异常
     """
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.AllowAny]
 
     def post(self, request, *args, **kwargs):
         serializer = AskSerializer(data=request.data)
@@ -265,10 +286,14 @@ class AskView(APIView):
 
         question = serializer.validated_data['question']
         conversation_id = serializer.validated_data.get('conversation_id')
-        user = request.user
+
+        # 处理匿名用户
+        user = request.user if request.user.is_authenticated else None
+        user_id = user.id if user else None
+        user_role = user.role if user else 'user'
         user_context = {
-            'user_id': user.id,
-            'role': getattr(user, 'role', 'user'),
+            'user_id': user_id,
+            'role': user_role,
             'college_id': getattr(user, 'college_id', None),
         }
 
@@ -277,7 +302,7 @@ class AskView(APIView):
         if sensitive_result.is_sensitive:
             logger.warning(
                 '敏感内容拦截: user=%s question=%s... rules=%s',
-                user.username, question[:60], sensitive_result.matched_rules,
+                user.username if user else 'anonymous', question[:60], sensitive_result.matched_rules,
             )
             SensitiveLog.objects.create(
                 user=user,
@@ -301,16 +326,28 @@ class AskView(APIView):
         route = route_question(question, user)
         is_data_query = route['type'] == 'data_query'
 
-        # 1. 获取或新建会话
-        if conversation_id:
-            conversation = get_object_or_404(
-                Conversation, id=conversation_id, user=user,
+        # 匿名用户不支持文件管理查询
+        if is_data_query and not user:
+            return Response(
+                {'detail': '请先登录以使用查询功能', 'code': ErrorCode.UNAUTHORIZED.value},
+                status=status.HTTP_401_UNAUTHORIZED,
             )
+
+        # 1. 获取或新建会话（匿名用户只能查自己刚创建 user=null 的对话）
+        if conversation_id:
+            if not user:
+                conversation = get_object_or_404(
+                    Conversation, id=conversation_id, user__isnull=True,
+                )
+            else:
+                conversation = get_object_or_404(
+                    Conversation, id=conversation_id, user=user,
+                )
         else:
             conversation = Conversation.objects.create(
                 user=user, title=question[:50],
             )
-            logger.info('新建会话 id=%d user=%s', conversation.id, user.username)
+            logger.info('新建会话 id=%d user=%s', conversation.id, user.username if user else 'anonymous')
 
         # 2. 保存用户消息
         ChatMessage.objects.create(
@@ -358,9 +395,9 @@ class AskView(APIView):
         messages = rag.build_rag_prompt(question, results, history=history)
 
         # 6. 创建 AI 消息占位（流结束后写入完整内容）
-        is_authorized = user.role in ('admin', 'super_admin')
+        is_authorized = user_role in ('admin', 'super_admin')
         references_detail = build_references_events(
-            results, user.role, user.id,
+            results, user_role, user_id,
         ).get('references_detail', [])
 
         assistant_msg = ChatMessage.objects.create(
@@ -404,7 +441,7 @@ class AskView(APIView):
                     yield _format_sse('suggested', suggested)
 
                 # 引用溯源
-                refs = build_references_events(results, user.role, user.id)
+                refs = build_references_events(results, user_role, user_id)
                 if 'references' in refs:
                     yield _format_sse('references', refs['references'])
                 if 'references_detail' in refs and is_authorized:
@@ -675,7 +712,7 @@ class HotQuestionsView(APIView):
     自动过滤与学习/学校/资料无关的噪音内容（如纯问候、测试消息、无意义短文本等）。
     适合展示在智能问答主界面。
     """
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.AllowAny]
 
     # 排除关键词（不区分大小写）：包含这些关键词的内容将被过滤掉
     EXCLUDE_KEYWORDS = [

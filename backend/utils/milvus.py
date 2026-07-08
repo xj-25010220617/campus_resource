@@ -240,7 +240,11 @@ class MilvusClient:
         top_k: int,
         filter_ids: Optional[List[int]],
     ) -> List[dict]:
-        import chromadb
+        try:
+            import chromadb
+        except ImportError:
+            logger.warning('chromadb 未安装，Chroma 向量检索不可用')
+            return []
         client = chromadb.PersistentClient(
             path=str(getattr(settings, 'CHROMA_DB_PATH', './chroma_db'))
         )
