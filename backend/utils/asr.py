@@ -58,6 +58,7 @@ def _load_model():
         model = AutoModel(
             model=model_name,
             device=device,
+            disable_update=True,
         )
         logger.info(f'ASR 模型加载完成，耗时 {time.time() - t0:.1f}s, device={device}')
         _model_error = None
@@ -86,18 +87,46 @@ def get_asr_model():
 
 def _convert_to_wav(src_path: str) -> str:
     """
-    使用 librosa 将音频文件转换为 16kHz 单声道 WAV。
+    将音频文件转换为 16kHz 单声道 WAV。
+    优先使用 pydub（支持 webm/ogg/opus），不可用时回退到 librosa。
     """
-    import librosa
-    import soundfile
-
     basename = os.path.basename(src_path)
     logger.info(f'正在转换音频格式: {basename} → WAV 16kHz')
-    audio, sr = librosa.load(src_path, sr=16000, mono=True)
-    duration = len(audio) / 16000
-    logger.info(f'音频信息: sr={sr}, duration={duration:.1f}s, samples={len(audio)}')
     tmp_path = tempfile.NamedTemporaryFile(suffix='.wav', delete=False).name
-    soundfile.write(tmp_path, audio, 16000, format='WAV')
+
+    # 1) 优先使用 pydub（支持 webm/ogg/opus 等浏览器原生格式）
+    try:
+        from pydub import AudioSegment
+        logger.info('使用 pydub 进行音频转换')
+        audio = AudioSegment.from_file(src_path)
+        audio = audio.set_channels(1).set_frame_rate(16000)
+        audio.export(tmp_path, format='wav')
+        duration = len(audio) / 1000.0
+        logger.info(f'pydub 转换完成: duration={duration:.1f}s, channels=1, rate=16000')
+    except ImportError:
+        logger.info('pydub 未安装，回退到 librosa')
+        # 2) 回退到 librosa（不支持 webm/ogg）
+        import librosa
+        import soundfile
+
+        audio, sr = librosa.load(src_path, sr=16000, mono=True)
+        duration = len(audio) / 16000
+        logger.info(f'librosa 音频信息: sr={sr}, duration={duration:.1f}s, samples={len(audio)}')
+        soundfile.write(tmp_path, audio, 16000, format='WAV')
+    except Exception as e:
+        logger.warning(f'pydub 转换失败 ({type(e).__name__}: {e})，尝试回退到 librosa')
+        try:
+            import librosa
+            import soundfile
+
+            audio, sr = librosa.load(src_path, sr=16000, mono=True)
+            duration = len(audio) / 16000
+            logger.info(f'librosa 音频信息: sr={sr}, duration={duration:.1f}s')
+            soundfile.write(tmp_path, audio, 16000, format='WAV')
+        except Exception as e2:
+            logger.error(f'librosa 回退也失败: {type(e2).__name__}: {e2}')
+            raise
+
     # 校验转换结果
     wav_size = os.path.getsize(tmp_path)
     if wav_size < _MIN_AUDIO_BYTES:
