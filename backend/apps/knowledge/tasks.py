@@ -11,10 +11,25 @@
 - Celery 未安装时（本地开发）自动降级为同步执行，视图层不需要写 try/except
 """
 import logging
+import re
 
 from utils.shared_task_compat import shared_task
 
 logger = logging.getLogger(__name__)
+
+
+def _cleanse_for_mysql_utf8mb3(text: str) -> str:
+    """清除 4 字节 Unicode 字符（MySQL utf8mb3 无法存储的码点）。"""
+    if not text:
+        return text
+    # 码点 >= U+10000 需要 4 字节 UTF-8 编码，utf8mb3 不支持
+    # Python 中这些字符的 ord() >= 0x10000
+    result = []
+    for c in text:
+        cp = ord(c)
+        if cp < 0x10000:
+            result.append(c)
+    return ''.join(result)
 
 
 @shared_task(bind=True, max_retries=2, default_retry_delay=30, ignore_result=True)
@@ -159,7 +174,7 @@ def index_document_task(self, doc_id: int):
             doc_chunks.append(DocChunk(
                 doc=doc,
                 chunk_index=c['chunk_index'],
-                content=c['content'],
+                content=_cleanse_for_mysql_utf8mb3(c['content']),  # 4字节字符清洗
                 token_count=0,
                 vector_id=vector_ids[i] if i < len(vector_ids) else f'doc_{doc_id}_chunk_{i}',
                 page_start=None,
