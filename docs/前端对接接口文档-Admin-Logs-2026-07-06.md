@@ -449,11 +449,14 @@ GET /api/admin/logs/operation/stats/
     {"key": "resource", "label": "资源", "count": 0},
     {"key": "category", "label": "分类", "count": 0}
   ],
-  "top_operators": [70, 16]
+  "top_operators": [
+    {"key": "1", "label": "admin", "count": 60},
+    {"key": "5", "label": "editor", "count": 26}
+  ]
 }
 ```
 
-> `top_operators` 返回前 10 名；目前 project 里 Resource/Category 暂无 CRUD，所以这两块值恒为 0——等后续该接口落地后会自动有数据。
+> `top_operators` 返回前 10 名操作者，每项为 `{key, label, count}` 结构，与 `by_action` / `by_target_type` 格式一致；目前 project 里 Resource/Category 暂无 CRUD，所以这两块值恒为 0——等后续该接口落地后会自动有数据。
 
 ---
 

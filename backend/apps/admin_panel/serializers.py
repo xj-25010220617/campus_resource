@@ -314,4 +314,4 @@ class OperationLogStatsSerializer(LogStatsBaseSerializer):
 
     by_action = serializers.ListField(child=_GroupCountSerializer())
     by_target_type = serializers.ListField(child=_GroupCountSerializer())
-    top_operators = serializers.ListField(child=serializers.IntegerField())
+    top_operators = serializers.ListField(child=_GroupCountSerializer())
