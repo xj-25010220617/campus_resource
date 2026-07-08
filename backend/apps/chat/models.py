@@ -7,6 +7,7 @@ class Conversation(models.Model):
     """会话（一个会话可包含多轮问答）"""
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        null=True, blank=True,
         related_name='conversations', verbose_name='用户'
     )
     title = models.CharField(max_length=256, blank=True, default='', verbose_name='会话标题')
@@ -20,7 +21,8 @@ class Conversation(models.Model):
         ordering = ['-updated_at']
 
     def __str__(self):
-        return f'{self.user.username} 的会话 #{self.id}'
+        username = self.user.username if self.user else '匿名'
+        return f'{username} 的会话 #{self.id}'
 
 
 class ChatMessage(models.Model):
@@ -60,7 +62,8 @@ class ChatMessage(models.Model):
 class QueryLog(models.Model):
     """RAG 查询日志（记录提问/命中/反馈，用于检索质量分析）"""
     user = models.ForeignKey(
-        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True,
         related_name='query_logs', verbose_name='用户'
     )
     conversation = models.ForeignKey(

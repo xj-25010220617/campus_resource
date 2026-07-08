@@ -55,3 +55,14 @@ class VoiceAskSerializer(serializers.Serializer):
         required=False, allow_null=True,
         help_text='会话ID（不传则新建）',
     )
+
+
+class ConversationRenameSerializer(serializers.ModelSerializer):
+    """会话重命名序列化器（仅允许修改 title）"""
+
+    title = serializers.CharField(required=True, max_length=50, help_text='新的对话名称')
+
+    class Meta:
+        model = Conversation
+        fields = ['id', 'title', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'created_at', 'updated_at']
