@@ -44,6 +44,9 @@ class FAQItemListView(generics.ListAPIView):
     - 仅返回 status='published' 的记录
     - 当前用户 college_id 匹配 college（NULL 的全局 FAQ 也可见）
     - 按 frequency 降序排列
+    
+    支持搜索参数：
+    - q (str): 关键词搜索，模糊匹配问题、答案、标签、分类名称
     """
     serializer_class = FAQItemListSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -53,9 +56,25 @@ class FAQItemListView(generics.ListAPIView):
         q = models.Q(college__isnull=True)
         if user.college_id:
             q |= models.Q(college_id=user.college_id)
-        return FAQItem.objects.filter(
+        
+        qs = FAQItem.objects.filter(
             status='published',
-        ).filter(q).order_by('-frequency', '-created_at')
+        ).filter(q)
+        
+        # 搜索功能：支持按问题、答案、标签、分类名称模糊搜索
+        search_query = self.request.query_params.get('q', '').strip()
+        if search_query:
+            # 构建搜索条件
+            search_q = models.Q(question__icontains=search_query)
+            search_q |= models.Q(answer__icontains=search_query)
+            # tags 是 JSONField 数组，使用 contains 匹配数组中的元素
+            search_q |= models.Q(tags__contains=search_query)
+            # 搜索分类名称
+            search_q |= models.Q(category__name__icontains=search_query)
+            
+            qs = qs.filter(search_q)
+        
+        return qs.order_by('-frequency', '-created_at')
 
 
 class FAQItemDetailView(generics.RetrieveAPIView):

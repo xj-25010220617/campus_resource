@@ -58,7 +58,20 @@ class ConversationViewSet(ModelViewSet):
     def get_queryset(self):
         if self.request.user.is_anonymous:
             return Conversation.objects.none()
-        return Conversation.objects.filter(user=self.request.user).prefetch_related('messages')
+        
+        qs = Conversation.objects.filter(user=self.request.user)
+        
+        # 搜索功能：支持按标题或消息内容模糊搜索
+        search_query = self.request.query_params.get('q', '').strip()
+        if search_query:
+            from django.db.models import Q
+            # 搜索标题，同时搜索关联的消息内容
+            qs = qs.filter(
+                Q(title__icontains=search_query) |
+                Q(messages__content__icontains=search_query)
+            ).distinct()
+        
+        return qs.prefetch_related('messages')
 
     def get_serializer_class(self):
         if self.action == 'list':
