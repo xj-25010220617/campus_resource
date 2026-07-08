@@ -477,29 +477,31 @@ def _apply_hard_filters(
     if one_year_ago:
         kd_qs = kd_qs.filter(created_at__gte=one_year_ago)
 
-    # AI 检索权限：private 绝不检索；public 按 scope 限缩
+    # AI 检索权限：private 绝不检索；public 按 college_id/department_id 限缩
     kd_qs = kd_qs.filter(visibility='public')
+    # 校级文档：college_id 和 department_id 均为 null
+    SCHOOL_LEVEL = Q(college_id__isnull=True, department_id__isnull=True)
     is_admin_query = role in ('admin', 'college_admin', 'dept_admin', 'super_admin')
     if not is_admin_query:
-        # 普通用户 AI 检索：scope=school全部 + scope=college本院 + scope=department本部门
-        conditions = Q(scope='school')
+        # 普通用户 AI 检索：校级全部 + 本院 + 本部门 + 自己上传
+        conditions = SCHOOL_LEVEL
         if user_college_id := user_context.get('college_id'):
-            conditions |= Q(scope='college', college_id=user_college_id)
+            conditions |= Q(college_id=user_college_id)
         if user_dept_id := user_context.get('department_id'):
-            conditions |= Q(scope='department', department_id=user_dept_id)
+            conditions |= Q(department_id=user_dept_id)
         if user_id:
             conditions |= Q(uploader_id=user_id)
         kd_qs = kd_qs.filter(conditions)
     elif role in ('college_admin', 'admin'):
         kd_qs = kd_qs.filter(
-            Q(scope='school')
-            | Q(scope='college', college_id=user_context.get('college_id'))
+            SCHOOL_LEVEL
+            | Q(college_id=user_context.get('college_id'))
             | Q(uploader_id=user_id),
         )
     elif role == 'dept_admin':
         kd_qs = kd_qs.filter(
-            Q(scope='school')
-            | Q(scope='department', department_id=user_context.get('department_id'))
+            SCHOOL_LEVEL
+            | Q(department_id=user_context.get('department_id'))
             | Q(uploader_id=user_id),
         )
     # super_admin: 不过滤
@@ -565,28 +567,30 @@ def _filter_by_permission(
     # KnowledgeDoc 权限（与 KnowledgeDocListView._rag_scope_filter 保持一致）
     if knowledge_ids:
         from django.db.models import Q
+        # 校级文档：college_id 和 department_id 均为 null
+        SCHOOL_LEVEL = Q(college_id__isnull=True, department_id__isnull=True)
         kd_qs = KnowledgeDoc.objects.filter(id__in=knowledge_ids, visibility='public')
         if role == 'super_admin':
             allowed_ids.update(-kid for kid in kd_qs.values_list('id', flat=True))
         elif role in ('college_admin', 'admin'):
             allowed_ids.update(-kid for kid in kd_qs.filter(
-                Q(scope='school')
-                | Q(scope='college', college_id=user_college_id)
+                SCHOOL_LEVEL
+                | Q(college_id=user_college_id)
                 | Q(uploader_id=user_id),
             ).values_list('id', flat=True))
         elif role == 'dept_admin':
             allowed_ids.update(-kid for kid in kd_qs.filter(
-                Q(scope='school')
-                | Q(scope='department', department_id=user_context.get('department_id'))
+                SCHOOL_LEVEL
+                | Q(department_id=user_context.get('department_id'))
                 | Q(uploader_id=user_id),
             ).values_list('id', flat=True))
         else:
-            # user（普通用户）：scope=school + scope=college(本院) + scope=department(本部门) + 自己上传
-            conditions = Q(scope='school')
+            # user（普通用户）：校级 + 本院 + 本部门 + 自己上传
+            conditions = SCHOOL_LEVEL
             if user_college_id:
-                conditions |= Q(scope='college', college_id=user_college_id)
+                conditions |= Q(college_id=user_college_id)
             if user_context.get('department_id'):
-                conditions |= Q(scope='department', department_id=user_context.get('department_id'))
+                conditions |= Q(department_id=user_context.get('department_id'))
             if user_id:
                 conditions |= Q(uploader_id=user_id)
             allowed_ids.update(-kid for kid in kd_qs.filter(conditions).values_list('id', flat=True))
