@@ -709,9 +709,49 @@ class HotQuestionsView(APIView):
     GET /api/chat/hot-questions/?days=7&top_k=10
 
     实时统计近期用户高频提问，按提问次数降序排列。
+    自动过滤与学习/学校/资料无关的噪音内容（如纯问候、测试消息、无意义短文本等）。
     适合展示在智能问答主界面。
     """
     permission_classes = [permissions.AllowAny]
+
+    # 排除关键词（不区分大小写）：包含这些关键词的内容将被过滤掉
+    EXCLUDE_KEYWORDS = [
+        # 无意义闲聊/问候
+        '你好', '早上好', '下午好', '晚上好', '大家好',
+        '哈哈哈', '呵呵', '嘿嘿', '嘻嘻', '嘿嘿嘿',
+        '再见', '拜拜', '88',
+        # 垃圾/测试内容
+        '测试', 'test', 'ceshi', 'asdf', 'qwerty',
+        # 无意义数字/符号
+        '111', '222', '333', '123', '1234', '12345',
+        '999', '000',
+        # 无关话题
+        '一加一', '1+1', '2+2', '3+3',
+        '生日快乐', 'happy birthday', '新年快乐', '节日快乐',
+        '天气', '天气预报',
+        # 身份询问
+        '你是谁', '你叫什么', '谁是你',
+        # 无意义重复字符序列
+        '一二三', '一二三四五',
+    ]
+
+    # 仅当内容长度超过此值时计入热点（单位：字符）
+    MIN_CONTENT_LENGTH = 4
+
+    @staticmethod
+    def _is_noise(content: str) -> bool:
+        """Python 层二次过滤：检测 SQL 层面难以表达的噪音模式"""
+        # 纯数字/符号/字母（无中文字符的学习相关内容）
+        import re
+        stripped = content.strip()
+        # 去掉常见标点后检查是否全是非中文字符
+        no_punct = re.sub(r'[，。！？、；：""''（）\-\s\d\w]', '', stripped)
+        if no_punct and all('一' <= c <= '鿿' for c in no_punct):
+            # 有中文，检查是否重复模式：去重后字符太少 → 反复重复几个字
+            unique_chars = set(no_punct)
+            if len(unique_chars) <= 2 and len(no_punct) >= 4:
+                return True
+        return False
 
     def get(self, request, *args, **kwargs):
         days = int(request.query_params.get('days', 7))
@@ -719,22 +759,36 @@ class HotQuestionsView(APIView):
 
         since = timezone.now() - timezone.timedelta(days=days)
 
-        from django.db.models import Count
+        from django.db.models import Count, Q
+
+        # 构建排除条件：内容包含任一排除关键词
+        exclude_q = Q()
+        for keyword in self.EXCLUDE_KEYWORDS:
+            exclude_q |= Q(content__icontains=keyword)
+
+        # 构建长度过滤条件：太短的文本（纯表情、单个词）视为无意义
+        from django.db.models.functions import Length
 
         questions_qs = (
             ChatMessage.objects
             .filter(role='user', created_at__gte=since)
+            .annotate(content_len=Length('content'))
+            .filter(content_len__gte=self.MIN_CONTENT_LENGTH)
+            .exclude(exclude_q)
             .values('content')
             .annotate(count=Count('id'))
-            .order_by('-count')[:top_k]
+            .order_by('-count')[:top_k * 2]  # 多取一些，留给 Python 层二次过滤
         )
 
-        results = [
-            {
+        results = []
+        for item in questions_qs:
+            if len(results) >= top_k:
+                break
+            if self._is_noise(item['content']):
+                continue
+            results.append({
                 'question': item['content'],
                 'count': item['count'],
-            }
-            for item in questions_qs
-        ]
+            })
 
         return Response(results)

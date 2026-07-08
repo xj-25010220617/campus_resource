@@ -16,6 +16,8 @@ lxml>=5.0.0
 # - 本地开发装了 venv 后必须装；未装会在加载 apps.faq.utils 时 ModuleNotFoundError
 # - 若不需要 FAQ 自动生成，可以省略；接口调用时会因 import 失败 500
 numpy>=1.26.0
+# 本地向量数据库（开发环境 Milvus 降级方案）
+chromadb>=1.5.0
 # 异步任务（可选）
 # - 生产/定时任务场景需要 celery + redis 作为 broker
 # - 本地开发不安装也能跑，utils.shared_task_compat 会自动降级为同步执行

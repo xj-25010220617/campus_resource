@@ -1,0 +1,27 @@
+name: Deploy Backend to Server
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to server via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          port: ${{ secrets.SSH_PORT }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            cd C:/wwwroot/campus_resource
+            git pull origin main
+            cd backend
+            call venv\Scripts\activate.bat
+            pip install -r requirements.txt
+            python manage.py migrate
+            taskkill /F /FI "WINDOWTITLE eq django-backend" 2>nul
+            start "django-backend" venv\Scripts\python.exe manage.py runserver 0.0.0.0:3000

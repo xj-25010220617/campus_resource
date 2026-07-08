@@ -64,7 +64,11 @@ class LLMClient:
             对应的向量列表
         """
         if not self.api_key:
+            logger.warning('API Key 未配置，使用 Mock Embedding')
             return self._mock_embed(texts)
+
+        # HTTP 4xx 为非可重试错误（除 429 限流外），直接降级
+        NON_RETRYABLE_STATUSES = {400, 401, 403, 404, 405, 406, 415}
 
         last_error = None
         for attempt in range(MAX_RETRIES):
@@ -79,6 +83,24 @@ class LLMClient:
                     },
                     timeout=10,
                 )
+
+                # 永久性错误（4xx 除 429 外）不重试
+                if resp.status_code in NON_RETRYABLE_STATUSES:
+                    try:
+                        body = resp.text[:200]
+                    except Exception:
+                        body = '(unable to read body)'
+                    logger.error(
+                        'Embedding API 返回永久性错误 status=%d body=%s '
+                        '— 降级为 Mock Embedding。'
+                        '请检查: ① API Key 是否有 embedding 模型权限 '
+                        '② 端点 %s/v1/embeddings 是否正确 '
+                        '③ 模型名 %s 是否存在',
+                        resp.status_code, body,
+                        self.base_url, LLM_EMBED_MODEL,
+                    )
+                    return self._mock_embed(texts)
+
                 resp.raise_for_status()
                 data = resp.json()
                 return [item['embedding'] for item in data['data']]
@@ -87,12 +109,19 @@ class LLMClient:
                 logger.warning(f'Embedding 超时 (attempt {attempt+1}/{MAX_RETRIES})')
             except requests.RequestException as e:
                 last_error = e
-                logger.warning(f'Embedding 请求失败 (attempt {attempt+1}/{MAX_RETRIES}): {e}')
+                status_hint = ''
+                if hasattr(e, 'response') and e.response is not None:
+                    status_hint = f' status={e.response.status_code}'
+                logger.warning(
+                    'Embedding 请求失败%s (attempt %d/%d): %s',
+                    status_hint, attempt + 1, MAX_RETRIES, e,
+                )
 
             if attempt < MAX_RETRIES - 1:
                 _retry_sleep(attempt + 1)
 
-        logger.error(f'Embedding 最终失败: {last_error}')
+        logger.error(f'Embedding 最终失败（已重试 {MAX_RETRIES} 次）: {last_error}')
+        logger.warning('Embedding 降级为 Mock 向量—RAG 检索准确度将受影响，请尽快修复 Embedding API 配置')
         return self._mock_embed(texts)  # 降级为 Mock
 
     def embed_one(self, text: str) -> List[float]:
