@@ -105,7 +105,6 @@ def _convert_to_wav(src_path: str) -> str:
         logger.info(f'pydub 转换完成: duration={duration:.1f}s, channels=1, rate=16000')
     except ImportError:
         logger.info('pydub 未安装，回退到 librosa')
-        # 2) 回退到 librosa（不支持 webm/ogg）
         import librosa
         import soundfile
 
@@ -113,16 +112,13 @@ def _convert_to_wav(src_path: str) -> str:
         duration = len(audio) / 16000
         logger.info(f'librosa 音频信息: sr={sr}, duration={duration:.1f}s, samples={len(audio)}')
         soundfile.write(tmp_path, audio, 16000, format='WAV')
-    except FileNotFoundError as e:
-        # pydub 依赖 ffmpeg，FileNotFoundError 说明系统未安装 ffmpeg，librosa 也无法处理 webm/ogg
-        logger.error(f'ffmpeg 未安装，pydub/librosa 均无法处理此格式: {e}')
-        raise RuntimeError(
-            f'音频转码失败：系统中未找到 ffmpeg。'
-            f'请执行 sudo apt install ffmpeg (Linux) 或下载 ffmpeg.exe 并添加到 PATH (Windows)。'
-            f'原始错误: {e}'
-        ) from e
     except Exception as e:
-        logger.warning(f'pydub 转换失败 ({type(e).__name__}: {e})，尝试回退到 librosa')
+        # pydub 失败（含 ffmpeg 缺失导致的 FileNotFoundError），尝试回退到 librosa
+        is_ffmpeg_missing = isinstance(e, FileNotFoundError)
+        logger.warning(
+            f'pydub 转换失败 ({type(e).__name__}: {e})，尝试回退到 librosa'
+            + ('（ffmpeg 未安装）' if is_ffmpeg_missing else '')
+        )
         try:
             import librosa
             import soundfile
@@ -132,8 +128,17 @@ def _convert_to_wav(src_path: str) -> str:
             logger.info(f'librosa 音频信息: sr={sr}, duration={duration:.1f}s')
             soundfile.write(tmp_path, audio, 16000, format='WAV')
         except Exception as e2:
-            logger.error(f'librosa 回退也失败: {type(e2).__name__}: {e2}')
-            raise
+            # pydub 和 librosa 都失败了
+            if is_ffmpeg_missing:
+                logger.error(f'librosa 回退也失败（很可能也因缺 ffmpeg）: {type(e2).__name__}: {e2}')
+                raise RuntimeError(
+                    f'音频转码失败：系统中未找到 ffmpeg。'
+                    f'请执行 sudo apt install ffmpeg (Linux) 或下载 ffmpeg.exe 并添加到 PATH (Windows)。'
+                    f'原始错误: {e}'
+                ) from e
+            else:
+                logger.error(f'librosa 回退也失败: {type(e2).__name__}: {e2}')
+                raise
 
     # 校验转换结果
     wav_size = os.path.getsize(tmp_path)
