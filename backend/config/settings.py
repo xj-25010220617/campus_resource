@@ -146,15 +146,6 @@ SIMPLE_JWT = {
     'AUTH_HEADER_TYPES': ('Bearer',),
 }
 
-# 缓存 — 文件缓存，跨进程共享，无需 Redis
-CACHES = {
-    'default': {
-        'BACKEND': 'django.core.cache.backends.filebased.FileBasedCache',
-        'LOCATION': BASE_DIR / 'cache',
-        'TIMEOUT': 120,
-    }
-}
-
 # DRF Spectacular (API docs)
 SPECTACULAR_SETTINGS = {
     'TITLE': '校园虚拟资源管理系统 API',

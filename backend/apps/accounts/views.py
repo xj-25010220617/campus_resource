@@ -25,32 +25,41 @@ User = get_user_model()
 # 手机扫码成功后 token 存到手机 localStorage，电脑端拿不到。
 # 所以后端在 state 下暂存 token，电脑每秒轮询 /api/auth/dingtalk/status/ 取回。
 # ------------------------------------------------------------------
-from django.core.cache import cache
+import time as _time
+from threading import Lock as _Lock
 
-DINGTALK_STATE_TTL = 120  # state 有效期 2 分钟
+_dingtalk_states: dict = {}     # {state: {access, refresh, user, expires_at}}
+_dingtalk_states_lock = _Lock()
+_DINGTALK_STATE_TTL = 120        # state 有效期 2 分钟
 
 
 def _save_dingtalk_state(state: str, access: str, refresh: str, user: dict):
     """扫码成功后暂存 token，供电脑端轮询获取"""
-    cache.set(f'dd_state_{state}', {
-        'access': access,
-        'refresh': refresh,
-        'user': user,
-    }, timeout=DINGTALK_STATE_TTL)
+    with _dingtalk_states_lock:
+        now = _time.time()
+        _dingtalk_states[state] = {
+            'access': access,
+            'refresh': refresh,
+            'user': user,
+            'expires_at': now + _DINGTALK_STATE_TTL,
+        }
+        # 顺带清理过期 state
+        expired = [k for k, v in _dingtalk_states.items() if v['expires_at'] < now]
+        for k in expired:
+            del _dingtalk_states[k]
 
 
 def _pop_dingtalk_state(state: str) -> dict:
     """轮询登录状态 — 取一次就删，防止重复用"""
-    key = f'dd_state_{state}'
-    data = cache.get(key)
-    if data:
-        cache.delete(key)
-        return {
-            'status': 'completed',
-            'access': data['access'],
-            'refresh': data['refresh'],
-            'user': data['user'],
-        }
+    with _dingtalk_states_lock:
+        data = _dingtalk_states.pop(state, None)
+        if data and data['expires_at'] > _time.time():
+            return {
+                'status': 'completed',
+                'access': data['access'],
+                'refresh': data['refresh'],
+                'user': data['user'],
+            }
     return {'status': 'pending'}
 
 
