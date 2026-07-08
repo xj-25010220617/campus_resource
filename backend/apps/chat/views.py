@@ -333,16 +333,16 @@ class AskView(APIView):
                 status=status.HTTP_401_UNAUTHORIZED,
             )
 
-        # 1. 获取或新建会话（匿名用户不支持访问已有会话）
+        # 1. 获取或新建会话（匿名用户只能查自己刚创建 user=null 的对话）
         if conversation_id:
             if not user:
-                return Response(
-                    {'detail': '请先登录以使用会话功能', 'code': ErrorCode.UNAUTHORIZED.value},
-                    status=status.HTTP_401_UNAUTHORIZED,
+                conversation = get_object_or_404(
+                    Conversation, id=conversation_id, user__isnull=True,
                 )
-            conversation = get_object_or_404(
-                Conversation, id=conversation_id, user=user,
-            )
+            else:
+                conversation = get_object_or_404(
+                    Conversation, id=conversation_id, user=user,
+                )
         else:
             conversation = Conversation.objects.create(
                 user=user, title=question[:50],
@@ -711,7 +711,7 @@ class HotQuestionsView(APIView):
     实时统计近期用户高频提问，按提问次数降序排列。
     适合展示在智能问答主界面。
     """
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.AllowAny]
 
     def get(self, request, *args, **kwargs):
         days = int(request.query_params.get('days', 7))
