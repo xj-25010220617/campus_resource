@@ -15,14 +15,22 @@ logger = logging.getLogger(__name__)
 
 
 def count_user_docs(user) -> dict:
-    """统计当前用户上传的文档数。
+    """统计文档数（超管看全部，管理员看自己的+本学院，普通用户仅看自己的）。
 
     Returns:
         {"total": int, "by_status": {"indexed": int, "uploaded": int, ...}}
     """
     from apps.knowledge.models import KnowledgeDoc
 
-    qs = KnowledgeDoc.objects.filter(uploader=user)
+    user_role = getattr(user, 'role', None) if user else None
+    if user_role == 'super_admin':
+        qs = KnowledgeDoc.objects.all()
+    elif user_role == 'admin':
+        qs = KnowledgeDoc.objects.filter(
+            Q(uploader=user) | Q(college_id=user.college_id)
+        )
+    else:
+        qs = KnowledgeDoc.objects.filter(uploader=user)
 
     total = qs.count()
     by_status = dict(qs.values_list("status").annotate(count=Count("id")))
@@ -55,7 +63,16 @@ def list_user_recent_docs(
     """
     from apps.knowledge.models import KnowledgeDoc
 
-    qs = KnowledgeDoc.objects.filter(uploader=user)
+    # 权限范围：超管看全部，管理员看自己的+本学院，普通用户仅看自己的
+    user_role = getattr(user, 'role', None) if user else None
+    if user_role == 'super_admin':
+        qs = KnowledgeDoc.objects.all()
+    elif user_role == 'admin':
+        qs = KnowledgeDoc.objects.filter(
+            Q(uploader=user) | Q(college_id=user.college_id)
+        )
+    else:
+        qs = KnowledgeDoc.objects.filter(uploader=user)
 
     if days:
         since = timezone.now() - timedelta(days=days)
@@ -171,7 +188,16 @@ def find_user_docs(
     """
     from apps.knowledge.models import KnowledgeDoc
 
-    qs = KnowledgeDoc.objects.filter(uploader=user)
+    # 权限范围：超管看全部，管理员看自己的+本学院的，普通用户仅看自己的
+    user_role = getattr(user, 'role', None) if user else None
+    if user_role == 'super_admin':
+        qs = KnowledgeDoc.objects.all()
+    elif user_role == 'admin':
+        qs = KnowledgeDoc.objects.filter(
+            Q(uploader=user) | Q(college_id=user.college_id)
+        )
+    else:
+        qs = KnowledgeDoc.objects.filter(uploader=user)
 
     if keywords:
         kw_query = Q()

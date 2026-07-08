@@ -651,6 +651,81 @@ def _enrich_with_doc_meta(hits: List[dict], min_score: float) -> List[dict]:
 
 
 # ------------------------------------------------------------------
+# 兜底：按标题/描述关键词搜索（向量检索无结果时降级）
+# ------------------------------------------------------------------
+def _fallback_title_search(
+    question: str,
+    user_context: dict,
+    top_k: int = 5,
+) -> List[dict]:
+    """当向量检索无结果时，从 KnowledgeDoc 标题/描述中按关键词匹配。
+
+    Returns:
+        [{'doc_id': int, 'doc_title': str, 'content': str, 'score': float, 'page': int}, ...]
+    """
+    import re
+    from django.db.models import Q
+    from apps.knowledge.models import KnowledgeDoc, DocChunk
+
+    # 提取关键词：去疑问词，取有意义的词
+    stop_words = {"什么", "怎么", "如何", "为什么", "吗", "呢", "吧", "嘛",
+                  "哪个", "哪些", "谁", "何时", "哪里", "是否", "有", "没有",
+                  "的", "了", "我", "你", "他", "她", "它", "们", "这个", "那个"}
+    words = re.findall(r'[一-鿿\w]+', question)
+    keywords = []
+    for w in words:
+        w = w.lower()
+        if w in stop_words or len(w) < 2:
+            continue
+        # 拆解混合词：如 "MySQL第二版" → "MySQL" + "第二版"
+        parts = re.findall(r'[a-z]+|[一-鿿]+', w)
+        for p in parts:
+            if len(p) >= 2 and p not in stop_words and p not in keywords:
+                keywords.append(p)
+    keywords = keywords[:5]
+    if not keywords:
+        return []
+
+    # 按关键词匹配标题/描述
+    kw_query = Q()
+    for kw in keywords:
+        kw_query |= Q(title__icontains=kw)
+        kw_query |= Q(description__icontains=kw)
+
+    # 权限过滤（同 retrieve 逻辑：超管全量，管理员本学院，用户自己的）
+    role = user_context.get('role', 'user')
+    college_id = user_context.get('college_id')
+    user_id = user_context.get('user_id')
+
+    if role == 'super_admin':
+        docs = KnowledgeDoc.objects.filter(kw_query)
+    elif role == 'admin' and college_id:
+        docs = KnowledgeDoc.objects.filter(
+            kw_query, Q(uploader_id=user_id) | Q(college_id=college_id)
+        )
+    elif user_id:
+        docs = KnowledgeDoc.objects.filter(kw_query, uploader_id=user_id)
+    else:
+        return []
+
+    docs = docs.filter(status='indexed').order_by('-created_at')[:top_k]
+
+    # 取每篇文档的第一个 chunk 作为内容预览
+    results = []
+    for doc in docs:
+        first_chunk = DocChunk.objects.filter(doc=doc).order_by('chunk_index').first()
+        content = first_chunk.content[:500] if first_chunk else (doc.description or doc.title)
+        results.append({
+            'doc_id': doc.id,
+            'doc_title': doc.title,
+            'content': content,
+            'score': 0.5,  # 固定中等分，低于向量检索的分数
+            'page': 0,
+        })
+    return results
+
+
+# ------------------------------------------------------------------
 # 检索主入口（升级版）
 # ------------------------------------------------------------------
 def retrieve(
@@ -683,7 +758,11 @@ def retrieve(
     candidate_ids = _apply_hard_filters(parsed_filters, user_context, top_k=500)
 
     if not candidate_ids:
-        logger.info(f'硬过滤后无候选: question={question[:50]}')
+        logger.info(f'硬过滤后无候选，尝试标题降级搜索: question={question[:50]}')
+        title_matches = _fallback_title_search(question, user_context, top_k=5)
+        if title_matches:
+            logger.info(f'标题降级搜索命中 {len(title_matches)} 条')
+            return title_matches
         return []
 
     logger.debug(f'硬过滤候选数: {len(candidate_ids)}, filters={parsed_filters}')
@@ -711,4 +790,13 @@ def retrieve(
     enriched = _enrich_with_doc_meta(merged, min_score)
 
     # 5. 权限校验
-    return _filter_by_permission(enriched, user_context)
+    results = _filter_by_permission(enriched, user_context)
+
+    # 6. 兜底：向量检索无结果时，按标题/描述关键词搜索
+    if not results:
+        title_matches = _fallback_title_search(question, user_context, top_k=5)
+        if title_matches:
+            logger.info(f'向量检索无结果，标题降级搜索命中 {len(title_matches)} 条')
+            return title_matches
+
+    return results

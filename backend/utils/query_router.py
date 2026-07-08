@@ -125,21 +125,26 @@ def _extract_keywords(question: str) -> list:
     return keywords[:5]
 
 
-def route_question(question: str, user=None) -> dict:
-    """判断问题意图并返回路由信息。
 
-    Args:
-        question: 用户问题
-        user: 用户对象（可选，用于权限判断）
+def _is_topic_search(question: str) -> bool:
+    """判断是否为纯关键词搜索（非完整问句）。
 
-    Returns:
-        {
-            "type": "data_query" | "rag" | "general",
-            "query_type": str,          # data_query 的子类型
-            "params": dict,             # 查询参数
-            "confidence": float,        # 置信度 0-1
-        }
+    特征：
+    - 无中文疑问词（什么/怎么/如何/吗/呢/为什么）
+    - 长度较短（<= 15 字）且为名词性短语
+    - 纯英文关键词
     """
+    q_words = ["什么", "怎么", "如何", "为什么", "吗", "呢", "吧", "嘛", "哪",
+               "谁", "何时", "何处", "是否", "能不能", "会不会", "有没有"]
+    for w in q_words:
+        if w in question:
+            return False
+    # 纯关键词特征：短（<= 15 字）且不是完整问句
+    return len(question) <= 20 and not question.endswith("？") and not question.endswith("?")
+
+
+def route_question(question: str, user=None) -> dict:
+    """判断问题意图并返回路由信息。"""
     if not question:
         return {"type": "general", "query_type": "", "params": {}, "confidence": 0.0}
 
@@ -183,6 +188,22 @@ def route_question(question: str, user=None) -> dict:
                 "query_type": query_type,
                 "params": params,
                 "confidence": 0.9,
+            }
+
+    # 兜底：纯关键词搜索（如 "mysql"、"奖学金"）→ 走 find_docs
+    if _is_topic_search(question):
+        user_role = getattr(user, 'role', None) if user else None
+        # 管理员才走 find_docs（普通用户无上传权限，搜不到结果）
+        if user_role in ('super_admin', 'admin'):
+            keywords = _extract_keywords(question)
+            if not keywords:
+                # 纯英文关键词（如 "mysql"）不会被中文停用词过滤掉
+                keywords = [question]
+            return {
+                "type": "data_query",
+                "query_type": "find_docs",
+                "params": {"keywords": keywords},
+                "confidence": 0.6,
             }
 
     # 没有匹配到文件管理查询，走 RAG
