@@ -39,12 +39,19 @@ class KnowledgeDocListSerializer(serializers.ModelSerializer):
     college_name = serializers.CharField(source='college.name', read_only=True)
     discipline_name = serializers.CharField(source='discipline.name', read_only=True)
     uploader_name = serializers.CharField(source='uploader.username', read_only=True)
+    uploader_college_name = serializers.CharField(
+        source='uploader.college.name', read_only=True, default='',
+    )
+    uploader_department_name = serializers.CharField(
+        source='uploader.department.name', read_only=True, default='',
+    )
 
     class Meta:
         model = KnowledgeDoc
         fields = [
             'id', 'title', 'file_type', 'file_size', 'status',
             'college_name', 'discipline_name', 'uploader_name',
+            'uploader_college_name', 'uploader_department_name',
             'chunk_count', 'created_at',
         ]
 

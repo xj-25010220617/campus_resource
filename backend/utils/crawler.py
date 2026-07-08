@@ -332,33 +332,38 @@ class NeusoftSpider:
         logger.info(f"开始全站爬取: max_pages={max_pages}")
         all_results = []
 
-        # 1. 爬首页
-        home_data = self.crawl_page(self.base_url)
-        if home_data:
-            all_results.append(home_data)
-
-        # 2. 找到首页中的重要栏目链接
+        # 1. 获取首页 HTML（一次性：用于内容提取 + 栏目链接提取）
         html = self._fetch(self.base_url)
-        if html:
-            links = self._extract_links(html, self.base_url)
-            section_urls = set()
-            for link in links:
-                if _is_important_section(link):
-                    section_urls.add(link)
+        if not html:
+            logger.warning("无法获取首页 HTML，终止爬取")
+            return []
 
-            logger.info(f"发现 {len(section_urls)} 个重要栏目")
+        # 解析首页内容
+        extracted = extract_text_from_html(html, self.base_url)
+        if extracted["content"] and len(extracted["content"]) >= 50:
+            extracted["url"] = self.base_url
+            all_results.append(extracted)
 
-            # 3. 爬取每个栏目
+        # 2. 从首页 HTML 中提取重要栏目链接
+        links = self._extract_links(html, self.base_url)
+        section_urls = set()
+        for link in links:
+            if _is_important_section(link):
+                section_urls.add(link)
+
+        logger.info(f"发现 {len(section_urls)} 个重要栏目")
+
+        # 3. 爬取每个栏目
+        remaining = max_pages - len(all_results)
+        for section_url in sorted(section_urls):
+            if remaining <= 0:
+                break
+            section_results = self.crawl_section(
+                section_url,
+                max_pages=min(20, remaining),
+            )
+            all_results.extend(section_results)
             remaining = max_pages - len(all_results)
-            for section_url in sorted(section_urls):
-                if remaining <= 0:
-                    break
-                section_results = self.crawl_section(
-                    section_url,
-                    max_pages=min(20, remaining),
-                )
-                all_results.extend(section_results)
-                remaining = max_pages - len(all_results)
 
         logger.info(f"全站爬取完成: 共 {len(all_results)} 页")
         return all_results
@@ -427,9 +432,6 @@ def save_page_as_knowledge_doc(
             logger.error("无法找到上传者用户")
             return None
 
-    # 自动匹配分类
-    category_id = _get_category_id_for_url(url)
-
     # 如果未指定 discipline_id，尝试从上传者所在学院推断第一个学科方向
     if discipline_id is None and college_id:
         from apps.classify.models import Discipline
@@ -476,13 +478,13 @@ def save_page_as_knowledge_doc(
         uploader=uploader,
         college_id=college_id,
         discipline_id=discipline_id,
-        category_id=category_id,
+        # category_id 不传（category 表已移除）
         status="uploaded",
     )
 
     logger.info(
         f"已创建 KnowledgeDoc: id={doc.id}, title={title[:40]}, "
-        f"category_id={category_id}, college_id={college_id}"
+        f"college_id={college_id}"
     )
 
     # 触发异步索引

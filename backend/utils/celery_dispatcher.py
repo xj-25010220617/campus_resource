@@ -37,9 +37,9 @@ def safe_delay(task, *args, **kwargs) -> Optional[Any]:
             type(e).__name__, e, getattr(task, 'name', task),
         )
         try:
-            # 降级同步执行：task.run 获取原始函数，传入 None 作为 self（兼容 bind=True）
-            if hasattr(task, 'run'):
-                return task.run(None, *args, **kwargs)
+            # 降级同步执行：直接调用 task（兼容 bind=True 和普通任务）
+            # 对 Celery 任务，task(*args) == task.run(*args) 且 bind=True 时
+            # Python 方法绑定已自动处理 self，无需额外传 None
             return task(*args, **kwargs)
         except Exception as sync_e:
             logger.error(

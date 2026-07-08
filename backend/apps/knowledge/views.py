@@ -116,6 +116,7 @@ class KnowledgeDocListView(generics.ListAPIView):
 
         queryset = KnowledgeDoc.objects.select_related(
             'college', 'discipline', 'uploader',
+            'uploader__college', 'uploader__department',
         ).all()
 
         # 可见性权限过滤
