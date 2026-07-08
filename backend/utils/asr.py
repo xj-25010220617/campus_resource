@@ -169,8 +169,13 @@ def _extract_text(result) -> str:
 
 def speech_to_text(audio_data: bytes, audio_format: str = 'wav') -> str:
     """
-    语音 → 文字转换。MP3/M4A/AAC/OGG 等格式自动转为 16kHz WAV 后识别。
+    语音 → 文字转换。
+    webm/ogg/mp4/opus 用 pydub 内存转码为 WAV；
+    mp3/m4a/aac/flac 等通过 _convert_to_wav 文件转码；
+    WAV 格式直接识别。
     """
+    import io
+
     fmt = (audio_format or 'wav').lower().lstrip('.')
     need_convert = fmt in _CONVERT_FORMATS
     ext = f'.{fmt}'
@@ -178,6 +183,27 @@ def speech_to_text(audio_data: bytes, audio_format: str = 'wav') -> str:
     wav_path = None
 
     try:
+        # 0) webm/ogg/mp4 等浏览器原生格式，用 pydub 先转为 WAV
+        if fmt in ('webm', 'ogg', 'mp4', 'opus'):
+            try:
+                from pydub import AudioSegment
+                logger.info(f'pydub 内存转码: {fmt} → WAV (size={len(audio_data)} bytes)')
+                audio = AudioSegment.from_file(io.BytesIO(audio_data), format=fmt)
+                audio = audio.set_channels(1).set_frame_rate(16000)
+                buffer = io.BytesIO()
+                audio.export(buffer, format='wav')
+                audio_data = buffer.getvalue()
+                fmt = 'wav'
+                ext = '.wav'
+                need_convert = False
+                logger.info(f'pydub 内存转码完成: {len(audio_data)} bytes')
+            except ImportError:
+                logger.error('pydub 未安装，无法处理 webm/ogg 格式。请执行: pip install pydub')
+                return ''
+            except Exception as e:
+                logger.error(f'pydub 转码失败 fmt={fmt}: {type(e).__name__}: {e}')
+                return ''
+
         # 1) 音频大小校验
         size = len(audio_data)
         if size < _MIN_AUDIO_BYTES:
