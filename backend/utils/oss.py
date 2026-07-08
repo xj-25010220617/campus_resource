@@ -46,8 +46,6 @@ class OSSClient:
         if self._bucket is None and self.auth:
             self._bucket = oss2.Bucket(
                 self.auth, self._raw_endpoint, self.bucket_name,
-                # (connect_timeout, read_timeout) — 连接用短超时快速失败，读取用长超时传输大文件
-                connect_timeout=(5, 60),
                 app_name='campus-resource',
             )
         return self._bucket
