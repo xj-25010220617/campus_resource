@@ -23,8 +23,8 @@ from apps.classify.utils.query_parser import parse as parse_query
 from .models import Conversation, ChatMessage, QueryLog, SensitiveLog
 from .serializers import (
     AskSerializer, ChatMessageSerializer, ConversationListSerializer,
-    ConversationSerializer, FeedbackSerializer, MessageRateSerializer,
-    VoiceAskSerializer,
+    ConversationRenameSerializer, ConversationSerializer,
+    FeedbackSerializer, MessageRateSerializer, VoiceAskSerializer,
 )
 
 
@@ -55,6 +55,8 @@ class ConversationViewSet(ModelViewSet):
     def get_serializer_class(self):
         if self.action == 'list':
             return ConversationListSerializer
+        if self.action == 'partial_update':
+            return ConversationRenameSerializer
         return ConversationSerializer
 
     def perform_create(self, serializer):
