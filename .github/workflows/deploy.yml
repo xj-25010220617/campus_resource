@@ -19,5 +19,8 @@ jobs:
           script: |
             cd C:/wwwroot/campus_resource
             git pull origin main
-            npm install --production
-            pm2 restart campus-backend || pm2 start app.js --name campus-backend
+            pip install -r backend/requirements.txt
+            cd backend
+            python manage.py migrate
+            taskkill /F /FI "WINDOWTITLE eq django-backend" 2>nul
+            start "django-backend" python manage.py runserver 0.0.0.0:3000
