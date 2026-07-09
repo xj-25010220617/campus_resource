@@ -12,6 +12,7 @@
 """
 import logging
 import re
+from typing import Optional
 
 from utils.shared_task_compat import shared_task
 
@@ -59,7 +60,7 @@ def extract_freshness_task(self, doc_id: int):
 def crawl_neusoft_website_task(
     self, max_pages: int = 100,
     uploader_id: int = 1,
-    college_id: int = 1,
+    college_id: Optional[int] = None,
     discipline_id: int = None,
 ):
     """
@@ -68,7 +69,7 @@ def crawl_neusoft_website_task(
     Args:
         max_pages: 本次爬取最大页数
         uploader_id: 上传者用户 ID
-        college_id: 所属学院 ID（爬取的内容归入该学院）
+        college_id: 所属学院 ID（默认 None=校级公开）
         discipline_id: 学科方向 ID（可选，默认自动推断）
     """
     from utils.crawler import crawl_and_index
@@ -154,7 +155,8 @@ def index_document_task(self, doc_id: int):
             logger.error(f'doc_id={doc_id} Embedding 失败或数量不匹配')
             raise RuntimeError('Embedding 失败')
 
-        # 4. 写入 Milvus
+        # 4. 确保向量集合存在 → 写入 Milvus
+        milvus_client.ensure_collection()
         milvus_chunks = []
         for i, c in enumerate(raw_chunks):
             milvus_chunks.append({

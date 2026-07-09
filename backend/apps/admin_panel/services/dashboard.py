@@ -57,6 +57,45 @@ def _format_dt(dt: datetime) -> str:
 
 
 # ----------------------------------------------------------------------
+# 数据范围（全量起止时间）
+# ----------------------------------------------------------------------
+def compute_data_range() -> dict:
+    """查询 5 张日志表，返回全平台最早一条和最新一条的 created_at。
+
+    用于 Dashboard 响应顶层的 start_at / end_at（固定值，不受 period 影响）。
+
+    Returns:
+        成功: {'start_at': datetime, 'end_at': datetime}
+        失败: {'error': str}
+    """
+    try:
+        from django.db.models import Min, Max
+
+        candidates = []
+
+        for model in (UploadLog, QueryLog, SensitiveLog, LoginLog, OperationLog):
+            agg = model.objects.aggregate(
+                earliest=Min('created_at'), latest=Max('created_at')
+            )
+            if agg['earliest']:
+                candidates.append(agg['earliest'])
+            if agg['latest']:
+                candidates.append(agg['latest'])
+
+        if not candidates:
+            now = timezone.now()
+            return {'start_at': now, 'end_at': now}
+
+        return {
+            'start_at': min(candidates),
+            'end_at': max(candidates),
+        }
+    except Exception as e:
+        logger.error('data_range 计算失败: %s', e)
+        return {'error': str(e)}
+
+
+# ----------------------------------------------------------------------
 # 块 1：上传日志
 # ----------------------------------------------------------------------
 def compute_upload_block(start: datetime, end: datetime) -> dict:
