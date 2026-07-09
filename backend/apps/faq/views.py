@@ -56,11 +56,13 @@ class FAQItemListView(generics.ListAPIView):
         q = models.Q(college__isnull=True)
         if user.college_id:
             q |= models.Q(college_id=user.college_id)
-        
-        qs = FAQItem.objects.filter(
-            status='published',
-        ).filter(q)
-        
+
+        qs = FAQItem.objects.filter(q)
+
+        # 按状态筛选（不传默认 published）
+        status_filter = self.request.query_params.get('status', 'published').strip()
+        qs = qs.filter(status=status_filter)
+
         # 搜索功能：支持按问题、答案、标签、分类名称模糊搜索
         search_query = self.request.query_params.get('q', '').strip()
         if search_query:
@@ -71,9 +73,19 @@ class FAQItemListView(generics.ListAPIView):
             search_q |= models.Q(tags__contains=search_query)
             # 搜索分类名称
             search_q |= models.Q(category__name__icontains=search_query)
-            
+
             qs = qs.filter(search_q)
-        
+
+        # 按分类筛选
+        category_id = self.request.query_params.get('category', '').strip()
+        if category_id:
+            qs = qs.filter(category_id=category_id)
+
+        # 按学院筛选
+        college_id = self.request.query_params.get('college_id', '').strip()
+        if college_id:
+            qs = qs.filter(college_id=college_id)
+
         return qs.order_by('-frequency', '-created_at')
 
 
@@ -199,6 +211,7 @@ class FAQManageListView(generics.ListAPIView):
     - search (str): 关键词搜索（匹配问题/答案/标签）
     - college_id (int): 按学院筛选
     - category (int): 按分类筛选
+    - status (str): 按状态筛选（draft / published / rejected）
     """
     serializer_class = FAQItemListSerializer
     permission_classes = [permissions.IsAuthenticated, IsFAQAdmin]
@@ -217,6 +230,7 @@ class FAQManageListView(generics.ListAPIView):
         search = self.request.query_params.get('search')
         college_id = self.request.query_params.get('college_id')
         category = self.request.query_params.get('category')
+        status = self.request.query_params.get('status')
 
         if search:
             from django.db.models import Q as _Q
@@ -229,6 +243,8 @@ class FAQManageListView(generics.ListAPIView):
             qs = qs.filter(college_id=college_id)
         if category:
             qs = qs.filter(category_id=category)
+        if status:
+            qs = qs.filter(status=status)
 
         return qs.order_by('-frequency', '-created_at')
 

@@ -109,7 +109,7 @@ class LLMClient:
             return []
 
         # 后端 1: DeepSeek API
-        if self.api_key and EMBED_BACKEND in ('deepseek',):
+        if self.chat_api_key and EMBED_BACKEND in ('deepseek',):
             result = self._embed_via_api(texts)
             if result:
                 return result
@@ -196,34 +196,54 @@ class LLMClient:
             return None
 
     def _embed_via_aliyun(self, texts: List[str]) -> Optional[List[List[float]]]:
-        """通过阿里云百炼（DashScope）获取向量。"""
-        import json as _json
-        try:
-            resp = ExternalClient.post(
-                'aliyun_embed',
-                'https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding',
-                headers={
-                    'Authorization': f'Bearer {ALIYUN_EMBED_API_KEY}',
-                    'Content-Type': 'application/json',
-                },
-                json={
-                    'model': ALIYUN_EMBED_MODEL,
-                    'input': {'texts': texts},
-                    'parameters': {'text_type': 'query'},
-                },
-                timeout=30,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                embeddings = [item['embedding'] for item in data['data']['embeddings']]
-                logger.info(f'阿里云 Embedding OK: {len(embeddings)}条 dim={len(embeddings[0])}')
-                return embeddings
-            else:
-                logger.error(f'阿里云 Embedding 失败 status={resp.status_code} body={resp.text[:200]}')
-                return None
-        except Exception as e:
-            logger.error(f'阿里云 Embedding 请求异常: {e}')
-            return None
+        """通过阿里云百炼（OpenAI 兼容模式）获取向量。
+        自动分批次（阿里云限制每批 ≤ 10 条）。
+
+        API 格式 (OpenAI-compatible):
+            POST {base_url}/embeddings
+            {"model": "text-embedding-v3", "input": ["text1", "text2"]}
+            → {"data": [{"embedding": [...], "index": 0}, ...]}
+        """
+        url = f'{self.embed_base_url.rstrip("/")}/embeddings'
+        BATCH_SIZE = 10
+        all_embeddings = []
+
+        for start in range(0, len(texts), BATCH_SIZE):
+            batch = texts[start:start + BATCH_SIZE]
+            for attempt in range(MAX_RETRIES):
+                try:
+                    resp = ExternalClient.post(
+                        'aliyun_embed',
+                        url,
+                        headers=self.embed_headers,
+                        json={
+                            'model': ALIYUN_EMBED_MODEL,
+                            'input': batch,
+                        },
+                        timeout=30,
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        data['data'].sort(key=lambda x: x['index'])
+                        all_embeddings.extend([item['embedding'] for item in data['data']])
+                        break  # batch done, next
+                    else:
+                        logger.warning(
+                            f'阿里云 Embedding 失败 (attempt {attempt+1}): '
+                            f'status={resp.status_code} body={resp.text[:200]}'
+                        )
+                except Exception as e:
+                    logger.warning(f'阿里云 Embedding 异常 (attempt {attempt+1}): {e}')
+
+                if attempt < MAX_RETRIES - 1:
+                    _retry_sleep(attempt + 1)
+                else:
+                    return None  # this batch failed entirely
+
+        if all_embeddings:
+            logger.info(f'阿里云 Embedding OK: {len(all_embeddings)}条 dim={len(all_embeddings[0])}')
+            return all_embeddings
+        return None
 
     def embed_one(self, text: str) -> List[float]:
         """单条文本向量化"""
