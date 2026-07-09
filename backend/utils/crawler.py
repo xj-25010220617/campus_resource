@@ -375,7 +375,7 @@ class NeusoftSpider:
 def save_page_as_knowledge_doc(
     page_data: dict,
     uploader_id: int = 1,
-    college_id: int = 1,
+    college_id: Optional[int] = None,
     discipline_id: int = None,
 ) -> Optional[int]:
     """将爬取的页面保存为 KnowledgeDoc 并触发异步索引。
@@ -501,7 +501,7 @@ def save_page_as_knowledge_doc(
 def crawl_and_index(
     max_pages: int = 50,
     uploader_id: int = 1,
-    college_id: int = 1,
+    college_id: Optional[int] = None,
     discipline_id: int = None,
 ) -> int:
     """全站爬取并自动索引到知识库。

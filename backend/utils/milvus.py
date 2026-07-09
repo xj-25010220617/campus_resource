@@ -153,7 +153,6 @@ class MilvusClient:
         client = chromadb.PersistentClient(
             path=str(getattr(settings, 'CHROMA_DB_PATH', './chroma_db'))
         )
-        collection = client.get_collection(name=self.COLLECTION_NAME)
         ids = [c['vector_id'] for c in chunks]
         metadatas = [
             {
@@ -166,6 +165,10 @@ class MilvusClient:
         ]
         # ChromaDB 存储文档文本
         documents = [c.get('chunk_text', '') for c in chunks]
+        collection = client.get_or_create_collection(
+            name=self.COLLECTION_NAME,
+            metadata={'hnsw:space': 'cosine'},
+        )
         collection.add(ids=ids, embeddings=embeddings, metadatas=metadatas, documents=documents)
         return ids
 
