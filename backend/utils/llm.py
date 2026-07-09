@@ -1,12 +1,12 @@
 """
 大模型 API 调用封装
 - DeepSeek Chat（对话生成，同步 + 异步流式）
-- DeepSeek Embedding（文本向量化）
+- Embedding（文本向量化，支持多后端：阿里云百炼 / 本地 / Mock）
 - 失败重试（指数退避）
 """
 import logging
 import time
-from typing import AsyncGenerator, Generator, List, Optional
+from typing import AsyncGenerator, Dict, Generator, List, Optional
 
 import requests
 from django.conf import settings
@@ -21,7 +21,26 @@ logger = logging.getLogger(__name__)
 LLM_API_KEY = getattr(settings, 'DEEPSEEK_API_KEY', '')
 LLM_BASE_URL = getattr(settings, 'DEEPSEEK_BASE_URL', 'https://api.deepseek.com')
 LLM_CHAT_MODEL = getattr(settings, 'DEEPSEEK_CHAT_MODEL', 'deepseek-chat')
-LLM_EMBED_MODEL = getattr(settings, 'DEEPSEEK_EMBED_MODEL', 'deepseek-embed')
+
+# ------------------------------------------------------------------
+# Embedding 后端配置
+# ------------------------------------------------------------------
+# EMBED_BACKEND 可选值：
+#   aliyun: 阿里云百炼（生产推荐，OpenAI 兼容模式）
+#   local: 本地 sentence-transformers
+#   mock:  SHA256 伪向量（无语义，仅开发调试）
+EMBED_BACKEND = getattr(settings, 'EMBED_BACKEND', 'aliyun')
+
+# 阿里云百炼 Embedding
+ALIYUN_EMBED_API_KEY = getattr(settings, 'ALIYUN_EMBED_API_KEY', '')
+ALIYUN_EMBED_MODEL = getattr(settings, 'ALIYUN_EMBED_MODEL', 'text-embedding-v3')
+ALIYUN_EMBED_BASE_URL = getattr(
+    settings, 'ALIYUN_EMBED_BASE_URL',
+    'https://dashscope.aliyuncs.com/compatible-mode/v1',
+)
+
+# 本地模型（仅 EMBED_BACKEND=local 时生效）
+LOCAL_EMBED_MODEL = getattr(settings, 'LOCAL_EMBED_MODEL', 'BAAI/bge-small-zh-v1.5')
 
 # Embedding 后端选择：'deepseek' / 'aliyun'（阿里云百炼）/ 'local'（本地 sentence-transformers）
 EMBED_BACKEND = getattr(settings, 'EMBED_BACKEND', 'deepseek')
@@ -44,18 +63,27 @@ def _retry_sleep(attempt: int):
 
 
 class LLMClient:
-    """DeepSeek API 封装"""
+    """DeepSeek API + 阿里云百炼 Embedding 封装"""
 
-    VECTOR_DIM = 1536  # text-embedding-v3 输出维度
+    VECTOR_DIM = 1024  # text-embedding-v3 维度（1024）
 
     def __init__(self):
-        self.api_key = LLM_API_KEY
-        self.base_url = LLM_BASE_URL
+        self.chat_api_key = LLM_API_KEY
+        self.chat_base_url = LLM_BASE_URL
+        self.embed_api_key = ALIYUN_EMBED_API_KEY
+        self.embed_base_url = ALIYUN_EMBED_BASE_URL
 
     @property
-    def headers(self):
+    def chat_headers(self):
         return {
-            'Authorization': f'Bearer {self.api_key}',
+            'Authorization': f'Bearer {self.chat_api_key}',
+            'Content-Type': 'application/json',
+        }
+
+    @property
+    def embed_headers(self):
+        return {
+            'Authorization': f'Bearer {self.embed_api_key}',
             'Content-Type': 'application/json',
         }
 
@@ -202,17 +230,12 @@ class LLMClient:
         results = self.embed([text])
         return results[0] if results else []
 
-    @staticmethod
-    def _mock_embed(texts: List[str]) -> List[List[float]]:
-        """
-        开发阶段无 API Key 时的 Mock。
-        生成 1536 维伪随机向量（与 text-embedding-v3 维度一致）。
-        """
+    def _mock_embed(self, texts: List[str]) -> List[List[float]]:
+        """开发阶段 Mock：生成 1024 维伪随机向量（与 text-embedding-v3 维度一致）"""
         import hashlib
         results = []
         for text in texts:
             h = hashlib.sha256(text.encode()).digest()
-            # 用文本 hash 展开到 1536 维
             vec = []
             for i in range(LLMClient.VECTOR_DIM):
                 b = h[i % len(h)]
@@ -242,7 +265,7 @@ class LLMClient:
         Returns:
             完整回复文本，失败返回 None
         """
-        if not self.api_key:
+        if not self.chat_api_key:
             return self._mock_chat(messages)
 
         last_error = None
@@ -250,8 +273,8 @@ class LLMClient:
             try:
                 resp = ExternalClient.post(
                     'deepseek_chat',
-                    f'{self.base_url}/v1/chat/completions',
-                    headers=self.headers,
+                    f'{self.chat_base_url}/v1/chat/completions',
+                    headers=self.chat_headers,
                     json={
                         'model': model or LLM_CHAT_MODEL,
                         'messages': messages,
@@ -296,7 +319,7 @@ class LLMClient:
             temperature: 生成温度（RAG 场景建议 0.3）
             max_tokens: 最大 token 数
         """
-        if not self.api_key:
+        if not self.chat_api_key:
             yield from self._mock_stream(messages)
             return
 
@@ -307,8 +330,8 @@ class LLMClient:
             try:
                 resp = ExternalClient.post(
                     'deepseek_stream',
-                    f'{self.base_url}/v1/chat/completions',
-                    headers=self.headers,
+                    f'{self.chat_base_url}/v1/chat/completions',
+                    headers=self.chat_headers,
                     json={
                         'model': model or LLM_CHAT_MODEL,
                         'messages': messages,
@@ -371,7 +394,7 @@ class LLMClient:
             temperature: 生成温度
             max_tokens: 最大 token 数
         """
-        if not self.api_key:
+        if not self.chat_api_key:
             for char in self._mock_chat(messages):
                 yield char
             return
@@ -392,8 +415,8 @@ class LLMClient:
                 async with httpx.AsyncClient(timeout=120.0) as client:
                     async with client.stream(
                         'POST',
-                        f'{self.base_url}/v1/chat/completions',
-                        headers=self.headers,
+                        f'{self.chat_base_url}/v1/chat/completions',
+                        headers=self.chat_headers,
                         json={
                             'model': model or LLM_CHAT_MODEL,
                             'messages': messages,

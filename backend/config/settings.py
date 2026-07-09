@@ -173,7 +173,7 @@ OSS_ENDPOINT = config('OSS_ENDPOINT', default='oss-cn-hangzhou.aliyuncs.com')
 OSS_BUCKET_NAME = config('OSS_BUCKET_NAME', default='')
 
 # ------------------------------------------------------------------
-# DeepSeek / LLM
+# DeepSeek / LLM（仅 Chat；Embedding 已迁移到阿里云百炼）
 # ------------------------------------------------------------------
 DEEPSEEK_API_KEY = config('DEEPSEEK_API_KEY', default='')
 DEEPSEEK_BASE_URL = config('DEEPSEEK_BASE_URL', default='https://api.deepseek.com')

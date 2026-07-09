@@ -19,7 +19,7 @@ class MilvusClient:
     """
 
     COLLECTION_NAME = 'campus_knowledge'
-    VECTOR_DIM = 1536  # text-embedding-v3 维度（与 llm.py _mock_embed 保持一致）
+    VECTOR_DIM = 1024  # text-embedding-v3 维度（与 llm.py _mock_embed 保持一致）
 
     def __init__(self):
         self._connected = False

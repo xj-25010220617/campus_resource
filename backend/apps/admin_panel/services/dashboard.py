@@ -1,8 +1,11 @@
 from typing import Optional
 """Admin Panel - Dashboard 聚合计算
 
-5 个纯函数对应 5 类日志块，每个函数：
-- 接收一个时间区间（start, end）
+6 个纯函数对应 Dashboard 响应：
+- 5 个按 period 区间计算的块（upload/query/sensitive/login/operation），每个函数接收 (start, end)
+- 1 个平台累计块 compute_totals()，不接 start/end，反映全平台截至当前的累计值
+
+所有函数：
 - 内部 try/except + logger.error，失败返回 `{'error': str}`
 - 返回 dict 结构稳定，前端可直接消费
 
@@ -12,6 +15,7 @@ from typing import Optional
 import logging
 from datetime import datetime
 
+from django.contrib.auth import get_user_model
 from django.db.models import Avg, Count, Q, Sum
 from django.db.models.functions import ExtractHour
 from django.utils import timezone
@@ -253,4 +257,33 @@ def compute_operation_block(start: datetime, end: datetime) -> dict:
         }
     except Exception as e:
         logger.error('operation block 计算失败: %s', e)
+        return {'error': str(e)}
+
+
+# ----------------------------------------------------------------------
+# 块 6：平台累计（不受 period 影响）
+# ----------------------------------------------------------------------
+def compute_totals() -> dict:
+    """平台累计统计块（Dashboard 顶层 totals 字段）。
+
+    与 blocks.* 的区别：本块不受 period 影响，反映截至当前的平台累计值。
+    - users: 全平台 User 总数（含所有角色）
+    - upload_total_size: 全平台 UploadLog.file_size 累计（字节）
+
+    Returns:
+        成功时返回 {'users': int, 'upload_total_size': int}
+        计算失败时返回 {'error': str}
+    """
+    try:
+        User = get_user_model()
+        user_count = User.objects.count()
+        total_size = (
+            UploadLog.objects.aggregate(s=Sum('file_size'))['s'] or 0
+        )
+        return {
+            'users': user_count,
+            'upload_total_size': total_size,
+        }
+    except Exception as e:
+        logger.error('totals 计算失败: %s', e)
         return {'error': str(e)}

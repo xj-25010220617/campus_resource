@@ -1,7 +1,7 @@
 # Dashboard 聚合接口
 
 > **接口归属**：`Admin Panel` 模块 — `LogsDashboardView`
-> **文档版本**：2026-07-07（无需鉴权，`AllowAny`）
+> **文档版本**：2026-07-09（新增顶层 `totals` 块：用户数 + 全平台文件总大小）
 > **适用环境**：本地开发 / 测试 / 生产（域名替换 base_url 即可）
 
 ---
@@ -23,7 +23,7 @@
 
 | 参数 | 类型 | 必填 | 默认 | 取值范围 | 说明 |
 |------|------|------|------|----------|------|
-| `period` | string | 否 | `day` | `day` / `week` / `month` | 决定 5 个统计块（upload/query/sensitive/login/operation）的时间区间 |
+| `period` | string | 否 | `day` | `day` / `week` / `month` | 决定 5 个统计块（upload/query/sensitive/login/operation）的时间区间；`totals` 块不受 period 影响 |
 
 ### period 时间区间语义（Asia/Shanghai）
 
@@ -42,6 +42,10 @@
   "period": "day",
   "start_at": "2026-07-07T00:00:00+08:00",
   "end_at":   "2026-07-07T18:00:00+08:00",
+  "totals": {
+    "users": 1234,
+    "upload_total_size": 524288000
+  },
   "blocks": {
     "upload":    { "...": "..." },
     "query":     { "...": "..." },
@@ -59,6 +63,7 @@
 | `period` | string | 回传请求中的 period |
 | `start_at` | string (ISO 8601) | 区间起点（带时区） |
 | `end_at` | string (ISO 8601) | 区间终点 = 服务端 `timezone.now()` |
+| `totals` | object | 平台累计块（不受 period 影响，详见 §4.6） |
 | `blocks` | object | 5 个统计块（详见下表） |
 
 ---
@@ -111,6 +116,15 @@
 | `by_target_type` | `[{key, label, count}]` | 按目标类型分组（user/resource/category/...） |
 | `top_operators` | `[integer]` | Top 10 操作次数列表（仅数值，无用户信息；Dashboard 为 AllowAny 故不暴露用户信息） |
 
+### 4.6 `totals`（**平台累计**，不受 period 影响）
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `users` | integer | 全平台 `User` 总数（含所有角色：super_admin / college_admin / dept_admin / user） |
+| `upload_total_size` | integer | 全平台 `UploadLog.file_size` 累计字节数（覆盖所有 period；非"今日/本周/本月"区间值） |
+
+> **与 `blocks.upload.total_size` 的区别**：`blocks.upload.total_size` 是 period 区间内的上传日志累计，受 `period` 控制；`totals.upload_total_size` 是全平台累计，永远不受 period 影响。
+
 ---
 
 ## 5. 失败响应
@@ -122,6 +136,7 @@
   "period": "day",
   "start_at": "...",
   "end_at":   "...",
+  "totals":   { "users": 1234, "upload_total_size": 524288000 },
   "blocks": {
     "upload":    { "total": 8, "...": "..." },
     "query":     { "error": "division by zero" },
@@ -132,7 +147,7 @@
 }
 ```
 
-> 前端应对每个块都做 `'error' in block` 判断，降级显示 "—" 或 "数据异常"。
+> 前端应对每个块都做 `'error' in block` 判断，降级显示 "—" 或 "数据异常"；`totals` 同样适用。
 
 ### 5.2 HTTP 错误码
 
@@ -220,6 +235,10 @@ print("上传总数:", data["blocks"]["upload"]["total"])
   "period": "day",
   "start_at": "2026-07-07T00:00:00+08:00",
   "end_at": "2026-07-07T18:00:00+08:00",
+  "totals": {
+    "users": 1234,
+    "upload_total_size": 524288000
+  },
   "blocks": {
     "upload": {
       "total": 42,
@@ -291,10 +310,16 @@ print("上传总数:", data["blocks"]["upload"]["total"])
 ```typescript
 interface GroupCount { key: string; label: string; count: number; }
 
+interface DashboardTotals {
+  users: number;
+  upload_total_size: number;
+}
+
 interface DashboardResponse {
   period: 'day' | 'week' | 'month';
   start_at: string;
   end_at: string;
+  totals: DashboardTotals | { error: string };
   blocks: {
     upload:    any;
     query:     any;
@@ -307,12 +332,17 @@ interface DashboardResponse {
 // 卡片取数对照
 const data = await fetchDashboard('day');
 
-cards[0] = { title: '上传总数', value: data.blocks.upload.total };
-cards[1] = { title: '查询总数', value: data.blocks.query.total };
-cards[2] = { title: '敏感拦截', value: data.blocks.sensitive.total };
-cards[3] = { title: '登录次数', value: data.blocks.login.total };
-cards[4] = { title: '操作次数', value: data.blocks.operation.total };
-cards[5] = { title: '存储总量', value: formatBytes(data.blocks.upload.total_size) };
+// 平台累计卡片（与 period 无关）
+cards[0] = { title: '用户总数', value: data.totals.users };
+cards[1] = { title: '存储总量', value: formatBytes(data.totals.upload_total_size) };
+
+// period 区间卡片
+cards[2] = { title: '上传总数', value: data.blocks.upload.total };
+cards[3] = { title: '查询总数', value: data.blocks.query.total };
+cards[4] = { title: '敏感拦截', value: data.blocks.sensitive.total };
+cards[5] = { title: '登录次数', value: data.blocks.login.total };
+cards[6] = { title: '操作次数', value: data.blocks.operation.total };
+cards[7] = { title: '区间上传', value: formatBytes(data.blocks.upload.total_size) };
 
 // 通用降级
 function blockOk(b: any) { return b && !('error' in b); }
@@ -343,6 +373,7 @@ function blockValue(b: any, fallback = '—') {
 |------|------|------|
 | 2026-07-07 | 1.0 | 初版（5 个统计块） |
 | 2026-07-07 | 1.1 | 移除鉴权要求，改为 `AllowAny`，所有人都可访问 |
+| 2026-07-09 | 1.2 | 新增顶层 `totals` 字段：`users`（全平台用户数） + `upload_total_size`（全平台上传文件总大小，字节）；与 `blocks.upload.total_size`（区间值）并存 |
 
 ---
 
