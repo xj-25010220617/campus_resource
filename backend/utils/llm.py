@@ -1,12 +1,12 @@
 """
 大模型 API 调用封装
 - DeepSeek Chat（对话生成，同步 + 异步流式）
-- DeepSeek Embedding（文本向量化）
+- Embedding（文本向量化，支持多后端：阿里云百炼 / 本地 / Mock）
 - 失败重试（指数退避）
 """
 import logging
 import time
-from typing import AsyncGenerator, Generator, List, Optional
+from typing import AsyncGenerator, Dict, Generator, List, Optional
 
 import requests
 from django.conf import settings
@@ -21,7 +21,26 @@ logger = logging.getLogger(__name__)
 LLM_API_KEY = getattr(settings, 'DEEPSEEK_API_KEY', '')
 LLM_BASE_URL = getattr(settings, 'DEEPSEEK_BASE_URL', 'https://api.deepseek.com')
 LLM_CHAT_MODEL = getattr(settings, 'DEEPSEEK_CHAT_MODEL', 'deepseek-chat')
-LLM_EMBED_MODEL = getattr(settings, 'DEEPSEEK_EMBED_MODEL', 'deepseek-embed')
+
+# ------------------------------------------------------------------
+# Embedding 后端配置
+# ------------------------------------------------------------------
+# EMBED_BACKEND 可选值：
+#   aliyun: 阿里云百炼（生产推荐，OpenAI 兼容模式）
+#   local: 本地 sentence-transformers
+#   mock:  SHA256 伪向量（无语义，仅开发调试）
+EMBED_BACKEND = getattr(settings, 'EMBED_BACKEND', 'aliyun')
+
+# 阿里云百炼 Embedding
+ALIYUN_EMBED_API_KEY = getattr(settings, 'ALIYUN_EMBED_API_KEY', '')
+ALIYUN_EMBED_MODEL = getattr(settings, 'ALIYUN_EMBED_MODEL', 'text-embedding-v3')
+ALIYUN_EMBED_BASE_URL = getattr(
+    settings, 'ALIYUN_EMBED_BASE_URL',
+    'https://dashscope.aliyuncs.com/compatible-mode/v1',
+)
+
+# 本地模型（仅 EMBED_BACKEND=local 时生效）
+LOCAL_EMBED_MODEL = getattr(settings, 'LOCAL_EMBED_MODEL', 'BAAI/bge-small-zh-v1.5')
 
 # 重试配置
 MAX_RETRIES = 3
@@ -35,18 +54,27 @@ def _retry_sleep(attempt: int):
 
 
 class LLMClient:
-    """DeepSeek API 封装"""
+    """DeepSeek API + 阿里云百炼 Embedding 封装"""
 
-    VECTOR_DIM = 1536  # text-embedding-v3 输出维度
+    VECTOR_DIM = 1024  # text-embedding-v3 维度（1024）
 
     def __init__(self):
-        self.api_key = LLM_API_KEY
-        self.base_url = LLM_BASE_URL
+        self.chat_api_key = LLM_API_KEY
+        self.chat_base_url = LLM_BASE_URL
+        self.embed_api_key = ALIYUN_EMBED_API_KEY
+        self.embed_base_url = ALIYUN_EMBED_BASE_URL
 
     @property
-    def headers(self):
+    def chat_headers(self):
         return {
-            'Authorization': f'Bearer {self.api_key}',
+            'Authorization': f'Bearer {self.chat_api_key}',
+            'Content-Type': 'application/json',
+        }
+
+    @property
+    def embed_headers(self):
+        return {
+            'Authorization': f'Bearer {self.embed_api_key}',
             'Content-Type': 'application/json',
         }
 
@@ -56,6 +84,7 @@ class LLMClient:
     def embed(self, texts: List[str]) -> List[List[float]]:
         """
         文本向量化（带重试）。
+        自动根据 EMBED_BACKEND 选择 aliyun / local / mock。
 
         Args:
             texts: 文本列表，每个元素一个 chunk
@@ -63,83 +92,71 @@ class LLMClient:
         Returns:
             对应的向量列表
         """
-        if not self.api_key:
-            logger.warning('API Key 未配置，使用 Mock Embedding')
+        if EMBED_BACKEND == 'mock' or not self.embed_api_key:
+            logger.warning('Embedding 使用 Mock（无 API Key 或 EMBED_BACKEND=mock）')
             return self._mock_embed(texts)
 
-        # HTTP 4xx 为非可重试错误（除 429 限流外），直接降级
-        NON_RETRYABLE_STATUSES = {400, 401, 403, 404, 405, 406, 415}
+        if EMBED_BACKEND == 'local':
+            return self._local_embed(texts)
 
+        # 阿里云百炼（默认）
+        return self._aliyun_embed(texts)
+
+    def _aliyun_embed(self, texts: List[str]) -> List[List[float]]:
+        """阿里云百炼 Embedding（OpenAI 兼容端点）"""
         last_error = None
         for attempt in range(MAX_RETRIES):
             try:
                 resp = ExternalClient.post(
                     'deepseek_embed',
-                    f'{self.base_url}/v1/embeddings',
-                    headers=self.headers,
+                    f'{self.embed_base_url}/embeddings',
+                    headers=self.embed_headers,
                     json={
-                        'model': LLM_EMBED_MODEL,
+                        'model': ALIYUN_EMBED_MODEL,
                         'input': texts,
                     },
                     timeout=10,
                 )
-
-                # 永久性错误（4xx 除 429 外）不重试
-                if resp.status_code in NON_RETRYABLE_STATUSES:
-                    try:
-                        body = resp.text[:200]
-                    except Exception:
-                        body = '(unable to read body)'
-                    logger.error(
-                        'Embedding API 返回永久性错误 status=%d body=%s '
-                        '— 降级为 Mock Embedding。'
-                        '请检查: ① API Key 是否有 embedding 模型权限 '
-                        '② 端点 %s/v1/embeddings 是否正确 '
-                        '③ 模型名 %s 是否存在',
-                        resp.status_code, body,
-                        self.base_url, LLM_EMBED_MODEL,
-                    )
-                    return self._mock_embed(texts)
-
                 resp.raise_for_status()
                 data = resp.json()
                 return [item['embedding'] for item in data['data']]
-            except requests.Timeout as e:
-                last_error = e
-                logger.warning(f'Embedding 超时 (attempt {attempt+1}/{MAX_RETRIES})')
             except requests.RequestException as e:
                 last_error = e
-                status_hint = ''
-                if hasattr(e, 'response') and e.response is not None:
-                    status_hint = f' status={e.response.status_code}'
-                logger.warning(
-                    'Embedding 请求失败%s (attempt %d/%d): %s',
-                    status_hint, attempt + 1, MAX_RETRIES, e,
-                )
+                logger.warning(f'Aliyun Embedding 失败 (attempt {attempt+1}/{MAX_RETRIES}): {e}')
+                if attempt < MAX_RETRIES - 1:
+                    _retry_sleep(attempt + 1)
+                continue
 
-            if attempt < MAX_RETRIES - 1:
-                _retry_sleep(attempt + 1)
+        logger.error(f'Aliyun Embedding 最终失败: {last_error}')
+        return self._mock_embed(texts)
 
-        logger.error(f'Embedding 最终失败（已重试 {MAX_RETRIES} 次）: {last_error}')
-        logger.warning('Embedding 降级为 Mock 向量—RAG 检索准确度将受影响，请尽快修复 Embedding API 配置')
-        return self._mock_embed(texts)  # 降级为 Mock
+    def _local_embed(self, texts: List[str]) -> List[List[float]]:
+        """本地 sentence-transformers Embedding"""
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError:
+            logger.error('sentence-transformers 未安装，回退到 Mock Embedding')
+            return self._mock_embed(texts)
+
+        try:
+            model = SentenceTransformer(LOCAL_EMBED_MODEL)
+            vectors = model.encode(texts).tolist()
+            return vectors
+        except Exception as e:
+            logger.error(f'Local Embedding 失败: {e}')
+            return self._mock_embed(texts)
 
     def embed_one(self, text: str) -> List[float]:
         """单条文本向量化"""
         results = self.embed([text])
         return results[0] if results else []
 
-    @staticmethod
-    def _mock_embed(texts: List[str]) -> List[List[float]]:
-        """
-        开发阶段无 API Key 时的 Mock。
-        生成 1536 维伪随机向量（与 text-embedding-v3 维度一致）。
-        """
+    def _mock_embed(self, texts: List[str]) -> List[List[float]]:
+        """开发阶段 Mock：生成 1024 维伪随机向量（与 text-embedding-v3 维度一致）"""
         import hashlib
         results = []
         for text in texts:
             h = hashlib.sha256(text.encode()).digest()
-            # 用文本 hash 展开到 1536 维
             vec = []
             for i in range(LLMClient.VECTOR_DIM):
                 b = h[i % len(h)]
@@ -169,7 +186,7 @@ class LLMClient:
         Returns:
             完整回复文本，失败返回 None
         """
-        if not self.api_key:
+        if not self.chat_api_key:
             return self._mock_chat(messages)
 
         last_error = None
@@ -177,8 +194,8 @@ class LLMClient:
             try:
                 resp = ExternalClient.post(
                     'deepseek_chat',
-                    f'{self.base_url}/v1/chat/completions',
-                    headers=self.headers,
+                    f'{self.chat_base_url}/v1/chat/completions',
+                    headers=self.chat_headers,
                     json={
                         'model': model or LLM_CHAT_MODEL,
                         'messages': messages,
@@ -223,7 +240,7 @@ class LLMClient:
             temperature: 生成温度（RAG 场景建议 0.3）
             max_tokens: 最大 token 数
         """
-        if not self.api_key:
+        if not self.chat_api_key:
             yield from self._mock_stream(messages)
             return
 
@@ -234,8 +251,8 @@ class LLMClient:
             try:
                 resp = ExternalClient.post(
                     'deepseek_stream',
-                    f'{self.base_url}/v1/chat/completions',
-                    headers=self.headers,
+                    f'{self.chat_base_url}/v1/chat/completions',
+                    headers=self.chat_headers,
                     json={
                         'model': model or LLM_CHAT_MODEL,
                         'messages': messages,
@@ -298,7 +315,7 @@ class LLMClient:
             temperature: 生成温度
             max_tokens: 最大 token 数
         """
-        if not self.api_key:
+        if not self.chat_api_key:
             for char in self._mock_chat(messages):
                 yield char
             return
@@ -319,8 +336,8 @@ class LLMClient:
                 async with httpx.AsyncClient(timeout=120.0) as client:
                     async with client.stream(
                         'POST',
-                        f'{self.base_url}/v1/chat/completions',
-                        headers=self.headers,
+                        f'{self.chat_base_url}/v1/chat/completions',
+                        headers=self.chat_headers,
                         json={
                             'model': model or LLM_CHAT_MODEL,
                             'messages': messages,

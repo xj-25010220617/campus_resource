@@ -173,12 +173,36 @@ OSS_ENDPOINT = config('OSS_ENDPOINT', default='oss-cn-hangzhou.aliyuncs.com')
 OSS_BUCKET_NAME = config('OSS_BUCKET_NAME', default='')
 
 # ------------------------------------------------------------------
-# DeepSeek / LLM
+# DeepSeek / LLM（仅 Chat；Embedding 已迁移到阿里云百炼）
 # ------------------------------------------------------------------
 DEEPSEEK_API_KEY = config('DEEPSEEK_API_KEY', default='')
 DEEPSEEK_BASE_URL = config('DEEPSEEK_BASE_URL', default='https://api.deepseek.com')
 DEEPSEEK_CHAT_MODEL = config('DEEPSEEK_CHAT_MODEL', default='deepseek-chat')
-DEEPSEEK_EMBED_MODEL = config('DEEPSEEK_EMBED_MODEL', default='deepseek-embed')
+DEEPSEEK_REASONER_MODEL = config('DEEPSEEK_REASONER_MODEL', default='deepseek-reasoner')
+
+# ------------------------------------------------------------------
+# Embedding 后端配置
+# ------------------------------------------------------------------
+# EMBED_BACKEND 可选值：
+#   aliyun（阿里云百炼，生产推荐，OpenAI 兼容模式，支持 text-embedding-v3 / v2 / v1）
+#   local （本地 sentence-transformers，离线可用，首次运行会下载模型）
+#   mock  （SHA256 伪向量，无语义，仅用于本地调试 UI 流程）
+EMBED_BACKEND = config('EMBED_BACKEND', default='aliyun')
+EMBED_VECTOR_DIM = config('ALIYUN_EMBED_DIM', default=1024, cast=int)
+
+# 阿里云百炼（DashScope）Embedding 配置
+ALIYUN_EMBED_BASE_URL = config(
+    'ALIYUN_EMBED_BASE_URL',
+    default='https://dashscope.aliyuncs.com/compatible-mode/v1',
+)
+ALIYUN_EMBED_API_KEY = config('ALIYUN_EMBED_API_KEY', default='')
+ALIYUN_EMBED_MODEL = config('ALIYUN_EMBED_MODEL', default='text-embedding-v3')
+
+# 本地模型（仅 EMBED_BACKEND=local 时生效）
+LOCAL_EMBED_MODEL = config(
+    'LOCAL_EMBED_MODEL',
+    default='sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2',
+)
 
 # ------------------------------------------------------------------
 # Milvus / ChromaDB

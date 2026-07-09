@@ -898,11 +898,25 @@ class LogsDashboardView(APIView):
     """超管日志仪表盘聚合接口
 
     GET /api/admin/logs/dashboard/?period=day|week|month
-    - period 缺省 day
+    功能：聚合 5 类日志（upload/query/sensitive/login/operation）+ 1 个平台累计块
+         （totals = 全平台用户数 + 全平台上传文件总大小），单次请求拿全所有顶部卡片数据。
+    参数：
+        - period (str, optional, default='day'): day / week / month
+          决定 5 个统计块的时间区间；totals 不受 period 影响。
+    返回：
+        {
+            "period": str,
+            "start_at": ISO 8601,
+            "end_at":   ISO 8601,
+            "totals":   {"users": int, "upload_total_size": int} 或 {"error": str},
+            "blocks":   {upload, query, sensitive, login, operation} 各块
+        }
+    实现细节：
     - 时间区间基于 Asia/Shanghai（settings.TIME_ZONE）
-    - 5 个块各自 try/except 隔离失败（块计算放 services/dashboard.py）
+    - 6 个块各自 try/except 隔离失败（块计算放 services/dashboard.py）
     - view 不接 try/except（遵循规范 §9）
-    - Dashboard 中 operation.top_operators 返回完整用户信息（super_admin 专属 stats 接口不含敏感数据，Dashboard 为 AllowAny 但已脱敏 key/label 为 username 而非 token/id）
+    - totals 与 blocks 平级，与 period 无关
+    - Dashboard 为 AllowAny，totals 仅返回数值，不暴露用户敏感信息
     """
     permission_classes = [permissions.AllowAny]
 
@@ -917,10 +931,12 @@ class LogsDashboardView(APIView):
             'login': dashboard_svc.compute_login_block(start, end),
             'operation': dashboard_svc.compute_operation_block(start, end),
         }
+        totals = dashboard_svc.compute_totals()
 
         return Response({
             'period': period,
             'start_at': start.isoformat(),
             'end_at': end.isoformat(),
+            'totals': totals,
             'blocks': blocks,
         })
