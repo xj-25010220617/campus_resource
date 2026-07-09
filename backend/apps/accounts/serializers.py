@@ -26,6 +26,19 @@ class UserSerializer(serializers.ModelSerializer):
             'date_joined',
         ]
 
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        role = instance.role
+        # 按角色只保留对应的归属字段，避免暴露矛盾数据
+        if role == 'dept_admin':
+            ret.pop('college', None)
+            ret.pop('college_name', None)
+        elif role in ('college_admin', 'user'):
+            ret.pop('department', None)
+            ret.pop('department_name', None)
+        # super_admin / admin 保留全部字段
+        return ret
+
 
 class ChangePasswordSerializer(serializers.Serializer):
     """修改密码序列化器"""

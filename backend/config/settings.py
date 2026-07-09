@@ -179,6 +179,11 @@ DEEPSEEK_API_KEY = config('DEEPSEEK_API_KEY', default='')
 DEEPSEEK_BASE_URL = config('DEEPSEEK_BASE_URL', default='https://api.deepseek.com')
 DEEPSEEK_CHAT_MODEL = config('DEEPSEEK_CHAT_MODEL', default='deepseek-chat')
 DEEPSEEK_EMBED_MODEL = config('DEEPSEEK_EMBED_MODEL', default='deepseek-embed')
+# Embedding 后端切换（deepseek / aliyun / local）
+EMBED_BACKEND = config('EMBED_BACKEND', default='deepseek')
+ALIYUN_EMBED_API_KEY = config('ALIYUN_EMBED_API_KEY', default='')
+ALIYUN_EMBED_MODEL = config('ALIYUN_EMBED_MODEL', default='text-embedding-v2')
+LOCAL_EMBED_MODEL = config('LOCAL_EMBED_MODEL', default='paraphrase-multilingual-MiniLM-L12-v2')
 
 # ------------------------------------------------------------------
 # Milvus / ChromaDB

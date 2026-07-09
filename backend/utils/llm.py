@@ -23,6 +23,15 @@ LLM_BASE_URL = getattr(settings, 'DEEPSEEK_BASE_URL', 'https://api.deepseek.com'
 LLM_CHAT_MODEL = getattr(settings, 'DEEPSEEK_CHAT_MODEL', 'deepseek-chat')
 LLM_EMBED_MODEL = getattr(settings, 'DEEPSEEK_EMBED_MODEL', 'deepseek-embed')
 
+# Embedding 后端选择：'deepseek' / 'aliyun'（阿里云百炼）/ 'local'（本地 sentence-transformers）
+EMBED_BACKEND = getattr(settings, 'EMBED_BACKEND', 'deepseek')
+LOCAL_EMBED_MODEL = getattr(settings, 'LOCAL_EMBED_MODEL', 'paraphrase-multilingual-MiniLM-L12-v2')
+ALIYUN_EMBED_API_KEY = getattr(settings, 'ALIYUN_EMBED_API_KEY', '')  # 复用 OSS 的 AccessKey
+ALIYUN_EMBED_MODEL = getattr(settings, 'ALIYUN_EMBED_MODEL', 'text-embedding-v2')
+
+# 备选 Embedding 模型名（当前模型 404 时自动尝试）
+FALLBACK_EMBED_MODELS = ['deepseek-embed', 'deepseek-embedding', 'deepseek-embedding-v1']
+
 # 重试配置
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 2  # 指数退避基数（秒）
@@ -55,7 +64,12 @@ class LLMClient:
     # ------------------------------------------------------------------
     def embed(self, texts: List[str]) -> List[List[float]]:
         """
-        文本向量化（带重试）。
+        文本向量化（多后端自动降级）。
+
+        优先顺序：
+        1. DeepSeek API（配置的模型名，404 时尝试备选模型名）
+        2. 本地 sentence-transformers（如果已安装且配置使用）
+        3. Mock Embedding（hash 向量）
 
         Args:
             texts: 文本列表，每个元素一个 chunk
@@ -63,66 +77,125 @@ class LLMClient:
         Returns:
             对应的向量列表
         """
-        if not self.api_key:
-            logger.warning('API Key 未配置，使用 Mock Embedding')
-            return self._mock_embed(texts)
+        if not texts:
+            return []
 
-        # HTTP 4xx 为非可重试错误（除 429 限流外），直接降级
+        # 后端 1: DeepSeek API
+        if self.api_key and EMBED_BACKEND in ('deepseek',):
+            result = self._embed_via_api(texts)
+            if result:
+                return result
+
+        # 后端 2: 阿里云百炼（已配置 API Key 时自动启用）
+        if EMBED_BACKEND == 'aliyun' and ALIYUN_EMBED_API_KEY:
+            result = self._embed_via_aliyun(texts)
+            if result:
+                return result
+
+        # 后端 3: 本地 sentence-transformers
+        if EMBED_BACKEND == 'local':
+            result = self._embed_via_local(texts)
+            if result:
+                return result
+
+        # 后端 4: 始终可用的 Mock 降级
+        logger.warning('所有 Embedding 后端不可用，降级为 Mock 向量')
+        return self._mock_embed(texts)
+
+    def _embed_via_api(self, texts: List[str]) -> Optional[List[List[float]]]:
+        """通过 DeepSeek API 获取向量，404 时自动尝试备选模型名。"""
+        model_names = [LLM_EMBED_MODEL]
+        if LLM_EMBED_MODEL not in FALLBACK_EMBED_MODELS:
+            model_names += FALLBACK_EMBED_MODELS
+
         NON_RETRYABLE_STATUSES = {400, 401, 403, 404, 405, 406, 415}
 
-        last_error = None
-        for attempt in range(MAX_RETRIES):
-            try:
-                resp = ExternalClient.post(
-                    'deepseek_embed',
-                    f'{self.base_url}/v1/embeddings',
-                    headers=self.headers,
-                    json={
-                        'model': LLM_EMBED_MODEL,
-                        'input': texts,
-                    },
-                    timeout=10,
-                )
-
-                # 永久性错误（4xx 除 429 外）不重试
-                if resp.status_code in NON_RETRYABLE_STATUSES:
-                    try:
-                        body = resp.text[:200]
-                    except Exception:
-                        body = '(unable to read body)'
-                    logger.error(
-                        'Embedding API 返回永久性错误 status=%d body=%s '
-                        '— 降级为 Mock Embedding。'
-                        '请检查: ① API Key 是否有 embedding 模型权限 '
-                        '② 端点 %s/v1/embeddings 是否正确 '
-                        '③ 模型名 %s 是否存在',
-                        resp.status_code, body,
-                        self.base_url, LLM_EMBED_MODEL,
+        for model in model_names:
+            for attempt in range(MAX_RETRIES):
+                try:
+                    resp = ExternalClient.post(
+                        'deepseek_embed',
+                        f'{self.base_url}/v1/embeddings',
+                        headers=self.headers,
+                        json={
+                            'model': model,
+                            'input': texts,
+                        },
+                        timeout=10,
                     )
-                    return self._mock_embed(texts)
 
-                resp.raise_for_status()
+                    if resp.status_code in NON_RETRYABLE_STATUSES:
+                        if resp.status_code == 404:
+                            logger.warning(
+                                f'Embedding 模型 "{model}" 不可用 (404)，尝试下一个...'
+                            )
+                            break  # 跳过此模型的全部重试
+                        logger.error(
+                            f'Embedding 永久错误 status={resp.status_code} '
+                            f'body={resp.text[:200]}'
+                        )
+                        return None
+
+                    resp.raise_for_status()
+                    data = resp.json()
+                    results = [item['embedding'] for item in data['data']]
+                    logger.info(f'Embedding API OK: model={model} {len(results)}条')
+                    return results
+
+                except requests.Timeout as e:
+                    logger.warning(f'Embedding 超时 model={model} ({attempt+1}/{MAX_RETRIES})')
+                except requests.RequestException as e:
+                    logger.warning(f'Embedding 失败 model={model} ({attempt+1}/{MAX_RETRIES}): {e}')
+
+                if attempt < MAX_RETRIES - 1:
+                    _retry_sleep(attempt + 1)
+
+        return None
+
+    def _embed_via_local(self, texts: List[str]) -> Optional[List[List[float]]]:
+        """通过本地 sentence-transformers 模型获取向量。"""
+        try:
+            from sentence_transformers import SentenceTransformer
+            model = SentenceTransformer(LOCAL_EMBED_MODEL)
+            embeddings = model.encode(texts, show_progress_bar=False)
+            logger.info(f'本地 Embedding OK: {len(embeddings)}条 dim={embeddings.shape[1]}')
+            return embeddings.tolist()
+        except ImportError:
+            logger.warning('sentence-transformers 未安装，本地 Embedding 不可用')
+            return None
+        except Exception as e:
+            logger.error(f'本地 Embedding 失败: {e}')
+            return None
+
+    def _embed_via_aliyun(self, texts: List[str]) -> Optional[List[List[float]]]:
+        """通过阿里云百炼（DashScope）获取向量。"""
+        import json as _json
+        try:
+            resp = ExternalClient.post(
+                'aliyun_embed',
+                'https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding',
+                headers={
+                    'Authorization': f'Bearer {ALIYUN_EMBED_API_KEY}',
+                    'Content-Type': 'application/json',
+                },
+                json={
+                    'model': ALIYUN_EMBED_MODEL,
+                    'input': {'texts': texts},
+                    'parameters': {'text_type': 'query'},
+                },
+                timeout=30,
+            )
+            if resp.status_code == 200:
                 data = resp.json()
-                return [item['embedding'] for item in data['data']]
-            except requests.Timeout as e:
-                last_error = e
-                logger.warning(f'Embedding 超时 (attempt {attempt+1}/{MAX_RETRIES})')
-            except requests.RequestException as e:
-                last_error = e
-                status_hint = ''
-                if hasattr(e, 'response') and e.response is not None:
-                    status_hint = f' status={e.response.status_code}'
-                logger.warning(
-                    'Embedding 请求失败%s (attempt %d/%d): %s',
-                    status_hint, attempt + 1, MAX_RETRIES, e,
-                )
-
-            if attempt < MAX_RETRIES - 1:
-                _retry_sleep(attempt + 1)
-
-        logger.error(f'Embedding 最终失败（已重试 {MAX_RETRIES} 次）: {last_error}')
-        logger.warning('Embedding 降级为 Mock 向量—RAG 检索准确度将受影响，请尽快修复 Embedding API 配置')
-        return self._mock_embed(texts)  # 降级为 Mock
+                embeddings = [item['embedding'] for item in data['data']['embeddings']]
+                logger.info(f'阿里云 Embedding OK: {len(embeddings)}条 dim={len(embeddings[0])}')
+                return embeddings
+            else:
+                logger.error(f'阿里云 Embedding 失败 status={resp.status_code} body={resp.text[:200]}')
+                return None
+        except Exception as e:
+            logger.error(f'阿里云 Embedding 请求异常: {e}')
+            return None
 
     def embed_one(self, text: str) -> List[float]:
         """单条文本向量化"""
