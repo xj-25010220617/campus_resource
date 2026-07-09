@@ -79,7 +79,7 @@ SYSTEM_PROMPT = """你是成都东软学院的AI智能助手，负责回答学�
 # RAG 控制参数（可通过 settings 覆盖）
 # ------------------------------------------------------------------
 RAG_TOP_K = 10
-RAG_SCORE_THRESHOLD = 0.6       # 低于此分数不放入 LLM 上下文
+RAG_SCORE_THRESHOLD = 0.35      # 低于此分数不放入 LLM 上下文
 RAG_REFERENCE_THRESHOLD = 0.7   # 低于此分数不作为引用展示
 CONTEXT_MAX_CHARS = 8000
 
@@ -531,61 +531,41 @@ def _filter_by_permission(
 ) -> List[dict]:
     """
     在 Top-K 命中里剥离用户不可见的 doc。
-
-    Args:
-        hits: retrieve() 输出的命中列表
-        user_context: 用户上下文
-
-    Returns:
-        过滤后的 hits
     """
     if not hits:
         return []
 
     from apps.resources.models import Resource
     from apps.knowledge.models import KnowledgeDoc
-
-    resource_ids = [h['doc_id'] for h in hits if h.get('doc_id', 0) > 0]
-    knowledge_ids = [abs(h['doc_id']) for h in hits if h.get('doc_id', 0) < 0]
+    from django.db.models import Q
 
     role = user_context.get('role', 'user')
     user_id = user_context.get('user_id')
     user_college_id = user_context.get('college_id')
 
-    # 构建权限缓存
+    doc_ids = list(set(h['doc_id'] for h in hits))
     allowed_ids = set()
 
-    # Resource 权限
-    if resource_ids:
-        res_docs = Resource.objects.filter(id__in=resource_ids).values('id', 'visibility', 'uploader_id')
-        for d in res_docs:
-            if d['visibility'] in ('public', 'internal'):
-                allowed_ids.add(d['id'])
-            elif d['visibility'] == 'restricted' and (role in ('super_admin', 'admin') or d['uploader_id'] == user_id):
-                allowed_ids.add(d['id'])
+    # Resource 权限：public/internal 可见
+    for d in Resource.objects.filter(id__in=doc_ids, visibility__in=['public', 'internal']).values('id'):
+        allowed_ids.add(d['id'])
 
-    # KnowledgeDoc 权限（与 KnowledgeDocListView._rag_scope_filter 保持一致）
-    if knowledge_ids:
-        from django.db.models import Q
-        # 校级文档：college_id 和 department_id 均为 null
+    # KnowledgeDoc 权限
+    remaining = [i for i in doc_ids if i not in allowed_ids]
+    if remaining:
         SCHOOL_LEVEL = Q(college_id__isnull=True, department_id__isnull=True)
-        kd_qs = KnowledgeDoc.objects.filter(id__in=knowledge_ids, visibility='public')
+        kd_qs = KnowledgeDoc.objects.filter(id__in=remaining, visibility='public')
         if role == 'super_admin':
-            allowed_ids.update(-kid for kid in kd_qs.values_list('id', flat=True))
+            allowed_ids.update(kd_qs.values_list('id', flat=True))
         elif role in ('college_admin', 'admin'):
-            allowed_ids.update(-kid for kid in kd_qs.filter(
-                SCHOOL_LEVEL
-                | Q(college_id=user_college_id)
-                | Q(uploader_id=user_id),
+            allowed_ids.update(kd_qs.filter(
+                SCHOOL_LEVEL | Q(college_id=user_college_id) | Q(uploader_id=user_id),
             ).values_list('id', flat=True))
         elif role == 'dept_admin':
-            allowed_ids.update(-kid for kid in kd_qs.filter(
-                SCHOOL_LEVEL
-                | Q(department_id=user_context.get('department_id'))
-                | Q(uploader_id=user_id),
+            allowed_ids.update(kd_qs.filter(
+                SCHOOL_LEVEL | Q(department_id=user_context.get('department_id')) | Q(uploader_id=user_id),
             ).values_list('id', flat=True))
         else:
-            # user（普通用户）：校级 + 本院 + 本部门 + 自己上传
             conditions = SCHOOL_LEVEL
             if user_college_id:
                 conditions |= Q(college_id=user_college_id)
@@ -593,10 +573,14 @@ def _filter_by_permission(
                 conditions |= Q(department_id=user_context.get('department_id'))
             if user_id:
                 conditions |= Q(uploader_id=user_id)
-            allowed_ids.update(-kid for kid in kd_qs.filter(conditions).values_list('id', flat=True))
+            allowed_ids.update(kd_qs.filter(conditions).values_list('id', flat=True))
 
     filtered = [h for h in hits if h.get('doc_id') in allowed_ids]
     return filtered[:5]
+
+
+# ------------------------------------------------------------------
+# 加载 doc 元信息
 
 
 # ------------------------------------------------------------------
@@ -606,30 +590,26 @@ def _enrich_with_doc_meta(hits: List[dict], min_score: float) -> List[dict]:
     """
     查询 MySQL resource / knowledge_doc 表，补全文档标题等元信息。
     过滤低于 min_score 的结果，返回 Top-5。
-    KnowledgeDoc 的 doc_id 为负数，解码时取绝对值。
     """
-    resource_ids = list({h['doc_id'] for h in hits if h.get('doc_id') and h['doc_id'] > 0})
-    knowledge_ids = list({abs(h['doc_id']) for h in hits if h.get('doc_id') and h['doc_id'] < 0})
+    doc_ids = list({int(h['doc_id']) for h in hits if h.get('doc_id')})
 
     doc_title_map = {}
 
-    # Resource 表
-    if resource_ids:
+    if doc_ids:
+        # 查 Resource 表
         try:
             from apps.resources.models import Resource
-            for d in Resource.objects.filter(id__in=resource_ids).values('id', 'title'):
+            for d in Resource.objects.filter(id__in=doc_ids).values('id', 'title'):
                 doc_title_map[d['id']] = d['title']
         except ImportError:
-            logger.debug('Resource 模型尚未就绪，使用占位标题')
-
-    # KnowledgeDoc 表
-    if knowledge_ids:
+            pass
+        # 查 KnowledgeDoc 表
         try:
             from apps.knowledge.models import KnowledgeDoc
-            for d in KnowledgeDoc.objects.filter(id__in=knowledge_ids).values('id', 'title'):
-                doc_title_map[-d['id']] = d['title']  # 负数 key 匹配
+            for d in KnowledgeDoc.objects.filter(id__in=doc_ids).values('id', 'title'):
+                doc_title_map[d['id']] = d['title']
         except ImportError:
-            logger.debug('KnowledgeDoc 模型尚未就绪，使用占位标题')
+            pass
 
     results = []
     for hit in hits:
@@ -637,9 +617,10 @@ def _enrich_with_doc_meta(hits: List[dict], min_score: float) -> List[dict]:
             continue
         if not hit.get('content'):
             continue
+        did = int(hit['doc_id'])
         results.append({
-            'doc_id': abs(hit['doc_id']),
-            'doc_title': doc_title_map.get(hit['doc_id'], '未知文档'),
+            'doc_id': did,
+            'doc_title': doc_title_map.get(did, '未知文档'),
             'content': hit['content'],
             'score': round(hit['score'], 4),
             'page': hit.get('page', 0),

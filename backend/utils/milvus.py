@@ -271,7 +271,8 @@ class MilvusClient:
                 doc_id = meta.get('doc_id')
 
                 # doc_id 硬过滤（跨版本兼容性兜底）
-                if filter_set is not None and doc_id not in filter_set:
+                # 注意: hard filter 把 KnowledgeDoc ID 转成了负数（-id）
+                if filter_set is not None and doc_id not in filter_set and -doc_id not in filter_set:
                     continue
 
                 hits.append({
@@ -281,7 +282,7 @@ class MilvusClient:
                     'chunk_text': doc_text,
                     'page_number': meta.get('page_number', 0),
                     'seq_order': meta.get('seq_order', 0),
-                    'score': results['distances'][0][i] if results.get('distances') else 0,
+                    'score': 1 - (results['distances'][0][i] if results.get('distances') else 0),
                 })
         return hits
 

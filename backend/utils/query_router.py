@@ -103,43 +103,54 @@ def _extract_time_param(question: str) -> Optional[dict]:
 
 
 def _extract_keywords(question: str) -> list:
-    """从问题中提取搜索关键词（用于 find_docs 类型）。"""
-    # 去除常见疑问词
-    stop_words = [
+    """从问题中提取搜索关键词（用于 find_docs 类型）。
+    使用 jieba 分词，避免粗暴替换导致关键词被截断。
+    """
+    try:
+        import jieba
+        words = jieba.lcut(question)
+    except ImportError:
+        # 无 jieba 时用正则按中英文拆分
+        words = re.findall(r'[a-zA-Z0-9]+|[一-鿿]+', question)
+
+    stop_words = {
         "我", "你", "的", "了", "有", "没有", "吗", "啊", "呢",
         "找", "查", "搜索", "检索", "看看", "显示", "列出",
         "多少", "几个", "哪个", "哪些", "什么", "怎么", "如何",
         "帮", "请", "一下", "最近", "上传", "文件", "文档", "资料",
-        "关于", "相关", "哪里", "可以",
-    ]
-    # 提取可能的搜索关键词
-    # 方法：去除停用词后，取有意义的词组
-    clean = question
-    for word in stop_words:
-        clean = clean.replace(word, " ")
-    clean = re.sub(r"\s+", " ", clean).strip()
-
-    # 如果有明确的关键词（如"找一下去年的教学课件"→"教学课件"）
-    # 简单分词提取
-    keywords = [w for w in clean.split() if len(w) >= 2]
+        "关于", "相关", "哪里", "可以", "查看", "详情", "信息",
+    }
+    keywords = [w for w in words if w.lower() not in stop_words and len(w) >= 2]
     return keywords[:5]
 
+
+
+def _has_chinese_only(s: str) -> bool:
+    """判断是否全部为中文（无英文字母）。"""
+    import re
+    return bool(re.fullmatch(r'[一-鿿　-〿＀-￯\s]+', s))
 
 
 def _is_topic_search(question: str) -> bool:
     """判断是否为纯关键词搜索（非完整问句）。
 
-    特征：
-    - 无中文疑问词（什么/怎么/如何/吗/呢/为什么）
-    - 长度较短（<= 15 字）且为名词性短语
-    - 纯英文关键词
+    只有以下情况路由到 find_docs：
+    - 纯英文关键词（如 "mysql"）
+    - 中英混合关键词（如 "MySQL第二版"）
+    - 含"文件/文档/资料"等搜索意图词
+    - 纯中文短语（如 "通知公告"）走 RAG 知识搜索
     """
     q_words = ["什么", "怎么", "如何", "为什么", "吗", "呢", "吧", "嘛", "哪",
                "谁", "何时", "何处", "是否", "能不能", "会不会", "有没有"]
     for w in q_words:
         if w in question:
             return False
-    # 纯关键词特征：短（<= 15 字）且不是完整问句
+
+    # 纯中文短语 → 走 RAG（可能是知识点名称）
+    if _has_chinese_only(question):
+        return False
+
+    # 非中文关键词：短且不是完整问句
     return len(question) <= 20 and not question.endswith("？") and not question.endswith("?")
 
 
