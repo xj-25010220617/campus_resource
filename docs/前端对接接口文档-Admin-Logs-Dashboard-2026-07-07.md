@@ -1,7 +1,7 @@
 # Dashboard 聚合接口
 
 > **接口归属**：`Admin Panel` 模块 — `LogsDashboardView`
-> **文档版本**：2026-07-09（新增顶层 `totals` 块：用户数 + 全平台文件总大小）
+> **文档版本**：2026-07-09（start_at/end_at 改为全平台数据起止时间，不再受 period 控制）
 > **适用环境**：本地开发 / 测试 / 生产（域名替换 base_url 即可）
 
 ---
@@ -40,8 +40,8 @@
 ```json
 {
   "period": "day",
-  "start_at": "2026-07-07T00:00:00+08:00",
-  "end_at":   "2026-07-07T18:00:00+08:00",
+  "start_at": "2026-06-01T00:00:00+08:00",
+  "end_at":   "2026-07-09T11:09:00+08:00",
   "totals": {
     "users": 1234,
     "upload_total_size": 524288000
@@ -61,8 +61,8 @@
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `period` | string | 回传请求中的 period |
-| `start_at` | string (ISO 8601) | 区间起点（带时区） |
-| `end_at` | string (ISO 8601) | 区间终点 = 服务端 `timezone.now()` |
+| `start_at` | string (ISO 8601) | 全平台日志最早一条的时间（不受 period 控制；查 5 张日志表取 min） |
+| `end_at` | string (ISO 8601) | 全平台日志最新一条的时间 = 服务端 `timezone.now()`（不受 period 控制） |
 | `totals` | object | 平台累计块（不受 period 影响，详见 §4.6） |
 | `blocks` | object | 5 个统计块（详见下表） |
 
@@ -233,8 +233,8 @@ print("上传总数:", data["blocks"]["upload"]["total"])
 ```json
 {
   "period": "day",
-  "start_at": "2026-07-07T00:00:00+08:00",
-  "end_at": "2026-07-07T18:00:00+08:00",
+  "start_at": "2026-06-01T00:00:00+08:00",
+  "end_at":   "2026-07-09T11:09:00+08:00",
   "totals": {
     "users": 1234,
     "upload_total_size": 524288000
@@ -374,6 +374,7 @@ function blockValue(b: any, fallback = '—') {
 | 2026-07-07 | 1.0 | 初版（5 个统计块） |
 | 2026-07-07 | 1.1 | 移除鉴权要求，改为 `AllowAny`，所有人都可访问 |
 | 2026-07-09 | 1.2 | 新增顶层 `totals` 字段：`users`（全平台用户数） + `upload_total_size`（全平台上传文件总大小，字节）；与 `blocks.upload.total_size`（区间值）并存 |
+| 2026-07-09 | 1.3 | `start_at` / `end_at` 改为全平台日志起止时间（不受 period 控制）；由 `compute_data_range()` 查 5 张日志表取 min/max created_at 得出 |
 
 ---
 
