@@ -17,7 +17,7 @@ from datetime import datetime
 
 from django.contrib.auth import get_user_model
 from django.db.models import Avg, Count, Q, Sum
-from django.db.models.functions import ExtractHour
+from django.db.models.functions import TruncHour, ExtractHour
 from django.utils import timezone
 
 from apps.chat.models import QueryLog, SensitiveLog
@@ -38,16 +38,25 @@ def parse_period(period: Optional[str]):
     - day: 今天 0:00 ~ now
     - week: 本周一 0:00 ~ now
     - month: 本月 1 日 0:00 ~ now
-    - 其他/缺省: day
+    - all: 全量数据（调用 compute_data_range 获取最早/最新日志时间）
+    - 其他/缺省: all
     """
     now = timezone.now()
-    if period == 'week':
+    if period == 'day':
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif period == 'week':
         start = now - timezone.timedelta(days=now.weekday())
         start = start.replace(hour=0, minute=0, second=0, microsecond=0)
     elif period == 'month':
         start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     else:
-        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        # 默认全量
+        dr = compute_data_range()
+        if 'error' in dr:
+            start = now
+        else:
+            start = dr['start_at']
+        return start, now
     return start, now
 
 
@@ -86,9 +95,10 @@ def compute_data_range() -> dict:
             now = timezone.now()
             return {'start_at': now, 'end_at': now}
 
+        tz = timezone.get_current_timezone()
         return {
-            'start_at': min(candidates),
-            'end_at': max(candidates),
+            'start_at': min(candidates).astimezone(tz),
+            'end_at': max(candidates).astimezone(tz),
         }
     except Exception as e:
         logger.error('data_range 计算失败: %s', e)
@@ -225,16 +235,21 @@ def compute_login_block(start: datetime, end: datetime) -> dict:
             }
             for row in qs.values('login_type').annotate(count=Count('id'))
         ]
-        # 按 24h 小时分桶
-        by_hour_rows = (
-            qs.annotate(hour=ExtractHour('created_at'))
+        # 按 24h 小时分桶（Asia/Shanghai）
+        # 注意：跨天同小时需要合并，因此先按 TruncHour 聚合再在 Python 中按小时数字合并
+        raw = (
+            qs.annotate(hour=TruncHour('created_at', tzinfo=timezone.get_current_timezone()))
             .values('hour')
             .annotate(count=Count('id'))
             .order_by('hour')
         )
+        hourly: dict[int, int] = {}
+        for row in raw:
+            h = row['hour'].hour
+            hourly[h] = hourly.get(h, 0) + row['count']
         by_hour = [
-            {'key': str(row['hour']), 'label': f'{row["hour"]:02d}:00', 'count': row['count']}
-            for row in by_hour_rows
+            {'key': str(h), 'label': f'{h:02d}:00', 'count': c}
+            for h, c in sorted(hourly.items())
         ]
         return {
             'total': total,

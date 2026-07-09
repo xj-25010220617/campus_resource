@@ -901,8 +901,12 @@ class LogsDashboardView(APIView):
     功能：聚合 5 类日志（upload/query/sensitive/login/operation）+ 1 个平台累计块
          （totals = 全平台用户数 + 全平台上传文件总大小），单次请求拿全所有顶部卡片数据。
     参数：
-        - period (str, optional, default='day'): day / week / month
+        - period (str, optional, default='all'): day / week / month / all
           决定 5 个统计块的时间区间；totals 不受 period 影响。
+          - day:   今日 0:00 ~ now
+          - week:  本周一 0:00 ~ now
+          - month: 本月 1 日 0:00 ~ now
+          - all:   全量数据（blocks 与 start_at/end_at 范围一致）
     返回：
         {
             "period": str,
@@ -923,7 +927,7 @@ class LogsDashboardView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def get(self, request):
-        period = request.query_params.get('period', 'day')
+        period = request.query_params.get('period') or 'all'
         block_start, block_end = dashboard_svc.parse_period(period)
         data_range = dashboard_svc.compute_data_range()
 
