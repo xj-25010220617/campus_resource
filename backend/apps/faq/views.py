@@ -38,18 +38,24 @@ class FAQCategoryListView(generics.ListAPIView):
 class FAQItemListView(generics.ListAPIView):
     """
     GET /api/faq/items/
-    获取已发布的 FAQ 列表
+    获取 FAQ 列表
 
     规则：
-    - 仅返回 status='published' 的记录
     - 当前用户 college_id 匹配 college（NULL 的全局 FAQ 也可见）
     - 按 frequency 降序排列
-    
-    支持搜索参数：
-    - q (str): 关键词搜索，模糊匹配问题、答案、标签、分类名称
+    - 每页 10 条
+
+    支持参数：
+    - q (str): 关键词搜索
+    - status (str): 状态筛选（不传则返回全部），可选 draft/published/rejected
+    - category (int): 分类筛选
+    - college_id (int): 学院筛选
+    - page (int): 页码
+    - page_size (int): 每页条数（最大 100）
     """
     serializer_class = FAQItemListSerializer
     permission_classes = [permissions.IsAuthenticated]
+    pagination_class = None  # 前端自行分页
 
     def get_queryset(self):
         user = self.request.user
@@ -59,9 +65,10 @@ class FAQItemListView(generics.ListAPIView):
 
         qs = FAQItem.objects.filter(q)
 
-        # 按状态筛选（不传默认 published）
-        status_filter = self.request.query_params.get('status', 'published').strip()
-        qs = qs.filter(status=status_filter)
+        # 按状态筛选（不传则返回全部状态）
+        status_filter = self.request.query_params.get('status', '').strip()
+        if status_filter:
+            qs = qs.filter(status=status_filter)
 
         # 搜索功能：支持按问题、答案、标签、分类名称模糊搜索
         search_query = self.request.query_params.get('q', '').strip()
