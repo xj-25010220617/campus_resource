@@ -365,12 +365,19 @@ class SsoCallbackView(APIView):
         with transaction.atomic():
             user = User.objects.filter(sso_uid=user_info['sso_uid']).first()
             if user:
-                # 已有用户：更新基本信息
-                user.email = user_info.get('email', user.email)
-                user.first_name = user_info.get('first_name', user.first_name)
-                user.last_name = user_info.get('last_name', user.last_name)
-                update_fields = ['email', 'first_name', 'last_name']
-                user.save(update_fields=update_fields)
+                # 只在本地字段为空时才同步，避免覆盖用户自己改的信息
+                update_fields = []
+                if not user.email and user_info.get('email'):
+                    user.email = user_info['email']
+                    update_fields.append('email')
+                if not user.first_name and user_info.get('first_name'):
+                    user.first_name = user_info['first_name']
+                    update_fields.append('first_name')
+                if not user.last_name and user_info.get('last_name'):
+                    user.last_name = user_info['last_name']
+                    update_fields.append('last_name')
+                if update_fields:
+                    user.save(update_fields=update_fields)
                 return user, False
 
             # 解析 college（college_admin / user 需要）
@@ -589,9 +596,19 @@ class DingtalkCallbackView(APIView):
         with transaction.atomic():
             user = User.objects.filter(sso_uid=union_id).first()
             if user:
-                user.email = email or user.email
-                user.phone = mobile or user.phone
-                user.save(update_fields=['email', 'phone'])
+                # 只在本地字段为空时才从钉钉同步，避免覆盖用户自己改的信息
+                updated = []
+                if not user.email and email:
+                    user.email = email
+                    updated.append('email')
+                if not user.phone and mobile:
+                    user.phone = mobile
+                    updated.append('phone')
+                if not user.first_name and nick:
+                    user.first_name = nick
+                    updated.append('first_name')
+                if updated:
+                    user.save(update_fields=updated)
                 return user, False
 
             user = User.objects.create_user(
@@ -704,9 +721,19 @@ class DingtalkRedirectView(APIView):
         with transaction.atomic():
             user = User.objects.filter(sso_uid=union_id).first()
             if user:
-                user.email = email or user.email
-                user.phone = mobile or user.phone
-                user.save(update_fields=['email', 'phone'])
+                # 只在本地字段为空时才从钉钉同步，避免覆盖用户自己改的信息
+                updated = []
+                if not user.email and email:
+                    user.email = email
+                    updated.append('email')
+                if not user.phone and mobile:
+                    user.phone = mobile
+                    updated.append('phone')
+                if not user.first_name and nick:
+                    user.first_name = nick
+                    updated.append('first_name')
+                if updated:
+                    user.save(update_fields=updated)
                 return user, False
             user = User.objects.create_user(
                 username=f'dd_{nick}' if nick else f'dd_{union_id[:12]}',

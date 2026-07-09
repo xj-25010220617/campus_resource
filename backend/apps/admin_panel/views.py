@@ -906,12 +906,14 @@ class LogsDashboardView(APIView):
     返回：
         {
             "period": str,
-            "start_at": ISO 8601,
-            "end_at":   ISO 8601,
+            "start_at": ISO 8601,  # 全平台数据起止时间（不受 period 影响）
+            "end_at":   ISO 8601,  # 全平台数据起止时间（不受 period 影响）
             "totals":   {"users": int, "upload_total_size": int} 或 {"error": str},
             "blocks":   {upload, query, sensitive, login, operation} 各块
         }
     实现细节：
+    - start_at / end_at：全平台日志起止时间，由 compute_data_range() 查 5 张日志表得出，不受 period 控制
+    - blocks.* 区间：由 parse_period(period) 决定
     - 时间区间基于 Asia/Shanghai（settings.TIME_ZONE）
     - 6 个块各自 try/except 隔离失败（块计算放 services/dashboard.py）
     - view 不接 try/except（遵循规范 §9）
@@ -922,21 +924,25 @@ class LogsDashboardView(APIView):
 
     def get(self, request):
         period = request.query_params.get('period', 'day')
-        start, end = dashboard_svc.parse_period(period)
+        block_start, block_end = dashboard_svc.parse_period(period)
+        data_range = dashboard_svc.compute_data_range()
 
         blocks = {
-            'upload': dashboard_svc.compute_upload_block(start, end),
-            'query': dashboard_svc.compute_query_block(start, end),
-            'sensitive': dashboard_svc.compute_sensitive_block(start, end),
-            'login': dashboard_svc.compute_login_block(start, end),
-            'operation': dashboard_svc.compute_operation_block(start, end),
+            'upload': dashboard_svc.compute_upload_block(block_start, block_end),
+            'query': dashboard_svc.compute_query_block(block_start, block_end),
+            'sensitive': dashboard_svc.compute_sensitive_block(block_start, block_end),
+            'login': dashboard_svc.compute_login_block(block_start, block_end),
+            'operation': dashboard_svc.compute_operation_block(block_start, block_end),
         }
         totals = dashboard_svc.compute_totals()
 
+        start_at = data_range.get('start_at') or block_start
+        end_at = data_range.get('end_at') or block_end
+
         return Response({
             'period': period,
-            'start_at': start.isoformat(),
-            'end_at': end.isoformat(),
+            'start_at': start_at.isoformat(),
+            'end_at': end_at.isoformat(),
             'totals': totals,
             'blocks': blocks,
         })
