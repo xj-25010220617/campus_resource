@@ -1,7 +1,7 @@
 # Dashboard 聚合接口
 
 > **接口归属**：`Admin Panel` 模块 — `LogsDashboardView`
-> **文档版本**：2026-07-09（start_at/end_at 改为全平台数据起止时间，不再受 period 控制）
+> **文档版本**：2026-07-09（默认 period=all；start_at/end_at 时区修正为 Asia/Shanghai；by_hour 跨天合并；移除 period=day）
 > **适用环境**：本地开发 / 测试 / 生产（域名替换 base_url 即可）
 
 ---
@@ -23,7 +23,7 @@
 
 | 参数 | 类型 | 必填 | 默认 | 取值范围 | 说明 |
 |------|------|------|------|----------|------|
-| `period` | string | 否 | `day` | `day` / `week` / `month` | 决定 5 个统计块（upload/query/sensitive/login/operation）的时间区间；`totals` 块不受 period 影响 |
+| `period` | string | 否 | `all` | `week` / `month` / `all` | 决定 5 个统计块（upload/query/sensitive/login/operation）的时间区间；`totals` / `start_at` / `end_at` 不受 period 影响 |
 
 ### period 时间区间语义（Asia/Shanghai）
 
@@ -32,6 +32,7 @@
 | `day` | 今天 00:00:00 | 当前时刻 |
 | `week` | 本周一 00:00:00 | 当前时刻 |
 | `month` | 本月 1 日 00:00:00 | 当前时刻 |
+| `all`（默认） | 全平台最早日志时间 | 当前时刻 |
 
 ---
 
@@ -39,7 +40,7 @@
 
 ```json
 {
-  "period": "day",
+  "period": "all",
   "start_at": "2026-06-01T00:00:00+08:00",
   "end_at":   "2026-07-09T11:09:00+08:00",
   "totals": {
@@ -61,10 +62,10 @@
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `period` | string | 回传请求中的 period |
-| `start_at` | string (ISO 8601) | 全平台日志最早一条的时间（不受 period 控制；查 5 张日志表取 min） |
-| `end_at` | string (ISO 8601) | 全平台日志最新一条的时间 = 服务端 `timezone.now()`（不受 period 控制） |
+| `start_at` | string (ISO 8601) | 全平台日志最早一条的时间（Asia/Shanghai 时区，不受 period 控制） |
+| `end_at` | string (ISO 8601) | 全平台日志最新一条的时间 = 服务端 `timezone.now()`（Asia/Shanghai 时区，不受 period 控制） |
 | `totals` | object | 平台累计块（不受 period 影响，详见 §4.6） |
-| `blocks` | object | 5 个统计块（详见下表） |
+| `blocks` | object | 5 个统计块（详见下表）；当 `period=all` 时与 `start_at`/`end_at` 范围一致 |
 
 ---
 
@@ -105,7 +106,7 @@
 | `fail_count` | integer | 失败数 |
 | `by_success` | `[{key, label, count}]` | 按成功/失败分组 |
 | `by_type` | `[{key, label, count}]` | 按登录类型分组（jwt/sso/sso_mock/...） |
-| `by_hour` | `[{key, label, count}]` | 按 24h 小时分桶（仅出现有事件的桶） |
+| `by_hour` | `[{key, label, count}]` | 按 24h 小时分桶（Asia/Shanghai，跨天同小时合并，仅出现有事件的桶） |
 
 ### 4.5 `blocks.operation`（按 period 区间）
 
@@ -165,8 +166,11 @@
 ### 6.1 cURL
 
 ```bash
-# 今日（默认 period=day）- 无需 Token
+# 默认全量（不传 period 则为 all；可选 week/month/all）
 curl -X GET "http://127.0.0.1:8000/api/admin/logs/dashboard/"
+
+# 当日
+curl -X GET "http://127.0.0.1:8000/api/admin/logs/dashboard/?period=day"
 
 # 本周
 curl -X GET "http://127.0.0.1:8000/api/admin/logs/dashboard/?period=week"
@@ -232,7 +236,7 @@ print("上传总数:", data["blocks"]["upload"]["total"])
 
 ```json
 {
-  "period": "day",
+  "period": "all",
   "start_at": "2026-06-01T00:00:00+08:00",
   "end_at":   "2026-07-09T11:09:00+08:00",
   "totals": {
@@ -316,7 +320,7 @@ interface DashboardTotals {
 }
 
 interface DashboardResponse {
-  period: 'day' | 'week' | 'month';
+  period: 'week' | 'month' | 'all';
   start_at: string;
   end_at: string;
   totals: DashboardTotals | { error: string };
@@ -375,6 +379,10 @@ function blockValue(b: any, fallback = '—') {
 | 2026-07-07 | 1.1 | 移除鉴权要求，改为 `AllowAny`，所有人都可访问 |
 | 2026-07-09 | 1.2 | 新增顶层 `totals` 字段：`users`（全平台用户数） + `upload_total_size`（全平台上传文件总大小，字节）；与 `blocks.upload.total_size`（区间值）并存 |
 | 2026-07-09 | 1.3 | `start_at` / `end_at` 改为全平台日志起止时间（不受 period 控制）；由 `compute_data_range()` 查 5 张日志表取 min/max created_at 得出 |
+| 2026-07-09 | 1.4 | `by_hour` 小时桶改为 `Asia/Shanghai` 时区（之前每行重复出现，跨天合并后已修复） |
+| 2026-07-09 | 1.5 | 默认 period 从 `'day'` 改为 `'all'`（全量数据）；新增 `period='all'` 取值，blocks 区间与 start_at/end_at 一致 |
+| 2026-07-09 | 1.6 | `start_at`/`end_at` 改为 Asia/Shanghai 时区（+08:00） |
+| 2026-07-09 | 1.7 | 移除 `period='day'` 选项；取值范围仅为 `week` / `month` / `all` |
 
 ---
 
