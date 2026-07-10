@@ -4,6 +4,8 @@ faster-whisper 语音识别模块
 - 语音 → 文字转换，内置 VAD 静音过滤
 - 懒加载 + 单例模式，首次调用自动下载模型
 """
+from __future__ import annotations
+
 import logging
 import os
 import threading
