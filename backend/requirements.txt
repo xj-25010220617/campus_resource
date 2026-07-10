@@ -6,10 +6,12 @@ django-filter==23.5
 mysqlclient==2.2.0
 drf-spectacular==0.27.1
 python-decouple==3.8
-funasr>=1.0.0
+faster-whisper>=1.0.0
 modelscope
 librosa
 soundfile
+# 音频转码（webm/ogg/opus → wav），语音识别前置依赖，需配合 ffmpeg
+pydub>=0.25.1
 beautifulsoup4>=4.12.0
 lxml>=5.0.0
 # FAQ 聚类算法依赖（apps/faq/utils.py 的 cosine_similarity）

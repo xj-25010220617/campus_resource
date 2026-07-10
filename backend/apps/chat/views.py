@@ -130,17 +130,17 @@ class MessageViewSet(ModelViewSet):
                 status=status.HTTP_403_FORBIDDEN
             )
 
-        # 更新消息反馈（存入 ChatMessage 或关联的 QueryLog）
-        # 这里先更新 ChatMessage 的 rating 字段（需要先添加到模型）
-        # 同时更新 QueryLog 的 user_feedback
+        # 更新 ChatMessage 的 rating 字段
         message.rating = rating
         message.save(update_fields=['rating'])
 
-        # 更新关联的 QueryLog
+        # 更新关联的 QueryLog — 取该会话最新一条（即本轮问答对应的查询日志）
         QueryLog.objects.filter(
             conversation=message.conversation,
-            question=message.content
-        ).update(user_feedback=1 if rating == 'like' else 0)
+            user=request.user,
+        ).order_by('-created_at').update(
+            user_feedback=1 if rating == 'like' else 0,
+        )
 
         return Response({'status': 'ok', 'rating': rating})
 
@@ -717,12 +717,6 @@ class FeedbackView(generics.CreateAPIView):
         )
 
         # 找到该会话最近一条 QueryLog，回填 user_feedback
-        QueryLog.objects.filter(
-            conversation=msg.conversation,
-            user=user,
-        ).order_by('-created_at').first()
-
-        # 用 update 而非 save，避免触发 save() 逻辑
         updated = QueryLog.objects.filter(
             conversation=msg.conversation,
             user=user,
@@ -771,8 +765,18 @@ class VoiceAskView(APIView):
             )
         audio_data = audio_file.read()
 
-        # 语音 → 文字
-        audio_fmt = audio_file.name.rsplit('.', 1)[-1] if '.' in audio_file.name else 'wav'
+        # 从 MIME type 提取格式（如 "audio/webm;codecs=opus" → "webm"）
+        # 备选：从文件名扩展名（如 "recording.webm" → "webm"）
+        # 最终由 asr.speech_to_text() 内部魔数检测兜底
+        mime_type = getattr(audio_file, 'content_type', '') or ''
+        if mime_type:
+            # 取 "audio/webm;codecs=opus" → "webm"
+            audio_fmt = mime_type.split(';')[0].split('/')[-1].strip()
+        elif '.' in audio_file.name:
+            audio_fmt = audio_file.name.rsplit('.', 1)[-1]
+        else:
+            audio_fmt = 'wav'
+
         text, asr_error = speech_to_text(audio_data, audio_fmt)
         if not text:
             # 映射 asr_error.error_type → 对应 ErrorCode
