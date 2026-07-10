@@ -59,11 +59,14 @@ class FAQItemListView(generics.ListAPIView):
 
     def get_queryset(self):
         user = self.request.user
-        q = models.Q(college__isnull=True)
-        if user.college_id:
-            q |= models.Q(college_id=user.college_id)
-
-        qs = FAQItem.objects.filter(q)
+        # 超管看全部，其他角色只看本学院+全局
+        if user.role == 'super_admin':
+            qs = FAQItem.objects.all()
+        else:
+            q = models.Q(college__isnull=True)
+            if user.college_id:
+                q |= models.Q(college_id=user.college_id)
+            qs = FAQItem.objects.filter(q)
 
         # 按状态筛选（不传则返回全部状态）
         status_filter = self.request.query_params.get('status', '').strip()
