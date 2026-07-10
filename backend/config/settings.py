@@ -212,11 +212,11 @@ DINGTALK_APP_KEY = config('DINGTALK_APP_KEY', default='')
 DINGTALK_APP_SECRET = config('DINGTALK_APP_SECRET', default='')
 
 # ------------------------------------------------------------------
-# ASR 语音识别（FunASR）
+# ASR 语音识别（faster-whisper）
 # ------------------------------------------------------------------
-ASR_MODEL_NAME = 'iic/SenseVoiceSmall'
+ASR_MODEL_NAME = 'small'
 ASR_TIMEOUT = 30
-ASR_DEBUG = True   # 开启后控制台打印 FunASR 原始返回值，排查完可关掉
+ASR_DEBUG = True   # 开启后控制台打印 faster-whisper 识别信息，排查完可关掉
 # FAQ 自动生成配置
 # ------------------------------------------------------------------
 # 最小占比阈值（百分比）— 超过此比例的问题才提取为 FAQ

@@ -1,8 +1,8 @@
 """
-FunASR 语音识别模块
-- 阿里达摩院开源 paraformer-zh 模型
-- 中文语音 → 文字转换
-- 懒加载 + 单例模式，首次调用自动下载模型（~300MB）
+faster-whisper 语音识别模块
+- OpenAI Whisper 的 CTranslate2 高性能重实现
+- 语音 → 文字转换，内置 VAD 静音过滤
+- 懒加载 + 单例模式，首次调用自动下载模型
 """
 import logging
 import os
@@ -80,29 +80,31 @@ def _has_cuda():
 
 
 def _load_model():
-    """懒加载 FunASR 模型（首次调用时下载，仅加载一次）"""
+    """懒加载 faster-whisper 模型（首次调用时下载，仅加载一次）"""
     global _model_error
     from django.conf import settings
 
-    model_name = getattr(
-        settings, 'ASR_MODEL_NAME',
-        'damo/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404',
-    )
-    device = 'cuda:0' if _has_cuda() else 'cpu'
-    logger.info(f'正在加载 ASR 模型: {model_name} (device={device}, 首次需下载 ~300MB)...')
+    model_name = getattr(settings, 'ASR_MODEL_NAME', 'small')
+    if _has_cuda():
+        device = 'cuda'
+        compute_type = 'float16'
+    else:
+        device = 'cpu'
+        compute_type = 'int8'
+    logger.info(f'正在加载 ASR 模型: {model_name} (device={device}, compute_type={compute_type}, 首次需下载)...')
     t0 = time.time()
     try:
-        from funasr import AutoModel
-        model = AutoModel(
-            model=model_name,
+        from faster_whisper import WhisperModel
+        model = WhisperModel(
+            model_name,
             device=device,
-            disable_update=True,
+            compute_type=compute_type,
         )
         logger.info(f'ASR 模型加载完成，耗时 {time.time() - t0:.1f}s, device={device}')
         _model_error = None
         return model
     except ImportError as e:
-        _model_error = f'依赖缺失: {e}。请执行 pip install funasr torch'
+        _model_error = f'依赖缺失: {e}。请执行 pip install faster-whisper'
         logger.error(f'ASR 模型加载失败: {_model_error}')
         raise
     except Exception as e:
@@ -187,37 +189,6 @@ def _convert_to_wav(src_path: str) -> str:
     return tmp_path
 
 
-def _extract_text(result) -> str:
-    """
-    从 FunASR/SenseVoice 返回结果中提取纯文本。
-    去除语言标签、情绪标签等标记符号。
-    """
-    import re
-
-    raw = ''
-    if isinstance(result, list) and len(result) > 0:
-        first = result[0]
-        if isinstance(first, dict):
-            raw = first.get('text') or first.get('value') or first.get('content') or ''
-        elif isinstance(first, str):
-            raw = first
-    elif isinstance(result, dict):
-        raw = result.get('text') or result.get('value') or ''
-    elif isinstance(result, str):
-        raw = result
-
-    if not raw:
-        return ''
-
-    # SenseVoice 标签格式：<|xxx|>，全部去除
-    cleaned = re.sub(r'<\|[^|]+\|>', '', raw).strip()
-
-    if _is_debug() and cleaned != raw:
-        logger.debug(f'ASR 文本清理: raw={raw[:120]} → cleaned={cleaned[:120]}')
-
-    return cleaned
-
-
 def speech_to_text(audio_data: bytes, audio_format: str = 'wav') -> tuple[str, dict | None]:
     """
     语音 → 文字转换。
@@ -243,17 +214,6 @@ def speech_to_text(audio_data: bytes, audio_format: str = 'wav') -> tuple[str, d
     """
     import io
 
-    # 0) 优先用文件头魔数检测格式，其次用传入的 audio_format
-    detected_fmt = _detect_format_from_header(audio_data)
-    if detected_fmt:
-        fmt = detected_fmt
-        _add_log('format_detect', 'ok', f'文件头魔数检测: {fmt}', None)
-    else:
-        fmt = (audio_format or 'wav').lower().lstrip('.')
-        _add_log('format_detect', 'ok', f'使用传入格式: {fmt}（魔数检测失败）', None)
-
-    need_convert = fmt in _CONVERT_FORMATS
-    ext = f'.{fmt}'
     raw_path = None
     wav_path = None
     error_log = []  # 记录每一步的执行情况
@@ -292,6 +252,18 @@ def speech_to_text(audio_data: bytes, audio_format: str = 'wav') -> tuple[str, d
                 logger.warning(f'pydub format={pydub_fmt} 失败: {type(e).__name__}: {e}')
                 continue
         return None
+
+    # 0) 优先用文件头魔数检测格式，其次用传入的 audio_format
+    detected_fmt = _detect_format_from_header(audio_data)
+    if detected_fmt:
+        fmt = detected_fmt
+        _add_log('format_detect', 'ok', f'文件头魔数检测: {fmt}', None)
+    else:
+        fmt = (audio_format or 'wav').lower().lstrip('.')
+        _add_log('format_detect', 'ok', f'使用传入格式: {fmt}（魔数检测失败）', None)
+
+    need_convert = fmt in _CONVERT_FORMATS
+    ext = f'.{fmt}'
 
     try:
         # 1) webm/ogg/mp4 等浏览器原生格式，用 pydub 内存转码为 WAV
@@ -412,46 +384,37 @@ def speech_to_text(audio_data: bytes, audio_format: str = 'wav') -> tuple[str, d
                 stage='model_load',
                 error_type='ASR_MODEL_NOT_LOADED',
                 detail=f'语音识别模型加载失败: {err}',
-                suggestion='请联系管理员检查 FunASR 模型是否正确安装，或检查服务器日志',
+                suggestion='请联系管理员检查 faster-whisper 模型是否正确安装，或检查服务器日志',
             )
         _add_log('model_load', 'ok', 'ASR 模型已就绪', None)
 
         # 5) 调用识别
         if _is_debug():
-            logger.debug(f'调用 model.generate, input_path={input_path}')
+            logger.debug(f'调用 model.transcribe, input_path={input_path}')
         _add_log('inference', 'ok', '开始语音识别推理', f'input_path={input_path}')
-        result = model.generate(input=input_path)
+        segments, info = model.transcribe(input_path, vad_filter=True)
+        # segments 是生成器，迭代时才真正执行推理，需先物化
+        text = ''.join(segment.text for segment in segments).strip()
 
         # 6) 调试日志
         if _is_debug():
-            logger.debug(f'FunASR raw result type={type(result).__name__}, '
-                         f'len={len(result) if hasattr(result, "__len__") else "N/A"}')
-            logger.debug(f'FunASR raw result[:200]={str(result)[:200]}')
-
-        if not result:
-            _add_log('inference', 'fail', 'ASR 模型返回空结果',
-                     f'result type={type(result).__name__}')
-            return '', _make_error(
-                stage='inference',
-                error_type='ASR_EMPTY_RESULT',
-                detail='语音识别模型返回空结果，音频中可能无有效语音或背景噪音过大',
-                suggestion='请在安静环境中重新录制，确保音频中包含清晰的中文语音',
-            )
+            lang = getattr(info, 'language', 'N/A')
+            duration = getattr(info, 'duration', 'N/A')
+            logger.debug(f'faster-whisper info: language={lang}, duration={duration}')
+            logger.debug(f'faster-whisper text[:200]={text[:200]}')
 
         _add_log('inference', 'ok', 'ASR 模型推理完成',
-                 f'result type={type(result).__name__}')
+                 f'language={getattr(info, "language", "N/A")}')
 
-        # 7) 提取文字
-        text = _extract_text(result)
+        # 7) 校验识别文字
         if not text:
-            result_preview = str(result)[:200] if result else 'None'
             _add_log('extract_text', 'fail', '未能从识别结果中提取到有效文字',
-                     f'result preview: {result_preview}')
+                     f'language={getattr(info, "language", "N/A")}')
             return '', _make_error(
                 stage='extract_text',
                 error_type='ASR_NO_TEXT_EXTRACTED',
-                detail='音频已识别但未提取到有效中文文字，可能音频中不包含中文或发音不清晰',
-                suggestion='请确认音频中包含中文语音，发音清晰，语速适中',
+                detail='音频已识别但未提取到有效文字，音频中可能无有效语音或背景噪音过大',
+                suggestion='请在安静环境中重新录制，确保音频中包含清晰的语音，发音清晰、语速适中',
             )
 
         _add_log('extract_text', 'ok', f'文字提取成功', f'text={text[:80]}...')
