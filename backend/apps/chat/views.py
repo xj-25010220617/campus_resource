@@ -130,17 +130,17 @@ class MessageViewSet(ModelViewSet):
                 status=status.HTTP_403_FORBIDDEN
             )
 
-        # 更新消息反馈（存入 ChatMessage 或关联的 QueryLog）
-        # 这里先更新 ChatMessage 的 rating 字段（需要先添加到模型）
-        # 同时更新 QueryLog 的 user_feedback
+        # 更新 ChatMessage 的 rating 字段
         message.rating = rating
         message.save(update_fields=['rating'])
 
-        # 更新关联的 QueryLog
+        # 更新关联的 QueryLog — 取该会话最新一条（即本轮问答对应的查询日志）
         QueryLog.objects.filter(
             conversation=message.conversation,
-            question=message.content
-        ).update(user_feedback=1 if rating == 'like' else 0)
+            user=request.user,
+        ).order_by('-created_at').update(
+            user_feedback=1 if rating == 'like' else 0,
+        )
 
         return Response({'status': 'ok', 'rating': rating})
 
@@ -568,12 +568,6 @@ class FeedbackView(generics.CreateAPIView):
         )
 
         # 找到该会话最近一条 QueryLog，回填 user_feedback
-        QueryLog.objects.filter(
-            conversation=msg.conversation,
-            user=user,
-        ).order_by('-created_at').first()
-
-        # 用 update 而非 save，避免触发 save() 逻辑
         updated = QueryLog.objects.filter(
             conversation=msg.conversation,
             user=user,
