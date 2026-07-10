@@ -33,29 +33,15 @@ def _get_config(key: str, default):
         return default
 
 
-NEUSOFT_BASE_URL = _get_config("NEUSOFT_WEBSITE_URL", "https://www.neusoft.edu.cn")
+NEUSOFT_BASE_URL = _get_config("NEUSOFT_WEBSITE_URL", "https://www.nsu.edu.cn")
 CRAWL_DELAY = _get_config("CRAWLER_CRAWL_DELAY", 0.5)
 
-# 重要栏目路径片段（文字内容栏目排前面，图片/多媒体排后面）
+# 重要栏目路径片段（新站 www.nsu.edu.cn 结构）
 IMPORTANT_SECTION_PATHS = [
-    "/html/984/",   # 通知公告（最重要，优先）
-    "/html/977/",   # 校园时讯
-    "/html/978/",   # 媒体聚焦
-    "/html/985/",   # 活动预告
-    "/html/975/",   # 头条新闻
-    "/html/1078/",  # 人才培养
-    "/html/1011/",  # 办学特色
-    "/html/1008/",  # 学校概况
-    "/html/1052/",  # 招生就业
-    "/html/1075/",  # 一流专业
-    "/html/1076/",  # 创业学院
-    "/html/1037/",  # 校园活动
-    "/html/1038/",  # 社团建设
-    "/html/1012/",  # 人才招聘
-    "/html/1046/",  # 招聘信息
-    "/html/1066/",  # 学生意见反馈
-    "/html/951/",   # 发展历程
-    "/html/840/",   # DNUI 影像（图片为主，放最后）
+    "/HTML/service/",   # 通知公告 / 服务指南
+    "/HTML/news/",      # 新闻动态
+    "/HTML/media/",     # 媒体关注
+    "/HTML/notice/",    # 通知公告
 ]
 
 # 不需要爬取的路径片段（附件、外链等）

@@ -222,6 +222,15 @@ def find_user_docs(
 
     qs = qs.select_related("category").order_by("-created_at")[:limit]
 
+    from utils.oss import oss_client
+
+    def _get_dl_url(doc) -> str:
+        if doc.oss_key:
+            url = oss_client.get_download_url(doc.oss_key, expires=3600)
+            if url:
+                return url
+        return ''
+
     return [
         {
             "id": doc.id,
@@ -233,6 +242,7 @@ def find_user_docs(
             "status": doc.get_status_display(),
             "created_at": doc.created_at.strftime("%Y-%m-%d %H:%M"),
             "category_name": doc.category.name if doc.category else "未分类",
+            "download_url": _get_dl_url(doc),
         }
         for doc in qs
     ]
@@ -301,7 +311,9 @@ _SYSTEM_PROMPT_TEMPLATE = """你是成都东东学院的 AI 智能助手，负�
 {result}
 
 请根据以上数据直接回答用户的问题。如果数据为空或没有找到，如实告知用户。
-回答要简洁、友好，使用中文。"""
+回答要简洁、友好，使用中文。
+
+注意：每条数据包含 download_url 字段，是文件的下载链接。如果查询到文件，请将文件名用 download_url 链接包装展示给用户。"""
 
 
 def build_data_query_prompt(question: str, result: dict) -> list:
