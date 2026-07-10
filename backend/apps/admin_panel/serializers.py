@@ -183,6 +183,7 @@ class AdminQueryLogSerializer(serializers.ModelSerializer):
     user_name = serializers.CharField(
         source='user.username', read_only=True, allow_null=True,
     )
+    created_at = serializers.DateTimeField(format='%Y/%m/%d %H:%M', read_only=True)
 
     class Meta:
         model = QueryLog
@@ -202,6 +203,7 @@ class AdminSensitiveLogSerializer(serializers.ModelSerializer):
     user_name = serializers.CharField(
         source='user.username', read_only=True, allow_null=True,
     )
+    created_at = serializers.DateTimeField(format='%Y/%m/%d %H:%M', read_only=True)
 
     class Meta:
         model = SensitiveLog
@@ -222,6 +224,7 @@ class AdminLoginLogSerializer(serializers.ModelSerializer):
     login_type_display = serializers.CharField(
         source='get_login_type_display', read_only=True,
     )
+    created_at = serializers.DateTimeField(format='%Y/%m/%d %H:%M', read_only=True)
 
     class Meta:
         model = LoginLog
@@ -247,6 +250,7 @@ class AdminOperationLogSerializer(serializers.ModelSerializer):
     target_type_display = serializers.CharField(
         source='get_target_type_display', read_only=True,
     )
+    created_at = serializers.DateTimeField(format='%Y/%m/%d %H:%M', read_only=True)
 
     class Meta:
         model = OperationLog
