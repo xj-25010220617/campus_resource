@@ -247,9 +247,9 @@ class FileUploadSerializer(serializers.Serializer):
     college_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属学院ID（默认取上传者学院）')
     department_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属部门ID（默认取上传者部门）')
     discipline_id = serializers.IntegerField(required=False, allow_null=True, help_text='学科方向ID（可选）')
-    keywords = serializers.CharField(
-        default='', allow_blank=True,
-        help_text='关键词 JSON 数组，如 ["关键词1","关键词2"]（可选，未提供时 AI 提取）',
+    keywords = serializers.ListField(
+        child=serializers.CharField(), required=False, default=list,
+        help_text='关键词列表（可选，未提供时 AI 提取）',
     )
     visibility = serializers.ChoiceField(
         choices=['public', 'private'],

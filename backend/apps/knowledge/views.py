@@ -1213,12 +1213,12 @@ class FileUploadView(APIView):
 
         # AI 自动填充缺失字段
         user_description = data.get('description', '')
-        raw_keywords = data.get('keywords', '')
+        raw_keywords = data.get('keywords', [])  # ListField 已解析为列表
 
         needs_ai = (
             not user_title
             or not user_description
-            or not (isinstance(raw_keywords, str) and raw_keywords.strip())
+            or not raw_keywords  # 直接检查列表是否为空
             or not user_provided_visibility
         )
         if needs_ai:
@@ -1228,8 +1228,8 @@ class FileUploadView(APIView):
                 description = user_description or ai_result['description'] or ''
                 visibility = data['visibility'] if user_provided_visibility else ai_result['visibility']
                 # 关键词：用户提供的优先
-                if isinstance(raw_keywords, str) and raw_keywords.strip():
-                    pass  # 稍后解析用户提供的关键词
+                if raw_keywords:
+                    pass  # 用户已提供关键词，保留
                 else:
                     raw_keywords = ai_result['keywords']
             else:
@@ -1288,14 +1288,7 @@ class FileUploadView(APIView):
         except Exception as e:
             logger.error(f'创建上传日志失败: {e}')
 
-        # 解析并创建关联关键词（兼容 JSON 字符串和列表两种格式）
-        if isinstance(raw_keywords, str) and raw_keywords.strip():
-            try:
-                raw_keywords = json.loads(raw_keywords)
-            except (json.JSONDecodeError, TypeError):
-                raw_keywords = []
-        if not isinstance(raw_keywords, list):
-            raw_keywords = []
+        # 创建关联关键词（ListField 已保证 raw_keywords 为列表）
         for phrase in raw_keywords:
             if isinstance(phrase, str) and phrase.strip():
                 Keyword.objects.create(
