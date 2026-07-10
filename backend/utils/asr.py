@@ -81,6 +81,35 @@ def _has_cuda():
         return False
 
 
+_ffmpeg_configured = False
+
+
+def _ensure_pydub_ffmpeg():
+    """
+    让 pydub 使用 imageio-ffmpeg 自带的 ffmpeg 二进制。
+
+    避免依赖服务器系统 PATH 中另装的 ffmpeg：imageio-ffmpeg 已在依赖内，
+    随 pip 一起装好。仅在首次调用时配置一次；未安装 imageio-ffmpeg 时静默跳过，
+    回退到 pydub 默认的 PATH 查找逻辑。
+    """
+    global _ffmpeg_configured
+    if _ffmpeg_configured:
+        return
+    _ffmpeg_configured = True
+    try:
+        import imageio_ffmpeg
+        from pydub import AudioSegment
+
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        AudioSegment.converter = ffmpeg_exe
+        AudioSegment.ffmpeg = ffmpeg_exe
+        logger.info(f'pydub 使用 imageio-ffmpeg 二进制: {ffmpeg_exe}')
+    except ImportError:
+        logger.info('imageio-ffmpeg 未安装，pydub 回退到系统 PATH 中的 ffmpeg')
+    except Exception as e:
+        logger.warning(f'配置 imageio-ffmpeg 失败，回退到系统 ffmpeg: {type(e).__name__}: {e}')
+
+
 def _load_model():
     """懒加载 faster-whisper 模型（首次调用时下载，仅加载一次）"""
     global _model_error
@@ -138,6 +167,7 @@ def _convert_to_wav(src_path: str) -> str:
 
     # 1) 优先使用 pydub（支持 webm/ogg/opus 等浏览器原生格式）
     try:
+        _ensure_pydub_ffmpeg()
         from pydub import AudioSegment
         logger.info('使用 pydub 进行音频转换')
         audio = AudioSegment.from_file(src_path)
@@ -273,6 +303,7 @@ def speech_to_text(audio_data: bytes, audio_format: str = 'wav') -> tuple[str, d
             # 浏览器 webm/ogg 可能带不同编解码器，尝试多种 format 参数
             pydub_formats = ['webm', 'ogg', 'opus', 'mp4'] if fmt == 'webm' else [fmt, 'ogg', 'opus', 'mp4']
             try:
+                _ensure_pydub_ffmpeg()
                 from pydub import AudioSegment
                 _add_log('format_convert', 'ok', f'开始 pydub 内存转码: {fmt} → WAV',
                          f'原始大小={len(audio_data)} bytes, 尝试 formats={pydub_formats}')
