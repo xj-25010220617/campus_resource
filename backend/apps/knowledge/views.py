@@ -900,6 +900,12 @@ class TextUploadView(APIView):
                     created_by=request.user,
                 )
 
+        # 触发异步索引（切片 + 向量化），使文档可被 AI 智能问答检索
+        from utils.celery_dispatcher import safe_delay
+        from .tasks import extract_freshness_task, index_document_task
+        safe_delay(extract_freshness_task, new_doc.id)
+        safe_delay(index_document_task, new_doc.id)
+
         return Response({
             'id': new_doc.id,
             'status': new_doc.status,
@@ -1297,6 +1303,13 @@ class FileUploadView(APIView):
                     match_type='fuzzy', weight=1, created_by=request.user,
                 )
 
+        # 触发异步索引（切片 + 向量化），使文档可被 AI 智能问答检索
+        # 遵循规范第 9 节：异常处理下沉到 utils 层，视图层不写 try/except
+        from utils.celery_dispatcher import safe_delay
+        from .tasks import extract_freshness_task, index_document_task
+        safe_delay(extract_freshness_task, new_doc.id)
+        safe_delay(index_document_task, new_doc.id)
+
         # 确保 raw_keywords 始终是列表（给前端返回用）
         if not isinstance(raw_keywords, list):
             raw_keywords = []
@@ -1485,6 +1498,12 @@ class BatchFileUploadView(APIView):
                     )
                 except Exception as e:
                     logger.error(f'批量上传创建日志失败 file={file_name}: {e}')
+
+                # 4g-2. 触发异步索引（切片 + 向量化），使文档可被 AI 智能问答检索
+                from utils.celery_dispatcher import safe_delay
+                from .tasks import extract_freshness_task, index_document_task
+                safe_delay(extract_freshness_task, new_doc.id)
+                safe_delay(index_document_task, new_doc.id)
 
                 # 4h. 记录成功
                 success_results.append({
