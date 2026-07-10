@@ -339,7 +339,7 @@ class AskView(APIView):
         if not _url:
             _url = _re.search(r'(www\.nsu\.edu\.cn[\S]*)', question)
         if not _url:
-            _topic_map = {'通知公告': '', '校园时讯': '', '学校概况': '', '招生就业': '', '图书馆': ''}
+            _topic_map = {'通知公告': '', '公告': '', '校园时讯': '', '新闻': '', '学校概况': '', '招生就业': '', '图书馆': ''}
             for _topic in _topic_map:
                 if _topic in question:
                     return self._handle_search_query(question, user, conversation_id, _topic)
