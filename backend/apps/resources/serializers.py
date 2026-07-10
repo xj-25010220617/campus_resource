@@ -55,6 +55,8 @@ class UploadLogSerializer(serializers.ModelSerializer):
     user_name = serializers.CharField(source='user.username', read_only=True)
     college_name = serializers.CharField(source='college.name', read_only=True)
     resource_title = serializers.CharField(source='resource.title', read_only=True, allow_null=True)
+    created_at = serializers.DateTimeField(format='%Y/%m/%d %H:%M', read_only=True)
+    completed_at = serializers.DateTimeField(format='%Y/%m/%d %H:%M', read_only=True)
 
     class Meta:
         model = UploadLog
