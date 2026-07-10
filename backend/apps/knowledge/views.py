@@ -1213,14 +1213,8 @@ class FileUploadView(APIView):
 
         # AI 自动填充缺失字段
         user_description = data.get('description', '')
-        raw_keywords = data.get('keywords', [])  # ListField 已解析为列表
-
-        # [临时调试] 排查前端 multipart 关键词丢失问题，确认后可删除
-        logger.warning(
-            f'[KW-DEBUG] raw_request_keys={list(request.data.keys())} | '
-            f'raw_request.getlist(keywords)={request.data.getlist("keywords") if hasattr(request.data, "getlist") else "N/A"} | '
-            f'validated_keywords={raw_keywords!r} (type={type(raw_keywords).__name__})'
-        )
+        # multipart 兼容：前端可能以 JSON 字符串 / 重复字段 / keywords[] 等多种形式发送关键词
+        raw_keywords = _normalize_keywords(request, data.get('keywords', []))
 
         needs_ai = (
             not user_title
@@ -1519,6 +1513,50 @@ class BatchFileUploadView(APIView):
             'success_count': len(success_results),
             'failed_count': len(failed_results),
         })
+
+
+def _normalize_keywords(request, validated_value) -> list:
+    """稳健提取关键词列表，兼容 JSON body 与 multipart 的多种发送格式。
+
+    multipart/form-data 上传文件时，前端可能以下列任意形式发送关键词：
+        - 真数组（JSON body 或重复字段 keywords=a&keywords=b）
+        - 单个 JSON 字符串，如 keywords='["关键词1","关键词2"]'
+        - 数组命名字段 keywords[]=a&keywords[]=b
+
+    统一归整为「去空后的字符串列表」，避免因格式不符被误判为空而触发 AI 重跑。
+
+    Args:
+        request: DRF Request，用于在 multipart 下回读原始字段
+        validated_value: 序列化器 ListField 解析出的值（list 或其它）
+
+    Returns:
+        规整后的关键词字符串列表（可能为空）
+    """
+    import json
+
+    candidates = []
+    if isinstance(validated_value, list):
+        candidates = list(validated_value)
+    elif isinstance(validated_value, str) and validated_value.strip():
+        candidates = [validated_value]
+
+    # multipart 下若序列化器没接到，回读原始请求（兼容 keywords / keywords[] 两种命名）
+    if not candidates and hasattr(request.data, 'getlist'):
+        candidates = request.data.getlist('keywords') or request.data.getlist('keywords[]')
+
+    # 单元素且是 JSON 数组字符串时展开，如 ['["a","b"]'] → ['a', 'b']
+    if len(candidates) == 1 and isinstance(candidates[0], str):
+        text = candidates[0].strip()
+        if text.startswith('[') and text.endswith(']'):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    candidates = parsed
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    # 归整为非空字符串列表
+    return [str(k).strip() for k in candidates if str(k).strip()]
 
 
 def _ai_classify(title: str = '', content: str = '') -> Optional[dict]:
