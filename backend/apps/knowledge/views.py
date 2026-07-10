@@ -1215,6 +1215,13 @@ class FileUploadView(APIView):
         user_description = data.get('description', '')
         raw_keywords = data.get('keywords', [])  # ListField 已解析为列表
 
+        # [临时调试] 排查前端 multipart 关键词丢失问题，确认后可删除
+        logger.warning(
+            f'[KW-DEBUG] raw_request_keys={list(request.data.keys())} | '
+            f'raw_request.getlist(keywords)={request.data.getlist("keywords") if hasattr(request.data, "getlist") else "N/A"} | '
+            f'validated_keywords={raw_keywords!r} (type={type(raw_keywords).__name__})'
+        )
+
         needs_ai = (
             not user_title
             or not user_description
