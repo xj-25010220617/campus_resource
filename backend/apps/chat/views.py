@@ -333,7 +333,20 @@ class AskView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # 0.5 意图路由：判断问题类型（文件管理查询 / 常规 RAG）
+        # 0.5 实时网页分析 / 联网搜索
+        import re as _re
+        _url = _re.search(r'https?://[^\s,，。；;]+', question)
+        if not _url:
+            _url = _re.search(r'(www\.nsu\.edu\.cn[\S]*)', question)
+        if not _url:
+            _topic_map = {'通知公告': '', '校园时讯': '', '学校概况': '', '招生就业': '', '图书馆': ''}
+            for _topic in _topic_map:
+                if _topic in question:
+                    return self._handle_search_query(question, user, conversation_id, _topic)
+        if _url:
+            return self._handle_web_query(question, user, conversation_id, _url.group())
+
+        # 0.6 意图路由：判断问题类型（文件管理查询 / 常规 RAG）
         from utils.query_router import route_question
         from utils.data_query import execute_query, build_data_query_prompt
         route = route_question(question, user)
@@ -538,6 +551,142 @@ class AskView(APIView):
         response['X-Accel-Buffering'] = 'no'
         response['Access-Control-Allow-Origin'] = '*'
         return response
+
+    def _handle_web_query(self, question, user, conversation_id, url, topic=''):
+        """实时抓取网页 → LLM 分析 → SSE 流式输出（不存储）。"""
+        from utils.web_fetcher import fetch_page
+        from utils.sse import _format_sse
+
+        # 抓取
+        page_text = fetch_page(url)
+        if not page_text or len(page_text) < 500:
+            # 网页抓取失败或内容太少（JS渲染页），走内建知识库
+            logger.info(f'网页内容不足({len(page_text) if page_text else 0}字)，走内建知识库')
+            return self._fallback_to_knowledge(question, user, conversation_id, topic or url)
+
+        # 若无会话则创建
+        conv, _ = Conversation.objects.get_or_create(
+            id=conversation_id if conversation_id else None,
+            defaults={'user': user if user else None, 'title': f'网页分析: {url[:40]}'},
+        )
+        ChatMessage.objects.create(conversation=conv, role='user', content=question)
+        assistant_msg = ChatMessage.objects.create(
+            conversation=conv, role='assistant', content='',
+        )
+
+        # 构造 Prompt：把网页内容作为上下文给 LLM
+        source_desc = f'（{topic}）' if topic else ''
+        system_prompt = (
+            '你是一个网站内容分析助手。用户要求查看网站内容，你已实时获取了该页面的内容。'
+            '请阅读并回答用户的问题。\n\n'
+            f'网页地址：{url} {source_desc}\n'
+            f'网页内容：\n---\n{page_text}\n---\n\n'
+            '请根据获取到的网页内容直接回答。如果页面内容是导航菜单而非具体文章，'
+            '请如实告知用户该页面上有哪些栏目或链接可供查看。'
+        )
+
+        def event_stream():
+            try:
+                yield _format_sse('start', {
+                    'conversation_id': conv.id, 'message_id': assistant_msg.id,
+                })
+                for token in llm_client.chat_stream(
+                    [{'role': 'system', 'content': system_prompt},
+                     {'role': 'user', 'content': question}],
+                    temperature=0.3, max_tokens=2048,
+                ):
+                    if token:
+                        yield _format_sse('token', {'content': token})
+                yield _format_sse('references', {'count': 1, 'summary': '实时抓取: ' + url})
+                yield _format_sse('done', {'message_id': assistant_msg.id})
+            except Exception as e:
+                logger.error(f'网页分析 SSE 异常: {e}')
+                yield _format_sse('error', {'message': '分析失败，请重试'})
+
+        response = StreamingHttpResponse(event_stream(), content_type='text/event-stream')
+        response['Cache-Control'] = 'no-cache'
+        response['X-Accel-Buffering'] = 'no'
+        response['Access-Control-Allow-Origin'] = '*'
+        return response
+
+    def _fallback_to_knowledge(self, question, user, conversation_id, topic):
+        """网页抓取失败时，用内建知识库回答。"""
+        from utils.sse import _format_sse
+        from utils.rag import NEUSOFT_KNOWLEDGE
+
+        conv, _ = Conversation.objects.get_or_create(
+            id=conversation_id if conversation_id else None,
+            defaults={'user': user, 'title': f'学校咨询: {question[:40]}'},
+        )
+        ChatMessage.objects.create(conversation=conv, role='user', content=question)
+        assistant_msg = ChatMessage.objects.create(conversation=conv, role='assistant', content='')
+
+        prompt = (
+            '你是成都东软学院的AI智能助手。用户想了解学校信息，'
+            '但学校官网是JS动态渲染的，无法直接抓取内容。\n\n'
+            f'请使用以下内建知识库回答：\n---\n{NEUSOFT_KNOWLEDGE}\n---\n\n'
+            '如果内建知识库不足以回答，请如实告知并建议访问官网 https://www.nsu.edu.cn。'
+        )
+
+        def _stream():
+            try:
+                yield _format_sse('start', {'conversation_id': conv.id, 'message_id': assistant_msg.id})
+                for token in llm_client.chat_stream(
+                    [{'role': 'system', 'content': prompt}, {'role': 'user', 'content': question}],
+                    temperature=0.3, max_tokens=1024,
+                ):
+                    if token:
+                        yield _format_sse('token', {'content': token})
+                yield _format_sse('references', {'count': 1, 'summary': '内建知识库'})
+                yield _format_sse('done', {'message_id': assistant_msg.id})
+            except Exception as e:
+                logger.error(f'知识库SSE异常: {e}')
+                yield _format_sse('error', {'message': '查询失败'})
+
+        response = StreamingHttpResponse(_stream(), content_type='text/event-stream')
+        response['Access-Control-Allow-Origin'] = '*'
+        return response
+
+    def _handle_search_query(self, question, user, conversation_id, topic):
+        """联网搜索 → LLM 分析 → SSE 输出。"""
+        from utils.web_search import search_school
+        from utils.sse import _format_sse
+
+        results = search_school(question)
+        conv, _ = Conversation.objects.get_or_create(
+            id=conversation_id or None,
+            defaults={'user': user, 'title': f'搜索: {question[:40]}'},
+        )
+        ChatMessage.objects.create(conversation=conv, role='user', content=question)
+        msg = ChatMessage.objects.create(conversation=conv, role='assistant', content='')
+
+        if not results:
+            sp = '你搜索了 "%s" 但没有找到结果，请如实告知。' % question
+        else:
+            lines = '\n'.join(
+                '%d. [%s](%s)\n   %s' % (i+1, r['title'], r['url'], r['snippet'])
+                for i, r in enumerate(results)
+            )
+            sp = '以下是通过搜索引擎找到的成都东软学院相关信息。请阅读并整理回答。\n\n%s\n\n请列出信息来源链接。' % lines
+
+        def _s():
+            try:
+                yield _format_sse('start', {'conversation_id': conv.id, 'message_id': msg.id})
+                for t in llm_client.chat_stream(
+                    [{'role': 'system', 'content': sp}, {'role': 'user', 'content': question}],
+                    temperature=0.3, max_tokens=1024,
+                ):
+                    if t:
+                        yield _format_sse('token', {'content': t})
+                yield _format_sse('references', {'count': len(results), 'summary': '联网搜索'})
+                yield _format_sse('done', {'message_id': msg.id})
+            except Exception as e:
+                logger.error(f'搜索SSE异常: {e}')
+                yield _format_sse('error', {'message': '搜索失败'})
+
+        r = StreamingHttpResponse(_s(), content_type='text/event-stream')
+        r['Cache-Control'] = 'no-cache'; r['X-Accel-Buffering'] = 'no'; r['Access-Control-Allow-Origin'] = '*'
+        return r
 
 
 class FeedbackView(generics.CreateAPIView):
