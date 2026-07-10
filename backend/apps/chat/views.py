@@ -622,8 +622,18 @@ class VoiceAskView(APIView):
             )
         audio_data = audio_file.read()
 
-        # 语音 → 文字
-        audio_fmt = audio_file.name.rsplit('.', 1)[-1] if '.' in audio_file.name else 'wav'
+        # 从 MIME type 提取格式（如 "audio/webm;codecs=opus" → "webm"）
+        # 备选：从文件名扩展名（如 "recording.webm" → "webm"）
+        # 最终由 asr.speech_to_text() 内部魔数检测兜底
+        mime_type = getattr(audio_file, 'content_type', '') or ''
+        if mime_type:
+            # 取 "audio/webm;codecs=opus" → "webm"
+            audio_fmt = mime_type.split(';')[0].split('/')[-1].strip()
+        elif '.' in audio_file.name:
+            audio_fmt = audio_file.name.rsplit('.', 1)[-1]
+        else:
+            audio_fmt = 'wav'
+
         text, asr_error = speech_to_text(audio_data, audio_fmt)
         if not text:
             # 映射 asr_error.error_type → 对应 ErrorCode

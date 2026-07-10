@@ -20,6 +20,44 @@ _model_error = None  # 记录模型加载失败原因
 # 需转码为 WAV 的格式
 _CONVERT_FORMATS = {'mp3', 'm4a', 'aac', 'ogg', 'flac', 'wma', 'opus', 'webm'}
 
+# 音频文件魔数（文件头特征）用于自动检测格式
+_MAGIC_BYTES = {
+    b'RIFF': 'wav',          # WAV
+    b'ID3': 'mp3',           # MP3 with ID3
+    b'\xff\xfb': 'mp3',      # MP3 without ID3 (MPEG audio frame sync)
+    b'\xff\xf3': 'mp3',      # MP3 without ID3
+    b'\xff\xf2': 'mp3',      # MP3 without ID3
+    b'\xff\xfa': 'mp3',      # MP3 without ID3
+    b'OggS': 'ogg',          # OGG/Opus
+    b'ftyp': 'm4a',          # M4A/AAC
+    b'\x1a\x45\xdf\xa3': 'webm',  # WebM/Opus (EBML header)
+    # WAV also starts with RIFF....WAVE
+}
+
+def _detect_format_from_header(audio_data: bytes) -> str | None:
+    """
+    通过文件头魔数自动检测音频格式。
+
+    Returns:
+        检测到的格式字符串（如 'wav', 'webm', 'ogg', 'mp3', 'm4a'），未知则返回 None。
+    """
+    for magic, fmt in _MAGIC_BYTES.items():
+        if audio_data.startswith(magic):
+            return fmt
+    return None
+
+# 格式到 pydub format 的映射（处理带参数的 mime type）
+_FORMAT_TO_PYDUB = {
+    'webm': 'webm',
+    'ogg': 'ogg',
+    'opus': 'ogg',     # opus 在 ogg 容器中
+    'mp3': 'mp3',
+    'm4a': 'm4a',
+    'aac': 'aac',
+    'wav': 'wav',
+    'flac': 'flac',
+}
+
 # 音频大小限制
 _MAX_AUDIO_BYTES = 10 * 1024 * 1024   # 10MB
 _MIN_AUDIO_BYTES = 512                # 太小肯定无效
@@ -205,7 +243,15 @@ def speech_to_text(audio_data: bytes, audio_format: str = 'wav') -> tuple[str, d
     """
     import io
 
-    fmt = (audio_format or 'wav').lower().lstrip('.')
+    # 0) 优先用文件头魔数检测格式，其次用传入的 audio_format
+    detected_fmt = _detect_format_from_header(audio_data)
+    if detected_fmt:
+        fmt = detected_fmt
+        _add_log('format_detect', 'ok', f'文件头魔数检测: {fmt}', None)
+    else:
+        fmt = (audio_format or 'wav').lower().lstrip('.')
+        _add_log('format_detect', 'ok', f'使用传入格式: {fmt}（魔数检测失败）', None)
+
     need_convert = fmt in _CONVERT_FORMATS
     ext = f'.{fmt}'
     raw_path = None
@@ -228,18 +274,38 @@ def speech_to_text(audio_data: bytes, audio_format: str = 'wav') -> tuple[str, d
             'error_log': error_log,
         }
 
+    def _pydub_convert_to_wav(data: bytes, try_formats: list[str]) -> bytes | None:
+        """
+        尝试多种 pydub format 参数进行内存转码。
+        返回转换后的 WAV bytes，失败返回 None。
+        """
+        from pydub import AudioSegment
+        for pydub_fmt in try_formats:
+            try:
+                audio = AudioSegment.from_file(io.BytesIO(data), format=pydub_fmt)
+                audio = audio.set_channels(1).set_frame_rate(16000)
+                buf = io.BytesIO()
+                audio.export(buf, format='wav')
+                logger.info(f'pydub 内存转码成功: format={pydub_fmt}, duration={len(audio)/1000:.1f}s')
+                return buf.getvalue()
+            except Exception as e:
+                logger.warning(f'pydub format={pydub_fmt} 失败: {type(e).__name__}: {e}')
+                continue
+        return None
+
     try:
-        # 0) webm/ogg/mp4 等浏览器原生格式，用 pydub 先转为 WAV
+        # 1) webm/ogg/mp4 等浏览器原生格式，用 pydub 内存转码为 WAV
         if fmt in ('webm', 'ogg', 'mp4', 'opus'):
+            # 浏览器 webm/ogg 可能带不同编解码器，尝试多种 format 参数
+            pydub_formats = ['webm', 'ogg', 'opus', 'mp4'] if fmt == 'webm' else [fmt, 'ogg', 'opus', 'mp4']
             try:
                 from pydub import AudioSegment
                 _add_log('format_convert', 'ok', f'开始 pydub 内存转码: {fmt} → WAV',
-                         f'原始大小={len(audio_data)} bytes')
-                audio = AudioSegment.from_file(io.BytesIO(audio_data), format=fmt)
-                audio = audio.set_channels(1).set_frame_rate(16000)
-                buffer = io.BytesIO()
-                audio.export(buffer, format='wav')
-                audio_data = buffer.getvalue()
+                         f'原始大小={len(audio_data)} bytes, 尝试 formats={pydub_formats}')
+                converted = _pydub_convert_to_wav(audio_data, pydub_formats)
+                if converted is None:
+                    raise ValueError('所有 pydub format 均失败')
+                audio_data = converted
                 fmt = 'wav'
                 ext = '.wav'
                 need_convert = False
@@ -256,7 +322,6 @@ def speech_to_text(audio_data: bytes, audio_format: str = 'wav') -> tuple[str, d
                     suggestion='请联系管理员安装 pydub 库：pip install pydub',
                 )
             except FileNotFoundError as e:
-                # pydub 依赖 ffmpeg/ffprobe 做格式转换，FileNotFoundError 说明系统未安装
                 _add_log('format_convert', 'fail',
                          f'ffmpeg 未安装或不在 PATH 中，pydub 无法处理 {fmt} 格式',
                          str(e))
