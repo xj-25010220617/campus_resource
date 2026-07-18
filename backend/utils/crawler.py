@@ -222,7 +222,7 @@ class NeusoftSpider:
         self.seen_hashes: Set[str] = set()  # 内容去重
 
     def _fetch(self, url: str) -> Optional[str]:
-        """请求 URL 返回 HTML，失败返回 None。"""
+        """请求 URL 返回 HTML，失败返回 None。JS 页面自动尝试 Playwright 渲染。"""
         if url in self.seen_urls:
             return None
         self.seen_urls.add(url)
@@ -231,7 +231,17 @@ class NeusoftSpider:
             resp.raise_for_status()
             resp.encoding = resp.apparent_encoding or "utf-8"
             time.sleep(CRAWL_DELAY)
-            return resp.text
+            html = resp.text
+
+            # 检测 JS 渲染页面，尝试 Playwright 兜底
+            from utils.js_renderer import is_js_rendered, render_page
+            if is_js_rendered(html):
+                logger.info('爬虫检测到 JS 渲染页面，尝试 Playwright: %s', url)
+                rendered = render_page(url)
+                if rendered:
+                    return rendered
+
+            return html
         except requests.RequestException as e:
             logger.warning(f"请求失败: {url} - {e}")
             return None

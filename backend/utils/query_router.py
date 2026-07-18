@@ -52,6 +52,31 @@ _DATA_QUERY_PATTERNS = {
     ],
 }
 
+# 资源查询关键词（Resource 表热门/排行/统计）
+_RESOURCE_QUERY_PATTERNS = {
+    "resource_popular": [
+        r"(热门|最火|最受欢迎|下载最多|最热|最多人看).*(资源|文件|资料|课件)",
+        r"(资源|文件|资料|课件).*(热门|最火|最受欢迎|下载最多|排行)",
+        r"(排行榜|排名|排行|TOP\d*).*(资源|下载|热度)",
+        r"(哪些|什么).*(资源|文件).*(最|比较).*(受欢迎|热门|多人)",
+    ],
+    "resource_recent": [
+        r"(最新|近期|最近).*(发布|上传|新增).*(资源|文件|课件)",
+        r"(资源|文件|课件).*(最新|近期).*(发布|上传|更新)",
+        r"(最近|有什么|有哪些).*(新资源|新文件|新课件)",
+    ],
+    "resource_ranking": [
+        r"(哪个|哪些|什么).*(学院|专业|学科).*(上传|发布|资源).*(多|最多|丰富)",
+        r"(学院|专业|学科).*(上传|发布|资源).*(排名|排行|最多)",
+        r"(看看|查看|各).*(学院|专业|学科).*(资源|情况|统计)",
+    ],
+    "resource_stats": [
+        r"(资源|资料|课件).*(统计|总数|总量|概况|总览)",
+        r"(多少|几个|多少).*(资源|资料|课件).*(总计|总共|一共|共有)",
+        r"(平台|系统).*(资源|资料).*(统计|概况|状况)",
+    ],
+}
+
 # 时间范围关键词
 _TIME_PATTERNS = {
     "this_year": [r"今年", r"本年度", r"202[4-9]年"],
@@ -197,6 +222,20 @@ def route_question(question: str, user=None) -> dict:
             if type_match:
                 params["file_type"] = type_match.group(1).lower()
 
+            return {
+                "type": "data_query",
+                "query_type": query_type,
+                "params": params,
+                "confidence": 0.9,
+            }
+
+    # 检查是否为资源查询（热门/排行/统计/最新）
+    for query_type, patterns in _RESOURCE_QUERY_PATTERNS.items():
+        if _match_pattern(question, patterns):
+            params = {}
+            time_param = _extract_time_param(question)
+            if time_param:
+                params.update(time_param)
             return {
                 "type": "data_query",
                 "query_type": query_type,

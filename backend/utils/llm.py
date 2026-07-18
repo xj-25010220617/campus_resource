@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 LLM_API_KEY = getattr(settings, 'DEEPSEEK_API_KEY', '')
 LLM_BASE_URL = getattr(settings, 'DEEPSEEK_BASE_URL', 'https://api.deepseek.com')
 LLM_CHAT_MODEL = getattr(settings, 'DEEPSEEK_CHAT_MODEL', 'deepseek-chat')
+LLM_EMBED_MODEL = getattr(settings, 'DEEPSEEK_EMBED_MODEL', 'deepseek-embed')
 
 # ------------------------------------------------------------------
 # Embedding 后端配置

@@ -236,3 +236,31 @@ FAQ_ANALYSIS_DAYS = 7
 NEUSOFT_WEBSITE_URL = config('NEUSOFT_WEBSITE_URL', default='https://www.neusoft.edu.cn')
 CRAWLER_MAX_PAGES = config('CRAWLER_MAX_PAGES', default=200, cast=int)
 CRAWLER_CRAWL_DELAY = config('CRAWLER_CRAWL_DELAY', default=0.5, cast=float)
+
+# ------------------------------------------------------------------
+# 启动健康检查
+# ------------------------------------------------------------------
+SKIP_STARTUP_HEALTH_CHECK = config('SKIP_STARTUP_HEALTH_CHECK', default=False, cast=bool)
+
+# ------------------------------------------------------------------
+# 同义词词典
+# ------------------------------------------------------------------
+SYNONYM_DICT_CUSTOM_PATH = config('SYNONYM_DICT_CUSTOM_PATH', default='')
+
+# ------------------------------------------------------------------
+# Cross-Encoder 重排序
+# ------------------------------------------------------------------
+CROSS_ENCODER_ENABLED = config('CROSS_ENCODER_ENABLED', default=True, cast=bool)
+CROSS_ENCODER_MODEL = config('CROSS_ENCODER_MODEL', default='BAAI/bge-reranker-v2-m3')
+
+# ------------------------------------------------------------------
+# 多轮对话摘要
+# ------------------------------------------------------------------
+MAX_HISTORY_ROUNDS_BEFORE_SUMMARY = config('MAX_HISTORY_ROUNDS_BEFORE_SUMMARY', default=3, cast=int)
+
+# ------------------------------------------------------------------
+# JS 渲染页面抓取（Playwright）
+# ------------------------------------------------------------------
+PLAYWRIGHT_ENABLED = config('PLAYWRIGHT_ENABLED', default=False, cast=bool)
+PLAYWRIGHT_TIMEOUT = config('PLAYWRIGHT_TIMEOUT', default=15000, cast=int)
+PLAYWRIGHT_HEADLESS = config('PLAYWRIGHT_HEADLESS', default=True, cast=bool)

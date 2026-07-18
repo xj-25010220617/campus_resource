@@ -8,6 +8,8 @@ import threading
 import time
 from typing import Dict, List, Optional
 
+from django.conf import settings
+
 from .llm import llm_client
 from .milvus import milvus_client
 
@@ -122,6 +124,54 @@ CONTEXT_MAX_CHARS = 8000
 # ------------------------------------------------------------------
 # Prompt 构造
 # ------------------------------------------------------------------
+# ------------------------------------------------------------------
+# 多轮对话摘要（超长历史时自动压缩）
+# ------------------------------------------------------------------
+MAX_HISTORY_ROUNDS = 3          # 超过 3 轮（6 条消息）触发摘要
+MAX_SUMMARY_CHARS = 200         # 摘要最大字符数
+
+_SUMMARIZE_PROMPT = """你是对话摘要助手。请将以下多轮对话历史压缩为一段简洁的摘要（{max_chars}字以内），
+保留关键信息：用户的核心需求、已完成的任务、当前讨论的主题。
+
+对话历史：
+{history}
+
+摘要："""
+
+
+def _summarize_history(history: List[dict]) -> Optional[str]:
+    """
+    将多轮对话历史压缩为摘要（调用 LLM）。
+
+    Args:
+        history: 历史消息列表 [{'role': str, 'content': str}, ...]
+
+    Returns:
+        摘要文本，失败返回 None（调用方回退到截断逻辑）
+    """
+    lines = []
+    for msg in history:
+        role = '用户' if msg['role'] == 'user' else '助手'
+        lines.append(f"{role}: {msg['content'][:500]}")
+    history_text = '\n'.join(lines)
+
+    prompt = _SUMMARIZE_PROMPT.format(
+        max_chars=MAX_SUMMARY_CHARS,
+        history=history_text,
+    )
+    messages = [{'role': 'user', 'content': prompt}]
+
+    try:
+        summary = llm_client.chat(messages, temperature=0.2, max_tokens=200)
+        if summary and len(summary.strip()) > 10:
+            logger.info('对话摘要生成成功: %d 字符', len(summary))
+            return summary.strip()
+    except Exception as e:
+        logger.warning('对话摘要生成失败: %s', e)
+
+    return None
+
+
 def build_rag_prompt(
     question: str,
     chunks: List[dict],
@@ -160,8 +210,23 @@ def build_rag_prompt(
 
     # 插入历史对话（多轮上下文）
     if history:
-        # 截取最近 N 轮（防止超长），保留最后 6 条消息
-        recent_history = history[-6:]
+        threshold = getattr(
+            settings, 'MAX_HISTORY_ROUNDS_BEFORE_SUMMARY', MAX_HISTORY_ROUNDS,
+        )
+        if len(history) > threshold * 2:
+            # 超过阈值：生成摘要 + 保留最近 2 轮
+            summary = _summarize_history(history)
+            if summary:
+                messages[0]['content'] += (
+                    f'\n\n## 历史对话摘要\n{summary}\n'
+                )
+                recent_history = history[-4:]  # 最近 2 轮 = 4 条消息
+            else:
+                # 摘要失败，回退到原有截断逻辑
+                recent_history = history[-6:]
+        else:
+            recent_history = history[-6:]
+
         for msg in recent_history:
             if msg['role'] in ('user', 'assistant'):
                 messages.append({
@@ -268,6 +333,10 @@ def _keyword_search(
 
     if not keywords:
         return []
+
+    # 同义词扩展
+    from utils.synonym import expand_keywords
+    keywords = expand_keywords(keywords)
 
     from django.db.models import Q
     from apps.resources.models import Resource
@@ -699,6 +768,11 @@ def _fallback_title_search(
             if len(p) >= 2 and p not in stop_words and p not in keywords:
                 keywords.append(p)
     keywords = keywords[:5]
+
+    # 同义词扩展
+    from utils.synonym import expand_keywords as _expand_kw
+    keywords = _expand_kw(keywords)
+
     if not keywords:
         return []
 
@@ -801,6 +875,15 @@ def retrieve(
         keyword_hits,
         keywords_boost=_keywords_boost_from_filters(parsed_filters),
     )
+
+    # 3.5 Cross-Encoder 精排（初检 Top-20 → 精排 Top-5）
+    if len(merged) > CROSS_ENCODER_TOP_K_OUTPUT:
+        try:
+            from utils.reranker import rerank_with_cross_encoder
+            merged = rerank_with_cross_encoder(question, merged)
+            logger.debug('Cross-Encoder 重排序后: %d 条', len(merged))
+        except ImportError:
+            pass  # reranker 模块不存在，静默跳过
 
     # 4. 加载 doc 元信息
     enriched = _enrich_with_doc_meta(merged, min_score)

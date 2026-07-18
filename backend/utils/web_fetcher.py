@@ -44,7 +44,17 @@ def fetch_page(url: str) -> Optional[str]:
         logger.warning(f'网页抓取失败: {url} - {e}')
         return None
 
-    soup = BeautifulSoup(resp.text, 'lxml')
+    html = resp.text
+
+    # 检测 JS 渲染页面，尝试 Playwright 兜底
+    from utils.js_renderer import is_js_rendered, render_page
+    if is_js_rendered(html):
+        logger.info('检测到 JS 渲染页面，尝试 Playwright: %s', url)
+        rendered = render_page(url)
+        if rendered:
+            html = rendered
+
+    soup = BeautifulSoup(html, 'lxml')
 
     # 提取标题
     title = ''

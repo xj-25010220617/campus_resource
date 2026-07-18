@@ -405,6 +405,31 @@ class AskView(APIView):
             parsed_filters=parsed,
         )
 
+        # 3.2b 知识库无结果 → 联网搜索兜底
+        web_search_used = False
+        if not results:
+            logger.info('知识库无结果，启动联网搜索兜底: %s', question[:50])
+            from utils.web_search import search_school
+            search_results = search_school(question, max_results=5)
+            if search_results:
+                web_search_used = True
+                for sr in search_results:
+                    results.append({
+                        'doc_id': 0,
+                        'doc_title': sr['title'],
+                        'content': (
+                            f"标题：{sr['title']}\n"
+                            f"摘要：{sr['snippet']}\n"
+                            f"来源：{sr['url']}"
+                        ),
+                        'score': 0.6,
+                        'page': 0,
+                        'source_type': 'web_search',
+                    })
+                logger.info('联网搜索兜底命中 %d 条', len(results))
+            else:
+                logger.info('联网搜索也无结果')
+
         # 3.3 写 query_log（预创建，response_ms 在流结束后回填）
         start_ts = time.time()
         query_log = QueryLog.objects.create(
