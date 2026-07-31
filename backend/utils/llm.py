@@ -144,8 +144,8 @@ class LLMClient:
                 try:
                     resp = ExternalClient.post(
                         'deepseek_embed',
-                        f'{self.base_url}/v1/embeddings',
-                        headers=self.headers,
+                        f'{self.chat_base_url}/v1/embeddings',
+                        headers=self.chat_headers,
                         json={
                             'model': model,
                             'input': texts,
