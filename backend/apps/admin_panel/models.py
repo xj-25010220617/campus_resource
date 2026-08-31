@@ -81,6 +81,7 @@ class OperationLog(models.Model):
         ('user', '用户'),
         ('resource', '资源'),
         ('category', '资源分类'),
+        ('department', '部门'),
     ]
 
     operator = models.ForeignKey(

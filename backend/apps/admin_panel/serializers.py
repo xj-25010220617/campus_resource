@@ -14,6 +14,7 @@ from rest_framework import serializers
 
 from apps.accounts.models import College
 from apps.chat.models import QueryLog, SensitiveLog
+from apps.classify.models import Department
 from apps.resources.models import UploadLog
 from apps.resources.serializers import UploadLogSerializer
 
@@ -319,3 +320,22 @@ class OperationLogStatsSerializer(LogStatsBaseSerializer):
     by_action = serializers.ListField(child=_GroupCountSerializer())
     by_target_type = serializers.ListField(child=_GroupCountSerializer())
     top_operators = serializers.ListField(child=_GroupCountSerializer())
+
+
+# ======================================================================
+# 三、部门管理（新增）
+# ======================================================================
+class DepartmentWriteSerializer(serializers.ModelSerializer):
+    """部门新建/编辑序列化器（超管）"""
+
+    class Meta:
+        model = Department
+        fields = ['id', 'name', 'parent', 'sort_order']
+        read_only_fields = ['id']
+
+    def validate(self, attrs):
+        """校验部门层级：最多两级，不能挂到二级部门下。"""
+        parent = attrs.get('parent')
+        if parent is not None and parent.parent_id is not None:
+            raise serializers.ValidationError({'parent': '部门最多支持两级，不能再挂到二级部门下'})
+        return attrs

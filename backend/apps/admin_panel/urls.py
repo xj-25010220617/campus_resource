@@ -22,6 +22,7 @@ from .views import (
     BatchResetPasswordView,
     CollegeListView,
     CurrentUserView,
+    DepartmentDestroyView,
     DepartmentListView,
     LoginLogStatsView,
     LogsDashboardView,
@@ -42,6 +43,7 @@ urlpatterns = [
     path('users/batch_delete/', BatchDeleteUsersView.as_view(), name='batch-delete-users'),
     path('colleges/', CollegeListView.as_view(), name='college-list'),
     path('departments/', DepartmentListView.as_view(), name='department-list'),
+    path('departments/<int:pk>/', DepartmentDestroyView.as_view(), name='department-delete'),
     path('me/', CurrentUserView.as_view(), name='current-user'),
 
     # ---- 超管日志管理（ListAPIView + RetrieveAPIView）----

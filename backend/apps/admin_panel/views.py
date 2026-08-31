@@ -45,6 +45,7 @@ from .serializers import (
     AdminUploadLogSerializer,
     BatchResetPasswordSerializer,
     CollegeSerializer,
+    DepartmentWriteSerializer,
     LoginLogStatsSerializer,
     OperationLogStatsSerializer,
     QueryLogStatsSerializer,
@@ -376,23 +377,67 @@ class CollegeListView(generics.ListAPIView):
     serializer_class = CollegeSerializer
 
 
-class DepartmentListView(generics.ListAPIView):
-    """部门列表查询接口
+class DepartmentListView(generics.ListCreateAPIView):
+    """部门列表查询 / 新建部门
 
-    GET /api/admin/departments/
-    权限：仅管理员
-    请求参数：
-        - college_id (int, optional): 按所属学院筛选
+    GET  /api/admin/departments/  - 部门列表（树形，所有管理员）
+    POST /api/admin/departments/  - 新建部门（仅超级管理员）
+    权限：
+        - GET: 所有管理员（IsAnyAdmin）
+        - POST: 仅超级管理员（IsSuperAdmin）
+    POST 请求体：
+        - name (str, required): 部门名称
+        - parent (int, optional): 上级部门 ID，空表示一级部门
+        - sort_order (int, optional): 排序值，默认 0
     """
-    permission_classes = [permissions.IsAuthenticated, IsAnyAdmin]
     serializer_class = DepartmentSerializer
 
+    def get_permissions(self):
+        if self.request.method == 'POST':
+            return [permissions.IsAuthenticated(), IsSuperAdmin()]
+        return [permissions.IsAuthenticated(), IsAnyAdmin()]
+
+    def get_serializer_class(self):
+        if self.request.method == 'POST':
+            return DepartmentWriteSerializer
+        return DepartmentSerializer
+
     def get_queryset(self):
-        qs = Department.objects.all().order_by('sort_order', 'id')
-        college_id = self.request.query_params.get('college_id')
-        if college_id:
-            qs = qs.filter(college_id=college_id)
-        return qs
+        return Department.objects.all().order_by('sort_order', 'id')
+
+    def perform_create(self, serializer):
+        serializer.save()
+        write_operation_log(
+            self.request,
+            action='create',
+            target_type='department',
+            instance=serializer.instance,
+            after=serializer.data,
+        )
+
+
+class DepartmentDestroyView(generics.DestroyAPIView):
+    """删除部门 - 超管
+
+    DELETE /api/admin/departments/{id}/
+    权限：仅超级管理员
+    说明：删除部门会级联删除其下级部门（parent CASCADE）；
+         归属该部门的用户 department 字段置空（SET_NULL）。
+    """
+    permission_classes = [permissions.IsAuthenticated, IsSuperAdmin]
+    queryset = Department.objects.all()
+
+    def perform_destroy(self, instance):
+        target_id = instance.pk
+        target_repr = str(instance)
+        instance.delete()
+        write_operation_log(
+            self.request,
+            action='delete',
+            target_type='department',
+            target_id=target_id,
+            target_repr=target_repr,
+        )
 
 
 class CurrentUserView(APIView):
@@ -865,7 +910,7 @@ class OperationLogStatsView(APIView):
              'count': row['count']}
             for row in qs.values('action').annotate(count=Count('id'))
         ]
-        target_label_map = {'user': '用户', 'resource': '资源', 'category': '分类'}
+        target_label_map = {'user': '用户', 'resource': '资源', 'category': '分类', 'department': '部门'}
         by_target_type = [
             {'key': row['target_type'],
              'label': target_label_map.get(row['target_type'], row['target_type']),
