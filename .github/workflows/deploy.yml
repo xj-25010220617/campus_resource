@@ -51,3 +51,4 @@ jobs:
             # 等待2秒并检查服务状态
             sleep 2
             curl -s -o /dev/null -w "HTTP状态码: %{http_code}\n" http://localhost:$PORT/api/docs/
+# 测试1
