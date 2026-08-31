@@ -16,20 +16,38 @@ jobs:
           port: ${{ secrets.SSH_PORT }}
           username: ${{ secrets.SSH_USERNAME }}
           key: ${{ secrets.SSH_KEY }}
-          # password: ${{ secrets.SSH_PASSWORD }}
           script: |
-            powershell -Command "
-            Set-Location C:/wwwroot/campus_resource
+            # 进入项目目录
+            cd /www/wwwroot/campus_resource
+
+            # 拉取最新代码
             git pull origin main
-            Set-Location backend
-            ./venv/Scripts/python.exe -m pip install -r requirements.txt
-            ./venv/Scripts/python.exe manage.py migrate
-            $port = 3000
-            $pid = (Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue | Select-Object -First 1).OwningProcess
-            if ($pid) { Stop-Process -Id $pid -Force; Write-Host 'Killed old Django (PID:' $pid ')' } else { Write-Host 'No old Django on port' $port }
-            Start-Sleep 1
-            Start-Process -FilePath './venv/Scripts/python.exe' -ArgumentList 'manage.py','runserver','0.0.0.0:3000' -WorkingDirectory 'C:/wwwroot/campus_resource/backend' -WindowStyle Hidden
-            Write-Host 'Django started on port' $port
-            Start-Sleep 2
-            Invoke-WebRequest -Uri 'http://localhost:3000/api/docs/' -UseBasicParsing -TimeoutSec 5 | Select-Object -ExpandProperty StatusCode
-            "
+
+            # 进入后端目录
+            cd backend
+
+            # 激活虚拟环境并安装依赖
+            source venv/bin/activate
+            pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+            # 执行数据库迁移
+            python manage.py migrate
+
+            # 设置端口
+            PORT=3000
+
+            # 杀掉旧进程（如果存在）
+            PID=$(lsof -t -i:$PORT)
+            if [ -n "$PID" ]; then
+              kill -9 $PID
+              echo "已杀掉旧进程 (PID: $PID)"
+            else
+              echo "端口 $PORT 上没有运行中的进程"
+            fi
+
+            # 启动新进程（后台运行）
+            nohup python manage.py runserver 0.0.0.0:$PORT > /tmp/backend.log 2>&1 &
+
+            # 等待2秒并检查服务状态
+            sleep 2
+            curl -s -o /dev/null -w "HTTP状态码: %{http_code}\n" http://localhost:$PORT/api/docs/
