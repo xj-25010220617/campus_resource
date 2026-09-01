@@ -141,7 +141,8 @@ class KnowledgeDocListView(generics.ListAPIView):
         - super_admin：全量
         - college_admin / admin：校级文档 + 本院文档（含部门级） + 自己上传的
         - dept_admin：校级文档 + 本部门文档 + 自己上传的
-        - user：校级文档 + 本院文档 + 本部门文档 + 自己上传的
+        - user：仅本人上传的文档（对齐接口文档「普通用户仅能查看/下载自己上传的文档」，
+          避免泄露他人私密/未完成文档）
         """
         # 校级文档：college_id 和 department_id 均为 null
         SCHOOL_LEVEL = Q(college_id__isnull=True, department_id__isnull=True)
@@ -160,14 +161,8 @@ class KnowledgeDocListView(generics.ListAPIView):
                 | Q(department_id=user.department_id)
                 | Q(uploader_id=user.id),
             )
-        # user（普通用户）
-        conditions = SCHOOL_LEVEL
-        if user.college_id:
-            conditions |= Q(college_id=user.college_id)
-        if user.department_id:
-            conditions |= Q(department_id=user.department_id)
-        conditions |= Q(uploader_id=user.id)
-        return queryset.filter(conditions)
+        # user（普通用户）：仅本人上传
+        return queryset.filter(uploader_id=user.id)
 
     @staticmethod
     def _rag_scope_filter(queryset, user_context):
@@ -433,7 +428,13 @@ class KeywordListView(APIView):
 
     def get(self, request, doc_id):
         """返回文档的关键词列表"""
-        doc = get_object_or_404(KnowledgeDoc, id=doc_id)
+        # 范围过滤：与文档列表一致，防止读取他人私密/未完成文档的关键词元数据
+        doc = get_object_or_404(
+            KnowledgeDocListView._admin_scope_filter(
+                KnowledgeDoc.objects.all(), request.user,
+            ),
+            id=doc_id,
+        )
         keywords = doc.keywords.order_by('-weight', '-created_at')
         return Response(KeywordSerializer(keywords, many=True).data)
 
@@ -677,8 +678,13 @@ class UploadCallbackView(APIView):
         self._validate_classification(data)
 
         # 再次 MD5 去重（防止并发上传导致重复）
+        # 仅当已存在文档对当前上传者可见时才提示重复，避免泄露他人文档存在性
         duplicate_doc = oss_client.check_duplicate(data['md5'])
-        if duplicate_doc:
+        if duplicate_doc and (
+            request.user.role == 'super_admin'
+            or duplicate_doc.uploader_id == request.user.id
+            or duplicate_doc.visibility == 'public'
+        ):
             return Response({
                 'id': duplicate_doc.id,
                 'status': duplicate_doc.status,
@@ -686,13 +692,13 @@ class UploadCallbackView(APIView):
             })
 
         # 创建文档记录
-        # 文档归属根据上传者角色自动确定
+        # 文档归属根据上传者角色自动确定：非超管强制使用本人归属，防止跨学院/跨部门污染
         if request.user.role == 'super_admin':
-            doc_college_id = None
-            doc_department_id = None
+            doc_college_id = data.get('college_id') or None
+            doc_department_id = data.get('department_id') or None
         else:
-            doc_college_id = data.get('college_id') or request.user.college_id
-            doc_department_id = data.get('department_id') or request.user.department_id
+            doc_college_id = request.user.college_id
+            doc_department_id = request.user.department_id
 
         new_doc = KnowledgeDoc.objects.create(
             oss_key=data['oss_key'],
@@ -946,11 +952,13 @@ class KnowledgeDocPreviewView(APIView):
 
     def get(self, request, pk):
         """返回文档预览内容"""
-        # user 角色不能直接预览单条文档，只能通过 /api/chat/ask/ AI 检索
-        if request.user.role == 'user':
-            raise PermissionDenied('请通过 AI 助手检索资料')
+        # 范围过滤：user 仅可预览本人上传；管理员仅限自己管理范围内文档，
+        # 防止通过枚举 pk 预览其他学院/部门/私密文档
         doc = get_object_or_404(
-            KnowledgeDoc.objects.select_related('uploader'), id=pk,
+            KnowledgeDocListView._admin_scope_filter(
+                KnowledgeDoc.objects.select_related('uploader'), request.user,
+            ),
+            id=pk,
         )
         ft = doc.file_type.lower() if doc.file_type else 'other'
 
