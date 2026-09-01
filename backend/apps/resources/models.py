@@ -244,8 +244,9 @@ class UploadLog(models.Model):
     file_type = models.CharField(max_length=16, verbose_name='文件类型')
     college = models.ForeignKey(
         'accounts.College', on_delete=models.PROTECT,
+        null=True, blank=True,
         verbose_name='所属学院',
-        db_comment='所属学院(1=计算机,2=智能科学,3=信商管理,4=数字艺术,5=外国语,6=健康医疗,7=高职,8=国际,9=基础,10=马院,11=创业,12=继续教育,13=退役军人)',
+        db_comment='所属学院(1=计算机,2=智能科学,3=信商管理,4=数字艺术,5=外国语,6=健康医疗,7=高职,8=国际,9=基础,10=马院,11=创业,12=继续教育,13=退役军人)；超管校级上传可为空',
     )
     department = models.ForeignKey(
         'classify.Department', on_delete=models.SET_NULL,

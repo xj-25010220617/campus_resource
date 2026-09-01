@@ -179,7 +179,7 @@ SPECTACULAR_SETTINGS = {
 # OSS configuration (placeholder — 实际使用时在 .env 中配置)
 OSS_ACCESS_KEY_ID = config('OSS_ACCESS_KEY_ID', default='')
 OSS_ACCESS_KEY_SECRET = config('OSS_ACCESS_KEY_SECRET', default='')
-OSS_ENDPOINT = config('OSS_ENDPOINT', default='oss-cn-hangzhou.aliyuncs.com')
+OSS_ENDPOINT = config('OSS_ENDPOINT', default='oss-cn-chengdu.aliyuncs.com')
 OSS_BUCKET_NAME = config('OSS_BUCKET_NAME', default='')
 
 # ------------------------------------------------------------------
