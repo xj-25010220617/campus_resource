@@ -28,10 +28,12 @@ class FAQCategoryListView(generics.ListAPIView):
     """
     GET /api/faq/categories/
     获取 FAQ 分类列表
+
+    对游客开放：分类不包含敏感信息，便于未登录用户浏览 FAQ。
     """
     queryset = FAQCategory.objects.all()
     serializer_class = FAQCategorySerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.AllowAny]
     pagination_class = None
 
 
@@ -41,7 +43,7 @@ class FAQItemListView(generics.ListAPIView):
     获取 FAQ 列表
 
     规则：
-    - 当前用户 college_id 匹配 college（NULL 的全局 FAQ 也可见）
+    - 当前用户 college_id 匹配 college（NULL 的全局 FAQ 也可见）；游客仅见全局公开 FAQ
     - 按 frequency 降序排列
     - 每页 10 条
 
@@ -54,24 +56,28 @@ class FAQItemListView(generics.ListAPIView):
     - page_size (int): 每页条数（最大 100）
     """
     serializer_class = FAQItemListSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    # 已发布条目对游客开放（FAQ 是公开知识库）；草稿/驳回仍通过
+    # /faq/drafts/ 与 /faq/manage/ 管理接口，仅管理员可访问。
+    permission_classes = [permissions.AllowAny]
     pagination_class = None  # 前端自行分页
 
     def get_queryset(self):
         user = self.request.user
-        # 超管看全部，其他角色只看本学院+全局
-        if user.role == 'super_admin':
+        # 超管看全部，其他角色（含游客）只看本学院+全局；游客无 college_id 故只看全局
+        if user.is_authenticated and user.role == 'super_admin':
             qs = FAQItem.objects.all()
         else:
             q = models.Q(college__isnull=True)
-            if user.college_id:
+            if user.is_authenticated and user.college_id:
                 q |= models.Q(college_id=user.college_id)
             qs = FAQItem.objects.filter(q)
 
-        # 按状态筛选（不传则返回全部状态）
+        # 按状态筛选：非 FAQ 管理员默认只见已发布；管理员可传 status 查看草稿/驳回
         status_filter = self.request.query_params.get('status', '').strip()
         if status_filter:
             qs = qs.filter(status=status_filter)
+        elif not IsFAQAdmin().has_permission(self.request, self):
+            qs = qs.filter(status='published')
 
         # 搜索功能：支持按问题、答案、标签、分类名称模糊搜索
         search_query = self.request.query_params.get('q', '').strip()
