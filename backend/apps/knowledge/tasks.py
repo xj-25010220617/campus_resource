@@ -88,6 +88,25 @@ def crawl_neusoft_website_task(
         raise self.retry(exc=e)
 
 
+@shared_task(bind=True, ignore_result=True)
+def refresh_daily_context_task(self):
+    """每日 00:05 心跳：刷新"每日数据"上下文，记录日期切换。
+
+    实际刷新逻辑在各实现中（课表/通知/天气等）；
+    本任务主要作用：
+    1. 调用 utils.context 打印/记录当前日期，作为跨天信号
+    2. 预热今日数据缓存（如果后续加了缓存）
+    3. 调度其他每日子任务（未来扩展点）
+    """
+    from django.utils import timezone
+    from utils.context import get_current_time_str, get_daily_briefing
+    now = timezone.now()
+    time_str = get_current_time_str(now=now)
+    briefing = get_daily_briefing()
+    logger.info('[每日上下文刷新] %s | briefing_chars=%d', time_str, len(briefing))
+    return {'time': time_str, 'briefing_chars': len(briefing)}
+
+
 @shared_task(bind=True, max_retries=2, default_retry_delay=60, ignore_result=True)
 def index_document_task(self, doc_id: int):
     """文档索引入库：解析 → 滑动窗口分块 → Embedding → Milvus + MySQL。

@@ -42,6 +42,10 @@ app.conf.beat_schedule = {
         'schedule': crontab(hour=5, minute=0, day_of_week=0),  # 每周日 05:00
         'kwargs': {'max_pages': 300, 'uploader_id': 1},
     },
+    'refresh-daily-context': {
+        'task': 'apps.knowledge.tasks.refresh_daily_context_task',
+        'schedule': crontab(hour=0, minute=5),  # 每天 00:05
+    },
 }
 
 

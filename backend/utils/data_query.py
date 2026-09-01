@@ -498,6 +498,8 @@ def execute_query(route: dict, user) -> dict:
 # ------------------------------------------------------------------
 _SYSTEM_PROMPT_TEMPLATE = """你是成都东东学院的 AI 智能助手，负责回答用户关于文件管理和知识库的问题。
 
+{context}
+
 用户查询了文件管理数据，以下是查询结果。请用自然语言回答用户的问题。
 
 查询结果：
@@ -520,9 +522,12 @@ def build_data_query_prompt(question: str, result: dict) -> list:
         messages 列表，可直接传给 llm_client.chat_stream()
     """
     import json
+    from utils.context import build_system_context
+    ctx = build_system_context()
 
     if not result["success"]:
         system_content = (
+            f"{ctx}\n\n"
             "你是成都东东学院的 AI 智能助手。用户查询文件管理数据时出错了，"
             "请礼貌地告知用户暂时无法查询，建议稍后重试或联系管理员。"
         )
@@ -533,7 +538,7 @@ def build_data_query_prompt(question: str, result: dict) -> list:
         return messages
 
     result_str = json.dumps(result["data"], ensure_ascii=False, indent=2)
-    system_content = _SYSTEM_PROMPT_TEMPLATE.format(result=result_str)
+    system_content = _SYSTEM_PROMPT_TEMPLATE.format(result=result_str, context=ctx)
 
     messages = [
         {"role": "system", "content": system_content},

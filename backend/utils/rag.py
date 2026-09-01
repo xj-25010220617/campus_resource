@@ -182,6 +182,8 @@ NEUSOFT_KNOWLEDGE = """## 学校概况
 
 SYSTEM_PROMPT = """你是成都东软学院的AI智能助手，负责回答学院教学、科研、管理相关问题以及常识性问题。
 
+{context}
+
 ## 学校内建知识库（可直接使用）
 {knowlege}
 
@@ -291,7 +293,12 @@ def build_rag_prompt(
         ref_lines.append(ref_block)
 
     refs_text = '\n\n'.join(ref_lines) if ref_lines else '暂无相关参考资料。'
-    system_content = SYSTEM_PROMPT.format(knowlege=NEUSOFT_KNOWLEDGE, references=refs_text)
+    from utils.context import build_system_context
+    system_content = SYSTEM_PROMPT.format(
+        knowlege=NEUSOFT_KNOWLEDGE,
+        references=refs_text,
+        context=build_system_context(),
+    )
 
     messages = [{'role': 'system', 'content': system_content}]
 
@@ -374,9 +381,11 @@ def generate_suggested_questions(
     import json
     import re as _re
 
-    prompt = _SUGGEST_PROMPT.format(
-        question=question[:300],
-        answer=answer[:1000],
+    # 用 replace 而非 str.format，避免回答/问题里出现 { } 时触发 KeyError/ValueError
+    prompt = (
+        _SUGGEST_PROMPT
+        .replace('{question}', question[:300])
+        .replace('{answer}', answer[:1000])
     )
     messages = [{'role': 'user', 'content': prompt}]
 

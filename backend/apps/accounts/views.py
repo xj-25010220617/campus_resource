@@ -444,6 +444,16 @@ class LogoutView(APIView):
         return Response({'detail': '已登出'}, status=status.HTTP_200_OK)
 
 
+def _unique_username(base: str) -> str:
+    """生成不重复的用户名：base 被占用时追加 _2、_3 直至可用。"""
+    if not User.objects.filter(username=base).exists():
+        return base
+    suffix = 2
+    while User.objects.filter(username=f'{base}_{suffix}').exists():
+        suffix += 1
+    return f'{base}_{suffix}'
+
+
 class DingtalkQrView(APIView):
     """
     钉钉扫码登录 — 获取扫码地址
@@ -616,15 +626,20 @@ class DingtalkCallbackView(APIView):
                 if not user.first_name and nick:
                     user.first_name = nick
                     updated.append('first_name')
+                if not user.nickname and nick:
+                    user.nickname = nick
+                    updated.append('nickname')
                 if updated:
                     user.save(update_fields=updated)
                 return user, False
 
+            base = nick if nick else union_id[:12]
             user = User.objects.create_user(
-                username=f'dd_{nick}' if nick else f'dd_{union_id[:12]}',
+                username=_unique_username(base),
                 email=email,
                 first_name=nick,
                 last_name='',
+                nickname=nick,
                 phone=mobile,
                 role='user',
                 sso_uid=union_id,
@@ -741,13 +756,17 @@ class DingtalkRedirectView(APIView):
                 if not user.first_name and nick:
                     user.first_name = nick
                     updated.append('first_name')
+                if not user.nickname and nick:
+                    user.nickname = nick
+                    updated.append('nickname')
                 if updated:
                     user.save(update_fields=updated)
                 return user, False
+            base = nick if nick else union_id[:12]
             user = User.objects.create_user(
-                username=f'dd_{nick}' if nick else f'dd_{union_id[:12]}',
+                username=_unique_username(base),
                 email=email, first_name=nick, last_name='',
-                phone=mobile, role='user', sso_uid=union_id,
+                nickname=nick, phone=mobile, role='user', sso_uid=union_id,
             )
             user.set_unusable_password()
             user.save(update_fields=['password'])
