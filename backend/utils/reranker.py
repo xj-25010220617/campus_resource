@@ -18,6 +18,7 @@ CROSS_ENCODER_MODEL = getattr(
 CROSS_ENCODER_TOP_N_INPUT = 20      # 初检取前 20 送入 Cross-Encoder
 CROSS_ENCODER_TOP_K_OUTPUT = 5      # Cross-Encoder 输出前 5
 CROSS_ENCODER_MAX_LENGTH = 512      # 每段文本最大长度
+CROSS_ENCODER_MIN_TRIGGER = 3       # 候选数 >=3 才触发 Rerank（3 以下不值得）
 
 _cross_encoder = None
 _cross_encoder_init_attempted = False
@@ -80,6 +81,10 @@ def rerank_with_cross_encoder(
 
     if not candidates:
         return []
+
+    # 候选过少不触发：少于 3 个 Rerank 意义不大
+    if len(candidates) < CROSS_ENCODER_MIN_TRIGGER:
+        return candidates[:top_k]
 
     # 截取 Top-N 送入 Cross-Encoder
     input_candidates = candidates[:CROSS_ENCODER_TOP_N_INPUT]
