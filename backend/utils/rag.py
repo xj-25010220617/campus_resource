@@ -975,13 +975,13 @@ def retrieve(
     )
 
     # 3.5 Cross-Encoder 精排（初检 Top-20 → 精排 Top-5）
-    if len(merged) > CROSS_ENCODER_TOP_K_OUTPUT:
-        try:
-            from utils.reranker import rerank_with_cross_encoder
+    try:
+        from utils.reranker import CROSS_ENCODER_TOP_K_OUTPUT, rerank_with_cross_encoder
+        if len(merged) > CROSS_ENCODER_TOP_K_OUTPUT:
             merged = rerank_with_cross_encoder(question, merged)
             logger.debug('Cross-Encoder 重排序后: %d 条', len(merged))
-        except ImportError:
-            pass  # reranker 模块不存在，静默跳过
+    except ImportError:
+        pass  # reranker 模块不存在，静默跳过
 
     # 4. 加载 doc 元信息
     enriched = _enrich_with_doc_meta(merged, min_score)

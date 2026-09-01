@@ -18,9 +18,9 @@ logger = logging.getLogger(__name__)
 # ------------------------------------------------------------------
 # 配置
 # ------------------------------------------------------------------
-LLM_API_KEY = getattr(settings, 'DEEPSEEK_API_KEY', '')
-LLM_BASE_URL = getattr(settings, 'DEEPSEEK_BASE_URL', 'https://api.deepseek.com')
-LLM_CHAT_MODEL = getattr(settings, 'DEEPSEEK_CHAT_MODEL', 'deepseek-chat')
+QWEN_API_KEY = getattr(settings, 'QWEN_API_KEY', '')
+QWEN_BASE_URL = getattr(settings, 'QWEN_BASE_URL', 'https://dashscope.aliyuncs.com/compatible-mode')
+QWEN_CHAT_MODEL = getattr(settings, 'QWEN_CHAT_MODEL', 'qwen-flash')
 
 # ------------------------------------------------------------------
 # Embedding 后端配置
@@ -53,14 +53,31 @@ def _retry_sleep(attempt: int):
     time.sleep(delay)
 
 
+def _check_ascii(name: str, value: str) -> bool:
+    """检查 API Key / Base URL 是否为纯 ASCII。
+
+    urllib3 用 latin-1 编码 HTTP 请求头，值里一旦混入非 ASCII 字符（中文、
+    emoji、不可见字符，通常是复制粘贴带入），请求会在发送前直接抛
+    `UnicodeEncodeError: 'latin-1' codec can't encode characters ...`。
+    这里提前校验，把"3 次重试后静默降级 Mock"变成一行可定位的错误日志。
+    """
+    if value and any(ord(ch) > 127 for ch in value):
+        logger.error(
+            f'{name} 含非 ASCII 字符: {value[:24]!r}。'
+            '通常是复制粘贴带入的中文/emoji/隐藏字符，请重新从控制台复制。'
+        )
+        return False
+    return True
+
+
 class LLMClient:
     """DeepSeek Chat + 阿里云百炼 Embedding 封装"""
 
     VECTOR_DIM = 1024  # text-embedding-v3 维度（1024）
 
     def __init__(self):
-        self.chat_api_key = LLM_API_KEY
-        self.chat_base_url = LLM_BASE_URL
+        self.chat_api_key = QWEN_API_KEY
+        self.chat_base_url = QWEN_BASE_URL
         self.embed_api_key = ALIYUN_EMBED_API_KEY
         self.embed_base_url = ALIYUN_EMBED_BASE_URL
 
@@ -101,9 +118,14 @@ class LLMClient:
 
         # 后端 1: 阿里云百炼（已配置 API Key 时自动启用）
         if EMBED_BACKEND == 'aliyun' and ALIYUN_EMBED_API_KEY:
-            result = self._embed_via_aliyun(texts)
-            if result:
-                return result
+            if not _check_ascii('ALIYUN_EMBED_API_KEY', ALIYUN_EMBED_API_KEY):
+                logger.error('EMBED_BACKEND=aliyun 但 API Key 含非 ASCII 字符，跳过阿里云（修复 .env 后重启）')
+            elif not _check_ascii('ALIYUN_EMBED_BASE_URL', self.embed_base_url):
+                logger.error('EMBED_BACKEND=aliyun 但 Base URL 含非 ASCII 字符，跳过阿里云（修复 .env 后重启）')
+            else:
+                result = self._embed_via_aliyun(texts)
+                if result:
+                    return result
 
         # 后端 2: 本地 sentence-transformers
         if EMBED_BACKEND == 'local':
@@ -213,7 +235,7 @@ class LLMClient:
 
         Args:
             messages: 消息列表 [{'role': 'system'|'user'|'assistant', 'content': str}]
-            model: 模型名，默认 deepseek-chat
+            model: 模型名，默认 qwen-flash
             temperature: 生成温度
             max_tokens: 最大 token 数
 
@@ -227,11 +249,11 @@ class LLMClient:
         for attempt in range(MAX_RETRIES):
             try:
                 resp = ExternalClient.post(
-                    'deepseek_chat',
+                    'llm_chat',
                     f'{self.chat_base_url}/v1/chat/completions',
                     headers=self.chat_headers,
                     json={
-                        'model': model or LLM_CHAT_MODEL,
+                        'model': model or QWEN_CHAT_MODEL,
                         'messages': messages,
                         'temperature': temperature,
                         'max_tokens': max_tokens,
@@ -284,11 +306,11 @@ class LLMClient:
         for attempt in range(MAX_RETRIES):
             try:
                 resp = ExternalClient.post(
-                    'deepseek_stream',
+                    'llm_stream',
                     f'{self.chat_base_url}/v1/chat/completions',
                     headers=self.chat_headers,
                     json={
-                        'model': model or LLM_CHAT_MODEL,
+                        'model': model or QWEN_CHAT_MODEL,
                         'messages': messages,
                         'temperature': temperature,
                         'max_tokens': max_tokens,
@@ -373,7 +395,7 @@ class LLMClient:
                         f'{self.chat_base_url}/v1/chat/completions',
                         headers=self.chat_headers,
                         json={
-                            'model': model or LLM_CHAT_MODEL,
+                            'model': model or QWEN_CHAT_MODEL,
                             'messages': messages,
                             'temperature': temperature,
                             'max_tokens': max_tokens,
@@ -412,7 +434,7 @@ class LLMClient:
     def _mock_chat(messages: List[dict]) -> str:
         """开发阶段 Mock 对话"""
         last_msg = messages[-1]['content'] if messages else ''
-        return f'[Mock LLM Response] 您的问题是：「{last_msg[:50]}...」。当前为开发模式，请配置 DEEPSEEK_API_KEY 后获取真实回答。'
+        return f'[Mock LLM Response] 您的问题是：「{last_msg[:50]}...」。当前为开发模式，请配置 QWEN_API_KEY 后获取真实回答。'
 
     @staticmethod
     def _mock_stream(messages: List[dict]) -> Generator[str, None, None]:

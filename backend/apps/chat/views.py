@@ -89,7 +89,13 @@ class ConversationViewSet(ModelViewSet):
         重命名会话，仅返回 id、title、created_at、updated_at
         """
         instance = self.get_object()
-        serializer = ConversationRenameSerializer(instance, data=request.data, partial=True)
+        data = dict(request.data)
+        # 空 title（纯问候语如"你好"被前端摘要逻辑剥空）视为"不修改"，
+        # 避免 title 字段 required/不允许 blank 直接 400。
+        title = data.get('title')
+        if title is not None and str(title).strip() == '':
+            data.pop('title', None)
+        serializer = ConversationRenameSerializer(instance, data=data, partial=True)
         serializer.is_valid(raise_exception=True)
         self.perform_update(serializer)
         return Response(serializer.data)
@@ -308,6 +314,7 @@ class AskView(APIView):
             'user_id': user_id,
             'role': user_role,
             'college_id': getattr(user, 'college_id', None),
+            'department_id': getattr(user, 'department_id', None),
         }
 
         # 0. 敏感内容检查
@@ -582,6 +589,13 @@ class AskView(APIView):
         from utils.web_fetcher import fetch_page
         from utils.sse import _format_sse
 
+        # 联网抓取为 SSRF 敏感路径：必须登录后才允许触发
+        if not user:
+            return Response(
+                {'detail': '请先登录以使用联网查询功能', 'code': ErrorCode.UNAUTHORIZED.value},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
         # 抓取
         page_text = fetch_page(url)
         if not page_text or len(page_text) < 500:
@@ -589,11 +603,11 @@ class AskView(APIView):
             logger.info(f'网页内容不足({len(page_text) if page_text else 0}字)，走内建知识库')
             return self._fallback_to_knowledge(question, user, conversation_id, topic or url)
 
-        # 若无会话则创建
-        conv, _ = Conversation.objects.get_or_create(
-            id=conversation_id if conversation_id else None,
-            defaults={'user': user if user else None, 'title': f'网页分析: {url[:40]}'},
-        )
+        # 会话归属校验：与主路径 AskView 一致，仅允许自己的会话
+        if conversation_id:
+            conv = get_object_or_404(Conversation, id=conversation_id, user=user)
+        else:
+            conv = Conversation.objects.create(user=user, title=f'网页分析: {url[:40]}')
         ChatMessage.objects.create(conversation=conv, role='user', content=question)
         assistant_msg = ChatMessage.objects.create(
             conversation=conv, role='assistant', content='',
@@ -639,10 +653,11 @@ class AskView(APIView):
         from utils.sse import _format_sse
         from utils.rag import NEUSOFT_KNOWLEDGE
 
-        conv, _ = Conversation.objects.get_or_create(
-            id=conversation_id if conversation_id else None,
-            defaults={'user': user, 'title': f'学校咨询: {question[:40]}'},
-        )
+        # 会话归属校验：与主路径 AskView 一致，仅允许自己的会话
+        if conversation_id:
+            conv = get_object_or_404(Conversation, id=conversation_id, user=user)
+        else:
+            conv = Conversation.objects.create(user=user, title=f'学校咨询: {question[:40]}')
         ChatMessage.objects.create(conversation=conv, role='user', content=question)
         assistant_msg = ChatMessage.objects.create(conversation=conv, role='assistant', content='')
 
@@ -678,10 +693,11 @@ class AskView(APIView):
         from utils.sse import _format_sse
 
         results = search_school(question)
-        conv, _ = Conversation.objects.get_or_create(
-            id=conversation_id or None,
-            defaults={'user': user, 'title': f'搜索: {question[:40]}'},
-        )
+        # 会话归属校验：与主路径 AskView 一致，仅允许自己的会话
+        if conversation_id:
+            conv = get_object_or_404(Conversation, id=conversation_id, user=user)
+        else:
+            conv = Conversation.objects.create(user=user, title=f'搜索: {question[:40]}')
         ChatMessage.objects.create(conversation=conv, role='user', content=question)
         msg = ChatMessage.objects.create(conversation=conv, role='assistant', content='')
 
@@ -851,6 +867,25 @@ class VoiceAskView(APIView):
         """RAG 检索 + LLM 流式 SSE，复用 AskView 核心逻辑"""
         from django.http import StreamingHttpResponse
         from utils.sse import _format_sse, build_references_events
+
+        # 敏感内容拦截：与文本通道 AskView 一致，防止经语音通道绕过
+        sensitive_result = check_sensitive(question)
+        if sensitive_result.is_sensitive:
+            SensitiveLog.objects.create(
+                user=user,
+                question=question,
+                matched_rules=sensitive_result.matched_rules,
+                matched_texts=sensitive_result.matched_texts,
+                refuse_message=sensitive_result.refuse_message,
+            )
+            return Response(
+                {
+                    'detail': sensitive_result.refuse_message,
+                    'code': ErrorCode.SENSITIVE_CONTENT.value,
+                    'matched_rules': sensitive_result.matched_rules,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         user_context = {
             'user_id': user.id, 'role': user.role,

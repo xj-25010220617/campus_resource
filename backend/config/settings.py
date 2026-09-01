@@ -5,9 +5,19 @@ from decouple import config
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = config('SECRET_KEY', default='django-insecure-dev-key-change-in-production-2026')
+_DEV_SECRET_KEY = 'django-insecure-dev-key-change-in-production-2026'
 
-DEBUG = config('DEBUG', default=True, cast=bool)
+SECRET_KEY = config('SECRET_KEY', default=_DEV_SECRET_KEY)
+
+# DEBUG 默认关闭（fail-closed）；本地开发在 .env 显式开启
+DEBUG = config('DEBUG', default=False, cast=bool)
+
+# 部署安全：生产环境（DEBUG=False）禁止使用已知的开发密钥
+if not DEBUG and SECRET_KEY == _DEV_SECRET_KEY:
+    from django.core.exceptions import ImproperlyConfigured
+    raise ImproperlyConfigured(
+        '生产环境必须显式设置 SECRET_KEY，禁止使用默认开发密钥'
+    )
 
 ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='*').split(',')
 
@@ -173,11 +183,12 @@ OSS_ENDPOINT = config('OSS_ENDPOINT', default='oss-cn-hangzhou.aliyuncs.com')
 OSS_BUCKET_NAME = config('OSS_BUCKET_NAME', default='')
 
 # ------------------------------------------------------------------
-# DeepSeek / LLM（仅 Chat；Embedding 已迁移到阿里云百炼）
+# Qwen（阿里云百炼）/ LLM — 仅 Chat；Embedding 同平台，见 ALIYUN_EMBED_*
 # ------------------------------------------------------------------
-DEEPSEEK_API_KEY = config('DEEPSEEK_API_KEY', default='')
-DEEPSEEK_BASE_URL = config('DEEPSEEK_BASE_URL', default='https://api.deepseek.com')
-DEEPSEEK_CHAT_MODEL = config('DEEPSEEK_CHAT_MODEL', default='deepseek-chat')
+# 统一命名为 QWEN_*；DEEPSEEK_* 仅作迁移期回退（升级后可在 .env 删除）。
+QWEN_API_KEY = config('QWEN_API_KEY', default=config('DEEPSEEK_API_KEY', default=''))
+QWEN_BASE_URL = config('QWEN_BASE_URL', default=config('DEEPSEEK_BASE_URL', default='https://dashscope.aliyuncs.com/compatible-mode'))
+QWEN_CHAT_MODEL = config('QWEN_CHAT_MODEL', default=config('DEEPSEEK_CHAT_MODEL', default='qwen-flash'))
 
 # Embedding 后端切换（aliyun / local / mock）
 EMBED_BACKEND = config('EMBED_BACKEND', default='aliyun')
@@ -208,6 +219,14 @@ CELERY_TIMEZONE = 'Asia/Shanghai'
 CELERY_TASK_TIME_LIMIT = 300
 CELERY_TASK_SOFT_TIME_LIMIT = 240
 CELERY_TASK_TRACK_STARTED = True
+
+# ------------------------------------------------------------------
+# SSO 单点登录
+# ------------------------------------------------------------------
+# Mock SSO 仅用于本地开发调试。生产环境必须保持默认 False；
+# 且即便误置为 True，仅当 DEBUG=True 时才会生效（见 accounts.views._sso_mock_enabled）。
+SSO_MOCK_ENABLED = config('SSO_MOCK_ENABLED', default=False, cast=bool)
+SSO_LOGIN_URL = config('SSO_LOGIN_URL', default='')
 
 # ------------------------------------------------------------------
 # 钉钉扫码登录
