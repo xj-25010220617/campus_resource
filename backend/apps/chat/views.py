@@ -89,7 +89,13 @@ class ConversationViewSet(ModelViewSet):
         重命名会话，仅返回 id、title、created_at、updated_at
         """
         instance = self.get_object()
-        serializer = ConversationRenameSerializer(instance, data=request.data, partial=True)
+        data = dict(request.data)
+        # 空 title（纯问候语如"你好"被前端摘要逻辑剥空）视为"不修改"，
+        # 避免 title 字段 required/不允许 blank 直接 400。
+        title = data.get('title')
+        if title is not None and str(title).strip() == '':
+            data.pop('title', None)
+        serializer = ConversationRenameSerializer(instance, data=data, partial=True)
         serializer.is_valid(raise_exception=True)
         self.perform_update(serializer)
         return Response(serializer.data)
