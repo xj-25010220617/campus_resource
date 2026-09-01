@@ -585,6 +585,10 @@ class AskView(APIView):
                         content=full_answer,
                     )
 
+                suggested = rag.generate_suggested_questions(question, full_answer)
+                if suggested:
+                    yield _format_sse('suggested', suggested)
+
                 yield _format_sse('done', {'message_id': assistant_msg.id})
 
             except GeneratorExit:
@@ -649,14 +653,19 @@ class AskView(APIView):
                 yield _format_sse('start', {
                     'conversation_id': conv.id, 'message_id': assistant_msg.id,
                 })
+                full_answer = []
                 for token in llm_client.chat_stream(
                     [{'role': 'system', 'content': system_prompt},
                      {'role': 'user', 'content': question}],
                     temperature=0.3, max_tokens=2048,
                 ):
                     if token:
+                        full_answer.append(token)
                         yield _format_sse('token', {'content': token})
                 yield _format_sse('references', {'count': 1, 'summary': '实时抓取: ' + url})
+                suggested = rag.generate_suggested_questions(question, ''.join(full_answer))
+                if suggested:
+                    yield _format_sse('suggested', suggested)
                 yield _format_sse('done', {'message_id': assistant_msg.id})
             except Exception as e:
                 logger.error(f'网页分析 SSE 异常: {e}')
@@ -693,13 +702,18 @@ class AskView(APIView):
         def _stream():
             try:
                 yield _format_sse('start', {'conversation_id': conv.id, 'message_id': assistant_msg.id})
+                full_answer = []
                 for token in llm_client.chat_stream(
                     [{'role': 'system', 'content': prompt}, {'role': 'user', 'content': question}],
                     temperature=0.3, max_tokens=1024,
                 ):
                     if token:
+                        full_answer.append(token)
                         yield _format_sse('token', {'content': token})
                 yield _format_sse('references', {'count': 1, 'summary': '内建知识库'})
+                suggested = rag.generate_suggested_questions(question, ''.join(full_answer))
+                if suggested:
+                    yield _format_sse('suggested', suggested)
                 yield _format_sse('done', {'message_id': assistant_msg.id})
             except Exception as e:
                 logger.error(f'知识库SSE异常: {e}')
@@ -740,13 +754,18 @@ class AskView(APIView):
         def _s():
             try:
                 yield _format_sse('start', {'conversation_id': conv.id, 'message_id': msg.id})
+                full_answer = []
                 for t in llm_client.chat_stream(
                     [{'role': 'system', 'content': sp}, {'role': 'user', 'content': question}],
                     temperature=0.3, max_tokens=1024,
                 ):
                     if t:
+                        full_answer.append(t)
                         yield _format_sse('token', {'content': t})
                 yield _format_sse('references', {'count': len(results), 'summary': '联网搜索'})
+                suggested = rag.generate_suggested_questions(question, ''.join(full_answer))
+                if suggested:
+                    yield _format_sse('suggested', suggested)
                 yield _format_sse('done', {'message_id': msg.id})
             except Exception as e:
                 logger.error(f'搜索SSE异常: {e}')
