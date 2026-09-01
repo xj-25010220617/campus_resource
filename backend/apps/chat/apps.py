@@ -31,7 +31,7 @@ class ChatConfig(AppConfig):
                 else:
                     logger.warning(
                         'Embedding API 健康检查失败: 返回空向量。'
-                        '请检查 DEEPSEEK_API_KEY 或 ALIYUN_EMBED_API_KEY 配置。'
+                        '请检查 ALIYUN_EMBED_API_KEY 配置。'
                         'RAG 检索将降级为关键词搜索。'
                     )
             except Exception as e:

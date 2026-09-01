@@ -18,9 +18,9 @@ logger = logging.getLogger(__name__)
 # ------------------------------------------------------------------
 # 配置
 # ------------------------------------------------------------------
-LLM_API_KEY = getattr(settings, 'DEEPSEEK_API_KEY', '')
-LLM_BASE_URL = getattr(settings, 'DEEPSEEK_BASE_URL', 'https://api.deepseek.com')
-LLM_CHAT_MODEL = getattr(settings, 'DEEPSEEK_CHAT_MODEL', 'deepseek-chat')
+QWEN_API_KEY = getattr(settings, 'QWEN_API_KEY', '')
+QWEN_BASE_URL = getattr(settings, 'QWEN_BASE_URL', 'https://dashscope.aliyuncs.com/compatible-mode')
+QWEN_CHAT_MODEL = getattr(settings, 'QWEN_CHAT_MODEL', 'qwen-flash')
 
 # ------------------------------------------------------------------
 # Embedding 后端配置
@@ -76,8 +76,8 @@ class LLMClient:
     VECTOR_DIM = 1024  # text-embedding-v3 维度（1024）
 
     def __init__(self):
-        self.chat_api_key = LLM_API_KEY
-        self.chat_base_url = LLM_BASE_URL
+        self.chat_api_key = QWEN_API_KEY
+        self.chat_base_url = QWEN_BASE_URL
         self.embed_api_key = ALIYUN_EMBED_API_KEY
         self.embed_base_url = ALIYUN_EMBED_BASE_URL
 
@@ -235,7 +235,7 @@ class LLMClient:
 
         Args:
             messages: 消息列表 [{'role': 'system'|'user'|'assistant', 'content': str}]
-            model: 模型名，默认 deepseek-chat
+            model: 模型名，默认 qwen-flash
             temperature: 生成温度
             max_tokens: 最大 token 数
 
@@ -249,11 +249,11 @@ class LLMClient:
         for attempt in range(MAX_RETRIES):
             try:
                 resp = ExternalClient.post(
-                    'deepseek_chat',
+                    'llm_chat',
                     f'{self.chat_base_url}/v1/chat/completions',
                     headers=self.chat_headers,
                     json={
-                        'model': model or LLM_CHAT_MODEL,
+                        'model': model or QWEN_CHAT_MODEL,
                         'messages': messages,
                         'temperature': temperature,
                         'max_tokens': max_tokens,
@@ -306,11 +306,11 @@ class LLMClient:
         for attempt in range(MAX_RETRIES):
             try:
                 resp = ExternalClient.post(
-                    'deepseek_stream',
+                    'llm_stream',
                     f'{self.chat_base_url}/v1/chat/completions',
                     headers=self.chat_headers,
                     json={
-                        'model': model or LLM_CHAT_MODEL,
+                        'model': model or QWEN_CHAT_MODEL,
                         'messages': messages,
                         'temperature': temperature,
                         'max_tokens': max_tokens,
@@ -395,7 +395,7 @@ class LLMClient:
                         f'{self.chat_base_url}/v1/chat/completions',
                         headers=self.chat_headers,
                         json={
-                            'model': model or LLM_CHAT_MODEL,
+                            'model': model or QWEN_CHAT_MODEL,
                             'messages': messages,
                             'temperature': temperature,
                             'max_tokens': max_tokens,
@@ -434,7 +434,7 @@ class LLMClient:
     def _mock_chat(messages: List[dict]) -> str:
         """开发阶段 Mock 对话"""
         last_msg = messages[-1]['content'] if messages else ''
-        return f'[Mock LLM Response] 您的问题是：「{last_msg[:50]}...」。当前为开发模式，请配置 DEEPSEEK_API_KEY 后获取真实回答。'
+        return f'[Mock LLM Response] 您的问题是：「{last_msg[:50]}...」。当前为开发模式，请配置 QWEN_API_KEY 后获取真实回答。'
 
     @staticmethod
     def _mock_stream(messages: List[dict]) -> Generator[str, None, None]:

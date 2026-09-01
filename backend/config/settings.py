@@ -173,11 +173,12 @@ OSS_ENDPOINT = config('OSS_ENDPOINT', default='oss-cn-hangzhou.aliyuncs.com')
 OSS_BUCKET_NAME = config('OSS_BUCKET_NAME', default='')
 
 # ------------------------------------------------------------------
-# DeepSeek / LLM（仅 Chat；Embedding 已迁移到阿里云百炼）
+# Qwen（阿里云百炼）/ LLM — 仅 Chat；Embedding 同平台，见 ALIYUN_EMBED_*
 # ------------------------------------------------------------------
-DEEPSEEK_API_KEY = config('DEEPSEEK_API_KEY', default='')
-DEEPSEEK_BASE_URL = config('DEEPSEEK_BASE_URL', default='https://api.deepseek.com')
-DEEPSEEK_CHAT_MODEL = config('DEEPSEEK_CHAT_MODEL', default='deepseek-chat')
+# 统一命名为 QWEN_*；DEEPSEEK_* 仅作迁移期回退（升级后可在 .env 删除）。
+QWEN_API_KEY = config('QWEN_API_KEY', default=config('DEEPSEEK_API_KEY', default=''))
+QWEN_BASE_URL = config('QWEN_BASE_URL', default=config('DEEPSEEK_BASE_URL', default='https://dashscope.aliyuncs.com/compatible-mode'))
+QWEN_CHAT_MODEL = config('QWEN_CHAT_MODEL', default=config('DEEPSEEK_CHAT_MODEL', default='qwen-flash'))
 
 # Embedding 后端切换（aliyun / local / mock）
 EMBED_BACKEND = config('EMBED_BACKEND', default='aliyun')
