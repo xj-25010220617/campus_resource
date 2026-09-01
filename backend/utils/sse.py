@@ -144,11 +144,13 @@ async def sse_response_async(async_generator, extra_events: dict = None):
 # SSE 事件格式化
 # ------------------------------------------------------------------
 def _format_sse(event: str, data) -> str:
-    """格式化一条 SSE 事件"""
-    if isinstance(data, dict):
+    """格式化一条 SSE 事件。
+
+    非字符串数据（dict / list / bool / int 等）统一 json.dumps 序列化，
+    避免 list 走 str() 产生单引号的非法 JSON（前端 JSON.parse 会失败）。
+    """
+    if not isinstance(data, str):
         data = json.dumps(data, ensure_ascii=False)
-    elif not isinstance(data, str):
-        data = str(data)
     return f'event: {event}\ndata: {data}\n\n'
 
 

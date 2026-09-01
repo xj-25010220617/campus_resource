@@ -374,9 +374,11 @@ def generate_suggested_questions(
     import json
     import re as _re
 
-    prompt = _SUGGEST_PROMPT.format(
-        question=question[:300],
-        answer=answer[:1000],
+    # 用 replace 而非 str.format，避免回答/问题里出现 { } 时触发 KeyError/ValueError
+    prompt = (
+        _SUGGEST_PROMPT
+        .replace('{question}', question[:300])
+        .replace('{answer}', answer[:1000])
     )
     messages = [{'role': 'user', 'content': prompt}]
 
