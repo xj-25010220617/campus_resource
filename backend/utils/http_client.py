@@ -30,6 +30,7 @@ TIMEOUT_PROFILES = {
     'deepseek_chat': ServiceTimeout(10, 60),
     'deepseek_stream': ServiceTimeout(10, 120),
     'deepseek_embed': ServiceTimeout(10, 30),
+    'aliyun_embed': ServiceTimeout(10, 30),
     'dingtalk': ServiceTimeout(5, 10),
     'oss_sdk': ServiceTimeout(5, 30),
     'oss_download': ServiceTimeout(5, 120),

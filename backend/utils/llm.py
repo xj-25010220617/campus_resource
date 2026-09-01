@@ -53,6 +53,23 @@ def _retry_sleep(attempt: int):
     time.sleep(delay)
 
 
+def _check_ascii(name: str, value: str) -> bool:
+    """检查 API Key / Base URL 是否为纯 ASCII。
+
+    urllib3 用 latin-1 编码 HTTP 请求头，值里一旦混入非 ASCII 字符（中文、
+    emoji、不可见字符，通常是复制粘贴带入），请求会在发送前直接抛
+    `UnicodeEncodeError: 'latin-1' codec can't encode characters ...`。
+    这里提前校验，把"3 次重试后静默降级 Mock"变成一行可定位的错误日志。
+    """
+    if value and any(ord(ch) > 127 for ch in value):
+        logger.error(
+            f'{name} 含非 ASCII 字符: {value[:24]!r}。'
+            '通常是复制粘贴带入的中文/emoji/隐藏字符，请重新从控制台复制。'
+        )
+        return False
+    return True
+
+
 class LLMClient:
     """DeepSeek Chat + 阿里云百炼 Embedding 封装"""
 
@@ -101,9 +118,14 @@ class LLMClient:
 
         # 后端 1: 阿里云百炼（已配置 API Key 时自动启用）
         if EMBED_BACKEND == 'aliyun' and ALIYUN_EMBED_API_KEY:
-            result = self._embed_via_aliyun(texts)
-            if result:
-                return result
+            if not _check_ascii('ALIYUN_EMBED_API_KEY', ALIYUN_EMBED_API_KEY):
+                logger.error('EMBED_BACKEND=aliyun 但 API Key 含非 ASCII 字符，跳过阿里云（修复 .env 后重启）')
+            elif not _check_ascii('ALIYUN_EMBED_BASE_URL', self.embed_base_url):
+                logger.error('EMBED_BACKEND=aliyun 但 Base URL 含非 ASCII 字符，跳过阿里云（修复 .env 后重启）')
+            else:
+                result = self._embed_via_aliyun(texts)
+                if result:
+                    return result
 
         # 后端 2: 本地 sentence-transformers
         if EMBED_BACKEND == 'local':
