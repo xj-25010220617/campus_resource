@@ -614,8 +614,10 @@ class AskView(APIView):
         )
 
         # 构造 Prompt：把网页内容作为上下文给 LLM
+        from utils.context import build_system_context
         source_desc = f'（{topic}）' if topic else ''
         system_prompt = (
+            f'{build_system_context()}\n\n'
             '你是一个网站内容分析助手。用户要求查看网站内容，你已实时获取了该页面的内容。'
             '请阅读并回答用户的问题。\n\n'
             f'网页地址：{url} {source_desc}\n'
@@ -652,6 +654,7 @@ class AskView(APIView):
         """网页抓取失败时，用内建知识库回答。"""
         from utils.sse import _format_sse
         from utils.rag import NEUSOFT_KNOWLEDGE
+        from utils.context import build_system_context
 
         # 会话归属校验：与主路径 AskView 一致，仅允许自己的会话
         if conversation_id:
@@ -662,6 +665,7 @@ class AskView(APIView):
         assistant_msg = ChatMessage.objects.create(conversation=conv, role='assistant', content='')
 
         prompt = (
+            f'{build_system_context()}\n\n'
             '你是成都东软学院的AI智能助手。用户想了解学校信息，'
             '但学校官网是JS动态渲染的，无法直接抓取内容。\n\n'
             f'请使用以下内建知识库回答：\n---\n{NEUSOFT_KNOWLEDGE}\n---\n\n'
@@ -691,6 +695,7 @@ class AskView(APIView):
         """联网搜索 → LLM 分析 → SSE 输出。"""
         from utils.web_search import search_school
         from utils.sse import _format_sse
+        from utils.context import build_system_context
 
         results = search_school(question)
         # 会话归属校验：与主路径 AskView 一致，仅允许自己的会话
@@ -702,13 +707,17 @@ class AskView(APIView):
         msg = ChatMessage.objects.create(conversation=conv, role='assistant', content='')
 
         if not results:
-            sp = '你搜索了 "%s" 但没有找到结果，请如实告知。' % question
+            sp = f'{build_system_context()}\n\n你搜索了 "%s" 但没有找到结果，请如实告知。' % question
         else:
             lines = '\n'.join(
                 '%d. [%s](%s)\n   %s' % (i+1, r['title'], r['url'], r['snippet'])
                 for i, r in enumerate(results)
             )
-            sp = '以下是通过搜索引擎找到的成都东软学院相关信息。请阅读并整理回答。\n\n%s\n\n请列出信息来源链接。' % lines
+            sp = (
+                f'{build_system_context()}\n\n'
+                '以下是通过搜索引擎找到的成都东软学院相关信息。请阅读并整理回答。\n\n'
+                '%s\n\n请列出信息来源链接。' % lines
+            )
 
         def _s():
             try:
