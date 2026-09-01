@@ -149,7 +149,7 @@ class UserAdminViewSet(OperationLogMixin, viewsets.ModelViewSet):
         elif u.role == 'dept_admin':
             data['department_id'] = u.department_id
             data['college'] = None
-            data.setdefault('role', 'user')
+            data['role'] = 'user'  # 强制锁定为普通用户，防止建出同级/上级角色
         serializer.save()
 
     def create(self, request, *args, **kwargs):
@@ -967,7 +967,9 @@ class LogsDashboardView(APIView):
     - 6 个块各自 try/except 隔离失败（块计算放 services/dashboard.py）
     - view 不接 try/except（遵循规范 §9）
     - totals 与 blocks 平级，与 period 无关
-    - Dashboard 为 AllowAny，totals 仅返回数值，不暴露用户敏感信息
+    - 权限：AllowAny。首页「平台数据概览」对所有人开放（含游客），
+      属于产品决策（2026-09-01），有意替代此前「仅管理员可访问」的限制。
+      返回的是平台聚合统计，不包含任何个人可识别信息。
     """
     permission_classes = [permissions.AllowAny]
 

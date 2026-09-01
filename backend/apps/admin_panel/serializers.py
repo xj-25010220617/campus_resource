@@ -106,7 +106,14 @@ class UserUpdateSerializer(serializers.ModelSerializer):
         return value
 
     def validate(self, attrs):
-        """组合校验：role × college × department"""
+        """组合校验：role × college × department，且角色/归属仅超管可改（防提权）"""
+        request_user = self.context['request'].user
+        # 非超管不得修改 role / college / department（防止低管理员自我提权或越权改归属）
+        if request_user.role != 'super_admin':
+            for field in ('role', 'college', 'department'):
+                if field in attrs:
+                    raise serializers.ValidationError({field: '只有超级管理员可以修改该字段'})
+
         role = attrs.get('role', getattr(self.instance, 'role', None))
         college = attrs.get('college', getattr(self.instance, 'college', None))
         department = attrs.get('department', getattr(self.instance, 'department', None))
