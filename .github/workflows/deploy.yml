@@ -30,25 +30,13 @@ jobs:
             source venv/bin/activate
             pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
-            # 执行数据库迁移
+            # 执行数据库迁移（含 admin_panel 审计表）
             python manage.py migrate
 
-            # 设置端口
-            PORT=3000
+            # 后端由 systemd 托管（campus-backend.service），部署后重启即可，
+            # 进程死亡由 systemd 自动拉起，不再依赖 SSH 会话里的 nohup。
+            systemctl restart campus-backend
 
-            # 杀掉旧进程（如果存在）
-            PID=$(lsof -t -i:$PORT)
-            if [ -n "$PID" ]; then
-              kill -9 $PID
-              echo "已杀掉旧进程 (PID: $PID)"
-            else
-              echo "端口 $PORT 上没有运行中的进程"
-            fi
-
-            # 启动新进程（后台运行）
-            nohup python manage.py runserver 0.0.0.0:$PORT > /tmp/backend.log 2>&1 &
-
-            # 等待2秒并检查服务状态
-            sleep 2
-            curl -s -o /dev/null -w "HTTP状态码: %{http_code}\n" http://localhost:$PORT/api/docs/
-# 测试1
+            # 健康检查：后端未起来则本次部署失败，避免"部署绿但服务挂"的静默失败
+            sleep 3
+            curl -sf http://127.0.0.1:3000/api/docs/ || { echo "后端启动失败"; exit 1; }

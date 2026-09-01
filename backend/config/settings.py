@@ -268,3 +268,22 @@ MAX_HISTORY_ROUNDS_BEFORE_SUMMARY = config('MAX_HISTORY_ROUNDS_BEFORE_SUMMARY', 
 PLAYWRIGHT_ENABLED = config('PLAYWRIGHT_ENABLED', default=False, cast=bool)
 PLAYWRIGHT_TIMEOUT = config('PLAYWRIGHT_TIMEOUT', default=15000, cast=int)
 PLAYWRIGHT_HEADLESS = config('PLAYWRIGHT_HEADLESS', default=True, cast=bool)
+
+
+# ===== 临时：绕过 MySQL 版本检查（MySQL 5.7 过渡期专用） =====
+# Django 4.2 要求 MySQL >= 8.0.11；当前服务器仍为 MySQL 5.7，
+# 不补丁的话每次建连都会抛 NotSupportedError 导致后端不可用。
+# 升级到 MySQL 8.0 后请删除本段（见 MySQL 5.7 -> 8.0 升级方案）。
+from django.db.backends.mysql.base import DatabaseWrapper
+
+_original_mysql_version_check = DatabaseWrapper.check_database_version_supported
+
+
+def _patched_mysql_version_check(self):
+    try:
+        _original_mysql_version_check(self)
+    except Exception:
+        pass  # 忽略版本错误，允许 MySQL 5.7 运行
+
+
+DatabaseWrapper.check_database_version_supported = _patched_mysql_version_check
