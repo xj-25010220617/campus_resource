@@ -223,13 +223,22 @@ class ChangePasswordView(APIView):
         return Response({'detail': '密码修改成功'}, status=status.HTTP_200_OK)
 
 
+def _sso_mock_enabled() -> bool:
+    """Mock SSO 安全门槛：仅在显式开启且处于 DEBUG 环境时可用。
+
+    生产环境（DEBUG=False）无论 SSO_MOCK_ENABLED 如何配置都不放行，
+    避免任何人用固定 code 换取高权限 JWT。
+    """
+    return bool(settings.DEBUG) and getattr(settings, 'SSO_MOCK_ENABLED', False)
+
+
 class SsoLoginView(APIView):
     """
     SSO 登录跳转
 
     GET /api/auth/sso/login/
     功能：
-        - Mock 模式（默认）：返回可用测试码列表，前端可跳转到回调接口完成 SSO 模拟
+        - Mock 模式（仅本地 DEBUG）：返回可用测试码列表，前端可跳转到回调接口完成 SSO 模拟
         - 正式模式：HTTP 302 重定向至学校统一认证页面
     返回：
         - Mock: {"mock_codes": [...], "redirect_url_template": "..."}
@@ -238,7 +247,7 @@ class SsoLoginView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def get(self, request):
-        is_mock = getattr(settings, 'SSO_MOCK_ENABLED', True)
+        is_mock = _sso_mock_enabled()
 
         if is_mock:
             # Mock 模式：返回可用测试码，前端选择后构造回调请求
@@ -285,7 +294,7 @@ class SsoCallbackView(APIView):
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
-        is_mock = getattr(settings, 'SSO_MOCK_ENABLED', True)
+        is_mock = _sso_mock_enabled()
 
         if is_mock:
             return self._handle_mock_callback(request)
