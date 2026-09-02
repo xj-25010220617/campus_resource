@@ -251,166 +251,127 @@ def find_user_docs(
 
 
 # ------------------------------------------------------------------
-# Resource 表数据查询（热门/排行/统计/最新）
+# KnowledgeDoc 表数据查询（热门/排行/统计/最新）
 # ------------------------------------------------------------------
-def get_popular_resources(
+# Keep the historical function names and response keys for callers that still
+# use the resource-query API.  KnowledgeDoc no longer stores download/view
+# counters or a published_at timestamp, so indexed_at (falling back to
+# created_at) is used as the publication time and those counters are exposed
+# as zero-valued compatibility fields.
+def _published_docs_queryset():
+    """Return documents that are available to knowledge-base queries."""
+    from apps.knowledge.models import KnowledgeDoc
+
+    return KnowledgeDoc.objects.filter(status='indexed')
+
+
+def get_popular_knowledge_docs(
     limit: int = 10,
     days: Optional[int] = None,
     college_id: Optional[int] = None,
     discipline_id: Optional[int] = None,
 ) -> List[dict]:
-    """查询热门资源（按下载量+浏览量综合排序）。
-
-    Args:
-        limit: 返回数量
-        days: 最近 N 天，None 表示不限时间
-        college_id: 按学院筛选
-        discipline_id: 按学科筛选
-
-    Returns:
-        [{'id': int, 'title': str, 'file_type': str, 'download_count': int,
-          'view_count': int, 'college_name': str, 'published_at': str}, ...]
-    """
-    from apps.resources.models import Resource
-
-    qs = Resource.objects.filter(status='published')
+    """查询热门知识文档（按最近索引时间排序，保留旧 API 字段）。"""
+    qs = _published_docs_queryset()
 
     if days:
         since = timezone.now() - timedelta(days=days)
-        qs = qs.filter(published_at__gte=since)
-
+        qs = qs.filter(Q(indexed_at__gte=since) | Q(indexed_at__isnull=True, created_at__gte=since))
     if college_id:
         qs = qs.filter(college_id=college_id)
     if discipline_id:
         qs = qs.filter(discipline_id=discipline_id)
 
-    qs = qs.select_related('college', 'uploader').order_by(
-        '-download_count', '-view_count'
-    )[:limit]
-
-    results = []
-    for r in qs:
-        results.append({
-            'id': r.id,
-            'title': r.title,
-            'description': (r.description or '')[:100],
-            'file_type': r.file_type,
-            'download_count': r.download_count,
-            'view_count': r.view_count,
-            'college_name': r.college.name if r.college else '未知',
-            'uploader_name': r.uploader.username if r.uploader else '未知',
-            'published_at': r.published_at.strftime('%Y-%m-%d') if r.published_at else '未知',
-        })
-    return results
+    qs = qs.select_related('college', 'uploader').order_by('-indexed_at', '-created_at')[:limit]
+    return [
+        {
+            'id': doc.id,
+            'title': doc.title,
+            'description': (doc.description or '')[:100],
+            'file_type': doc.file_type,
+            'download_count': 0,
+            'view_count': 0,
+            'college_name': doc.college.name if doc.college else '未知',
+            'uploader_name': doc.uploader.username if doc.uploader else '未知',
+            'published_at': (doc.indexed_at or doc.created_at).strftime('%Y-%m-%d'),
+        }
+        for doc in qs
+    ]
 
 
-def get_recent_resources(
+def get_recent_knowledge_docs(
     limit: int = 10,
     days: int = 7,
     college_id: Optional[int] = None,
     discipline_id: Optional[int] = None,
 ) -> List[dict]:
-    """查询最新发布的资源。
-
-    Args:
-        limit: 返回数量
-        days: 最近 N 天
-        college_id: 按学院筛选
-        discipline_id: 按学科筛选
-    """
-    from apps.resources.models import Resource
-
+    """查询最近索引的知识文档（保留旧 API 字段）。"""
     since = timezone.now() - timedelta(days=days)
-    qs = Resource.objects.filter(status='published', published_at__gte=since)
-
+    qs = _published_docs_queryset().filter(
+        Q(indexed_at__gte=since) | Q(indexed_at__isnull=True, created_at__gte=since)
+    )
     if college_id:
         qs = qs.filter(college_id=college_id)
     if discipline_id:
         qs = qs.filter(discipline_id=discipline_id)
 
-    qs = qs.select_related('college', 'uploader', 'category').order_by('-published_at')[:limit]
+    qs = qs.select_related('college', 'uploader', 'category').order_by('-indexed_at', '-created_at')[:limit]
+    return [
+        {
+            'id': doc.id,
+            'title': doc.title,
+            'description': (doc.description or '')[:100],
+            'file_type': doc.file_type,
+            'download_count': 0,
+            'view_count': 0,
+            'college_name': doc.college.name if doc.college else '未知',
+            'category_name': doc.category.name if doc.category else '未分类',
+            'uploader_name': doc.uploader.username if doc.uploader else '未知',
+            'published_at': (doc.indexed_at or doc.created_at).strftime('%Y-%m-%d'),
+        }
+        for doc in qs
+    ]
 
-    results = []
-    for r in qs:
-        results.append({
-            'id': r.id,
-            'title': r.title,
-            'description': (r.description or '')[:100],
-            'file_type': r.file_type,
-            'download_count': r.download_count,
-            'view_count': r.view_count,
-            'college_name': r.college.name if r.college else '未知',
-            'category_name': r.category.name if r.category else '未分类',
-            'uploader_name': r.uploader.username if r.uploader else '未知',
-            'published_at': r.published_at.strftime('%Y-%m-%d') if r.published_at else '未知',
-        })
-    return results
 
-
-def get_resource_ranking_by_college(limit: int = 20) -> List[dict]:
-    """按学院统计资源数量和下载量排名。
-
-    Args:
-        limit: 返回数量
-    """
-    from apps.resources.models import Resource
-    from django.db.models import Count, Sum
-
+def get_doc_ranking_by_college(limit: int = 20) -> List[dict]:
+    """按学院统计已索引知识文档数量（保留旧 API 字段）。"""
     qs = (
-        Resource.objects
-        .filter(status='published', college__isnull=False)
+        _published_docs_queryset()
+        .filter(college__isnull=False)
         .values('college__name')
-        .annotate(
-            total_count=Count('id'),
-            total_downloads=Sum('download_count'),
-            total_views=Sum('view_count'),
-        )
+        .annotate(total_count=Count('id'))
         .order_by('-total_count')[:limit]
     )
-
     return [
         {
             'college_name': item['college__name'],
             'resource_count': item['total_count'],
-            'total_downloads': item['total_downloads'] or 0,
-            'total_views': item['total_views'] or 0,
+            'total_downloads': 0,
+            'total_views': 0,
         }
         for item in qs
     ]
 
 
-def get_resource_stats() -> dict:
-    """统计平台资源总量（总量/按类型/按状态）。"""
-    from apps.resources.models import Resource
-    from django.db.models import Count, Sum
+def get_doc_stats() -> dict:
+    """统计知识文档总量（保留旧资源统计 API 的返回结构）。"""
+    from apps.knowledge.models import KnowledgeDoc
 
-    total = Resource.objects.filter(status='published').count()
-    total_downloads = (
-        Resource.objects.filter(status='published')
-        .aggregate(s=Sum('download_count'))['s'] or 0
-    )
-    total_views = (
-        Resource.objects.filter(status='published')
-        .aggregate(s=Sum('view_count'))['s'] or 0
-    )
-
+    published_qs = _published_docs_queryset()
     by_type = list(
-        Resource.objects.filter(status='published')
-        .values('file_type')
+        published_qs.values('file_type')
         .annotate(count=Count('id'))
         .order_by('-count')
     )
-
     by_status = list(
-        Resource.objects.values('status')
+        KnowledgeDoc.objects.values('status')
         .annotate(count=Count('id'))
         .order_by('-count')
     )
-
     return {
-        'total': total,
-        'total_downloads': total_downloads,
-        'total_views': total_views,
+        'total': published_qs.count(),
+        'total_downloads': 0,
+        'total_views': 0,
         'by_file_type': by_type,
         'by_status': by_status,
     }
@@ -460,8 +421,8 @@ def execute_query(route: dict, user) -> dict:
             )
             return {"success": True, "data": data}
 
-        elif query_type == "resource_popular":
-            data = get_popular_resources(
+        elif query_type == "popular_docs":
+            data = get_popular_knowledge_docs(
                 limit=params.get("limit", 10),
                 days=params.get("days"),
                 college_id=params.get("college_id"),
@@ -469,8 +430,8 @@ def execute_query(route: dict, user) -> dict:
             )
             return {"success": True, "data": data}
 
-        elif query_type == "resource_recent":
-            data = get_recent_resources(
+        elif query_type == "recent_docs_platform":
+            data = get_recent_knowledge_docs(
                 limit=params.get("limit", 10),
                 days=params.get("days", 7),
                 college_id=params.get("college_id"),
@@ -478,14 +439,30 @@ def execute_query(route: dict, user) -> dict:
             )
             return {"success": True, "data": data}
 
-        elif query_type == "resource_ranking":
-            data = get_resource_ranking_by_college(
+        elif query_type == "doc_ranking":
+            data = get_doc_ranking_by_college(
                 limit=params.get("limit", 20),
             )
             return {"success": True, "data": data}
 
+        elif query_type == "doc_stats":
+            return {"success": True, "data": get_doc_stats()}
+
+        # Compatibility for routes persisted by older clients.
+        elif query_type == "resource_popular":
+            return {"success": True, "data": get_popular_knowledge_docs(
+                limit=params.get("limit", 10), days=params.get("days"),
+                college_id=params.get("college_id"), discipline_id=params.get("discipline_id"),
+            )}
+        elif query_type == "resource_recent":
+            return {"success": True, "data": get_recent_knowledge_docs(
+                limit=params.get("limit", 10), days=params.get("days", 7),
+                college_id=params.get("college_id"), discipline_id=params.get("discipline_id"),
+            )}
+        elif query_type == "resource_ranking":
+            return {"success": True, "data": get_doc_ranking_by_college(limit=params.get("limit", 20))}
         elif query_type == "resource_stats":
-            return {"success": True, "data": get_resource_stats()}
+            return {"success": True, "data": get_doc_stats()}
 
         else:
             return {"success": False, "data": None, "error": f"未知查询类型: {query_type}"}

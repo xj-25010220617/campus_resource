@@ -415,113 +415,49 @@ def generate_suggested_questions(
 
 
 # ------------------------------------------------------------------
-# 关键词搜索（双表支持）
+# 关键词搜索
 # ------------------------------------------------------------------
 def _keyword_search(
     question: str,
     top_k: int = 10,
     doc_ids: Optional[List[int]] = None,
 ) -> List[dict]:
-    """
-    MySQL 关键词匹配搜索（支持 Resource 和 KnowledgeDoc 双表）。
-
-    - Resource 命中的 doc_id 为正数，KnowledgeDoc 命中的 doc_id 为负数。
-    - 关键词路命中时返回 content 字段（title + description 拼接），
-      解决旧版 content='' 被 _enrich_with_doc_meta 过滤掉的问题。
-
-    Args:
-        question: 用户问题
-        top_k: 返回数量
-        doc_ids: 限定检索的 doc_id 列表（来自硬过滤，正负混排）
-    """
+    """在 KnowledgeDoc 元数据中进行关键词匹配。"""
     try:
         import jieba
         keywords = list(jieba.cut(question))[:10]
     except ImportError:
         keywords = question.split()[:10]
 
+    from utils.synonym import expand_keywords
+    keywords = expand_keywords(keywords)
     if not keywords:
         return []
 
-    # 同义词扩展
-    from utils.synonym import expand_keywords
-    keywords = expand_keywords(keywords)
-
     from django.db.models import Q
-    from apps.resources.models import Resource
+    from apps.knowledge.models import KnowledgeDoc
 
-    # 拆分 doc_ids（正数=Resource，负数=KnowledgeDoc 的真实 ID）
-    resource_candidate_ids = None
-    kdoc_candidate_ids = None
+    kw_query = Q()
+    for kw in keywords:
+        if len(kw) >= 2:
+            kw_query |= Q(title__icontains=kw)
+            kw_query |= Q(description__icontains=kw)
+
+    qs = KnowledgeDoc.objects.filter(kw_query, status='indexed')
     if doc_ids is not None:
-        resource_candidate_ids = [d for d in doc_ids if d > 0]
-        kdoc_candidate_ids = [abs(d) for d in doc_ids if d < 0]
+        qs = qs.filter(id__in=[doc_id for doc_id in doc_ids if doc_id > 0])
 
-    # ---------- Resource 表关键词匹配 ----------
-    resource_results = []
-    if resource_candidate_ids is not None and not resource_candidate_ids:
-        # 硬过滤后无 Resource 候选，直接跳过 Resource 表
-        pass
-    else:
-        kw_query = Q()
-        for kw in keywords:
-            if len(kw) >= 2:
-                kw_query |= Q(title__icontains=kw)
-                kw_query |= Q(description__icontains=kw)
-                kw_query |= Q(course_term__icontains=kw)
-
-        resource_qs = Resource.objects.filter(
-            kw_query, status='published'
-        )
-        if resource_candidate_ids is not None:
-            resource_qs = resource_qs.filter(id__in=resource_candidate_ids)
-
-        # 取 title + description 前 300 字作为 content
-        for d in resource_qs.values('id', 'title', 'description')[:top_k]:
-            excerpt = (d['description'] or '')[:300]
-            resource_results.append({
-                'doc_id': d['id'],
-                'doc_title': d['title'],
-                'content': f"{d['title']} {excerpt}".strip(),
-                'score': 0.55,
-                'page': 0,
-            })
-
-    # ---------- KnowledgeDoc 表关键词匹配 ----------
-    kdoc_results = []
-    if kdoc_candidate_ids is not None and not kdoc_candidate_ids:
-        pass
-    else:
-        try:
-            from apps.knowledge.models import KnowledgeDoc
-
-            kw_query = Q()
-            for kw in keywords:
-                if len(kw) >= 2:
-                    kw_query |= Q(title__icontains=kw)
-                    kw_query |= Q(description__icontains=kw)
-
-            kdoc_qs = KnowledgeDoc.objects.filter(
-                kw_query, status='indexed'
-            )
-            if kdoc_candidate_ids is not None:
-                kdoc_qs = kdoc_qs.filter(id__in=kdoc_candidate_ids)
-
-            for d in kdoc_qs.values('id', 'title', 'description')[:top_k]:
-                excerpt = (d['description'] or '')[:300]
-                kdoc_results.append({
-                    'doc_id': -d['id'],           # 负数区分来源
-                    'doc_title': d['title'],
-                    'content': f"{d['title']} {excerpt}".strip(),
-                    'score': 0.55,
-                    'page': 0,
-                })
-        except ImportError:
-            logger.debug('KnowledgeDoc 模型尚未就绪，跳过知识库关键词搜索')
-
-    # 合并（Resource 在前，KnowledgeDoc 在后，截取 top_k）
-    combined = resource_results + kdoc_results
-    return combined[:top_k]
+    results = []
+    for doc in qs.values('id', 'title', 'description')[:top_k]:
+        excerpt = (doc['description'] or '')[:300]
+        results.append({
+            'doc_id': doc['id'],
+            'doc_title': doc['title'],
+            'content': f"{doc['title']} {excerpt}".strip(),
+            'score': 0.55,
+            'page': 0,
+        })
+    return results
 
 
 def _keywords_boost_from_filters(filters: dict) -> dict:
@@ -608,55 +544,46 @@ def _apply_hard_filters(
     user_context: dict,
     top_k: int = 500,
 ) -> List[int]:
-    """
-    对 resource 表执行 SQL 硬过滤，返回候选 doc_id 列表。
-
-    Args:
-        filters: parse() 输出的过滤条件
-        user_context: {'role': 'user', 'college_id': 1, 'user_id': 123}
-        top_k: 最多返回多少候选（默认 500）
-
-    Returns:
-        doc_id 列表
-    """
-    from apps.resources.models import Resource
-    from apps.knowledge.models import KnowledgeDoc
-    from django.db.models import Q
+    """对 KnowledgeDoc 执行 SQL 硬过滤并返回候选文档 ID。"""
     from datetime import timedelta
+    from django.db.models import Q
     from django.utils import timezone
+    from apps.knowledge.models import KnowledgeDoc
 
-    # --- 默认时间范围：近一年（用户明确要求历史时跳过）---
     time_range = filters.get('time_range')
     need_history = filters.get('need_history', False)
     one_year_ago = None
     if not time_range and not need_history:
         one_year_ago = timezone.now() - timedelta(days=365)
 
-    # --- Resource 表硬过滤 ---
-    qs = Resource.objects.filter(status='published')
-
-    # 默认一年时间过滤
+    qs = KnowledgeDoc.objects.filter(status='indexed')
     if one_year_ago:
-        qs = qs.filter(published_at__gte=one_year_ago)
+        qs = qs.filter(created_at__gte=one_year_ago)
 
-    # 1. 可见层级权限
     role = user_context.get('role', 'user')
     user_id = user_context.get('user_id')
+    college_id = user_context.get('college_id')
+    department_id = user_context.get('department_id')
+    school_level = Q(college_id__isnull=True, department_id__isnull=True)
+
+    # AI 检索仅允许公开文档；管理员按其管理范围可见，超管全量。
+    qs = qs.filter(visibility='public')
     if role == 'super_admin':
-        visibility_q = Q()
-    elif role == 'admin':
-        visibility_q = Q(visibility__in=['public', 'internal'])
+        pass
+    elif role in ('admin', 'college_admin'):
+        qs = qs.filter(school_level | Q(college_id=college_id) | Q(uploader_id=user_id))
+    elif role == 'dept_admin':
+        qs = qs.filter(school_level | Q(department_id=department_id) | Q(uploader_id=user_id))
     else:
-        visibility_q = Q(visibility__in=['public', 'internal'])
-        visibility_q |= Q(visibility='restricted', uploader_id=user_id)
-    qs = qs.filter(visibility_q)
+        conditions = school_level
+        if college_id:
+            conditions |= Q(college_id=college_id)
+        if department_id:
+            conditions |= Q(department_id=department_id)
+        if user_id:
+            conditions |= Q(uploader_id=user_id)
+        qs = qs.filter(conditions)
 
-    # 2. 适用对象
-    audience = filters.get('target_audience')
-    if audience and audience != 'all':
-        qs = qs.filter(Q(target_audience=audience) | Q(target_audience='all'))
-
-    # 3. 学科 / 学院 / 分类 / 格式 / 学期
     if (cid := filters.get('college_id')):
         qs = qs.filter(college_id=cid)
     if (did := filters.get('discipline_id')):
@@ -665,74 +592,15 @@ def _apply_hard_filters(
         qs = qs.filter(category_id__in=cat_ids)
     if (ft := filters.get('file_type')):
         qs = qs.filter(file_type=ft)
-    if (term := filters.get('course_term')):
-        qs = qs.filter(course_term__icontains=term)
-
-    # 4. 时间范围
     if (tr := filters.get('time_range')):
-        import re as _re
-        if _re.match(r'^\d{4}$', tr):
-            year = int(tr)
-            qs = qs.filter(published_at__year=year)
-        elif _re.match(r'^\d{4}-\d{2}$', tr):
+        import re
+        if re.match(r'^\d{4}$', tr):
+            qs = qs.filter(created_at__year=int(tr))
+        elif re.match(r'^\d{4}-\d{2}$', tr):
             year, month = tr.split('-')
-            qs = qs.filter(
-                published_at__year=int(year),
-                published_at__month=int(month),
-            )
+            qs = qs.filter(created_at__year=int(year), created_at__month=int(month))
 
-    resource_ids = list(qs.values_list('id', flat=True)[:top_k])
-
-    # --- KnowledgeDoc 表硬过滤（AI 只能检索公开文件）---
-    kd_qs = KnowledgeDoc.objects.filter(status='indexed')
-
-    # 默认一年时间过滤
-    if one_year_ago:
-        kd_qs = kd_qs.filter(created_at__gte=one_year_ago)
-
-    # AI 检索权限：private 绝不检索；public 按 college_id/department_id 限缩
-    kd_qs = kd_qs.filter(visibility='public')
-    # 校级文档：college_id 和 department_id 均为 null
-    SCHOOL_LEVEL = Q(college_id__isnull=True, department_id__isnull=True)
-    is_admin_query = role in ('admin', 'college_admin', 'dept_admin', 'super_admin')
-    if not is_admin_query:
-        # 普通用户 AI 检索：校级全部 + 本院 + 本部门 + 自己上传
-        conditions = SCHOOL_LEVEL
-        if user_college_id := user_context.get('college_id'):
-            conditions |= Q(college_id=user_college_id)
-        if user_dept_id := user_context.get('department_id'):
-            conditions |= Q(department_id=user_dept_id)
-        if user_id:
-            conditions |= Q(uploader_id=user_id)
-        kd_qs = kd_qs.filter(conditions)
-    elif role in ('college_admin', 'admin'):
-        kd_qs = kd_qs.filter(
-            SCHOOL_LEVEL
-            | Q(college_id=user_context.get('college_id'))
-            | Q(uploader_id=user_id),
-        )
-    elif role == 'dept_admin':
-        kd_qs = kd_qs.filter(
-            SCHOOL_LEVEL
-            | Q(department_id=user_context.get('department_id'))
-            | Q(uploader_id=user_id),
-        )
-    # super_admin: 不过滤
-
-    # 应用相同的学科/学院/分类筛选
-    if (cid := filters.get('college_id')):
-        kd_qs = kd_qs.filter(college_id=cid)
-    if (did := filters.get('discipline_id')):
-        kd_qs = kd_qs.filter(discipline_id=did)
-    if (cat_ids := filters.get('category_ids')):
-        kd_qs = kd_qs.filter(category_id__in=cat_ids)
-    if (ft := filters.get('file_type')):
-        kd_qs = kd_qs.filter(file_type=ft)
-
-    knowledge_doc_ids = list(kd_qs.values_list('id', flat=True)[:top_k])
-
-    # 合并两表 ID（Resource 用正数，KnowledgeDoc 用负数区分来源）
-    return resource_ids + [-kid for kid in knowledge_doc_ids]
+    return list(qs.values_list('id', flat=True)[:top_k])
 
 
 # ------------------------------------------------------------------
@@ -748,48 +616,44 @@ def _filter_by_permission(
     if not hits:
         return []
 
-    from apps.resources.models import Resource
     from apps.knowledge.models import KnowledgeDoc
     from django.db.models import Q
 
     role = user_context.get('role', 'user')
     user_id = user_context.get('user_id')
     user_college_id = user_context.get('college_id')
+    doc_ids = list(set(h['doc_id'] for h in hits if h.get('doc_id')))
+    if not doc_ids:
+        return []
 
-    doc_ids = list(set(h['doc_id'] for h in hits))
-    allowed_ids = set()
+    school_level = Q(college_id__isnull=True, department_id__isnull=True)
+    qs = KnowledgeDoc.objects.filter(
+        id__in=doc_ids, visibility='public',
+    )
+    if role == 'super_admin':
+        pass
+    elif role in ('college_admin', 'admin'):
+        qs = qs.filter(
+            school_level | Q(college_id=user_college_id) | Q(uploader_id=user_id),
+        )
+    elif role == 'dept_admin':
+        qs = qs.filter(
+            school_level
+            | Q(department_id=user_context.get('department_id'))
+            | Q(uploader_id=user_id),
+        )
+    else:
+        conditions = school_level
+        if user_college_id:
+            conditions |= Q(college_id=user_college_id)
+        if user_context.get('department_id'):
+            conditions |= Q(department_id=user_context['department_id'])
+        if user_id:
+            conditions |= Q(uploader_id=user_id)
+        qs = qs.filter(conditions)
 
-    # Resource 权限：public/internal 可见
-    for d in Resource.objects.filter(id__in=doc_ids, visibility__in=['public', 'internal']).values('id'):
-        allowed_ids.add(d['id'])
-
-    # KnowledgeDoc 权限
-    remaining = [i for i in doc_ids if i not in allowed_ids]
-    if remaining:
-        SCHOOL_LEVEL = Q(college_id__isnull=True, department_id__isnull=True)
-        kd_qs = KnowledgeDoc.objects.filter(id__in=remaining, visibility='public')
-        if role == 'super_admin':
-            allowed_ids.update(kd_qs.values_list('id', flat=True))
-        elif role in ('college_admin', 'admin'):
-            allowed_ids.update(kd_qs.filter(
-                SCHOOL_LEVEL | Q(college_id=user_college_id) | Q(uploader_id=user_id),
-            ).values_list('id', flat=True))
-        elif role == 'dept_admin':
-            allowed_ids.update(kd_qs.filter(
-                SCHOOL_LEVEL | Q(department_id=user_context.get('department_id')) | Q(uploader_id=user_id),
-            ).values_list('id', flat=True))
-        else:
-            conditions = SCHOOL_LEVEL
-            if user_college_id:
-                conditions |= Q(college_id=user_college_id)
-            if user_context.get('department_id'):
-                conditions |= Q(department_id=user_context.get('department_id'))
-            if user_id:
-                conditions |= Q(uploader_id=user_id)
-            allowed_ids.update(kd_qs.filter(conditions).values_list('id', flat=True))
-
-    filtered = [h for h in hits if h.get('doc_id') in allowed_ids]
-    return filtered[:5]
+    allowed_ids = set(qs.values_list('id', flat=True))
+    return [h for h in hits if h.get('doc_id') in allowed_ids][:5]
 
 
 # ------------------------------------------------------------------
@@ -801,28 +665,15 @@ def _filter_by_permission(
 # ------------------------------------------------------------------
 def _enrich_with_doc_meta(hits: List[dict], min_score: float) -> List[dict]:
     """
-    查询 MySQL resource / knowledge_doc 表，补全文档标题等元信息。
-    过滤低于 min_score 的结果，返回 Top-5。
+    关键词命中返回 content 字段（标题 + 描述拼接），用于补充检索结果。
     """
+    from apps.knowledge.models import KnowledgeDoc
+
     doc_ids = list({int(h['doc_id']) for h in hits if h.get('doc_id')})
-
-    doc_title_map = {}
-
-    if doc_ids:
-        # 查 Resource 表
-        try:
-            from apps.resources.models import Resource
-            for d in Resource.objects.filter(id__in=doc_ids).values('id', 'title'):
-                doc_title_map[d['id']] = d['title']
-        except ImportError:
-            pass
-        # 查 KnowledgeDoc 表
-        try:
-            from apps.knowledge.models import KnowledgeDoc
-            for d in KnowledgeDoc.objects.filter(id__in=doc_ids).values('id', 'title'):
-                doc_title_map[d['id']] = d['title']
-        except ImportError:
-            pass
+    doc_title_map = {
+        row['id']: row['title']
+        for row in KnowledgeDoc.objects.filter(id__in=doc_ids).values('id', 'title')
+    }
 
     results = []
     for hit in hits:

@@ -32,7 +32,7 @@ class UserAdminSerializer(serializers.ModelSerializer):
     college_name = serializers.CharField(source='college.name', read_only=True)
     department_name = serializers.CharField(source='department.name', read_only=True)
     role_display = serializers.CharField(source='get_role_display', read_only=True)
-    resource_count = serializers.IntegerField(source='resources.count', read_only=True)
+    uploaded_doc_count = serializers.IntegerField(source='uploaded_docs.count', read_only=True)
 
     class Meta:
         model = User
@@ -42,10 +42,10 @@ class UserAdminSerializer(serializers.ModelSerializer):
             'college', 'college_name',
             'department', 'department_name',
             'phone', 'avatar', 'is_active', 'date_joined',
-            'last_login', 'resource_count',
+            'last_login', 'uploaded_doc_count',
         ]
         read_only_fields = [
-            'id', 'username', 'date_joined', 'last_login', 'resource_count',
+            'id', 'username', 'date_joined', 'last_login', 'uploaded_doc_count',
             'role_display', 'college_name', 'department_name',
         ]
 

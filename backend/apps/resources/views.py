@@ -2,102 +2,23 @@
 import datetime as _datetime
 
 from django.db.models import Count, Sum
-from django.db.models.functions import Cast
-from django.db.models import TextField
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
-from rest_framework import generics, permissions, status, viewsets
+from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from drf_spectacular.utils import extend_schema
 
-from apps.classify.models import Category
-from apps.admin_panel.permissions import IsAnyAdmin, scope_upload_logs, scope_resources_for_browse
-from config.permissions import IsAdminOrSuperAdmin
+from apps.admin_panel.permissions import IsAnyAdmin, scope_upload_logs
 
-from .models import Resource, UploadLog
+from .models import UploadLog
 from .serializers import (
-    ResourceListSerializer,
     UploadLogSerializer,
     UploadLogStatsSerializer,
     UploadLogCompleteSerializer,
 )
-
-
-@extend_schema(
-    summary='资源列表',
-    description='分页返回已发布资源列表，支持按学院、学科、分类、关键词筛选',
-    tags=['资源管理'],
-    operation_id='资源列表',
-)
-class ResourceListView(generics.ListAPIView):
-    """
-    资源列表接口
-
-    GET /api/resources/
-    功能：分页返回已发布资源列表，支持按学院、学科、分类、关键词筛选
-    请求参数：
-        - page (int, default=1): 页码
-        - page_size (int, default=20): 每页数量
-        - college_id (int, optional): 按学院ID精确筛选
-        - discipline_id (int, optional): 按学科方向ID精确筛选
-        - category_id (int, optional): 按资源类型筛选，一级分类自动包含其下所有二级分类
-        - keyword (str, optional): 按关键词模糊匹配
-    权限规则：
-        - super_admin：全校已发布资源
-        - admin / college_admin：本学院已发布资源（department IS NULL）
-        - dept_admin：本部门已发布资源（college IS NULL）
-        - user（普通用户）：什么都看不到，只能通过 /api/chat/ask/ AI 检索
-    返回：DRF 分页包装后的资源列表，每条包含 id / title / description / file_type / file_size /
-          uploader_name / college_name / discipline_name / category_name（完整路径）/
-          category_icon / keywords / status / visibility / view_count / download_count / created_at
-    """
-    serializer_class = ResourceListSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        queryset = Resource.objects.select_related(
-            'college', 'discipline', 'category', 'uploader',
-        ).all()
-
-        # 范围过滤：user 直接 qs.none()，其余按本学院/本部门只返回 status='published' 的资源
-        queryset = scope_resources_for_browse(queryset, self.request.user)
-
-        # 学院筛选
-        college_id = self.request.query_params.get('college_id')
-        if college_id:
-            queryset = queryset.filter(college_id=college_id)
-
-        # 学科方向筛选
-        discipline_id = self.request.query_params.get('discipline_id')
-        if discipline_id:
-            queryset = queryset.filter(discipline_id=discipline_id)
-
-        # 分类筛选：一级分类 → 包含其下所有二级分类
-        category_id = self.request.query_params.get('category_id')
-        if category_id:
-            try:
-                category = Category.objects.get(id=category_id)
-            except Category.DoesNotExist:
-                return queryset.none()
-            if category.parent is None:
-                # 一级分类：获取所有子分类 ID
-                child_ids = category.children.values_list('id', flat=True)
-                queryset = queryset.filter(category_id__in=child_ids)
-            else:
-                # 二级分类：精确匹配
-                queryset = queryset.filter(category_id=category_id)
-
-        # 关键词模糊匹配（JSONField 文本搜索）
-        keyword = self.request.query_params.get('keyword')
-        if keyword:
-            queryset = queryset.annotate(
-                keywords_text=Cast('keywords', TextField()),
-            ).filter(keywords_text__icontains=keyword)
-
-        return queryset.order_by('-created_at')
 
 
 @extend_schema(
@@ -124,7 +45,7 @@ class UploadLogViewSet(viewsets.ReadOnlyModelViewSet):
         - 其他：无权限
     """
     queryset = UploadLog.objects.select_related(
-        'user', 'college', 'department', 'resource',
+        'user', 'college', 'department', 'knowledge_doc',
     )
     serializer_class = UploadLogSerializer
     permission_classes = [permissions.IsAuthenticated, IsAnyAdmin]
@@ -260,7 +181,7 @@ class UploadLogViewSet(viewsets.ReadOnlyModelViewSet):
 
         请求体:
             - status: str, 必填，success 或 failed
-            - resource_id: int, success 时必填，关联的资源ID
+            - knowledge_doc_id: int, success 时必填，关联的知识文档ID
             - error_message: str, failed 时必填，错误信息
 
         响应:
@@ -278,10 +199,10 @@ class UploadLogViewSet(viewsets.ReadOnlyModelViewSet):
         upload_log.completed_at = timezone.now()
 
         if validated_data['status'] == 'success':
-            upload_log.resource_id = validated_data['resource_id']
+            upload_log.knowledge_doc_id = validated_data['knowledge_doc_id']
             upload_log.error_message = ''
         else:
-            upload_log.resource = None
+            upload_log.knowledge_doc = None
             upload_log.error_message = validated_data['error_message']
 
         upload_log.save()

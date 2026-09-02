@@ -598,7 +598,7 @@ class UploadSTSView(APIView):
         - file_size (int, required): 文件大小（字节）
         - md5 (str, required): 文件 MD5 哈希值
     返回：
-        - 重复文件: {"duplicate": true, "resource_id": <doc.id>}
+        - 重复文件: {"duplicate": true, "knowledge_doc_id": <doc.id>}
         - 正常凭证: {"oss_key": "...", "upload_url": "...", "sts_credentials": {...}, "dev_mode": false, "duplicate": false}
     """
     permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
@@ -617,7 +617,7 @@ class UploadSTSView(APIView):
         if duplicate_doc:
             return Response({
                 'duplicate': True,
-                'resource_id': duplicate_doc.id,
+                'knowledge_doc_id': duplicate_doc.id,
             })
 
         # 获取 STS 临时凭证（scope 根据上传者角色自动确定）
@@ -1306,6 +1306,7 @@ class FileUploadView(APIView):
         try:
             UploadLog.objects.create(
                 user=request.user,
+                knowledge_doc=new_doc,
                 file_name=uploaded_file.name,
                 file_size=uploaded_file.size,
                 file_type=ext,
@@ -1522,6 +1523,7 @@ class BatchFileUploadView(APIView):
                 try:
                     UploadLog.objects.create(
                         user=user,
+                        knowledge_doc=new_doc,
                         file_name=file_name,
                         file_size=uploaded_file.size,
                         file_type=ext,
