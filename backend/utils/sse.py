@@ -240,7 +240,9 @@ def build_references_events(
             from apps.knowledge.models import KnowledgeDoc
             doc = KnowledgeDoc.objects.filter(id=r['doc_id']).first()
             if doc and doc.oss_key:
-                entry['download_url'] = oss_client.get_download_url(doc.oss_key, expires=300)
+                entry['download_url'] = oss_client.get_download_url(
+                    doc.oss_key, expires=300, file_name=doc.file_name,
+                )
         except (ImportError, Exception):
             pass
         detail.append(entry)

@@ -408,7 +408,9 @@ class KnowledgeDocDownloadView(generics.RetrieveAPIView):
 
     def retrieve(self, request, *args, **kwargs):
         instance = self.get_object()
-        download_url = oss_client.get_download_url(instance.oss_key)
+        download_url = oss_client.get_download_url(
+            instance.oss_key, file_name=instance.file_name,
+        )
         return Response({'download_url': download_url})
 
 

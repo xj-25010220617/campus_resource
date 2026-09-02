@@ -131,12 +131,45 @@ class OSSClient:
     # ------------------------------------------------------------------
     # 签名下载 URL
     # ------------------------------------------------------------------
-    def get_download_url(self, oss_key: str, expires: int = 300) -> str:
-        """生成带签名的下载 URL，默认有效期 300 秒"""
+    def _build_content_disposition(self, file_name: str) -> str:
+        """
+        构造 Content-Disposition 头值，使下载的文件使用原始文件名。
+
+        上传时对象名是随机 UUID（见 _generate_oss_key），OSS 默认按对象名保存，
+        导致下载文件名与原始文件名不一致。这里通过 response-content-disposition
+        响应头覆盖，让浏览器以原始文件名保存：
+            - filename="..."  ASCII 回退（兼容旧浏览器）
+            - filename*=UTF-8''...  RFC 5987 编码（支持中文等非 ASCII 文件名）
+        """
+        # ASCII 回退：仅保留可打印 ASCII，去掉引号/分号/反斜杠/路径分隔符等危险字符
+        ascii_name = ''.join(
+            c for c in file_name if 32 <= ord(c) < 127 and c not in '";\\/'
+        ).strip() or 'download'
+        # RFC 5987：整名 UTF-8 百分号编码（safe='' 连 '/' 一起转义，防路径注入）
+        encoded_name = quote(file_name, safe='')
+        return f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{encoded_name}'
+
+    def get_download_url(self, oss_key: str, expires: int = 300,
+                         file_name: str = None) -> str:
+        """
+        生成带签名的下载 URL，默认有效期 300 秒。
+
+        Args:
+            oss_key: OSS 对象 Key
+            expires: 有效期（秒）
+            file_name: 原始文件名。传入时通过 response-content-disposition
+                响应头覆盖，使下载文件以原始文件名保存（否则为 UUID 对象名）。
+                预览场景（<img>/<video> 内联播放）不要传，避免触发附件下载。
+        """
         if not self.bucket:
             return ''
+        params = None
+        if file_name:
+            params = {
+                'response-content-disposition': self._build_content_disposition(file_name),
+            }
         try:
-            return self.bucket.sign_url('GET', oss_key, expires)
+            return self.bucket.sign_url('GET', oss_key, expires, params=params)
         except Exception as e:
             logger.error(f'生成下载 URL 失败 oss_key={oss_key}: {e}')
             return ''
@@ -145,6 +178,7 @@ class OSSClient:
         """
         生成带签名的预览 URL（有效期 3600 秒，适合音频/视频播放）。
         与 get_download_url 相同机制，仅默认有效期更长。
+        不携带 Content-Disposition 覆盖，浏览器内联显示（PDF/图片/音视频）。
         """
         return self.get_download_url(oss_key, expires)
 

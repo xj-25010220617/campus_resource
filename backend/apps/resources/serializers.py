@@ -2,6 +2,7 @@
 from rest_framework import serializers
 
 from .models import Resource, UploadLog
+from utils.oss import oss_client
 
 
 class ResourceListSerializer(serializers.ModelSerializer):
@@ -42,12 +43,31 @@ class ResourceListSerializer(serializers.ModelSerializer):
 class ResourceDetailSerializer(ResourceListSerializer):
     """资源详情序列化器"""
 
+    # 下载：带原始文件名的签名附件 URL（下载文件名与上传时一致）
+    download_url = serializers.SerializerMethodField()
+    # 预览：签名 URL（无 Content-Disposition，浏览器内联显示 PDF/图片/音视频）
+    oss_url = serializers.SerializerMethodField()
+
     class Meta(ResourceListSerializer.Meta):
         fields = ResourceListSerializer.Meta.fields + [
-            'file_name', 'oss_url', 'keywords',
+            'file_name', 'oss_url', 'download_url', 'keywords',
             'target_audience', 'course_term',
             'audit_comment', 'auditor',
         ]
+
+    def get_download_url(self, obj) -> str:
+        """带原始文件名的签名下载 URL（附件下载）"""
+        if not obj.oss_key:
+            return ''
+        return oss_client.get_download_url(
+            obj.oss_key, expires=604800, file_name=obj.file_name,
+        )
+
+    def get_oss_url(self, obj) -> str:
+        """签名预览 URL（无 attachment，浏览器内联显示）"""
+        if not obj.oss_key:
+            return ''
+        return oss_client.get_preview_url(obj.oss_key, expires=604800)
 
 
 class UploadLogSerializer(serializers.ModelSerializer):

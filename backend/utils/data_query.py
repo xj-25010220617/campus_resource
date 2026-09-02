@@ -226,7 +226,9 @@ def find_user_docs(
 
     def _get_dl_url(doc) -> str:
         if doc.oss_key:
-            url = oss_client.get_download_url(doc.oss_key, expires=3600)
+            url = oss_client.get_download_url(
+                doc.oss_key, expires=3600, file_name=doc.file_name,
+            )
             if url:
                 return url
         return ''
