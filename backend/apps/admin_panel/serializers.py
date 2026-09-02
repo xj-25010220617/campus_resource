@@ -337,7 +337,7 @@ class DepartmentWriteSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Department
-        fields = ['id', 'name', 'parent', 'sort_order']
+        fields = ['id', 'name', 'parent']
         read_only_fields = ['id']
 
     def validate(self, attrs):

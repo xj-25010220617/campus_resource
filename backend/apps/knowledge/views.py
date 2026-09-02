@@ -483,23 +483,19 @@ class KeywordCreateView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
-        # 同一文档内 phrase 唯一性校验
-        if Keyword.objects.filter(doc=doc, phrase=data['phrase']).exists():
-            return Response(
-                {'detail': f'关键词 "{data["phrase"]}" 已存在于此文档中', 'code': ErrorCode.CONFLICT.value},
-                status=status.HTTP_409_CONFLICT,
-            )
-
-        # 创建关键词
-        keyword = Keyword.objects.create(
+        # 同一文档内 phrase 唯一性：已存在则幂等返回 200，否则创建返回 201
+        keyword, created = Keyword.objects.get_or_create(
             doc=doc,
             phrase=data['phrase'],
-            match_type=data.get('match_type', 'fuzzy'),
-            weight=data.get('weight', 1),
-            created_by=request.user,
+            defaults={
+                'match_type': data.get('match_type', 'fuzzy'),
+                'weight': data.get('weight', 1),
+                'created_by': request.user,
+            },
         )
 
-        return Response(KeywordSerializer(keyword).data, status=status.HTTP_201_CREATED)
+        status_code = status.HTTP_201_CREATED if created else status.HTTP_200_OK
+        return Response(KeywordSerializer(keyword).data, status=status_code)
 
 
 @extend_schema(
@@ -722,16 +718,17 @@ class UploadCallbackView(APIView):
             visibility=data.get('visibility', 'public'),
         )
 
-        # 创建关联关键词
+        # 创建关联关键词（去重：同一文档内 phrase 不重复）
         keywords = data.get('keywords', [])
+        seen = set()
         for phrase in keywords:
-            Keyword.objects.create(
-                doc=new_doc,
-                phrase=phrase,
-                match_type='fuzzy',
-                weight=1,
-                created_by=request.user,
-            )
+            p = phrase.strip() if isinstance(phrase, str) else ''
+            if p and p not in seen:
+                seen.add(p)
+                Keyword.objects.get_or_create(
+                    doc=new_doc, phrase=p,
+                    defaults={'match_type': 'fuzzy', 'weight': 1, 'created_by': request.user},
+                )
 
         # TODO: 调用 Celery 异步索引任务（甲同学完成后集成）
         # index_document.delay(doc_id=new_doc.id)
@@ -900,15 +897,15 @@ class TextUploadView(APIView):
             visibility=visibility,
         )
 
-        # 创建关联关键词
+        # 创建关联关键词（去重：同一文档内 phrase 不重复）
+        _seen = set()
         for phrase in keywords:
-            if isinstance(phrase, str) and phrase.strip():
-                Keyword.objects.create(
-                    doc=new_doc,
-                    phrase=phrase.strip(),
-                    match_type='fuzzy',
-                    weight=1,
-                    created_by=request.user,
+            p = phrase.strip() if isinstance(phrase, str) else ''
+            if p and p not in _seen:
+                _seen.add(p)
+                Keyword.objects.get_or_create(
+                    doc=new_doc, phrase=p,
+                    defaults={'match_type': 'fuzzy', 'weight': 1, 'created_by': request.user},
                 )
 
         # 触发异步索引（切片 + 向量化），使文档可被 AI 智能问答检索
@@ -1318,12 +1315,15 @@ class FileUploadView(APIView):
         except Exception as e:
             logger.error(f'创建上传日志失败: {e}')
 
-        # 创建关联关键词（ListField 已保证 raw_keywords 为列表）
+        # 创建关联关键词（去重：同一文档内 phrase 不重复）
+        _seen = set()
         for phrase in raw_keywords:
-            if isinstance(phrase, str) and phrase.strip():
-                Keyword.objects.create(
-                    doc=new_doc, phrase=phrase.strip(),
-                    match_type='fuzzy', weight=1, created_by=request.user,
+            p = phrase.strip() if isinstance(phrase, str) else ''
+            if p and p not in _seen:
+                _seen.add(p)
+                Keyword.objects.get_or_create(
+                    doc=new_doc, phrase=p,
+                    defaults={'match_type': 'fuzzy', 'weight': 1, 'created_by': request.user},
                 )
 
         # 触发异步索引（切片 + 向量化），使文档可被 AI 智能问答检索
@@ -1510,12 +1510,15 @@ class BatchFileUploadView(APIView):
                     visibility=visibility,
                 )
 
-                # 4f. 创建关键词
+                # 4f. 创建关键词（去重：同一文档内 phrase 不重复）
+                _seen = set()
                 for phrase in raw_keywords:
-                    if isinstance(phrase, str) and phrase.strip():
-                        Keyword.objects.create(
-                            doc=new_doc, phrase=phrase.strip(),
-                            match_type='fuzzy', weight=1, created_by=user,
+                    p = phrase.strip() if isinstance(phrase, str) else ''
+                    if p and p not in _seen:
+                        _seen.add(p)
+                        Keyword.objects.get_or_create(
+                            doc=new_doc, phrase=p,
+                            defaults={'match_type': 'fuzzy', 'weight': 1, 'created_by': user},
                         )
 
                 # 4g. 创建上传日志
