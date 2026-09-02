@@ -27,7 +27,7 @@ from rest_framework.views import APIView
 from config.permissions import IsAdminOrSuperAdmin
 from utils.celery_dispatcher import safe_delay
 from utils.error_codes import ErrorCode
-from utils.oss import oss_client
+from utils.oss import guess_content_type, oss_client
 
 from .models import ChunkedUploadSession, Keyword, KnowledgeDoc
 from .serializers import ALLOWED_FILE_TYPES, normalize_file_type
@@ -159,7 +159,9 @@ class ChunkUploadInitView(APIView):
         # 新建：初始化 OSS Multipart Upload
         oss_key = _build_oss_key(request.user, filename)
         try:
-            result = oss_client.bucket.init_multipart_upload(oss_key)
+            result = oss_client.bucket.init_multipart_upload(
+                oss_key, headers={'Content-Type': guess_content_type(filename)},
+            )
         except oss2.exceptions.OssError as e:
             logger.error(f'初始化分片上传失败 oss_key={oss_key}: {e}')
             return Response(

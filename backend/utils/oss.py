@@ -20,6 +20,55 @@ from django.core.files.uploadedfile import UploadedFile
 logger = logging.getLogger(__name__)
 
 
+# 扩展名 → Content-Type 映射。对象上传时写入 OSS 元数据，供浏览器内联预览。
+# 注意：阿里云 OSS **不支持**签名 URL 上的 response-content-type 参数
+# （会返回 400 InvalidRequest: Can not override response header on content-type），
+# 因此 Content-Type 必须在 put_object / multipart 上传时就写对，不能事后覆盖。
+MIME_MAP = {
+    # 图片
+    'png': 'image/png', 'jpg': 'image/jpeg', 'jpeg': 'image/jpeg',
+    'gif': 'image/gif', 'webp': 'image/webp', 'bmp': 'image/bmp',
+    'svg': 'image/svg+xml', 'ico': 'image/x-icon', 'tiff': 'image/tiff', 'tif': 'image/tiff',
+    'psd': 'image/vnd.adobe.photoshop',
+    # 音频
+    'mp3': 'audio/mpeg', 'wav': 'audio/wav', 'ogg': 'audio/ogg',
+    'flac': 'audio/flac', 'aac': 'audio/aac', 'm4a': 'audio/mp4', 'amr': 'audio/amr',
+    # 视频
+    'mp4': 'video/mp4', 'm4v': 'video/mp4', 'webm': 'video/webm', 'mov': 'video/quicktime',
+    'avi': 'video/x-msvideo', 'mkv': 'video/x-matroska', 'flv': 'video/x-flv',
+    # 文档
+    'pdf': 'application/pdf',
+    'doc': 'application/msword',
+    'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'ppt': 'application/vnd.ms-powerpoint',
+    'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    'xls': 'application/vnd.ms-excel',
+    'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    # 文本 / 数据
+    'txt': 'text/plain', 'md': 'text/markdown',
+    'html': 'text/html', 'htm': 'text/html',
+    'csv': 'text/csv', 'json': 'application/json', 'xml': 'application/xml',
+    'yaml': 'text/yaml', 'yml': 'text/yaml',
+    # 压缩包 / 其它
+    'zip': 'application/zip', 'rar': 'application/x-rar-compressed', '7z': 'application/x-7z-compressed',
+    'epub': 'application/epub+zip', 'pub': 'application/x-mspublisher',
+    'ai': 'application/postscript', 'stl': 'model/stl', 'obj': 'model/obj',
+}
+
+DEFAULT_MIME_TYPE = 'application/octet-stream'
+
+
+def guess_content_type(file_name: str) -> str:
+    """按扩展名推断 Content-Type；空/未知一律返回 application/octet-stream。
+
+    支持直接传原始文件名（如 "校园平面图.jpg"），也支持传纯扩展名（"jpg"）。
+    """
+    if not file_name:
+        return DEFAULT_MIME_TYPE
+    ext = file_name.rsplit('.', 1)[-1].strip().lower()
+    return MIME_MAP.get(ext, DEFAULT_MIME_TYPE)
+
+
 class OSSClient:
     """阿里云 OSS 操作封装"""
 
@@ -174,26 +223,25 @@ class OSSClient:
             logger.error(f'生成下载 URL 失败 oss_key={oss_key}: {e}')
             return ''
 
-    def get_preview_url(self, oss_key: str, expires: int = 3600,
-                        content_type: str = None) -> str:
+    def get_preview_url(self, oss_key: str, expires: int = 3600) -> str:
         """
         生成带签名的预览 URL（有效期 3600 秒，适合音频/视频播放）。
         与 get_download_url 相同机制，仅默认有效期更长。
         不携带 Content-Disposition 覆盖，浏览器内联显示（PDF/图片/音视频）。
 
+        注意：阿里云 OSS **不支持** response-content-type 参数——签名 URL 带上它会返回
+        400 InvalidRequest: Can not override response header on content-type。
+        因此这里不做 MIME 覆盖，对象的 Content-Type 必须在**上传时**写对
+        （见 guess_content_type()），否则浏览器会按 application/octet-stream 处理。
+
         Args:
             oss_key: OSS 对象 Key
             expires: 有效期（秒）
-            content_type: 覆盖响应 Content-Type（如 image/png），
-                修正上传时未正确设置的 MIME 类型，使浏览器内联显示而非下载。
         """
         if not self.bucket:
             return ''
-        params = {}
-        if content_type:
-            params['response-content-type'] = content_type
         try:
-            return self.bucket.sign_url('GET', oss_key, expires, params=params or None)
+            return self.bucket.sign_url('GET', oss_key, expires)
         except Exception as e:
             logger.error(f'生成预览 URL 失败 oss_key={oss_key}: {e}')
             return ''
@@ -262,7 +310,10 @@ class OSSClient:
             logger.error('OSS Bucket 未初始化，无法上传文本')
             return False
         try:
-            self.bucket.put_object(oss_key, content.encode('utf-8'))
+            self.bucket.put_object(
+                oss_key, content.encode('utf-8'),
+                headers={'Content-Type': 'text/plain; charset=utf-8'},
+            )
             logger.info(f'文本上传成功 oss_key={oss_key}, size={len(content)} chars')
             return True
         except Exception as e:
