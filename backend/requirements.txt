@@ -26,3 +26,5 @@ chromadb>=1.5.0
 celery>=5.3.0
 redis>=5.0.0
 imageio-ffmpeg
+# 图片缩放（视觉模型读图前压缩），图片智能分类依赖
+Pillow>=10.0.0

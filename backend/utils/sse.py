@@ -30,6 +30,7 @@ def sse_response(generator, extra_events: dict = None):
             - start: 会话/消息 ID
             - references: 普通用户的引用摘要 {count, summary}
             - references_detail: 授权用户引用详情 [{doc_title, page, score, download_url}, ...]
+            - images: 内联展示的图片预览 [{doc_id, doc_title, description, preview_url}, ...]
             - suggested: 推荐问题列表
             - confidence: 置信度 {score}
             - done: 结束标记
@@ -53,6 +54,10 @@ def sse_response(generator, extra_events: dict = None):
             # 4. references_detail（admin/super_admin 可看完整引用）
             if extra_events and extra_events.get('references_detail'):
                 yield _format_sse('references_detail', extra_events['references_detail'])
+
+            # 4.5 images（内联展示的图片预览）
+            if extra_events and extra_events.get('images'):
+                yield _format_sse('images', extra_events['images'])
 
             # 5. suggested_questions
             if extra_events and extra_events.get('suggested'):
@@ -112,6 +117,10 @@ async def sse_response_async(async_generator, extra_events: dict = None):
             # 4. references_detail
             if extra_events and extra_events.get('references_detail'):
                 yield _format_sse('references_detail', extra_events['references_detail'])
+
+            # 4.5 images（内联展示的图片预览）
+            if extra_events and extra_events.get('images'):
+                yield _format_sse('images', extra_events['images'])
 
             # 5. suggested
             if extra_events and extra_events.get('suggested'):
@@ -240,7 +249,9 @@ def build_references_events(
             from apps.knowledge.models import KnowledgeDoc
             doc = KnowledgeDoc.objects.filter(id=r['doc_id']).first()
             if doc and doc.oss_key:
-                entry['download_url'] = oss_client.get_download_url(doc.oss_key, expires=300)
+                entry['download_url'] = oss_client.get_download_url(
+                    doc.oss_key, expires=300, file_name=doc.file_name,
+                )
         except (ImportError, Exception):
             pass
         detail.append(entry)
@@ -259,6 +270,33 @@ def build_references_events(
             pass
 
     return {'references_detail': detail}
+
+
+def build_images_events(image_results: list) -> dict:
+    """构造 images 事件数据（图片预览 URL 列表，供前端内联展示）。
+
+    Args:
+        image_results: retrieve_images() 返回的图片文档列表
+
+    Returns:
+        {'images': [{'doc_id','doc_title','description','preview_url'}, ...]}
+    """
+    from .oss import oss_client
+
+    images = []
+    for r in image_results:
+        entry = {
+            'doc_id': r.get('doc_id'),
+            'doc_title': r.get('doc_title', ''),
+            'description': (r.get('description') or '')[:200],
+            'preview_url': '',
+        }
+        oss_key = r.get('oss_key', '')
+        if oss_key:
+            # 签名预览 URL（不带 attachment，浏览器内联显示图片）
+            entry['preview_url'] = oss_client.get_preview_url(oss_key, expires=3600) or ''
+        images.append(entry)
+    return {'images': images}
 
 
 def build_error_sse(message: str, code: ErrorCode = ErrorCode.SSE_ERROR):

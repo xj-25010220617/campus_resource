@@ -1,6 +1,7 @@
 from rest_framework import serializers
 
 from .models import KnowledgeDoc, Keyword
+from utils.oss import oss_client
 
 
 class KnowledgeDocSerializer(serializers.ModelSerializer):
@@ -12,11 +13,16 @@ class KnowledgeDocSerializer(serializers.ModelSerializer):
     college_name = serializers.CharField(source='college.name', read_only=True)
     uploader_name = serializers.CharField(source='uploader.username', read_only=True)
 
+    # 下载：带原始文件名的签名附件 URL（下载文件名与上传时一致，见 oss.get_download_url）
+    download_url = serializers.SerializerMethodField()
+    # 预览：签名 URL（无 Content-Disposition，浏览器内联显示 PDF/图片/音视频）
+    oss_url = serializers.SerializerMethodField()
+
     class Meta:
         model = KnowledgeDoc
         fields = [
             'id', 'title', 'description', 'source_type', 'source_url',
-            'oss_key', 'oss_url', 'file_name', 'file_type', 'file_size',
+            'oss_key', 'oss_url', 'download_url', 'file_name', 'file_type', 'file_size',
             'md5_hash', 'page_count',
             'discipline', 'discipline_name',
             'category', 'category_name',
@@ -27,10 +33,24 @@ class KnowledgeDocSerializer(serializers.ModelSerializer):
             'created_at', 'updated_at', 'indexed_at',
         ]
         read_only_fields = [
-            'id', 'source_type', 'oss_key', 'oss_url', 'file_name', 'file_type',
+            'id', 'source_type', 'oss_key', 'file_name', 'file_type',
             'file_size', 'md5_hash', 'page_count', 'uploader',
             'chunk_count', 'created_at', 'updated_at', 'indexed_at',
         ]
+
+    def get_download_url(self, obj) -> str:
+        """带原始文件名的签名下载 URL（附件下载）"""
+        if not obj.oss_key:
+            return ''
+        return oss_client.get_download_url(
+            obj.oss_key, expires=604800, file_name=obj.file_name,
+        )
+
+    def get_oss_url(self, obj) -> str:
+        """签名预览 URL（无 attachment，浏览器内联显示）"""
+        if not obj.oss_key:
+            return ''
+        return oss_client.get_preview_url(obj.oss_key, expires=604800)
 
 
 class KnowledgeDocListSerializer(serializers.ModelSerializer):
@@ -58,20 +78,31 @@ class KnowledgeDocListSerializer(serializers.ModelSerializer):
 
 # 文件大小限制常量（字节）
 FILE_SIZE_LIMITS = {
-    # 文档类 — 50MB
-    'pdf': 50 * 1024 * 1024, 'doc': 50 * 1024 * 1024, 'docx': 50 * 1024 * 1024,
-    'ppt': 50 * 1024 * 1024, 'pptx': 50 * 1024 * 1024,
-    'xls': 50 * 1024 * 1024, 'xlsx': 50 * 1024 * 1024,
+    # 文档类
+    'pdf': 50 * 1024 * 1024,                          # PDF — 50MB（多页扫描件/图纸）
+    'doc': 30 * 1024 * 1024, 'docx': 30 * 1024 * 1024,  # Word — 30MB
+    'xls': 30 * 1024 * 1024, 'xlsx': 30 * 1024 * 1024,  # Excel — 30MB
+    'ppt': 50 * 1024 * 1024, 'pptx': 50 * 1024 * 1024,  # PPT — 50MB（含高清图汇报）
     'txt': 50 * 1024 * 1024, 'md': 50 * 1024 * 1024, 'html': 50 * 1024 * 1024,
-    # 图片类 — 10MB
-    'png': 10 * 1024 * 1024, 'jpg': 10 * 1024 * 1024, 'jpeg': 10 * 1024 * 1024,
-    'gif': 10 * 1024 * 1024, 'webp': 10 * 1024 * 1024,
+    'csv': 30 * 1024 * 1024,                          # CSV 表格 — 30MB（名单/数据导出）
+    # 图片类 — 30MB（相机原图可放宽至此档）
+    'png': 30 * 1024 * 1024, 'jpg': 30 * 1024 * 1024, 'jpeg': 30 * 1024 * 1024,
+    'gif': 30 * 1024 * 1024, 'webp': 30 * 1024 * 1024,
+    'bmp': 30 * 1024 * 1024, 'tiff': 30 * 1024 * 1024, 'tif': 30 * 1024 * 1024,
+    # 压缩包 — 80MB（多文件打包场景）
+    'zip': 80 * 1024 * 1024, 'rar': 80 * 1024 * 1024, '7z': 80 * 1024 * 1024,
     # 音频类 — 50MB
     'mp3': 50 * 1024 * 1024, 'wav': 50 * 1024 * 1024, 'ogg': 50 * 1024 * 1024,
     'flac': 50 * 1024 * 1024, 'aac': 50 * 1024 * 1024, 'm4a': 50 * 1024 * 1024,
+    'amr': 50 * 1024 * 1024,
     # 视频类 — 500MB
     'mp4': 500 * 1024 * 1024, 'webm': 500 * 1024 * 1024, 'mov': 500 * 1024 * 1024,
     'avi': 500 * 1024 * 1024, 'mkv': 500 * 1024 * 1024, 'flv': 500 * 1024 * 1024,
+    'm4v': 500 * 1024 * 1024,
+    # 设计源文件 / 3D 模型 / 电子书 / Publisher（二进制附件，归 other 类别）
+    'psd': 100 * 1024 * 1024, 'ai': 100 * 1024 * 1024,    # 设计源文件 — 100MB
+    'stl': 200 * 1024 * 1024, 'obj': 200 * 1024 * 1024, 'fbx': 200 * 1024 * 1024,  # 3D 模型 — 200MB
+    'epub': 50 * 1024 * 1024, 'pub': 50 * 1024 * 1024,    # 电子书 / Publisher — 50MB
     # 其他 — 50MB
     'other': 50 * 1024 * 1024,
 }
@@ -81,14 +112,18 @@ ALLOWED_FILE_TYPES = {
     # 文档类
     'pdf', 'doc', 'docx', 'ppt', 'pptx', 'xls', 'xlsx',
     'txt', 'md', 'html',
+    # 表格（纯文本，可索引）
+    'csv',
     # 图片类
-    'png', 'jpg', 'jpeg', 'gif', 'webp',
+    'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'tiff', 'tif',
     # 音频类
-    'mp3', 'wav', 'ogg', 'flac', 'aac', 'm4a',
+    'mp3', 'wav', 'ogg', 'flac', 'aac', 'm4a', 'amr',
     # 视频类
-    'mp4', 'webm', 'mov', 'avi', 'mkv', 'flv',
+    'mp4', 'webm', 'mov', 'avi', 'mkv', 'flv', 'm4v',
     # 压缩包类
-    'zip', 'rar',
+    'zip', 'rar', '7z',
+    # 设计源文件 / 3D 模型 / 电子书 / Publisher（二进制附件，归 other）
+    'psd', 'ai', 'stl', 'obj', 'fbx', 'epub', 'pub',
     # 其他（兜底）
     'other',
 }
@@ -113,6 +148,55 @@ def _validate_file_type(file_type: str) -> None:
         raise serializers.ValidationError(
             f'不支持的文件类型 "{ft}"，支持的类型：{", ".join(sorted(ALLOWED_FILE_TYPES))}'
         )
+
+
+# 扩展名 → 文件类型类别映射（与 KnowledgeDoc.FILE_TYPE_CHOICES 对齐）
+# KnowledgeDoc.file_type 实际存储「类别」（video/image/audio/pdf/doc/…），
+# 而上传时前端/文件名拿到的是「扩展名」（mp4/jpg/docx/…），此处统一归一化。
+EXT_TO_FILE_TYPE = {
+    # 文档类
+    'doc': 'doc', 'docx': 'doc',
+    'ppt': 'ppt', 'pptx': 'ppt',
+    'xls': 'xls', 'xlsx': 'xls',
+    'csv': 'xls',
+    'pdf': 'pdf',
+    'md': 'md', 'txt': 'txt',
+    'html': 'html', 'htm': 'html',
+    # 图片类
+    'png': 'image', 'jpg': 'image', 'jpeg': 'image',
+    'gif': 'image', 'webp': 'image', 'bmp': 'image',
+    'tiff': 'image', 'tif': 'image',
+    # 音频类
+    'mp3': 'audio', 'wav': 'audio', 'ogg': 'audio',
+    'flac': 'audio', 'aac': 'audio', 'm4a': 'audio', 'amr': 'audio',
+    # 视频类
+    'mp4': 'video', 'webm': 'video', 'mov': 'video',
+    'avi': 'video', 'mkv': 'video', 'flv': 'video', 'm4v': 'video',
+    # 压缩包（归档类归入 other）
+    'zip': 'other', 'rar': 'other', '7z': 'other',
+    # 设计源文件 / 3D 模型 / 电子书 / Publisher（二进制附件，归 other）
+    'psd': 'other', 'ai': 'other',
+    'stl': 'other', 'obj': 'other', 'fbx': 'other',
+    'epub': 'other', 'pub': 'other',
+}
+
+
+def normalize_file_type(file_type: str) -> str:
+    """将文件类型归一化为 KnowledgeDoc.FILE_TYPE_CHOICES 中的类别。
+
+    兼容两种入参（幂等）：
+    - 已是类别（video/image/audio/pdf/doc/…）→ 原样返回
+    - 扩展名（mp4/avi/mkv/docx/jpg/…）→ 映射到对应类别
+    未知扩展名兜底为 'other'。
+    """
+    ft = (file_type or 'other').strip().lower()
+    if ft in dict(KnowledgeDoc.FILE_TYPE_CHOICES):
+        return ft
+    return EXT_TO_FILE_TYPE.get(ft, 'other')
+
+
+# 图片类扩展名集合（由 EXT_TO_FILE_TYPE 派生，单一数据源，随映射自动同步）
+IMAGE_FILE_TYPES = {ext for ext, cat in EXT_TO_FILE_TYPE.items() if cat == 'image'}
 
 
 class UploadSTSRequestSerializer(serializers.Serializer):
@@ -267,6 +351,12 @@ class AIClassifySerializer(serializers.Serializer):
     )
     content = serializers.CharField(
         default='', allow_blank=True, help_text='文本内容片段（可选，建议前 2000 字）',
+    )
+    image = serializers.CharField(
+        # 上限约 10MB 原图（base64 放大 ~4/3），防止超大 base64 拖垮解码内存
+        max_length=14_000_000,
+        required=False, allow_blank=True, default='',
+        help_text='图片 base64（可选，可带 data:image/...;base64, 前缀），用于图片内容识别',
     )
 
 

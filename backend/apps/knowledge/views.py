@@ -37,11 +37,14 @@ from .models import Keyword, KnowledgeDoc
 from .serializers import (
     AIClassifySerializer,
     ALLOWED_FILE_TYPES,
+    FILE_SIZE_LIMITS,
+    IMAGE_FILE_TYPES,
     FileUploadSerializer,
     KeywordCreateSerializer,
     KeywordSerializer,
     KnowledgeDocListSerializer,
     KnowledgeDocSerializer,
+    normalize_file_type,
     TextUploadSerializer,
     UploadCallbackSerializer,
     UploadSTSRequestSerializer,
@@ -406,7 +409,9 @@ class KnowledgeDocDownloadView(generics.RetrieveAPIView):
 
     def retrieve(self, request, *args, **kwargs):
         instance = self.get_object()
-        download_url = oss_client.get_download_url(instance.oss_key)
+        download_url = oss_client.get_download_url(
+            instance.oss_key, file_name=instance.file_name,
+        )
         return Response({'download_url': download_url})
 
 
@@ -706,7 +711,7 @@ class UploadCallbackView(APIView):
             description=data.get('description', ''),
             file_name=data['file_name'],
             file_size=data['file_size'],
-            file_type=data['file_type'],
+            file_type=normalize_file_type(data['file_type']),
             md5_hash=data['md5'],
             source_type='upload',
             uploader=request.user,
@@ -1144,6 +1149,15 @@ class FileUploadView(APIView):
                 {'file': f'不支持的文件类型 ".{ext}"，支持的类型：{", ".join(sorted(ALLOWED_FILE_TYPES))}'}
             )
 
+        # 校验文件大小
+        max_size = FILE_SIZE_LIMITS.get(ext, FILE_SIZE_LIMITS['other'])
+        if uploaded_file.size > max_size:
+            max_mb = max_size // (1024 * 1024)
+            cur_mb = uploaded_file.size // (1024 * 1024)
+            raise ValidationError(
+                {'file': f'{ext} 文件大小不能超过 {max_mb}MB，当前大小 {cur_mb}MB'}
+            )
+
         # 生成 OSS 对象 Key（根据上传者角色确定路径）
         now = datetime.now()
         safe_filename = f'{uuid.uuid4().hex[:12]}.{ext}'
@@ -1237,7 +1251,8 @@ class FileUploadView(APIView):
             or not user_provided_visibility
         )
         if needs_ai:
-            ai_result = _ai_classify(title, extracted_text)
+            image_bytes = file_bytes if ext in IMAGE_FILE_TYPES else None
+            ai_result = _ai_classify(title, extracted_text, image_bytes=image_bytes)
             if ai_result:
                 title = user_title or ai_result['title'] or fallback_title
                 description = user_description or ai_result['description'] or ''
@@ -1276,7 +1291,7 @@ class FileUploadView(APIView):
             oss_key=oss_key,
             oss_url=oss_url,
             file_name=uploaded_file.name,
-            file_type=ext,
+            file_type=normalize_file_type(ext),
             file_size=uploaded_file.size,
             md5_hash=md5_hash,
             college_id=doc_college_id,
@@ -1415,6 +1430,17 @@ class BatchFileUploadView(APIView):
                     })
                     continue
 
+                # 4a2. 校验文件大小
+                max_size = FILE_SIZE_LIMITS.get(ext, FILE_SIZE_LIMITS['other'])
+                if uploaded_file.size > max_size:
+                    max_mb = max_size // (1024 * 1024)
+                    cur_mb = uploaded_file.size // (1024 * 1024)
+                    failed_results.append({
+                        'file_name': file_name,
+                        'error': f'{ext} 文件大小不能超过 {max_mb}MB，当前大小 {cur_mb}MB',
+                    })
+                    continue
+
                 # 4b. 生成 OSS 对象 Key 并上传
                 now = datetime.now()
                 safe_filename = f'{uuid.uuid4().hex[:12]}.{ext}'
@@ -1454,7 +1480,8 @@ class BatchFileUploadView(APIView):
 
                 # 4d. AI 自动生成标题、描述、关键词
                 fallback_title = file_name.rsplit('.', 1)[0] if '.' in file_name else file_name
-                ai_result = _ai_classify(fallback_title, extracted_text)
+                image_bytes = file_bytes if ext in IMAGE_FILE_TYPES else None
+                ai_result = _ai_classify(fallback_title, extracted_text, image_bytes=image_bytes)
                 if ai_result:
                     title = ai_result.get('title') or fallback_title
                     description = ai_result.get('description') or ''
@@ -1473,7 +1500,7 @@ class BatchFileUploadView(APIView):
                     oss_key=oss_key,
                     oss_url=oss_url,
                     file_name=file_name,
-                    file_type=ext,
+                    file_type=normalize_file_type(ext),
                     file_size=uploaded_file.size,
                     md5_hash=md5_hash,
                     college_id=doc_college_id,
@@ -1586,15 +1613,38 @@ def _normalize_keywords(request, validated_value) -> list:
     return [str(k).strip() for k in candidates if str(k).strip()]
 
 
-def _ai_classify(title: str = '', content: str = '') -> Optional[dict]:
-    """调用 LLM 智能分析文档，返回 title/description/keywords/visibility。
+def _decode_image_base64(image_str: str) -> Optional[bytes]:
+    """解码前端传来的图片 base64，返回原始字节。
 
-    供 AIClassifyView、FileUploadView、TextUploadView 复用。
-    失败时返回 None，调用方自行降级处理。
+    支持带 / 不带 data URL 前缀（如 'data:image/jpeg;base64,...'）。空串或解码失败返回 None。
+    """
+    import base64
+    import re
+
+    image_str = (image_str or '').strip()
+    if not image_str:
+        return None
+    match = re.match(r'^data:[^;]+;base64,', image_str)
+    if match:
+        image_str = image_str[match.end():]
+    try:
+        return base64.b64decode(image_str, validate=False)
+    except Exception:
+        return None
+
+
+def _ai_classify(title: str = '', content: str = '', image_bytes: Optional[bytes] = None) -> Optional[dict]:
+    """调用 LLM（文本或视觉）智能分析文档，返回 title/description/keywords/visibility。
+
+    供 AIClassifyView、FileUploadView、TextUploadView、BatchUploadView 复用。
+    - 传入 image_bytes（图片二进制）时走视觉模型 qwen-vl-plus，根据图片内容生成；
+    - 否则走文本模型 qwen-flash，根据标题/文本内容生成。
+    视觉识别失败时回退文本分类；仍失败返回 None，调用方自行降级处理。
 
     Args:
         title: 文档标题（可为空字符串）
         content: 文本内容片段（可为空字符串）
+        image_bytes: 图片二进制（可为 None，有值即优先走视觉分支）
 
     Returns:
         成功: {'title': str, 'description': str, 'keywords': list[str],
@@ -1604,39 +1654,75 @@ def _ai_classify(title: str = '', content: str = '') -> Optional[dict]:
     import json
     import re
 
-    prompt = (
-        f"你是校园知识库智能助手。请根据文档信息完成以下任务：\n"
-        f"1. 如果标题为空，根据内容生成一个简洁的文档标题（20字以内）\n"
-        f"2. 如果内容非空，生成一段100-200字的文档描述\n"
-        f"3. 提取5-10个关键词\n"
-        f"4. 推荐可见性（visibility）：\n"
-        f"   - public: 公开（一般文档、教学资料等）\n"
-        f"   - private: 私密（涉及人事、财务、敏感信息等）\n\n"
-        f"文档标题：{title or '（未提供，请根据内容生成）'}\n"
-        f"文档内容：{content[:2000] or '（未提供）'}\n\n"
-        f"只返回JSON（不要markdown代码块标记）：\n"
-        f'{{"title":"生成的标题","description":"生成的描述","keywords":["关键词1","关键词2",...],"visibility":"public|private","confidence":"high|medium|low"}}'
+    json_schema = (
+        '只返回JSON（不要markdown代码块标记）：\n'
+        '{"title":"生成的标题","description":"生成的描述","keywords":["关键词1","关键词2",...],'
+        '"visibility":"public|private","confidence":"high|medium|low"}'
     )
 
-    try:
-        from utils.llm import llm_client
-        raw = llm_client.chat(
-            messages=[{'role': 'user', 'content': prompt}],
-            temperature=0.0, max_tokens=500,
+    def _parse_ai_json(raw: Optional[str]) -> Optional[dict]:
+        """解析 LLM 返回的 JSON；空结果或非 JSON 返回 None（供视觉/文本分支共用）。"""
+        if not raw:
+            return None
+        try:
+            match = re.search(r'\{.*\}', raw, re.DOTALL)
+            return json.loads(match.group(0)) if match else json.loads(raw)
+        except (json.JSONDecodeError, AttributeError):
+            logger.warning(f'LLM 返回非 JSON，跳过该分支 raw={raw[:200]!r}')
+            return None
+
+    result = None
+
+    # 1) 视觉分支：有图时优先读图内容
+    if image_bytes is not None:
+        vision_prompt = (
+            f"你是校园知识库智能助手。这是一张上传到校园知识库的图片，请直接观察图片画面内容，完成以下任务：\n"
+            f"1. 根据图片内容生成一个简洁的标题（20字以内）\n"
+            f"2. 生成一段100-200字的描述，准确概括图片画面内容（禁止只写文件名或图片类型）\n"
+            f"3. 提取5-10个与图片内容相关的关键词\n"
+            f"4. 推荐可见性（visibility）：\n"
+            f"   - public: 公开（一般资料、教学图片等）\n"
+            f"   - private: 私密（涉及人事、财务、敏感信息等）\n\n"
+            f"参考标题（文件名）：{title or '（未提供）'}\n\n"
+            f"{json_schema}"
         )
-    except Exception as e:
-        logger.error(f'LLM 分析失败: {e}')
-        return None
+        try:
+            from utils.llm import image_bytes_to_data_url, llm_client
+            data_url = image_bytes_to_data_url(image_bytes)
+            if data_url:
+                raw = llm_client.chat_vision(vision_prompt, [data_url], temperature=0.0, max_tokens=500)
+                result = _parse_ai_json(raw)
+        except Exception as e:
+            logger.error(f'视觉 LLM 分析失败: {e}')
+        if result is None:
+            logger.warning('视觉分析失败或返回非 JSON，回退文本分类')
 
-    if not raw:
-        logger.warning('LLM 分析返回空结果')
-        return None
+    # 2) 文本分支：无图，或视觉失败/解析失败后的兜底
+    if result is None:
+        text_prompt = (
+            f"你是校园知识库智能助手。请根据文档信息完成以下任务：\n"
+            f"1. 如果标题为空，根据内容生成一个简洁的文档标题（20字以内）\n"
+            f"2. 如果内容非空，生成一段100-200字的文档描述\n"
+            f"3. 提取5-10个关键词\n"
+            f"4. 推荐可见性（visibility）：\n"
+            f"   - public: 公开（一般文档、教学资料等）\n"
+            f"   - private: 私密（涉及人事、财务、敏感信息等）\n\n"
+            f"文档标题：{title or '（未提供，请根据内容生成）'}\n"
+            f"文档内容：{content[:2000] or '（未提供）'}\n\n"
+            f"{json_schema}"
+        )
+        try:
+            from utils.llm import llm_client
+            raw = llm_client.chat(
+                messages=[{'role': 'user', 'content': text_prompt}],
+                temperature=0.0, max_tokens=500,
+            )
+            result = _parse_ai_json(raw)
+        except Exception as e:
+            logger.error(f'LLM 分析失败: {e}')
 
-    try:
-        match = re.search(r'\{.*\}', raw, re.DOTALL)
-        result = json.loads(match.group(0)) if match else json.loads(raw)
-    except (json.JSONDecodeError, AttributeError):
-        logger.warning(f'LLM 分析解析失败 raw={raw[:200]}')
+    if result is None:
+        logger.warning('LLM 分析最终失败（空结果或解析失败）')
         return None
 
     # 校验 AI 返回的 visibility 是否在合法范围内
@@ -1681,9 +1767,10 @@ class AIClassifyView(APIView):
 
         title = data.get('title', '')
         content = data.get('content', '')
+        image_bytes = _decode_image_base64(data.get('image', ''))
 
-        # 调用公共 AI 分析函数
-        ai_result = _ai_classify(title, content)
+        # 调用公共 AI 分析函数（有图走视觉，无图走文本）
+        ai_result = _ai_classify(title, content, image_bytes=image_bytes)
 
         if ai_result is None:
             return Response(

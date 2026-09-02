@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 QWEN_API_KEY = getattr(settings, 'QWEN_API_KEY', '')
 QWEN_BASE_URL = getattr(settings, 'QWEN_BASE_URL', 'https://dashscope.aliyuncs.com/compatible-mode')
 QWEN_CHAT_MODEL = getattr(settings, 'QWEN_CHAT_MODEL', 'qwen-flash')
+QWEN_VL_MODEL = getattr(settings, 'QWEN_VL_MODEL', 'qwen-vl-plus')
 
 # ------------------------------------------------------------------
 # Embedding 后端配置
@@ -68,6 +69,53 @@ def _check_ascii(name: str, value: str) -> bool:
         )
         return False
     return True
+
+
+def image_bytes_to_data_url(image_bytes: bytes, max_size: int = 1280, quality: int = 85) -> Optional[str]:
+    """将图片二进制压缩为 base64 data URL（供视觉模型读取）。
+
+    用 Pillow 解码 → 长边缩到 ≤ max_size → 转 RGB（透明铺白底）→ 存 JPEG → base64。
+    返回形如 'data:image/jpeg;base64,...' 的字符串；解码失败或像素超限返回 None（调用方回退文本分类）。
+    """
+    import base64
+    import io
+
+    try:
+        from PIL import Image
+    except ImportError:
+        logger.warning('Pillow 未安装，无法将图片传给视觉模型，回退文本分类')
+        return None
+
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        width, height = img.size
+        # 像素数硬顶 8000 万：低于 Pillow 默认告警线，覆盖所有手机照片，
+        # 超大 PNG/扫描图直接放弃，避免整图解码瞬时占用数百 MB 内存。
+        if width * height > 80_000_000:
+            logger.warning(f'图片像素过大 {width}x{height}，放弃视觉识别，回退文本分类')
+            return None
+        # JPEG 走 draft 惰性重采样：超大 JPEG 不解全图就缩到目标尺寸
+        try:
+            img.draft('RGB', (max_size, max_size))
+        except Exception:
+            pass
+        img.thumbnail((max_size, max_size), Image.LANCZOS)
+        img.load()
+        if img.mode in ('RGBA', 'LA', 'P'):
+            # 带透明通道/调色板图先铺白底再转 RGB，避免直接 convert 出现黑底
+            rgba = img.convert('RGBA')
+            background = Image.new('RGB', rgba.size, (255, 255, 255))
+            background.paste(rgba, mask=rgba.split()[-1])
+            img = background
+        else:
+            img = img.convert('RGB')
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG', quality=quality)
+        b64 = base64.b64encode(buf.getvalue()).decode('ascii')
+        return f'data:image/jpeg;base64,{b64}'
+    except Exception as e:
+        logger.warning(f'图片处理失败，回退文本分类: {e}')
+        return None
 
 
 class LLMClient:
@@ -274,6 +322,73 @@ class LLMClient:
                 _retry_sleep(attempt + 1)
 
         logger.error(f'Chat 最终失败: {last_error}')
+        return None
+
+    # ------------------------------------------------------------------
+    # Chat（视觉 / 多模态）— 图片理解，非流式
+    # ------------------------------------------------------------------
+    def chat_vision(
+        self,
+        text: str,
+        image_data_urls: List[str],
+        model: str = None,
+        temperature: float = 0.0,
+        max_tokens: int = 800,
+    ) -> Optional[str]:
+        """
+        视觉（多模态）对话：把图片 + 文本一起发给视觉模型（默认 qwen-vl-plus）。
+
+        OpenAI 兼容格式：messages[0].content 为列表，元素含 type=text 与
+        type=image_url 两种。image_data_urls 为 'data:image/...;base64,...' 列表。
+
+        Args:
+            text: 提示词文本
+            image_data_urls: 图片 data URL 列表
+            model: 视觉模型名，默认 qwen-vl-plus
+            temperature: 生成温度
+            max_tokens: 最大 token 数
+
+        Returns:
+            完整回复文本，失败返回 None
+        """
+        if not image_data_urls:
+            return None
+        if not self.chat_api_key:
+            return self._mock_chat([{'role': 'user', 'content': text}])
+
+        content = [{'type': 'text', 'text': text}]
+        for data_url in image_data_urls:
+            content.append({'type': 'image_url', 'image_url': {'url': data_url}})
+
+        last_error = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = ExternalClient.post(
+                    'llm_vision',
+                    f'{self.chat_base_url}/v1/chat/completions',
+                    headers=self.chat_headers,
+                    json={
+                        'model': model or QWEN_VL_MODEL,
+                        'messages': [{'role': 'user', 'content': content}],
+                        'temperature': temperature,
+                        'max_tokens': max_tokens,
+                        'stream': False,
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                return data['choices'][0]['message']['content']
+            except requests.Timeout as e:
+                last_error = e
+                logger.warning(f'Vision 超时 (attempt {attempt+1}/{MAX_RETRIES})')
+            except requests.RequestException as e:
+                last_error = e
+                logger.warning(f'Vision 请求失败 (attempt {attempt+1}/{MAX_RETRIES}): {e}')
+
+            if attempt < MAX_RETRIES - 1:
+                _retry_sleep(attempt + 1)
+
+        logger.error(f'Vision 最终失败: {last_error}')
         return None
 
     # ------------------------------------------------------------------

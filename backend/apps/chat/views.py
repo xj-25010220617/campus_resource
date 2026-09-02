@@ -16,7 +16,7 @@ from apps.knowledge.models import KnowledgeDoc
 from utils import rag
 from utils.llm import llm_client
 from utils.sensitive_filter import check_sensitive
-from utils.sse import _format_sse, build_references_events
+from utils.sse import _format_sse, build_images_events, build_references_events
 from utils.error_codes import ErrorCode
 from apps.classify.utils.query_parser import parse as parse_query
 
@@ -137,18 +137,23 @@ class MessageViewSet(ModelViewSet):
             )
 
         # 更新 ChatMessage 的 rating 字段
-        message.rating = rating
+        # rating='none' 表示取消反馈，置为 None
+        if rating == 'none':
+            message.rating = None
+        else:
+            message.rating = rating
         message.save(update_fields=['rating'])
 
         # 更新关联的 QueryLog — 取该会话最新一条（即本轮问答对应的查询日志）
+        feedback_value = 1 if rating == 'like' else (0 if rating == 'dislike' else -1)
         QueryLog.objects.filter(
             conversation=message.conversation,
             user=request.user,
         ).order_by('-created_at').update(
-            user_feedback=1 if rating == 'like' else 0,
+            user_feedback=feedback_value,
         )
 
-        return Response({'status': 'ok', 'rating': rating})
+        return Response({'status': 'ok', 'rating': message.rating})
 
     @extend_schema(
         summary='查看消息引用来源',
@@ -463,6 +468,16 @@ class AskView(APIView):
             else:
                 logger.info('联网搜索也无结果')
 
+        # 3.2c 图片检索（用于回答内联展示相关图片）
+        image_intent = rag._detect_image_intent(question)
+        images = rag.retrieve_images(
+            question=question,
+            user_context=user_context,
+            parsed_filters=parsed,
+            top_k=8 if image_intent else 4,
+        )
+        images_events = build_images_events(images)  # 预计算，保持流内无异常
+
         # 3.3 写 query_log（预创建，response_ms 在流结束后回填）
         start_ts = time.time()
         query_log = QueryLog.objects.create(
@@ -476,7 +491,14 @@ class AskView(APIView):
         )
 
         # 5. 构造 Prompt（含历史上下文）
-        messages = rag.build_rag_prompt(question, results, history=history)
+        llm_question = question
+        if image_intent and images:
+            titles = '、'.join(img['doc_title'] for img in images[:6])
+            llm_question = (
+                f'{question}\n\n'
+                f'（系统已为你检索到相关图片：{titles}。请在回答末尾说明"已为你找到相关图片，详见下方"。）'
+            )
+        messages = rag.build_rag_prompt(llm_question, results, history=history)
 
         # 6. 创建 AI 消息占位（流结束后写入完整内容）
         is_authorized = user_role in ('admin', 'super_admin')
@@ -530,6 +552,10 @@ class AskView(APIView):
                     yield _format_sse('references', refs['references'])
                 if 'references_detail' in refs and is_authorized:
                     yield _format_sse('references_detail', refs['references_detail'])
+
+                # 图片（内联展示）
+                if images_events.get('images'):
+                    yield _format_sse('images', images_events['images'])
 
                 # done 事件
                 yield _format_sse('done', {'message_id': assistant_msg.id})

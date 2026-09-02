@@ -189,6 +189,8 @@ OSS_BUCKET_NAME = config('OSS_BUCKET_NAME', default='')
 QWEN_API_KEY = config('QWEN_API_KEY', default=config('DEEPSEEK_API_KEY', default=''))
 QWEN_BASE_URL = config('QWEN_BASE_URL', default=config('DEEPSEEK_BASE_URL', default='https://dashscope.aliyuncs.com/compatible-mode'))
 QWEN_CHAT_MODEL = config('QWEN_CHAT_MODEL', default=config('DEEPSEEK_CHAT_MODEL', default='qwen-flash'))
+# 视觉（多模态）模型 — 图片内容识别/智能分类用，独立于文本对话模型
+QWEN_VL_MODEL = config('QWEN_VL_MODEL', default='qwen-vl-plus')
 
 # Embedding 后端切换（aliyun / local / mock）
 EMBED_BACKEND = config('EMBED_BACKEND', default='aliyun')
