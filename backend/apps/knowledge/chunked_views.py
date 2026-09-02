@@ -30,19 +30,13 @@ from utils.error_codes import ErrorCode
 from utils.oss import oss_client
 
 from .models import ChunkedUploadSession, Keyword, KnowledgeDoc
-from .serializers import ALLOWED_FILE_TYPES
+from .serializers import ALLOWED_FILE_TYPES, normalize_file_type
 from .tasks import extract_freshness_task, index_document_task
 
 logger = logging.getLogger(__name__)
 
 # 上传会话过期时间（小时），超时由定时任务清理并 abort OSS 分片
 SESSION_EXPIRE_HOURS = 24
-
-_FILE_TYPE_MAP = {
-    'docx': 'doc', 'pptx': 'ppt', 'xlsx': 'xls',
-    'png': 'image', 'jpg': 'image', 'jpeg': 'image',
-    'gif': 'image', 'webp': 'image',
-}
 
 
 def _build_oss_key(user, file_name: str) -> str:
@@ -304,7 +298,7 @@ class ChunkMergeView(APIView):
 
         # 创建知识文档记录
         ext = session.file_name.rsplit('.', 1)[-1].lower() if '.' in session.file_name else 'other'
-        file_type = ext if ext in dict(KnowledgeDoc.FILE_TYPE_CHOICES) else _FILE_TYPE_MAP.get(ext, 'other')
+        file_type = normalize_file_type(ext)
         visibility = request.data.get('visibility', 'public')
         if visibility not in ('public', 'private'):
             visibility = 'public'

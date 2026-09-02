@@ -118,6 +118,45 @@ def _validate_file_type(file_type: str) -> None:
         )
 
 
+# 扩展名 → 文件类型类别映射（与 KnowledgeDoc.FILE_TYPE_CHOICES 对齐）
+# KnowledgeDoc.file_type 实际存储「类别」（video/image/audio/pdf/doc/…），
+# 而上传时前端/文件名拿到的是「扩展名」（mp4/jpg/docx/…），此处统一归一化。
+EXT_TO_FILE_TYPE = {
+    # 文档类
+    'doc': 'doc', 'docx': 'doc',
+    'ppt': 'ppt', 'pptx': 'ppt',
+    'xls': 'xls', 'xlsx': 'xls',
+    'pdf': 'pdf',
+    'md': 'md', 'txt': 'txt',
+    'html': 'html', 'htm': 'html',
+    # 图片类
+    'png': 'image', 'jpg': 'image', 'jpeg': 'image',
+    'gif': 'image', 'webp': 'image',
+    # 音频类
+    'mp3': 'audio', 'wav': 'audio', 'ogg': 'audio',
+    'flac': 'audio', 'aac': 'audio', 'm4a': 'audio',
+    # 视频类
+    'mp4': 'video', 'webm': 'video', 'mov': 'video',
+    'avi': 'video', 'mkv': 'video', 'flv': 'video',
+    # 压缩包（归档类归入 other）
+    'zip': 'other', 'rar': 'other',
+}
+
+
+def normalize_file_type(file_type: str) -> str:
+    """将文件类型归一化为 KnowledgeDoc.FILE_TYPE_CHOICES 中的类别。
+
+    兼容两种入参（幂等）：
+    - 已是类别（video/image/audio/pdf/doc/…）→ 原样返回
+    - 扩展名（mp4/avi/mkv/docx/jpg/…）→ 映射到对应类别
+    未知扩展名兜底为 'other'。
+    """
+    ft = (file_type or 'other').strip().lower()
+    if ft in dict(KnowledgeDoc.FILE_TYPE_CHOICES):
+        return ft
+    return EXT_TO_FILE_TYPE.get(ft, 'other')
+
+
 class UploadSTSRequestSerializer(serializers.Serializer):
     """获取OSS上传凭证请求参数"""
 
