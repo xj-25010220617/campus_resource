@@ -37,6 +37,7 @@ from .models import Keyword, KnowledgeDoc
 from .serializers import (
     AIClassifySerializer,
     ALLOWED_FILE_TYPES,
+    FILE_SIZE_LIMITS,
     FileUploadSerializer,
     KeywordCreateSerializer,
     KeywordSerializer,
@@ -1144,6 +1145,15 @@ class FileUploadView(APIView):
                 {'file': f'不支持的文件类型 ".{ext}"，支持的类型：{", ".join(sorted(ALLOWED_FILE_TYPES))}'}
             )
 
+        # 校验文件大小
+        max_size = FILE_SIZE_LIMITS.get(ext, FILE_SIZE_LIMITS['other'])
+        if uploaded_file.size > max_size:
+            max_mb = max_size // (1024 * 1024)
+            cur_mb = uploaded_file.size // (1024 * 1024)
+            raise ValidationError(
+                {'file': f'{ext} 文件大小不能超过 {max_mb}MB，当前大小 {cur_mb}MB'}
+            )
+
         # 生成 OSS 对象 Key（根据上传者角色确定路径）
         now = datetime.now()
         safe_filename = f'{uuid.uuid4().hex[:12]}.{ext}'
@@ -1412,6 +1422,17 @@ class BatchFileUploadView(APIView):
                     failed_results.append({
                         'file_name': file_name,
                         'error': f'不支持的文件类型 ".{ext}"',
+                    })
+                    continue
+
+                # 4a2. 校验文件大小
+                max_size = FILE_SIZE_LIMITS.get(ext, FILE_SIZE_LIMITS['other'])
+                if uploaded_file.size > max_size:
+                    max_mb = max_size // (1024 * 1024)
+                    cur_mb = uploaded_file.size // (1024 * 1024)
+                    failed_results.append({
+                        'file_name': file_name,
+                        'error': f'{ext} 文件大小不能超过 {max_mb}MB，当前大小 {cur_mb}MB',
                     })
                     continue
 
