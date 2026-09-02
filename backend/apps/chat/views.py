@@ -14,7 +14,7 @@ from rest_framework.viewsets import ModelViewSet
 from apps.knowledge.models import KnowledgeDoc
 
 from utils import rag
-from utils.llm import llm_client
+from utils.llm import llm_client, LLMTimeoutError
 from utils.sensitive_filter import check_sensitive
 from utils.sse import _format_sse, build_images_events, build_references_events
 from utils.error_codes import ErrorCode
@@ -513,10 +513,9 @@ class AskView(APIView):
 
         # 7. SSE 流式响应
         def event_stream():
-            """生成 SSE 事件流（finally 保证 query_log 回填；断连时后台拉完并落库）。"""
+            """生成 SSE 事件流（finally 保证 query_log 回填；断连时把已收内容落库后结束）。"""
             collected_tokens = []
             saved_len = 0
-            stream = None
 
             def _persist_partial():
                 """把当前已生成内容增量落库，避免客户端断连/切走后回答丢失。"""
@@ -573,18 +572,17 @@ class AskView(APIView):
                 yield _format_sse('done', {'message_id': assistant_msg.id})
 
             except GeneratorExit:
-                # 客户端断开（如切到其他对话）：后台继续把 LLM 流拉完并落库，回答不丢
-                if stream is not None:
-                    try:
-                        for token in stream:
-                            if token:
-                                collected_tokens.append(token)
-                                if len(collected_tokens) % 20 == 0:
-                                    _persist_partial()
-                    except Exception:
-                        pass
+                # 客户端断开：把已收到的部分内容落库后直接结束。
+                # 后台续收由前端方案 A 覆盖（切换时不 abort，SSE 后台继续收），后端不再兜底拉完。
                 _persist_partial()
                 raise
+            except LLMTimeoutError as e:
+                # AI 回答超时：下发明确提示 + 已检索到的图片（让图片不因超时而丢失）
+                logger.warning(f'AI 回答超时: {e}')
+                _persist_partial()
+                yield _format_sse('error', {'message': 'AI回答超时，请稍后重试', 'code': ErrorCode.SSE_ERROR.value})
+                if images_events.get('images'):
+                    yield _format_sse('images', images_events['images'])
             except Exception as e:
                 logger.error(f'SSE 流异常: {e}')
                 _persist_partial()

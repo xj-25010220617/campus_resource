@@ -118,6 +118,10 @@ def image_bytes_to_data_url(image_bytes: bytes, max_size: int = 1280, quality: i
         return None
 
 
+class LLMTimeoutError(Exception):
+    """LLM 请求超时或最终失败（已重试 MAX_RETRIES 次）。"""
+
+
 class LLMClient:
     """DeepSeek Chat + 阿里云百炼 Embedding 封装"""
 
@@ -415,6 +419,9 @@ class LLMClient:
             yield from self._mock_stream(messages)
             return
 
+        if not _check_ascii('QWEN_API_KEY', self.chat_api_key):
+            raise LLMTimeoutError('QWEN_API_KEY 含非 ASCII 字符，请检查配置后重试')
+
         import json as _json
 
         last_error = None
@@ -462,7 +469,7 @@ class LLMClient:
                 _retry_sleep(attempt + 1)
 
         logger.error(f'Stream 最终失败: {last_error}')
-        yield from self._mock_stream(messages)
+        raise LLMTimeoutError(f'AI 回答超时（已重试 {MAX_RETRIES} 次）：{last_error}')
 
     # ------------------------------------------------------------------
     # Chat（流式）— 异步生成器（httpx）
