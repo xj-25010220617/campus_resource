@@ -353,6 +353,8 @@ class AIClassifySerializer(serializers.Serializer):
         default='', allow_blank=True, help_text='文本内容片段（可选，建议前 2000 字）',
     )
     image = serializers.CharField(
+        # 上限约 10MB 原图（base64 放大 ~4/3），防止超大 base64 拖垮解码内存
+        max_length=14_000_000,
         required=False, allow_blank=True, default='',
         help_text='图片 base64（可选，可带 data:image/...;base64, 前缀），用于图片内容识别',
     )

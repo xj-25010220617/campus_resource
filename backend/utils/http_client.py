@@ -29,6 +29,8 @@ class ServiceTimeout(namedtuple('ServiceTimeout', ['connect', 'read'])):
 TIMEOUT_PROFILES = {
     'llm_chat': ServiceTimeout(10, 60),
     'llm_stream': ServiceTimeout(10, 120),
+    # 视觉/多模态读图（qwen-vl），图片内容大、响应慢，read 放宽到 120s
+    'llm_vision': ServiceTimeout(10, 120),
     'aliyun_embed': ServiceTimeout(10, 30),
     'dingtalk': ServiceTimeout(5, 10),
     'oss_sdk': ServiceTimeout(5, 30),
