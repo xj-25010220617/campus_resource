@@ -985,13 +985,45 @@ class KnowledgeDocPreviewView(APIView):
 
     def _media_preview(self, doc, file_type):
         """生成签名预览 URL，供前端 <audio>/<video>/<img> 等标签使用"""
-        preview_url = oss_client.get_preview_url(doc.oss_key)
+        # 根据文件扩展名推断 MIME 类型，修正 OSS 上传时缺失的 Content-Type
+        content_type = self._guess_content_type(doc.file_name)
+        preview_url = oss_client.get_preview_url(doc.oss_key, content_type=content_type)
         return Response({
             'preview_type': 'url',
             'content': preview_url,
             'file_type': file_type,
             'file_name': doc.file_name,
         })
+
+    # MIME 类型映射（修正 OSS 上传时未设置 Content-Type 的问题）
+    _MIME_MAP = {
+        # 图片
+        'png': 'image/png', 'jpg': 'image/jpeg', 'jpeg': 'image/jpeg',
+        'gif': 'image/gif', 'webp': 'image/webp', 'bmp': 'image/bmp',
+        'svg': 'image/svg+xml', 'ico': 'image/x-icon', 'tiff': 'image/tiff',
+        # 音频
+        'mp3': 'audio/mpeg', 'wav': 'audio/wav', 'ogg': 'audio/ogg',
+        'flac': 'audio/flac', 'aac': 'audio/aac', 'm4a': 'audio/mp4',
+        # 视频
+        'mp4': 'video/mp4', 'webm': 'video/webm', 'mov': 'video/quicktime',
+        'avi': 'video/x-msvideo', 'mkv': 'video/x-matroska', 'flv': 'video/x-flv',
+        # 文档
+        'pdf': 'application/pdf',
+        'doc': 'application/msword',
+        'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'ppt': 'application/vnd.ms-powerpoint',
+        'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        'xls': 'application/vnd.ms-excel',
+        'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    }
+
+    @classmethod
+    def _guess_content_type(cls, file_name: str) -> str:
+        """根据文件扩展名推断 MIME 类型，未知时返回空字符串"""
+        if not file_name or '.' not in file_name:
+            return ''
+        ext = file_name.rsplit('.', 1)[-1].lower()
+        return cls._MIME_MAP.get(ext, '')
 
     def _text_preview(self, doc, file_type):
         """从 OSS 下载文本内容并直接返回"""

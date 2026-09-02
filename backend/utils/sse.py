@@ -272,6 +272,22 @@ def build_references_events(
     return {'references_detail': detail}
 
 
+# 图片 MIME 类型映射（供 AI 对话图片内联展示）
+_IMAGE_MIME_MAP = {
+    'png': 'image/png', 'jpg': 'image/jpeg', 'jpeg': 'image/jpeg',
+    'gif': 'image/gif', 'webp': 'image/webp', 'bmp': 'image/bmp',
+    'svg': 'image/svg+xml',
+}
+
+
+def _guess_image_content_type(file_name: str) -> str:
+    """根据文件扩展名推断图片 MIME 类型"""
+    if not file_name or '.' not in file_name:
+        return ''
+    ext = file_name.rsplit('.', 1)[-1].lower()
+    return _IMAGE_MIME_MAP.get(ext, '')
+
+
 def build_images_events(image_results: list) -> dict:
     """构造 images 事件数据（图片预览 URL 列表，供前端内联展示）。
 
@@ -294,7 +310,12 @@ def build_images_events(image_results: list) -> dict:
         oss_key = r.get('oss_key', '')
         if oss_key:
             # 签名预览 URL（不带 attachment，浏览器内联显示图片）
-            entry['preview_url'] = oss_client.get_preview_url(oss_key, expires=3600) or ''
+            # 传入 content_type 修正 OSS 上传时缺失的 MIME 类型
+            file_name = r.get('file_name', '')
+            content_type = _guess_image_content_type(file_name)
+            entry['preview_url'] = oss_client.get_preview_url(
+                oss_key, expires=3600, content_type=content_type,
+            ) or ''
         images.append(entry)
     return {'images': images}
 
