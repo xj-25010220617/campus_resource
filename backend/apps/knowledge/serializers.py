@@ -195,6 +195,10 @@ def normalize_file_type(file_type: str) -> str:
     return EXT_TO_FILE_TYPE.get(ft, 'other')
 
 
+# 图片类扩展名集合（由 EXT_TO_FILE_TYPE 派生，单一数据源，随映射自动同步）
+IMAGE_FILE_TYPES = {ext for ext, cat in EXT_TO_FILE_TYPE.items() if cat == 'image'}
+
+
 class UploadSTSRequestSerializer(serializers.Serializer):
     """获取OSS上传凭证请求参数"""
 
@@ -347,6 +351,10 @@ class AIClassifySerializer(serializers.Serializer):
     )
     content = serializers.CharField(
         default='', allow_blank=True, help_text='文本内容片段（可选，建议前 2000 字）',
+    )
+    image = serializers.CharField(
+        required=False, allow_blank=True, default='',
+        help_text='图片 base64（可选，可带 data:image/...;base64, 前缀），用于图片内容识别',
     )
 
 
