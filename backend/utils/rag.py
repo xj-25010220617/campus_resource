@@ -980,10 +980,12 @@ def retrieve(
             vector_hits.extend(milvus_client.search(
                 q_emb, top_k=top_k, filter_ids=candidate_ids,
             ))
-    # 去重：按 doc_id+page 保留最高分
+    # 去重：按 vector_id 或 (doc_id, chunk_index) 去重，保留同文档的多块
+    # 原来按 (doc_id, page) 去重会导致每篇文档只保留 1 个块（知识文档 page 恒为 0）
     seen = {}
     for h in vector_hits:
-        key = (h.get('doc_id'), h.get('page'))
+        # 优先用 vector_id（唯一标识）
+        key = h.get('vector_id') or (h.get('doc_id'), h.get('chunk_index'))
         if key not in seen or h.get('score', 0) > seen[key].get('score', 0):
             seen[key] = h
     vector_hits = list(seen.values())
