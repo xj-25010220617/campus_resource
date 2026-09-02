@@ -1660,9 +1660,21 @@ def _ai_classify(title: str = '', content: str = '', image_bytes: Optional[bytes
         '"visibility":"public|private","confidence":"high|medium|low"}'
     )
 
-    raw = None
+    def _parse_ai_json(raw: Optional[str]) -> Optional[dict]:
+        """解析 LLM 返回的 JSON；空结果或非 JSON 返回 None（供视觉/文本分支共用）。"""
+        if not raw:
+            return None
+        try:
+            match = re.search(r'\{.*\}', raw, re.DOTALL)
+            return json.loads(match.group(0)) if match else json.loads(raw)
+        except (json.JSONDecodeError, AttributeError):
+            logger.warning(f'LLM 返回非 JSON，跳过该分支 raw={raw[:200]!r}')
+            return None
+
+    result = None
+
+    # 1) 视觉分支：有图时优先读图内容
     if image_bytes is not None:
-        # 视觉分支：直接观察图片内容
         vision_prompt = (
             f"你是校园知识库智能助手。这是一张上传到校园知识库的图片，请直接观察图片画面内容，完成以下任务：\n"
             f"1. 根据图片内容生成一个简洁的标题（20字以内）\n"
@@ -1679,13 +1691,14 @@ def _ai_classify(title: str = '', content: str = '', image_bytes: Optional[bytes
             data_url = image_bytes_to_data_url(image_bytes)
             if data_url:
                 raw = llm_client.chat_vision(vision_prompt, [data_url], temperature=0.0, max_tokens=500)
+                result = _parse_ai_json(raw)
         except Exception as e:
             logger.error(f'视觉 LLM 分析失败: {e}')
-        if not raw:
-            logger.warning('视觉分析失败或返回空，回退文本分类')
+        if result is None:
+            logger.warning('视觉分析失败或返回非 JSON，回退文本分类')
 
-    if raw is None:
-        # 文本分支（含视觉回退）
+    # 2) 文本分支：无图，或视觉失败/解析失败后的兜底
+    if result is None:
         text_prompt = (
             f"你是校园知识库智能助手。请根据文档信息完成以下任务：\n"
             f"1. 如果标题为空，根据内容生成一个简洁的文档标题（20字以内）\n"
@@ -1704,19 +1717,12 @@ def _ai_classify(title: str = '', content: str = '', image_bytes: Optional[bytes
                 messages=[{'role': 'user', 'content': text_prompt}],
                 temperature=0.0, max_tokens=500,
             )
+            result = _parse_ai_json(raw)
         except Exception as e:
             logger.error(f'LLM 分析失败: {e}')
-            return None
 
-    if not raw:
-        logger.warning('LLM 分析返回空结果')
-        return None
-
-    try:
-        match = re.search(r'\{.*\}', raw, re.DOTALL)
-        result = json.loads(match.group(0)) if match else json.loads(raw)
-    except (json.JSONDecodeError, AttributeError):
-        logger.warning(f'LLM 分析解析失败 raw={raw[:200]}')
+    if result is None:
+        logger.warning('LLM 分析最终失败（空结果或解析失败）')
         return None
 
     # 校验 AI 返回的 visibility 是否在合法范围内

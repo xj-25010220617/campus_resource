@@ -74,8 +74,8 @@ def _check_ascii(name: str, value: str) -> bool:
 def image_bytes_to_data_url(image_bytes: bytes, max_size: int = 1280, quality: int = 85) -> Optional[str]:
     """将图片二进制压缩为 base64 data URL（供视觉模型读取）。
 
-    用 Pillow 解码 → 转 RGB → 长边缩到 ≤ max_size → 存 JPEG → base64。
-    返回形如 'data:image/jpeg;base64,...' 的字符串；解码失败返回 None（调用方回退文本分类）。
+    用 Pillow 解码 → 长边缩到 ≤ max_size → 转 RGB（透明铺白底）→ 存 JPEG → base64。
+    返回形如 'data:image/jpeg;base64,...' 的字符串；解码失败或像素超限返回 None（调用方回退文本分类）。
     """
     import base64
     import io
@@ -88,6 +88,18 @@ def image_bytes_to_data_url(image_bytes: bytes, max_size: int = 1280, quality: i
 
     try:
         img = Image.open(io.BytesIO(image_bytes))
+        width, height = img.size
+        # 像素数硬顶 8000 万：低于 Pillow 默认告警线，覆盖所有手机照片，
+        # 超大 PNG/扫描图直接放弃，避免整图解码瞬时占用数百 MB 内存。
+        if width * height > 80_000_000:
+            logger.warning(f'图片像素过大 {width}x{height}，放弃视觉识别，回退文本分类')
+            return None
+        # JPEG 走 draft 惰性重采样：超大 JPEG 不解全图就缩到目标尺寸
+        try:
+            img.draft('RGB', (max_size, max_size))
+        except Exception:
+            pass
+        img.thumbnail((max_size, max_size), Image.LANCZOS)
         img.load()
         if img.mode in ('RGBA', 'LA', 'P'):
             # 带透明通道/调色板图先铺白底再转 RGB，避免直接 convert 出现黑底
@@ -97,7 +109,6 @@ def image_bytes_to_data_url(image_bytes: bytes, max_size: int = 1280, quality: i
             img = background
         else:
             img = img.convert('RGB')
-        img.thumbnail((max_size, max_size), Image.LANCZOS)
         buf = io.BytesIO()
         img.save(buf, format='JPEG', quality=quality)
         b64 = base64.b64encode(buf.getvalue()).decode('ascii')
