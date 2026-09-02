@@ -21,6 +21,7 @@ from django.db.models.functions import TruncHour, ExtractHour
 from django.utils import timezone
 
 from apps.chat.models import QueryLog, SensitiveLog
+from apps.knowledge.models import KnowledgeDoc
 from apps.resources.models import UploadLog
 
 from ..models import LoginLog, OperationLog
@@ -341,3 +342,43 @@ def compute_totals() -> dict:
     except Exception as e:
         logger.error('totals 计算失败: %s', e)
         return {'error': str(e)}
+
+
+# ----------------------------------------------------------------------
+# 块 7：首页公开数据概览（全量累计，供 /api/platform/stats/）
+# ----------------------------------------------------------------------
+def compute_public_stats() -> dict:
+    """首页「平台数据概览」公开六项指标（AllowAny，无 period，全量累计）。
+
+    对外口径（产品决策 2026-09-02）：
+    - users:            User.role='user' 的师生账号数（不含各类管理员）
+    - storage_bytes:    已收录资料占用字节 = Sum(KnowledgeDoc.file_size)
+    - docs:             资料总数 = KnowledgeDoc 全表计数（上传即算，删除随行消失）
+    - queries:          QueryLog 累计（AI 问答次数）
+    - sensitive_blocks: SensitiveLog 累计（敏感词命中拦截）
+    - logins:           LoginLog 累计（平台登录次数）
+
+    安全约定：
+    - 公开端点不携带任何学院/操作人/明细粒度，也不返回错误原文
+    - 单项失败 → 该项 None + 服务端日志；接口结构保持稳定，前端以 0/缺省兜底
+    """
+    from django.contrib.auth import get_user_model
+
+    User = get_user_model()
+    results: dict = {}
+
+    def _count(label: str, fn):
+        try:
+            results[label] = fn()
+        except Exception as e:
+            logger.error('public stats「%s」计算失败: %s', label, e)
+            results[label] = None
+
+    _count('users', lambda: User.objects.filter(role='user').count())
+    _count('storage_bytes', lambda: KnowledgeDoc.objects.aggregate(s=Sum('file_size'))['s'] or 0)
+    _count('docs', lambda: KnowledgeDoc.objects.count())
+    _count('queries', lambda: QueryLog.objects.count())
+    _count('sensitive_blocks', lambda: SensitiveLog.objects.count())
+    _count('logins', lambda: LoginLog.objects.count())
+
+    return results
