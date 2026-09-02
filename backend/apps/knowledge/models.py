@@ -209,3 +209,48 @@ class DocChunk(models.Model):
 
     def __str__(self):
         return f'{self.doc.title} - 切片#{self.chunk_index}'
+
+
+class ChunkedUploadSession(models.Model):
+    """分片上传会话——大文件分片上传的状态记录，分片数据存于 OSS Multipart Upload"""
+    STATUS_CHOICES = [
+        ('uploading', '上传中'),
+        ('completed', '已完成'),
+        ('aborted', '已取消'),
+    ]
+
+    upload_id = models.CharField(
+        max_length=128, primary_key=True, verbose_name='OSS分片上传ID',
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name='chunked_uploads', verbose_name='上传用户',
+    )
+    file_name = models.CharField(max_length=256, verbose_name='原始文件名')
+    file_size = models.BigIntegerField(default=0, verbose_name='文件大小（字节）')
+    file_md5 = models.CharField(
+        max_length=32, db_index=True, verbose_name='文件MD5哈希',
+    )
+    oss_key = models.CharField(max_length=512, verbose_name='OSS对象Key')
+    status = models.CharField(
+        max_length=16, choices=STATUS_CHOICES, default='uploading',
+        db_index=True, verbose_name='状态',
+    )
+    created_at = models.DateTimeField(
+        auto_now_add=True, db_index=True, verbose_name='创建时间',
+    )
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        db_table = 'chunked_upload_session'
+        verbose_name = '分片上传会话'
+        verbose_name_plural = verbose_name
+        ordering = ['-created_at']
+        db_table_comment = '大文件分片上传会话表(分片数据存OSS，本表只存状态；status=uploading且超时的会话由定时任务清理)'
+        indexes = [
+            models.Index(fields=['user', 'status'], name='idx_cus_user_status'),
+            models.Index(fields=['file_md5', 'status'], name='idx_cus_md5_status'),
+        ]
+
+    def __str__(self):
+        return f'{self.user.username} 分片上传 {self.file_name} [{self.status}]'

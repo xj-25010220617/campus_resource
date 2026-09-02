@@ -1,5 +1,10 @@
 from django.urls import path
 
+from .chunked_views import (
+    ChunkMergeView,
+    ChunkUploadInitView,
+    ChunkUploadView,
+)
 from .views import (
     AIClassifyView,
     BatchFileUploadView,
@@ -30,6 +35,11 @@ urlpatterns = [
     path('upload/ai-classify/', AIClassifyView.as_view(), name='upload_ai_classify'),
     path('upload/classify/', AIClassifyView.as_view(), name='upload_classify'),
     path('upload/callback/', UploadCallbackView.as_view(), name='upload_callback'),
+
+    # 分片上传（大文件）
+    path('upload/chunk/init/', ChunkUploadInitView.as_view(), name='upload_chunk_init'),
+    path('upload/chunk/', ChunkUploadView.as_view(), name='upload_chunk'),
+    path('upload/chunk/merge/', ChunkMergeView.as_view(), name='upload_chunk_merge'),
 
     # 文档
     path('docs/', KnowledgeDocListView.as_view(), name='knowledge_doc_list'),

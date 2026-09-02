@@ -405,6 +405,24 @@ class AskView(APIView):
         parsed = parse_query(question, user_context)
         logger.debug(f'parsed_filters: {parsed}')
 
+        # 3.1.5 FAQ 短路：高频问题走 FAQ 表（如果有）
+        try:
+            from apps.faq.models import FAQ
+            from django.db.models import Q
+            if len(question) <= 30:
+                faq_hit = FAQ.objects.filter(
+                    Q(question__icontains=question[:20]),
+                ).first()
+                if faq_hit:
+                    logger.info('FAQ 短路命中: q=%s faq_id=%d', question[:30], faq_hit.id)
+                    return Response({
+                        'answer': faq_hit.answer,
+                        'source': 'faq',
+                        'faq_id': faq_hit.id,
+                    })
+        except (ImportError, AttributeError, Exception):
+            pass  # 没有 FAQ 表或字段不匹配，静默跳过
+
         # 3.2 RAG 检索（新版：硬过滤 + 双路召回 + 权限校验）
         results = rag.retrieve(
             question=question,

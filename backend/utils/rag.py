@@ -204,9 +204,13 @@ SYSTEM_PROMPT = """你是成都东软学院的AI智能助手，负责回答学�
 # ------------------------------------------------------------------
 # RAG 控制参数（可通过 settings 覆盖）
 # ------------------------------------------------------------------
-RAG_TOP_K = 10
-RAG_SCORE_THRESHOLD = 0.35      # 低于此分数不放入 LLM 上下文
-RAG_REFERENCE_THRESHOLD = 0.7   # 低于此分数不作为引用展示
+# ------------------------------------------------------------------
+# 设计说明：
+# - TOP_K 初检取多些，给 Rerank 留挑选空间
+# - SCORE_THRESHOLD 初检宽一些（0.35→0.30），避免漏召回；Rerank 精排后重新评估
+RAG_TOP_K = 15
+RAG_SCORE_THRESHOLD = 0.30      # 低于此分数不放入 LLM 上下文（Rerank 精排后重新评估）
+RAG_REFERENCE_THRESHOLD = 0.65  # 低于此分数不作为引用展示
 CONTEXT_MAX_CHARS = 8000
 
 
@@ -949,6 +953,12 @@ def retrieve(
     # 检测用户是否需要历史数据（含"历年/历史/全部"等关键词则不限时间）
     parsed_filters['need_history'] = _detect_history_intent(question)
 
+    # 0. Query 改写：口语化提问 → 多个检索词（多路检索后合并去重）
+    from utils.query_rewriter import rewrite_query
+    rewrite_questions = rewrite_query(question)
+    if len(rewrite_questions) > 1:
+        logger.debug('Query 改写: %s -> %s', question[:30], rewrite_questions)
+
     # 1. SQL 硬过滤 → 候选 ID 列表
     candidate_ids = _apply_hard_filters(parsed_filters, user_context, top_k=500)
 
@@ -962,13 +972,21 @@ def retrieve(
 
     logger.debug(f'硬过滤候选数: {len(candidate_ids)}, filters={parsed_filters}')
 
-    # 2. 双路召回（仅在候选范围内检索）
-    question_embedding = _cached_embed(question)
+    # 2. 双路召回（仅在候选范围内检索，对每个改写版本都检索）
     vector_hits = []
-    if question_embedding:
-        vector_hits = milvus_client.search(
-            question_embedding, top_k=top_k, filter_ids=candidate_ids,
-        )
+    for q in rewrite_questions:
+        q_emb = _cached_embed(q)
+        if q_emb:
+            vector_hits.extend(milvus_client.search(
+                q_emb, top_k=top_k, filter_ids=candidate_ids,
+            ))
+    # 去重：按 doc_id+page 保留最高分
+    seen = {}
+    for h in vector_hits:
+        key = (h.get('doc_id'), h.get('page'))
+        if key not in seen or h.get('score', 0) > seen[key].get('score', 0):
+            seen[key] = h
+    vector_hits = list(seen.values())
 
     keyword_hits = _keyword_search(
         question, top_k=top_k, doc_ids=candidate_ids,
@@ -981,10 +999,10 @@ def retrieve(
         keywords_boost=_keywords_boost_from_filters(parsed_filters),
     )
 
-    # 3.5 Cross-Encoder 精排（初检 Top-20 → 精排 Top-5）
+    # 3.5 Cross-Encoder 精排（候选 >=3 即触发）
     try:
         from utils.reranker import CROSS_ENCODER_TOP_K_OUTPUT, rerank_with_cross_encoder
-        if len(merged) > CROSS_ENCODER_TOP_K_OUTPUT:
+        if len(merged) >= 3:
             merged = rerank_with_cross_encoder(question, merged)
             logger.debug('Cross-Encoder 重排序后: %d 条', len(merged))
     except ImportError:
@@ -995,6 +1013,21 @@ def retrieve(
 
     # 5. 权限校验
     results = _filter_by_permission(enriched, user_context)
+
+    # 5.5 检索质量监控日志（学校投入使用后用于诊断与告警）
+    if results:
+        top3_scores = [round(r.get('score', 0), 3) for r in results[:3]]
+        logger.info(
+            '[RAG监控] 候选=%d 向量=%d 关键词=%d Rerank后Top3=%s 返回=%d',
+            len(candidate_ids), len(vector_hits), len(keyword_hits),
+            top3_scores, len(results),
+        )
+    else:
+        logger.warning(
+            '[RAG监控] 零召回 q=%s 候选=%d 向量=%d 关键词=%d',
+            question[:50], len(candidate_ids),
+            len(vector_hits), len(keyword_hits),
+        )
 
     # 6. 兜底：向量检索无结果时，按标题/描述关键词搜索
     if not results:
