@@ -1008,17 +1008,18 @@ class PublicStatsView(APIView):
     """首页「平台数据概览」公开接口
 
     GET /api/platform/stats/
-    功能：首页公开展示 6 项全量累计指标（AllowAny，含游客，无需 Token），
+    功能：首页公开展示 7 项全量累计指标（AllowAny，含游客，无需 Token），
          （产品决策 2026-09-02）替代此前误用 /admin/logs/dashboard/ 的公开展示。
     参数：不接收参数；固定全量口径，与 period 无关。
     返回：
         {
-            "users": int | null,            # 用户总数（role=user，不含管理员）
-            "storage_bytes": int | null,    # 存储总量（已收录资料占用字节）
-            "docs": int | null,             # 资料总数（全部已上传资料）
-            "queries": int | null,          # 查询总数（AI 问答累计）
-            "sensitive_blocks": int | null, # 敏感拦截（命中敏感词累计）
-            "logins": int | null,           # 登录次数（平台累计登录）
+            "users": int | null,             # 用户总数（role=user，不含管理员）
+            "storage_bytes": int | null,     # 存储总量（已收录资料占用字节）
+            "docs": int | null,              # 资料总数（全部已上传资料）
+            "queries": int | null,           # 查询总数（AI 问答累计）
+            "avg_response_sec": float | null, # 平均响应时长（秒，response_ms>0 的均值）
+            "sensitive_blocks": int | null,   # 敏感拦截（命中敏感词累计）
+            "logins": int | null,            # 登录次数（平台累计登录）
         }
     安全约定：
     - 只返回以上聚合数字，无学院/操作人/error 原文等任何明细（口径见 compute_public_stats）
@@ -1029,7 +1030,7 @@ class PublicStatsView(APIView):
     authentication_classes = []
     permission_classes = [permissions.AllowAny]
 
-    CACHE_KEY = 'public_platform_stats_v1'
+    CACHE_KEY = 'public_platform_stats_v2'
     CACHE_TTL = 120
 
     def get(self, request):
@@ -1037,7 +1038,7 @@ class PublicStatsView(APIView):
         if data is None:
             data = dashboard_svc.compute_public_stats()
 
-            # 整库不可用（六项全 null）→ 不缓存、503，前端走错误态而不是静默显示 0；
+            # 整库不可用（七项全 null）→ 不缓存、503，前端走错误态而不是静默显示 0；
             # 仅局部失败（某项 null）仍缓存返回，其余真实数字照常展示。
             if all(value is None for value in data.values()):
                 return Response(status=status.HTTP_503_SERVICE_UNAVAILABLE)

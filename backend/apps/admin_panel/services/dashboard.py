@@ -348,15 +348,17 @@ def compute_totals() -> dict:
 # 块 7：首页公开数据概览（全量累计，供 /api/platform/stats/）
 # ----------------------------------------------------------------------
 def compute_public_stats() -> dict:
-    """首页「平台数据概览」公开六项指标（AllowAny，无 period，全量累计）。
+    """首页「平台数据概览」公开七项指标（AllowAny，无 period，全量累计）。
 
-    对外口径（产品决策 2026-09-02）：
-    - users:            User.role='user' 的师生账号数（不含各类管理员）
-    - storage_bytes:    已收录资料占用字节 = Sum(KnowledgeDoc.file_size)
+    对外口径（产品决策 2026-09-02；avg_response_sec 2026-09-02 增补）：
+    - users:            用户总数 = User.role='user' 的师生账号数（不含各类管理员）
+    - storage_bytes:    存储总量 = 已收录资料占用字节 Sum(KnowledgeDoc.file_size)
     - docs:             资料总数 = KnowledgeDoc 全表计数（上传即算，删除随行消失）
-    - queries:          QueryLog 累计（AI 问答次数）
-    - sensitive_blocks: SensitiveLog 累计（敏感词命中拦截）
-    - logins:           LoginLog 累计（平台登录次数）
+    - queries:          查询总数 = QueryLog 累计（AI 问答次数）
+    - avg_response_sec: 平均响应时长（秒，保留 1 位小数）=
+                        Avg(QueryLog.response_ms，仅 response_ms>0) / 1000
+    - sensitive_blocks: 敏感拦截 = SensitiveLog 累计（敏感词命中拦截）
+    - logins:           登录次数 = LoginLog 累计（平台登录次数）
 
     安全约定：
     - 公开端点不携带任何学院/操作人/明细粒度，也不返回错误原文
@@ -378,6 +380,13 @@ def compute_public_stats() -> dict:
     _count('storage_bytes', lambda: KnowledgeDoc.objects.aggregate(s=Sum('file_size'))['s'] or 0)
     _count('docs', lambda: KnowledgeDoc.objects.count())
     _count('queries', lambda: QueryLog.objects.count())
+
+    def _avg_response_seconds():
+        # 仅统计 response_ms>0 的真实响应，过滤掉正在流式/未回填的 0 值行
+        avg_ms = QueryLog.objects.filter(response_ms__gt=0).aggregate(a=Avg('response_ms'))['a']
+        return round(avg_ms / 1000, 1) if avg_ms is not None else None
+
+    _count('avg_response_sec', _avg_response_seconds)
     _count('sensitive_blocks', lambda: SensitiveLog.objects.count())
     _count('logins', lambda: LoginLog.objects.count())
 
