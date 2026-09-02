@@ -37,11 +37,13 @@ from .models import Keyword, KnowledgeDoc
 from .serializers import (
     AIClassifySerializer,
     ALLOWED_FILE_TYPES,
+    FILE_SIZE_LIMITS,
     FileUploadSerializer,
     KeywordCreateSerializer,
     KeywordSerializer,
     KnowledgeDocListSerializer,
     KnowledgeDocSerializer,
+    normalize_file_type,
     TextUploadSerializer,
     UploadCallbackSerializer,
     UploadSTSRequestSerializer,
@@ -708,7 +710,7 @@ class UploadCallbackView(APIView):
             description=data.get('description', ''),
             file_name=data['file_name'],
             file_size=data['file_size'],
-            file_type=data['file_type'],
+            file_type=normalize_file_type(data['file_type']),
             md5_hash=data['md5'],
             source_type='upload',
             uploader=request.user,
@@ -1146,6 +1148,15 @@ class FileUploadView(APIView):
                 {'file': f'不支持的文件类型 ".{ext}"，支持的类型：{", ".join(sorted(ALLOWED_FILE_TYPES))}'}
             )
 
+        # 校验文件大小
+        max_size = FILE_SIZE_LIMITS.get(ext, FILE_SIZE_LIMITS['other'])
+        if uploaded_file.size > max_size:
+            max_mb = max_size // (1024 * 1024)
+            cur_mb = uploaded_file.size // (1024 * 1024)
+            raise ValidationError(
+                {'file': f'{ext} 文件大小不能超过 {max_mb}MB，当前大小 {cur_mb}MB'}
+            )
+
         # 生成 OSS 对象 Key（根据上传者角色确定路径）
         now = datetime.now()
         safe_filename = f'{uuid.uuid4().hex[:12]}.{ext}'
@@ -1278,7 +1289,7 @@ class FileUploadView(APIView):
             oss_key=oss_key,
             oss_url=oss_url,
             file_name=uploaded_file.name,
-            file_type=ext,
+            file_type=normalize_file_type(ext),
             file_size=uploaded_file.size,
             md5_hash=md5_hash,
             college_id=doc_college_id,
@@ -1417,6 +1428,17 @@ class BatchFileUploadView(APIView):
                     })
                     continue
 
+                # 4a2. 校验文件大小
+                max_size = FILE_SIZE_LIMITS.get(ext, FILE_SIZE_LIMITS['other'])
+                if uploaded_file.size > max_size:
+                    max_mb = max_size // (1024 * 1024)
+                    cur_mb = uploaded_file.size // (1024 * 1024)
+                    failed_results.append({
+                        'file_name': file_name,
+                        'error': f'{ext} 文件大小不能超过 {max_mb}MB，当前大小 {cur_mb}MB',
+                    })
+                    continue
+
                 # 4b. 生成 OSS 对象 Key 并上传
                 now = datetime.now()
                 safe_filename = f'{uuid.uuid4().hex[:12]}.{ext}'
@@ -1475,7 +1497,7 @@ class BatchFileUploadView(APIView):
                     oss_key=oss_key,
                     oss_url=oss_url,
                     file_name=file_name,
-                    file_type=ext,
+                    file_type=normalize_file_type(ext),
                     file_size=uploaded_file.size,
                     md5_hash=md5_hash,
                     college_id=doc_college_id,

@@ -44,7 +44,10 @@ class FeedbackSerializer(serializers.Serializer):
 
 class MessageRateSerializer(serializers.Serializer):
     """消息反馈请求参数"""
-    rating = serializers.ChoiceField(choices=['like', 'dislike'], help_text='like=点赞 / dislike=点踩')
+    rating = serializers.ChoiceField(
+        choices=['like', 'dislike', 'none'],
+        help_text='like=点赞 / dislike=点踩 / none=取消反馈',
+    )
 
 
 class VoiceAskSerializer(serializers.Serializer):

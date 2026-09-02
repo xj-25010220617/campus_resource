@@ -137,18 +137,23 @@ class MessageViewSet(ModelViewSet):
             )
 
         # 更新 ChatMessage 的 rating 字段
-        message.rating = rating
+        # rating='none' 表示取消反馈，置为 None
+        if rating == 'none':
+            message.rating = None
+        else:
+            message.rating = rating
         message.save(update_fields=['rating'])
 
         # 更新关联的 QueryLog — 取该会话最新一条（即本轮问答对应的查询日志）
+        feedback_value = 1 if rating == 'like' else (0 if rating == 'dislike' else -1)
         QueryLog.objects.filter(
             conversation=message.conversation,
             user=request.user,
         ).order_by('-created_at').update(
-            user_feedback=1 if rating == 'like' else 0,
+            user_feedback=feedback_value,
         )
 
-        return Response({'status': 'ok', 'rating': rating})
+        return Response({'status': 'ok', 'rating': message.rating})
 
     @extend_schema(
         summary='查看消息引用来源',

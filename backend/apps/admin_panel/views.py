@@ -868,8 +868,8 @@ class LoginLogStatsView(APIView):
             for row in qs.values('login_type').annotate(count=Count('id'))
         ]
         by_hour = [
-            {'key': str(row['hour']),
-             'label': f'{row["hour"]:02d}:00',
+            {'key': str(row['hour'] if row['hour'] is not None else -1),
+             'label': f'{row["hour"]:02d}:00' if row['hour'] is not None else '未知',
              'count': row['count']}
             for row in qs.annotate(hour=ExtractHour('created_at'))
             .values('hour').annotate(count=Count('id'))

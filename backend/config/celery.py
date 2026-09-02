@@ -46,6 +46,10 @@ app.conf.beat_schedule = {
         'task': 'apps.knowledge.tasks.refresh_daily_context_task',
         'schedule': crontab(hour=0, minute=5),  # 每天 00:05
     },
+    'cleanup-expired-upload-sessions': {
+        'task': 'apps.knowledge.tasks.cleanup_expired_upload_sessions_task',
+        'schedule': crontab(hour=3, minute=30),  # 每天 03:30
+    },
 }
 
 

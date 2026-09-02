@@ -224,3 +224,42 @@ def index_document_task(self, doc_id: int):
         except Exception:
             pass
         raise self.retry(exc=e)
+
+
+@shared_task(bind=True, ignore_result=True)
+def cleanup_expired_upload_sessions_task(self, expire_hours: int = 24):
+    """清理超时未完成的分片上传会话。
+
+    对 status=uploading 且 updated_at 超过 expire_hours 的会话：
+    1. 调 OSS AbortMultipartUpload 释放云端已传分片占用的存储
+    2. 会话标记为 aborted
+
+    异常处理:
+        - 单个会话 abort 失败不影响其他会话，等待下轮重试
+    """
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    from apps.knowledge.chunked_views import SESSION_EXPIRE_HOURS
+    from apps.knowledge.models import ChunkedUploadSession
+    from utils.oss import oss_client
+
+    expire = timedelta(hours=expire_hours or SESSION_EXPIRE_HOURS)
+    expired = ChunkedUploadSession.objects.filter(
+        status='uploading', updated_at__lt=timezone.now() - expire,
+    )
+    count = 0
+    for session in expired.iterator():
+        try:
+            if oss_client.bucket:
+                oss_client.bucket.abort_multipart_upload(session.oss_key, session.upload_id)
+            session.status = 'aborted'
+            session.save(update_fields=['status', 'updated_at'])
+            count += 1
+        except Exception as e:
+            logger.warning(
+                f'清理分片会话失败 upload_id={session.upload_id}: {e}'
+            )
+    logger.info(f'cleanup_expired_upload_sessions_task: 清理过期分片会话 {count} 个')
+    return None
