@@ -12,6 +12,7 @@ from typing import Optional
 import datetime as _datetime
 
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
@@ -967,11 +968,12 @@ class LogsDashboardView(APIView):
     - 6 个块各自 try/except 隔离失败（块计算放 services/dashboard.py）
     - view 不接 try/except（遵循规范 §9）
     - totals 与 blocks 平级，与 period 无关
-    - 权限：AllowAny。首页「平台数据概览」对所有人开放（含游客），
-      属于产品决策（2026-09-01），有意替代此前「仅管理员可访问」的限制。
-      返回的是平台聚合统计，不包含任何个人可识别信息。
+    - 权限：IsSuperAdmin（超管专属，与其余 /admin/logs/* 接口一致）。
+      首页「平台数据概览」的公开展示已拆出到 /api/platform/stats/
+      （见 PublicStatsView），本接口 2026-09-02 收回为超管日志看板专用，
+      全字段（by_*/top_operators 等）仅超管可见。
     """
-    permission_classes = [permissions.AllowAny]
+    permission_classes = [permissions.IsAuthenticated, IsSuperAdmin]
 
     def get(self, request):
         period = request.query_params.get('period') or 'all'
@@ -997,3 +999,49 @@ class LogsDashboardView(APIView):
             'totals': totals,
             'blocks': blocks,
         })
+
+
+# ======================================================================
+# 六、首页公开数据概览（游客可见，无需 Token）
+# ======================================================================
+class PublicStatsView(APIView):
+    """首页「平台数据概览」公开接口
+
+    GET /api/platform/stats/
+    功能：首页公开展示 7 项全量累计指标（AllowAny，含游客，无需 Token），
+         （产品决策 2026-09-02）替代此前误用 /admin/logs/dashboard/ 的公开展示。
+    参数：不接收参数；固定全量口径，与 period 无关。
+    返回：
+        {
+            "users": int | null,             # 用户总数（role=user，不含管理员）
+            "storage_bytes": int | null,     # 存储总量（已收录资料占用字节）
+            "docs": int | null,              # 资料总数（全部已上传资料）
+            "queries": int | null,           # 查询总数（AI 问答累计）
+            "avg_response_sec": float | null, # 平均响应时长（秒，response_ms>0 的均值）
+            "sensitive_blocks": int | null,   # 敏感拦截（命中敏感词累计）
+            "logins": int | null,            # 登录次数（平台累计登录）
+        }
+    安全约定：
+    - 只返回以上聚合数字，无学院/操作人/error 原文等任何明细（口径见 compute_public_stats）
+    - 单项计算失败 → 该项 null + 服务端日志，响应结构保持稳定
+    - 服务端缓存 120s，避免游客每次刷新重复扫表
+    """
+    # 完全公开：不做任何认证，即使请求头携带过期/伪造 Token 也不影响访问
+    authentication_classes = []
+    permission_classes = [permissions.AllowAny]
+
+    CACHE_KEY = 'public_platform_stats_v2'
+    CACHE_TTL = 120
+
+    def get(self, request):
+        data = cache.get(self.CACHE_KEY)
+        if data is None:
+            data = dashboard_svc.compute_public_stats()
+
+            # 整库不可用（七项全 null）→ 不缓存、503，前端走错误态而不是静默显示 0；
+            # 仅局部失败（某项 null）仍缓存返回，其余真实数字照常展示。
+            if all(value is None for value in data.values()):
+                return Response(status=status.HTTP_503_SERVICE_UNAVAILABLE)
+            cache.set(self.CACHE_KEY, data, self.CACHE_TTL)
+
+        return Response(data)

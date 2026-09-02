@@ -293,8 +293,12 @@ def build_images_events(image_results: list) -> dict:
         }
         oss_key = r.get('oss_key', '')
         if oss_key:
-            # 签名预览 URL（不带 attachment，浏览器内联显示图片）
-            entry['preview_url'] = oss_client.get_preview_url(oss_key, expires=3600) or ''
+            # 签名预览 URL（不带 attachment / content-type 覆盖，浏览器内联显示图片）。
+            # 注意：阿里云 OSS 不支持 response-content-type 参数（400 InvalidRequest），
+            # 图片 Content-Type 已在上传时写对（utils.oss.guess_content_type），<img> 亦会嗅探。
+            entry['preview_url'] = oss_client.get_preview_url(
+                oss_key, expires=3600,
+            ) or ''
         images.append(entry)
     return {'images': images}
 

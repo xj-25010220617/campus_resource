@@ -50,7 +50,7 @@ class DepartmentSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Department
-        fields = ['id', 'name', 'parent', 'sort_order', 'children']
+        fields = ['id', 'name', 'parent', 'children']
 
     def get_children(self, obj):
         children = obj.children.all()

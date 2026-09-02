@@ -14,7 +14,7 @@ from rest_framework.viewsets import ModelViewSet
 from apps.knowledge.models import KnowledgeDoc
 
 from utils import rag
-from utils.llm import llm_client
+from utils.llm import llm_client, LLMTimeoutError
 from utils.sensitive_filter import check_sensitive
 from utils.sse import _format_sse, build_images_events, build_references_events
 from utils.error_codes import ErrorCode
@@ -291,7 +291,7 @@ class AskView(APIView):
         事件类型：
         - event: start          → data: {"conversation_id": int, "message_id": int}
         - event: token          → data: {"content": "..."}
-        - event: suggested      → data: ["问题1", "问题2", "问题3"]
+        - event: suggested      → data: [{"display": "引导句", "question": "干净问句"}, ...]
         - event: references     → data: {"count": 3, "summary": "参考了3份文档"}
         - event: references_detail → data: [{"doc_id": int, "doc_title": "...", ...}]
         - event: done           → data: {"message_id": int}
@@ -514,7 +514,18 @@ class AskView(APIView):
 
         # 7. SSE 流式响应
         def event_stream():
-            """生成 SSE 事件流（finally 保证 query_log 回填）"""
+            """生成 SSE 事件流（finally 保证 query_log 回填；断连时把已收内容落库后结束）。"""
+            collected_tokens = []
+            saved_len = 0
+
+            def _persist_partial():
+                """把当前已生成内容增量落库，避免客户端断连/切走后回答丢失。"""
+                nonlocal saved_len
+                content = ''.join(collected_tokens)
+                if len(content) > saved_len:
+                    ChatMessage.objects.filter(id=assistant_msg.id).update(content=content)
+                    saved_len = len(content)
+
             try:
                 # start 事件
                 yield _format_sse('start', {
@@ -523,20 +534,20 @@ class AskView(APIView):
                 })
 
                 # 流式生成
-                collected_tokens = []
                 stream = llm_client.chat_stream(messages)
                 for token in stream:
                     if token:
                         collected_tokens.append(token)
                         yield _format_sse('token', {'content': token})
+                        # 每 20 token 增量落库，防止切走/断连后内容丢失
+                        if len(collected_tokens) % 20 == 0:
+                            _persist_partial()
 
                 full_answer = ''.join(collected_tokens)
 
                 # 保存 AI 回答（流结束后写库）
                 if full_answer:
-                    ChatMessage.objects.filter(id=assistant_msg.id).update(
-                        content=full_answer,
-                    )
+                    _persist_partial()
                     logger.info(
                         'AI 回答完成 msg_id=%d conv_id=%d tokens=%d',
                         assistant_msg.id, conversation.id, len(collected_tokens),
@@ -562,12 +573,27 @@ class AskView(APIView):
                 yield _format_sse('done', {'message_id': assistant_msg.id})
 
             except GeneratorExit:
+                # 客户端断开：把已收到的部分内容落库后直接结束。
+                # 后台续收由前端方案 A 覆盖（切换时不 abort，SSE 后台继续收），后端不再兜底拉完。
+                _persist_partial()
                 raise
+            except LLMTimeoutError as e:
+                # AI 回答超时：下发明确提示 + 已检索到的图片（让图片不因超时而丢失）
+                logger.warning(f'AI 回答超时: {e}')
+                _persist_partial()
+                yield _format_sse('error', {'message': 'AI回答超时，请稍后重试', 'code': ErrorCode.SSE_ERROR.value})
+                if images_events.get('images'):
+                    yield _format_sse('images', images_events['images'])
             except Exception as e:
                 logger.error(f'SSE 流异常: {e}')
+                _persist_partial()
                 yield _format_sse('error', {'message': '回答生成失败，请重试', 'code': ErrorCode.SSE_ERROR.value})
             finally:
-                # 保证流中断时 response_ms 也能回填（客户端断连、Django 回收 generator 时触发）
+                # 兜底落库 + 保证流中断时 response_ms 也能回填（客户端断连、Django 回收 generator 时触发）
+                try:
+                    _persist_partial()
+                except Exception:
+                    pass
                 elapsed_ms = int((time.time() - start_ts) * 1000)
                 try:
                     QueryLog.objects.filter(id=query_log.id).update(response_ms=elapsed_ms)
