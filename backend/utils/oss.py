@@ -174,13 +174,29 @@ class OSSClient:
             logger.error(f'生成下载 URL 失败 oss_key={oss_key}: {e}')
             return ''
 
-    def get_preview_url(self, oss_key: str, expires: int = 3600) -> str:
+    def get_preview_url(self, oss_key: str, expires: int = 3600,
+                        content_type: str = None) -> str:
         """
         生成带签名的预览 URL（有效期 3600 秒，适合音频/视频播放）。
         与 get_download_url 相同机制，仅默认有效期更长。
         不携带 Content-Disposition 覆盖，浏览器内联显示（PDF/图片/音视频）。
+
+        Args:
+            oss_key: OSS 对象 Key
+            expires: 有效期（秒）
+            content_type: 覆盖响应 Content-Type（如 image/png），
+                修正上传时未正确设置的 MIME 类型，使浏览器内联显示而非下载。
         """
-        return self.get_download_url(oss_key, expires)
+        if not self.bucket:
+            return ''
+        params = {}
+        if content_type:
+            params['response-content-type'] = content_type
+        try:
+            return self.bucket.sign_url('GET', oss_key, expires, params=params or None)
+        except Exception as e:
+            logger.error(f'生成预览 URL 失败 oss_key={oss_key}: {e}')
+            return ''
 
     # ------------------------------------------------------------------
     # MD5 去重检查

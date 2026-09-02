@@ -17,4 +17,6 @@ urlpatterns = [
     path('api/admin/', include('apps.admin_panel.urls')),
     path('api/resources/', include('apps.resources.urls')),
     path('api/', include('apps.faq.urls')),
+    # 首页公开数据概览（AllowAny，无需 Token）——见 apps.admin_panel.views.PublicStatsView
+    path('api/platform/', include('apps.admin_panel.platform_urls')),
 ]
