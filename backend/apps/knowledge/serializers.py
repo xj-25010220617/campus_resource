@@ -1,6 +1,7 @@
 from rest_framework import serializers
 
 from .models import KnowledgeDoc, Keyword
+from utils.oss import oss_client
 
 
 class KnowledgeDocSerializer(serializers.ModelSerializer):
@@ -12,11 +13,16 @@ class KnowledgeDocSerializer(serializers.ModelSerializer):
     college_name = serializers.CharField(source='college.name', read_only=True)
     uploader_name = serializers.CharField(source='uploader.username', read_only=True)
 
+    # 下载：带原始文件名的签名附件 URL（下载文件名与上传时一致，见 oss.get_download_url）
+    download_url = serializers.SerializerMethodField()
+    # 预览：签名 URL（无 Content-Disposition，浏览器内联显示 PDF/图片/音视频）
+    oss_url = serializers.SerializerMethodField()
+
     class Meta:
         model = KnowledgeDoc
         fields = [
             'id', 'title', 'description', 'source_type', 'source_url',
-            'oss_key', 'oss_url', 'file_name', 'file_type', 'file_size',
+            'oss_key', 'oss_url', 'download_url', 'file_name', 'file_type', 'file_size',
             'md5_hash', 'page_count',
             'discipline', 'discipline_name',
             'category', 'category_name',
@@ -27,10 +33,24 @@ class KnowledgeDocSerializer(serializers.ModelSerializer):
             'created_at', 'updated_at', 'indexed_at',
         ]
         read_only_fields = [
-            'id', 'source_type', 'oss_key', 'oss_url', 'file_name', 'file_type',
+            'id', 'source_type', 'oss_key', 'file_name', 'file_type',
             'file_size', 'md5_hash', 'page_count', 'uploader',
             'chunk_count', 'created_at', 'updated_at', 'indexed_at',
         ]
+
+    def get_download_url(self, obj) -> str:
+        """带原始文件名的签名下载 URL（附件下载）"""
+        if not obj.oss_key:
+            return ''
+        return oss_client.get_download_url(
+            obj.oss_key, expires=604800, file_name=obj.file_name,
+        )
+
+    def get_oss_url(self, obj) -> str:
+        """签名预览 URL（无 attachment，浏览器内联显示）"""
+        if not obj.oss_key:
+            return ''
+        return oss_client.get_preview_url(obj.oss_key, expires=604800)
 
 
 class KnowledgeDocListSerializer(serializers.ModelSerializer):
