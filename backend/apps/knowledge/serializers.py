@@ -64,17 +64,25 @@ FILE_SIZE_LIMITS = {
     'xls': 30 * 1024 * 1024, 'xlsx': 30 * 1024 * 1024,  # Excel — 30MB
     'ppt': 50 * 1024 * 1024, 'pptx': 50 * 1024 * 1024,  # PPT — 50MB（含高清图汇报）
     'txt': 50 * 1024 * 1024, 'md': 50 * 1024 * 1024, 'html': 50 * 1024 * 1024,
+    'csv': 30 * 1024 * 1024,                          # CSV 表格 — 30MB（名单/数据导出）
     # 图片类 — 30MB（相机原图可放宽至此档）
     'png': 30 * 1024 * 1024, 'jpg': 30 * 1024 * 1024, 'jpeg': 30 * 1024 * 1024,
     'gif': 30 * 1024 * 1024, 'webp': 30 * 1024 * 1024,
+    'bmp': 30 * 1024 * 1024, 'tiff': 30 * 1024 * 1024, 'tif': 30 * 1024 * 1024,
     # 压缩包 — 80MB（多文件打包场景）
-    'zip': 80 * 1024 * 1024, 'rar': 80 * 1024 * 1024,
+    'zip': 80 * 1024 * 1024, 'rar': 80 * 1024 * 1024, '7z': 80 * 1024 * 1024,
     # 音频类 — 50MB
     'mp3': 50 * 1024 * 1024, 'wav': 50 * 1024 * 1024, 'ogg': 50 * 1024 * 1024,
     'flac': 50 * 1024 * 1024, 'aac': 50 * 1024 * 1024, 'm4a': 50 * 1024 * 1024,
+    'amr': 50 * 1024 * 1024,
     # 视频类 — 500MB
     'mp4': 500 * 1024 * 1024, 'webm': 500 * 1024 * 1024, 'mov': 500 * 1024 * 1024,
     'avi': 500 * 1024 * 1024, 'mkv': 500 * 1024 * 1024, 'flv': 500 * 1024 * 1024,
+    'm4v': 500 * 1024 * 1024,
+    # 设计源文件 / 3D 模型 / 电子书 / Publisher（二进制附件，归 other 类别）
+    'psd': 100 * 1024 * 1024, 'ai': 100 * 1024 * 1024,    # 设计源文件 — 100MB
+    'stl': 200 * 1024 * 1024, 'obj': 200 * 1024 * 1024, 'fbx': 200 * 1024 * 1024,  # 3D 模型 — 200MB
+    'epub': 50 * 1024 * 1024, 'pub': 50 * 1024 * 1024,    # 电子书 / Publisher — 50MB
     # 其他 — 50MB
     'other': 50 * 1024 * 1024,
 }
@@ -84,14 +92,18 @@ ALLOWED_FILE_TYPES = {
     # 文档类
     'pdf', 'doc', 'docx', 'ppt', 'pptx', 'xls', 'xlsx',
     'txt', 'md', 'html',
+    # 表格（纯文本，可索引）
+    'csv',
     # 图片类
-    'png', 'jpg', 'jpeg', 'gif', 'webp',
+    'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'tiff', 'tif',
     # 音频类
-    'mp3', 'wav', 'ogg', 'flac', 'aac', 'm4a',
+    'mp3', 'wav', 'ogg', 'flac', 'aac', 'm4a', 'amr',
     # 视频类
-    'mp4', 'webm', 'mov', 'avi', 'mkv', 'flv',
+    'mp4', 'webm', 'mov', 'avi', 'mkv', 'flv', 'm4v',
     # 压缩包类
-    'zip', 'rar',
+    'zip', 'rar', '7z',
+    # 设计源文件 / 3D 模型 / 电子书 / Publisher（二进制附件，归 other）
+    'psd', 'ai', 'stl', 'obj', 'fbx', 'epub', 'pub',
     # 其他（兜底）
     'other',
 }
@@ -126,20 +138,26 @@ EXT_TO_FILE_TYPE = {
     'doc': 'doc', 'docx': 'doc',
     'ppt': 'ppt', 'pptx': 'ppt',
     'xls': 'xls', 'xlsx': 'xls',
+    'csv': 'xls',
     'pdf': 'pdf',
     'md': 'md', 'txt': 'txt',
     'html': 'html', 'htm': 'html',
     # 图片类
     'png': 'image', 'jpg': 'image', 'jpeg': 'image',
-    'gif': 'image', 'webp': 'image',
+    'gif': 'image', 'webp': 'image', 'bmp': 'image',
+    'tiff': 'image', 'tif': 'image',
     # 音频类
     'mp3': 'audio', 'wav': 'audio', 'ogg': 'audio',
-    'flac': 'audio', 'aac': 'audio', 'm4a': 'audio',
+    'flac': 'audio', 'aac': 'audio', 'm4a': 'audio', 'amr': 'audio',
     # 视频类
     'mp4': 'video', 'webm': 'video', 'mov': 'video',
-    'avi': 'video', 'mkv': 'video', 'flv': 'video',
+    'avi': 'video', 'mkv': 'video', 'flv': 'video', 'm4v': 'video',
     # 压缩包（归档类归入 other）
-    'zip': 'other', 'rar': 'other',
+    'zip': 'other', 'rar': 'other', '7z': 'other',
+    # 设计源文件 / 3D 模型 / 电子书 / Publisher（二进制附件，归 other）
+    'psd': 'other', 'ai': 'other',
+    'stl': 'other', 'obj': 'other', 'fbx': 'other',
+    'epub': 'other', 'pub': 'other',
 }
 
 
