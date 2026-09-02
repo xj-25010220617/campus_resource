@@ -291,7 +291,7 @@ class AskView(APIView):
         事件类型：
         - event: start          → data: {"conversation_id": int, "message_id": int}
         - event: token          → data: {"content": "..."}
-        - event: suggested      → data: ["问题1", "问题2", "问题3"]
+        - event: suggested      → data: [{"display": "引导句", "question": "干净问句"}, ...]
         - event: references     → data: {"count": 3, "summary": "参考了3份文档"}
         - event: references_detail → data: [{"doc_id": int, "doc_title": "...", ...}]
         - event: done           → data: {"message_id": int}

@@ -341,23 +341,18 @@ def build_rag_prompt(
 # 相关推荐
 # ------------------------------------------------------------------
 _SUGGEST_PROMPT = """你是成都东软学院智能问答系统的推荐助手。
-你的任务是根据用户刚才的提问和AI的回答，生成3个引导性的追问建议，帮助用户深入了解更多相关信息。
+你的任务是根据用户刚才的提问和AI的回答，生成3个追问建议，帮助用户深入了解相关信息。
 
-核心要求——引导式追问风格：
-1. 每个建议必须自然地承接用户刚才的提问，采用"您刚才问了XXX，需要我为您……吗？"或类似引导句式
-2. 建议要具体、有价值，从回答中挖掘可延伸、可细化、可对比的方向
-3. 覆盖不同维度：如数据细分、横向对比、操作指南、政策解读、历史沿革等
-4. 语气亲切自然，像一位贴心的校园助手在主动提供帮助
+每个建议需要同时给出两种文本：
+1. "display"：引导式问句，用于前端展示，语气亲切自然、承接上文，例如"您查询了学校在校生人数，需要我为您分别整理各学院的学生分布情况吗？"
+2. "question"：去掉引导套话后的干净问题，是用户点击后实际发送的提问，必须是一句话问句，不要带"您刚才问了""需要我为您""让我帮您"等引导/客套词
 
-追问角度示例：
-- 宏观→微观细化（如：查询了总人数→建议细分学生/教师/各学院人数）
-- 单一→横向对比（如：了解某个专业→建议对比相关专业或同学院其他专业）
-- 概念→操作落地（如：了解奖学金种类→建议了解申请条件和流程）
-- 当前→历史趋势（如：了解今年招生→建议对比往年录取分数线）
-- 数据→解读分析（如：看到某政策→建议了解政策背景和影响）
+要求：
+- display 与 question 表达同一个意思，但 question 更简短、可直接作为提问发送
+- 覆盖不同维度：数据细分、横向对比、操作指南、政策解读、历史沿革等
 
-用 JSON 数组格式输出3个建议，不要额外文字。
-示例输出：["您查询了学校在校生人数，需要我为您分别整理各学院的学生分布情况吗？", "想了解专任教师的具体构成吗？比如高级职称和硕博士比例？", "需要我帮您对比近几年在校生人数的变化趋势吗？"]
+用 JSON 数组输出，每个元素是 {"display": "...", "question": "..."}，不要额外文字。
+示例输出：[{"display": "您查询了学校在校生人数，需要我为您分别整理各学院的学生分布情况吗？", "question": "各学院的学生人数分别是多少？"}, {"display": "想了解专任教师的具体构成吗？比如高级职称和硕博士比例？", "question": "专任教师中高级职称和硕博士各占多少？"}, {"display": "需要我帮您对比近几年在校生人数的变化趋势吗？", "question": "近几年在校生人数有什么变化趋势？"}]
 
 用户问题：{question}
 AI回答：{answer}
@@ -368,8 +363,8 @@ def generate_suggested_questions(
     question: str,
     answer: str,
     max_questions: int = 3,
-) -> List[str]:
-    """根据问答内容生成相关推荐问题。
+) -> List[dict]:
+    """根据问答内容生成相关推荐问题（展示句 + 可直接发送的干净问句）。
 
     Args:
         question: 用户原始问题
@@ -377,7 +372,9 @@ def generate_suggested_questions(
         max_questions: 推荐问题数量（默认 3）
 
     Returns:
-        推荐问题列表，生成失败返回空列表
+        [{'display': str, 'question': str}, ...]，生成失败返回空列表
+        - display: 引导式问句（前端展示用）
+        - question: 干净问句（用户点击后实际发送）
     """
     if not answer or not answer.strip():
         return []
@@ -393,25 +390,45 @@ def generate_suggested_questions(
     )
     messages = [{'role': 'user', 'content': prompt}]
 
-    result = llm_client.chat(messages, temperature=0.7, max_tokens=300)
+    result = llm_client.chat(messages, temperature=0.7, max_tokens=400)
     if not result:
         return []
 
     # 解析 JSON 数组
+    parsed = None
     try:
-        return json.loads(result.strip())[:max_questions]
+        parsed = json.loads(result.strip())
     except (json.JSONDecodeError, TypeError):
-        pass
+        # 尝试从 markdown 代码块中提取
+        match = _re.search(r'```(?:json)?\s*(\[.*?\])\s*```', result, _re.DOTALL)
+        if match:
+            try:
+                parsed = json.loads(match.group(1))
+            except (json.JSONDecodeError, TypeError):
+                parsed = None
 
-    # 尝试从 markdown 代码块中提取
-    match = _re.search(r'```(?:json)?\s*(\[.*?\])\s*```', result, _re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(1))[:max_questions]
-        except (json.JSONDecodeError, TypeError):
-            pass
+    if not isinstance(parsed, list):
+        return []
 
-    return []
+    # 归一化：兼容 LLM 偶尔返回纯字符串（旧格式），统一转为 {display, question}
+    normalized = []
+    for item in parsed:
+        if isinstance(item, str):
+            text = item.strip()
+            if text:
+                normalized.append({'display': text, 'question': text})
+        elif isinstance(item, dict):
+            display = str(item.get('display') or '').strip()
+            question = str(item.get('question') or '').strip()
+            if not question:
+                question = display
+            if not display:
+                display = question
+            if question:
+                normalized.append({'display': display, 'question': question})
+        if len(normalized) >= max_questions:
+            break
+    return normalized
 
 
 # ------------------------------------------------------------------
