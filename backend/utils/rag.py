@@ -925,6 +925,118 @@ def _fallback_title_search(
 
 
 # ------------------------------------------------------------------
+# 图片检索（AI 问答内联展示图片）
+# ------------------------------------------------------------------
+IMAGE_INTENT_KEYWORDS = ('图片', '照片', '海报', 'logo', '图标', '截图', '设计图', '示意图')
+
+
+def _detect_image_intent(question: str) -> bool:
+    """检测用户是否明确想找图片（用于放宽图片召回数量 + 回答中提及图片）。"""
+    q = (question or '').lower()
+    return any(k in q for k in IMAGE_INTENT_KEYWORDS)
+
+
+def retrieve_images(
+    question: str,
+    user_context: Optional[dict] = None,
+    parsed_filters: Optional[dict] = None,
+    top_k: int = 4,
+) -> List[dict]:
+    """检索与问题相关的图片文档，用于 AI 问答流内联展示。
+
+    与文本 RAG 的 retrieve() 相互独立：图片没有文本分块、不参与向量召回，
+    但图片入库时已由视觉模型生成 title/description，此处按标题/描述关键词匹配。
+
+    注意：**不按 status='indexed' 过滤**——图片无文本可索引，index_document_task
+    会把图片置为 'failed'（或误把二进制当文本索引），因此仅按
+    file_type='image' + visibility='public' + 权限过滤，功能自洽。
+
+    Returns:
+        [{'doc_id','doc_title','description','oss_key','file_name','score'}, ...]
+    """
+    user_context = user_context or {'role': 'user'}
+    parsed_filters = parsed_filters or {}
+    role = user_context.get('role', 'user')
+    user_id = user_context.get('user_id')
+    college_id = user_context.get('college_id')
+    department_id = user_context.get('department_id')
+
+    # 关键词提取（复用 _keyword_search 的 jieba + 同义词扩展）
+    try:
+        import jieba
+        keywords = list(jieba.cut(question))[:10]
+    except ImportError:
+        keywords = question.split()[:10]
+
+    from utils.synonym import expand_keywords
+    keywords = expand_keywords(keywords)
+
+    valid_keywords = [k for k in keywords if len(k) >= 2]
+    if not valid_keywords:
+        return []
+
+    from django.db.models import Q
+    from apps.knowledge.models import KnowledgeDoc
+
+    # 权限过滤（复刻 _apply_hard_filters 的 KnowledgeDoc 段）
+    SCHOOL_LEVEL = Q(college_id__isnull=True, department_id__isnull=True)
+    qs = KnowledgeDoc.objects.filter(
+        file_type='image', visibility='public',
+    )
+
+    is_admin_query = role in ('admin', 'college_admin', 'dept_admin', 'super_admin')
+    if not is_admin_query:
+        conditions = SCHOOL_LEVEL
+        if college_id:
+            conditions |= Q(college_id=college_id)
+        if department_id:
+            conditions |= Q(department_id=department_id)
+        if user_id:
+            conditions |= Q(uploader_id=user_id)
+        qs = qs.filter(conditions)
+    elif role in ('college_admin', 'admin'):
+        qs = qs.filter(
+            SCHOOL_LEVEL
+            | Q(college_id=college_id)
+            | Q(uploader_id=user_id),
+        )
+    elif role == 'dept_admin':
+        qs = qs.filter(
+            SCHOOL_LEVEL
+            | Q(department_id=department_id)
+            | Q(uploader_id=user_id),
+        )
+    # super_admin：不过滤
+
+    # 关键词匹配标题 / 描述
+    kw_query = Q()
+    for kw in valid_keywords:
+        kw_query |= Q(title__icontains=kw)
+        kw_query |= Q(description__icontains=kw)
+    qs = qs.filter(kw_query)
+
+    # 学科 / 学院 / 分类筛选（与检索一致；不应用 file_type，已强制 image）
+    if (cid := parsed_filters.get('college_id')):
+        qs = qs.filter(college_id=cid)
+    if (did := parsed_filters.get('discipline_id')):
+        qs = qs.filter(discipline_id=did)
+    if (cat_ids := parsed_filters.get('category_ids')):
+        qs = qs.filter(category_id__in=cat_ids)
+
+    results = []
+    for d in qs.values('id', 'title', 'description', 'oss_key', 'file_name')[:top_k]:
+        results.append({
+            'doc_id': d['id'],
+            'doc_title': d['title'],
+            'description': (d['description'] or '')[:200],
+            'oss_key': d['oss_key'],
+            'file_name': d['file_name'],
+            'score': 0.5,
+        })
+    return results
+
+
+# ------------------------------------------------------------------
 # 检索主入口（升级版）
 # ------------------------------------------------------------------
 def retrieve(
