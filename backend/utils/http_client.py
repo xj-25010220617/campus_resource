@@ -28,7 +28,9 @@ class ServiceTimeout(namedtuple('ServiceTimeout', ['connect', 'read'])):
 
 TIMEOUT_PROFILES = {
     'llm_chat': ServiceTimeout(10, 60),
-    'llm_stream': ServiceTimeout(10, 120),
+    # read 60s：流式问答超时后 3 次重试总耗时约 3×60+退避 ≈ 190s，
+    # 需控制在 nginx /api/chat/ proxy_read_timeout(300s) 之内，否则 error 事件发不出去
+    'llm_stream': ServiceTimeout(10, 60),
     # 视觉/多模态读图（qwen-vl），图片内容大、响应慢，read 放宽到 120s
     'llm_vision': ServiceTimeout(10, 120),
     'aliyun_embed': ServiceTimeout(10, 30),

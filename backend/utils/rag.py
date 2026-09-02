@@ -994,11 +994,15 @@ def retrieve_images(
 
     from django.db.models import Q
     from apps.knowledge.models import KnowledgeDoc
+    from apps.knowledge.serializers import IMAGE_FILE_TYPES
+
+    # 兼容存量数据：file_type 可能是类别 'image'，也可能是历史存的原始扩展名（jpg/png 等）
+    image_types = ['image'] + sorted(IMAGE_FILE_TYPES)
 
     # 权限过滤（复刻 _apply_hard_filters 的 KnowledgeDoc 段）
     SCHOOL_LEVEL = Q(college_id__isnull=True, department_id__isnull=True)
     qs = KnowledgeDoc.objects.filter(
-        file_type='image', visibility='public',
+        file_type__in=image_types, visibility='public',
     )
 
     is_admin_query = role in ('admin', 'college_admin', 'dept_admin', 'super_admin')
@@ -1025,6 +1029,9 @@ def retrieve_images(
         )
     # super_admin：不过滤
 
+    # 权限过滤后的基准集合（不含关键词/学科/分类筛选），供图片意图兜底使用
+    base_qs = qs
+
     # 关键词匹配标题 / 描述
     kw_query = Q()
     for kw in valid_keywords:
@@ -1050,6 +1057,19 @@ def retrieve_images(
             'file_name': d['file_name'],
             'score': 0.5,
         })
+
+    # 图片意图但关键词/筛选匹配不到：兜底返回最近上传的公开图片，避免"找图"问题返回空
+    if not results and _detect_image_intent(question):
+        for d in base_qs.order_by('-created_at').values('id', 'title', 'description', 'oss_key', 'file_name')[:top_k]:
+            results.append({
+                'doc_id': d['id'],
+                'doc_title': d['title'],
+                'description': (d['description'] or '')[:200],
+                'oss_key': d['oss_key'],
+                'file_name': d['file_name'],
+                'score': 0.3,
+            })
+
     return results
 
 
