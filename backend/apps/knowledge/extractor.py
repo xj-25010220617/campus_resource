@@ -47,6 +47,7 @@ class FreshnessResult:
 # 文本抽取（抽自 config/celery.py 的实现，复用之）
 # ------------------------------------------------------------------
 def _parse_pdf(file_path: str) -> str:
+    # 先尝试 PyMuPDF（性能更好）
     try:
         import fitz  # PyMuPDF
         doc = fitz.open(file_path)
@@ -56,11 +57,13 @@ def _parse_pdf(file_path: str) -> str:
     except Exception:
         pass
 
+    # 回退到 pdfplumber
     try:
         import pdfplumber
         text = ''
         with pdfplumber.open(file_path) as pdf:
-            for page in pdf.pages[:5]:  # 只取前 5 页（日期一般在前几页）
+            # 移除页数限制，读取全部内容
+            for page in pdf.pages:
                 t = page.extract_text()
                 if t:
                     text += t + '\n'
@@ -71,22 +74,34 @@ def _parse_pdf(file_path: str) -> str:
 
 
 def _parse_docx(file_path: str) -> str:
+    """DOCX 解析：段落 + 表格 + 文本框"""
     try:
         from docx import Document
         doc = Document(file_path)
-        return '\n'.join(p.text for p in doc.paragraphs)
+
+        # 1. 提取段落
+        text_parts = [p.text for p in doc.paragraphs if p.text.strip()]
+
+        # 2. 提取表格（行政文档核心内容常在表格里）
+        for table in doc.tables:
+            for row in table.rows:
+                row_text = '\t'.join(cell.text.strip() for cell in row.cells)
+                if row_text.strip():
+                    text_parts.append(row_text)
+
+        return '\n'.join(text_parts)
     except Exception as e:
         logger.warning(f'DOCX 解析失败: {e}')
         return ''
 
 
 def _parse_pptx(file_path: str) -> str:
-    """PPT 仅取前 8 张幻灯片（日期通常在封面/末页）"""
+    """PPTX 解析：全部幻灯片"""
     try:
         from pptx import Presentation
         prs = Presentation(file_path)
         text = ''
-        for slide in list(prs.slides)[:8]:
+        for slide in prs.slides:
             for shape in slide.shapes:
                 if shape.has_text_frame:
                     text += shape.text_frame.text + '\n'
@@ -97,13 +112,16 @@ def _parse_pptx(file_path: str) -> str:
 
 
 def _parse_xlsx(file_path: str) -> str:
+    """XLSX 解析：全部 sheet，全部行"""
     try:
         import openpyxl
         wb = openpyxl.load_workbook(file_path, data_only=True)
         text = ''
-        for sheet_name in wb.sheetnames[:3]:
+        for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
-            for row in ws.iter_rows(max_row=20, values_only=True):
+            # 添加 sheet 标题便于上下文
+            text += f'=== 工作表: {sheet_name} ===\n'
+            for row in ws.iter_rows(values_only=True):
                 row_text = '\t'.join(str(c) if c is not None else '' for c in row)
                 if row_text.strip():
                     text += row_text + '\n'
@@ -113,14 +131,90 @@ def _parse_xlsx(file_path: str) -> str:
         return ''
 
 
+def _parse_xls(file_path: str) -> str:
+    """XLS 旧格式解析（xlrd 回退方案）"""
+    try:
+        import xlrd
+        # xlrd 2.0+ 不支持 .xlsx，这里只处理 .xls
+        workbook = xlrd.open_workbook(file_path, formatting_info=False, on_demand=True)
+        text = ''
+        for sheet_idx in range(workbook.nsheets):
+            sheet = workbook.sheet_by_index(sheet_idx)
+            text += f'=== 工作表: {sheet.name} ===\n'
+            for row_idx in range(sheet.nrows):
+                row = sheet.row_values(row_idx)
+                row_text = '\t'.join(str(cell) if cell not in ('', None) else '' for cell in row)
+                if row_text.strip():
+                    text += row_text + '\n'
+        workbook.release_resources()
+        return text
+    except ImportError:
+        logger.warning('xlrd 未安装，XLS 解析不可用（pip install xlrd==1.2.0）')
+        return ''
+    except Exception as e:
+        logger.warning(f'XLS 解析失败: {e}')
+        return ''
+
+
+def _parse_doc(file_path: str) -> str:
+    """DOC 旧格式解析（antiword 或 docx2txt 回退方案）"""
+    # 方案1: antiword（Linux，最快）
+    try:
+        import subprocess
+        result = subprocess.run(['antiword', file_path], capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            return result.stdout
+    except (FileNotFoundError, ImportError, subprocess.TimeoutExpired, Exception):
+        pass
+
+    # 方案2: docx2txt（跨平台）
+    try:
+        import docx2txt
+        return docx2txt.process(file_path)
+    except ImportError:
+        logger.warning('docx2txt 未安装，DOC 解析不可用（pip install docx2txt）')
+        return ''
+    except Exception as e:
+        logger.warning(f'DOC 解析失败: {e}')
+        return ''
+
+    # 方案3: LibreOffice 转换（最兼容但慢）
+    try:
+        import subprocess
+        import tempfile
+        import os
+
+        # 创建临时目录
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 调用 LibreOffice 转换为 txt
+            subprocess.run([
+                'soffice', '--headless', '--convert-to', 'txt',
+                '--outdir', tmpdir, file_path
+            ], capture_output=True, timeout=60)
+
+            # 读取转换后的 txt
+            txt_path = os.path.join(tmpdir, os.path.splitext(os.path.basename(file_path))[0] + '.txt')
+            if os.path.exists(txt_path):
+                with open(txt_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    return f.read()
+    except (FileNotFoundError, ImportError, subprocess.TimeoutExpired, Exception):
+        pass
+
+    return ''
+
+
 _EXTRACTORS = {
     'pdf': _parse_pdf,
-    'doc': _parse_docx,
-    'docx': _parse_docx,
-    'ppt': _parse_pptx,
-    'pptx': _parse_pptx,
-    'xls': _parse_xlsx,
-    'xlsx': _parse_xlsx,
+    'doc': _parse_doc,      # 旧格式 DOC
+    'docx': _parse_docx,    # 新格式 DOCX
+    'ppt': _parse_pptx,     # PPT 实际上也是 .pptx 格式
+    'pptx': _parse_pptx,    # PPTX
+    'xls': _parse_xls,      # 旧格式 XLS
+    'xlsx': _parse_xlsx,    # 新格式 XLSX
+    'txt': lambda p: open(p, 'r', encoding='utf-8', errors='ignore').read(),
+    'md': lambda p: open(p, 'r', encoding='utf-8', errors='ignore').read(),
+    'html': lambda p: open(p, 'r', encoding='utf-8', errors='ignore').read(),
+    'htm': lambda p: open(p, 'r', encoding='utf-8', errors='ignore').read(),
 }
 
 
@@ -152,9 +246,9 @@ def extract_text_from_oss(oss_key: str, file_type: str) -> str:
         # 3. 抽取文本
         extractor = _EXTRACTORS.get(file_type.lower())
         if not extractor:
-            # 纯文本类型
+            # 纯文本类型：移除截断限制，读取全部内容
             with open(tmp_path, 'r', encoding='utf-8', errors='ignore') as f:
-                return f.read()[:TEXT_SNIPPET_CHARS * 2]
+                return f.read()
         return extractor(tmp_path)
     except Exception as e:
         logger.error(f'下载/抽取失败 oss_key={oss_key}: {e}')

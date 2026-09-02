@@ -351,10 +351,16 @@ class AskView(APIView):
         if not _url:
             _url = _re.search(r'(www\.nsu\.edu\.cn[\S]*)', question)
         if not _url:
+            # 放宽 topic 拦截：只有当问题明确要求"最新/当前/实时"信息时才劫持到联网搜索
+            # 避免用户问关于"图书馆"的知识库内容也被强制联网
             _topic_map = {'通知公告': '', '公告': '', '校园时讯': '', '新闻': '', '学校概况': '', '招生就业': '', '图书馆': ''}
-            for _topic in _topic_map:
-                if _topic in question:
-                    return self._handle_search_query(question, user, conversation_id, _topic)
+            _fresh_keywords = ['最新', '今天', '最近', '当前', '实时', '现', '即时']
+            has_fresh_intent = any(kw in question for kw in _fresh_keywords)
+
+            if has_fresh_intent:
+                for _topic in _topic_map:
+                    if _topic in question:
+                        return self._handle_search_query(question, user, conversation_id, _topic)
         if _url:
             return self._handle_web_query(question, user, conversation_id, _url.group())
 
@@ -411,13 +417,15 @@ class AskView(APIView):
         logger.debug(f'parsed_filters: {parsed}')
 
         # 3.1.5 FAQ 短路：高频问题走 FAQ 表（如果有）
+        # 收紧条件：仅对非常短的问题（<=15 字）且 FAQ 问题也较短（<=25 字）时才短路
         try:
             from apps.faq.models import FAQ
             from django.db.models import Q
-            if len(question) <= 30:
+            if len(question) <= 15:
+                # 只匹配问题长度相近的 FAQ，避免用长 FAQ 匹配短问题
                 faq_hit = FAQ.objects.filter(
-                    Q(question__icontains=question[:20]),
-                ).first()
+                    Q(question__iexact=question) | Q(question__contains=question),
+                ).annotate(q_len=Q).filter(q_len__lte=25).first()
                 if faq_hit:
                     logger.info('FAQ 短路命中: q=%s faq_id=%d', question[:30], faq_hit.id)
                     return Response({

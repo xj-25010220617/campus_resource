@@ -211,9 +211,11 @@ class MilvusClient:
         # 硬过滤：只检索指定 doc_id 范围内的向量（来自 SQL 硬过滤）
         expr = None
         if filter_ids:
-            # Milvus 表达式：doc_id in [1, 2, 3, ...]
-            # 为防止空列表出错，跳过 expr
-            expr = f'doc_id in {filter_ids}'
+            # 处理负数 doc_id（KnowledgeDoc 用负数区分来源，但 Milvus 存储的是正 ID）
+            # 例如: filter_ids = [1, 2, -5, -8] → 需要匹配 doc_id in [1, 2, 5, 8]
+            positive_ids = [abs(d) for d in filter_ids if d != 0]
+            if positive_ids:
+                expr = f'doc_id in {positive_ids}'
 
         results = collection.search(
             data=[query_embedding],
