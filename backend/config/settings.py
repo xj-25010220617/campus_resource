@@ -254,6 +254,9 @@ FAQ_CLUSTER_THRESHOLD = 0.85
 FAQ_DEDUP_THRESHOLD = 0.90
 # 日志采集天数
 FAQ_ANALYSIS_DAYS = 7
+# 官网/知识库 FAQ 草稿生成配置
+FAQ_WEBSITE_MAX_PAGES = config('FAQ_WEBSITE_MAX_PAGES', default=20, cast=int)
+FAQ_WEBSITE_MAX_DOCS = config('FAQ_WEBSITE_MAX_DOCS', default=20, cast=int)
 
 # ------------------------------------------------------------------
 # 官网爬虫配置

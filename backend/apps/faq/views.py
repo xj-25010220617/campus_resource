@@ -359,7 +359,7 @@ class FAQGenerateTriggerView(generics.GenericAPIView):
         from utils.celery_dispatcher import safe_delay
         from .tasks import generate_faq_weekly
 
-        async_result = safe_delay(generate_faq_weekly)
+        async_result = safe_delay(generate_faq_weekly, log_id=log.id)
 
         return Response(
             {
@@ -367,6 +367,40 @@ class FAQGenerateTriggerView(generics.GenericAPIView):
                 'status': log.status,
                 'task_id': getattr(async_result, 'id', None),
                 'message': 'FAQ 生成任务已投递，可通过 GET /api/faq/generation-logs/{id}/ 查看进度',
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class FAQWebsiteGenerateTriggerView(generics.GenericAPIView):
+    """手动触发官网/知识库 FAQ 草稿生成（仅 super_admin）。"""
+    permission_classes = [permissions.IsAuthenticated, IsSuperAdmin]
+
+    def post(self, request, *args, **kwargs):
+        from datetime import timedelta
+
+        running_log = FAQGenerationLog.objects.filter(status='running').first()
+        if running_log and running_log.started_at \
+                and running_log.started_at > timezone.now() - timedelta(hours=2):
+            return Response(
+                {
+                    'detail': f'已有 FAQ 生成任务正在进行（log_id={running_log.id}），请稍后再试',
+                    'code': 'FAQ_GENERATION_RUNNING',
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        log = FAQGenerationLog.objects.create(status='running')
+        from utils.celery_dispatcher import safe_delay
+        from .tasks import generate_faq_from_website
+
+        async_result = safe_delay(generate_faq_from_website, log_id=log.id)
+        return Response(
+            {
+                'log_id': log.id,
+                'status': log.status,
+                'task_id': getattr(async_result, 'id', None),
+                'message': '官网 FAQ 草稿生成任务已投递，可通过生成日志查看进度',
             },
             status=status.HTTP_200_OK,
         )
