@@ -526,7 +526,7 @@ class AdminUploadLogListView(generics.ListAPIView):
 
     def get_queryset(self):
         qs = UploadLog.objects.select_related(
-            'user', 'college', 'department', 'resource',
+            'user', 'college', 'department', 'knowledge_doc',
         )
         for key in ('user_id', 'status', 'college_id', 'department_id', 'file_type'):
             value = self.request.query_params.get(key)
@@ -551,7 +551,7 @@ class AdminUploadLogDetailView(generics.RetrieveAPIView):
     permission_classes = [permissions.IsAuthenticated, IsSuperAdmin]
     serializer_class = AdminUploadLogSerializer
     queryset = UploadLog.objects.select_related(
-        'user', 'college', 'department', 'resource',
+        'user', 'college', 'department', 'knowledge_doc',
     )
 
 

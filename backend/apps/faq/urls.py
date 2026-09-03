@@ -12,6 +12,7 @@ from .views import (
     FAQGenerationLogListView,
     FAQGenerationLogDetailView,
     FAQGenerateTriggerView,
+    FAQWebsiteGenerateTriggerView,
 )
 
 urlpatterns = [
@@ -31,6 +32,11 @@ urlpatterns = [
 
     # 手动触发 FAQ 生成（仅 super_admin）
     path('faq/generate/', FAQGenerateTriggerView.as_view(), name='faq_generate_trigger'),
+    path(
+        'faq/generate-from-website/',
+        FAQWebsiteGenerateTriggerView.as_view(),
+        name='faq_generate_from_website',
+    ),
 
     # FAQ 生成日志（管理端查看）
     path('faq/generation-logs/', FAQGenerationLogListView.as_view(), name='faq_generation_logs'),

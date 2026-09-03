@@ -421,11 +421,12 @@ class AskView(APIView):
         try:
             from apps.faq.models import FAQ
             from django.db.models import Q
+            from django.db.models.functions import Length
             if len(question) <= 15:
                 # 只匹配问题长度相近的 FAQ，避免用长 FAQ 匹配短问题
                 faq_hit = FAQ.objects.filter(
                     Q(question__iexact=question) | Q(question__contains=question),
-                ).annotate(q_len=Q).filter(q_len__lte=25).first()
+                ).annotate(q_len=Length('question')).filter(q_len__lte=25).first()
                 if faq_hit:
                     logger.info('FAQ 短路命中: q=%s faq_id=%d', question[:30], faq_hit.id)
                     return Response({

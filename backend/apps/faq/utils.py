@@ -167,6 +167,54 @@ def filter_by_ratio(
     return [c for c, _ in top]
 
 
+def generate_faq_from_source(title: str, content: str, source_url: str = '') -> Optional[dict]:
+    """根据官网文档生成单条 FAQ 草稿，答案必须有来源依据。"""
+    if not content or not content.strip():
+        return None
+
+    system_prompt = """你是校园官网 FAQ 编辑。只能依据用户提供的文档内容生成一条 FAQ。
+不得补充文档中没有的事实、电话、网址、时间或政策；信息不足时返回 null。
+输出严格 JSON，不要 Markdown 或其他文字：
+{"question":"标准化问题","answer":"依据原文整理的答案","tags":["标签"],"college_name":"学院名称或全局"}
+问题应是学生或教职工会实际提出的办事问题，答案简洁、可执行；答案中不得声称文档未提及的内容。"""
+    user_prompt = (
+        f"文档标题：{title[:300]}\\n来源：{source_url[:500]}\\n"
+        f"文档内容：\\n{content[:12000]}\\n\\n"
+        "若文档不包含明确的办事/服务信息，返回 null。"
+    )
+    try:
+        import json as _json
+        response = llm_client.chat(
+            messages=[
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': user_prompt},
+            ],
+            temperature=0.2,
+            max_tokens=1200,
+        )
+        if not response:
+            return None
+        text = response.strip()
+        if text.lower() == 'null':
+            return None
+        if '```' in text:
+            text = text.split('```json')[-1].split('```')[0].strip()
+        result = _json.loads(text)
+        question = str(result.get('question') or '').strip()
+        answer = str(result.get('answer') or '').strip()
+        if not question or not answer:
+            return None
+        return {
+            'question': question[:500],
+            'answer': answer,
+            'tags': result.get('tags', []) if isinstance(result.get('tags', []), list) else [],
+            'college_name': str(result.get('college_name') or '全局'),
+        }
+    except Exception as exc:
+        logger.warning('官网文档 FAQ 生成失败 title=%s: %s', title[:50], exc)
+        return None
+
+
 def generate_faq_draft(cluster: QuestionCluster) -> Optional[dict]:
     """
     对单个高频问题簇调用 LLM 生成 FAQ 草稿（阶段4）。

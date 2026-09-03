@@ -25,6 +25,7 @@ from .utils import (
     cluster_similar_questions,
     filter_by_ratio,
     generate_faq_draft,
+    generate_faq_from_source,
     cosine_similarity,
 )
 
@@ -32,34 +33,38 @@ logger = logging.getLogger(__name__)
 
 
 @shared_task(bind=True, max_retries=2, default_retry_delay=120)
-def generate_faq_weekly(self):
+def generate_faq_weekly(self, log_id=None):
     """
     主入口：每周 FAQ 自动提取流程。
 
     由 Celery Beat 定时触发（每周一 03:00）。
     也可手动调用: python manage.py shell -c "from apps.faq.tasks import generate_faq_weekly; generate_faq_weekly()"
     """
-    # 防重叠：检查是否有正在运行的
-    running_log = FAQGenerationLog.objects.filter(status='running').first()
-    if running_log:
-        # 超过 2 小时视为僵死，允许重新运行
-        if running_log.started_at and running_log.started_at > timezone.now() - timedelta(hours=2):
-            logger.warning('FAQ 生成任务已在运行中（log_id=%d），跳过本次触发', running_log.id)
+    # API 触发时复用已创建的日志；Beat/命令行则自行创建日志。
+    if log_id:
+        log = FAQGenerationLog.objects.get(id=log_id)
+        if log.status != 'running':
+            logger.warning('FAQ 生成日志已结束（log_id=%d, status=%s）', log.id, log.status)
             return
-        else:
+    else:
+        # 防重叠：检查是否有正在运行的
+        running_log = FAQGenerationLog.objects.filter(status='running').first()
+        if running_log:
+            # 超过 2 小时视为僵死，允许重新运行
+            if running_log.started_at and running_log.started_at > timezone.now() - timedelta(hours=2):
+                logger.warning('FAQ 生成任务已在运行中（log_id=%d），跳过本次触发', running_log.id)
+                return
             logger.warning('发现僵死的 FAQ 生成任务（log_id=%d），重新开始', running_log.id)
             running_log.status = 'failed'
             running_log.error_message = '超时自动标记为失败'
             running_log.completed_at = timezone.now()
             running_log.save(update_fields=['status', 'error_message', 'completed_at'])
-
-    # 创建运行日志
-    log = FAQGenerationLog.objects.create(status='running')
+        log = FAQGenerationLog.objects.create(status='running')
     logger.info('FAQ 自动生成开始（log_id=%d）', log.id)
 
     try:
         # ---- 阶段1: 采集 ----
-        since = timezone.now() - timedelta(days=7)
+        since = timezone.now() - timedelta(days=getattr(settings, 'FAQ_ANALYSIS_DAYS', 7))
         messages = (
             ChatMessage.objects
             .filter(role='user', created_at__gte=since)
@@ -221,11 +226,100 @@ def generate_faq_weekly(self):
                     'FAQ 生成最终状态: log_id=%d status=%s drafts=%d',
                     log.id, log.status, drafts_created,
                 )
-
     except Exception as e:
-        logger.error(f'FAQ 自动生成失败: {e}')
+        logger.exception('FAQ 自动生成失败（log_id=%d）', log.id)
+        if log.status == 'running':
+            log.status = 'failed'
+            log.error_message = str(e)[:2000]
+            log.completed_at = timezone.now()
+            log.save(update_fields=['status', 'error_message', 'completed_at'])
+        raise self.retry(exc=e)
+
+
+@shared_task(bind=True, max_retries=1, default_retry_delay=120)
+def generate_faq_from_website(self, log_id=None, max_pages=None, max_docs=None):
+    """抓取学校官网，并仅从抓取文档中生成待审核 FAQ 草稿。"""
+    from apps.knowledge.extractor import extract_text_from_oss
+    from apps.knowledge.models import KnowledgeDoc
+    from utils.crawler import crawl_and_index
+
+    max_pages = max_pages or getattr(settings, 'FAQ_WEBSITE_MAX_PAGES', 20)
+    max_docs = max_docs or getattr(settings, 'FAQ_WEBSITE_MAX_DOCS', 20)
+    max_pages = max(1, min(int(max_pages), 500))
+    max_docs = max(1, min(int(max_docs), 100))
+    if log_id:
+        log = FAQGenerationLog.objects.get(id=log_id)
+        if log.status != 'running':
+            return
+    else:
+        active_log = FAQGenerationLog.objects.filter(status='running').first()
+        if active_log and active_log.started_at > timezone.now() - timedelta(hours=2):
+            logger.warning('FAQ 官网生成任务已在运行中（log_id=%d）', active_log.id)
+            return
+        log = FAQGenerationLog.objects.create(status='running')
+
+    try:
+        saved_count = crawl_and_index(max_pages=max_pages)
+        docs = list(
+            KnowledgeDoc.objects.filter(
+                source_type='website', visibility='public', status__in=['uploaded', 'indexed'],
+            ).order_by('-created_at')[:max_docs]
+        )
+        log.total_questions = len(docs)
+        log.clusters_found = saved_count
+        log.save(update_fields=['total_questions', 'clusters_found'])
+
+        created = 0
+        existing_faqs = FAQItem.objects.filter(status__in=['draft', 'published'])
+        existing_questions = set(existing_faqs.values_list('question', flat=True))
+        processed_doc_ids = {
+            doc_id
+            for related_doc_ids in existing_faqs.values_list('related_doc_ids', flat=True)
+            for doc_id in (related_doc_ids or [])
+        }
+        for doc in docs:
+            # A document already represented by a draft or published FAQ is
+            # immutable for this pipeline; do not generate a second draft.
+            if doc.id in processed_doc_ids:
+                continue
+            text = extract_text_from_oss(doc.oss_key, doc.file_type)
+            result = generate_faq_from_source(doc.title, text, doc.source_url)
+            if not result or result['question'] in existing_questions:
+                continue
+            FAQItem.objects.create(
+                question=result['question'],
+                answer=result['answer'],
+                tags=result['tags'],
+                status='draft',
+                college_id=_resolve_college_id(result['college_name']),
+                related_doc_ids=[doc.id],
+                source_period_start=doc.created_at,
+                source_period_end=timezone.now(),
+            )
+            existing_questions.add(result['question'])
+            processed_doc_ids.add(doc.id)
+            created += 1
+
+        log.status = 'completed'
+        log.drafts_generated = created
+        log.completed_at = timezone.now()
+        if not created:
+            log.error_message = '官网文档已处理，但未发现可生成的可审核 FAQ。'
+        log.save(update_fields=['status', 'drafts_generated', 'completed_at', 'error_message'])
+        logger.info('FAQ 官网生成完成（log_id=%d, docs=%d, drafts=%d）', log.id, len(docs), created)
+        return log.id
+    except Exception as exc:
+        logger.exception('FAQ 官网生成失败（log_id=%d）', log.id)
         log.status = 'failed'
-        log.error_message = str(e)[:2000]
+        log.error_message = str(exc)[:2000]
         log.completed_at = timezone.now()
         log.save(update_fields=['status', 'error_message', 'completed_at'])
-        raise self.retry(exc=e)
+        raise
+
+
+def _resolve_college_id(college_name):
+    if not college_name or college_name == '全局':
+        return None
+    from apps.accounts.models import College
+    college = College.objects.filter(name__icontains=college_name).first()
+    return college.id if college else None
