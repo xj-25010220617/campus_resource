@@ -175,6 +175,12 @@ def index_document_task(self, doc_id: int):
             raise RuntimeError('Embedding 失败')
 
         # 4. 确保向量集合存在 → 写入 Milvus
+        # Remove remnants from an earlier attempt before writing a fresh index.
+        # Milvus vector IDs are deterministic, so deleting by document makes retries
+        # safe and prevents duplicate chunks from being returned.
+        milvus_client.delete_by_doc(doc_id)
+        DocChunk.objects.filter(doc_id=doc_id).delete()
+
         milvus_client.ensure_collection()
         milvus_chunks = []
         for i, c in enumerate(raw_chunks):

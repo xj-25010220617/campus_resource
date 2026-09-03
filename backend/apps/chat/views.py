@@ -504,7 +504,7 @@ class AskView(APIView):
         # 6. 创建 AI 消息占位（流结束后写入完整内容）
         is_authorized = user_role in ('admin', 'super_admin')
         references_detail = build_references_events(
-            results, user_role, user_id,
+            results, user_role, user_id, user_context=user_context,
         ).get('references_detail', [])
 
         assistant_msg = ChatMessage.objects.create(
@@ -559,7 +559,9 @@ class AskView(APIView):
                     yield _format_sse('suggested', suggested)
 
                 # 引用溯源
-                refs = build_references_events(results, user_role, user_id)
+                refs = build_references_events(
+                    results, user_role, user_id, user_context=user_context,
+                )
                 if 'references' in refs:
                     yield _format_sse('references', refs['references'])
                 if 'references_detail' in refs and is_authorized:
@@ -1030,7 +1032,6 @@ class VoiceAskView(APIView):
                     min_score=rag.RAG_SCORE_THRESHOLD,
                 )
                 messages = rag.build_rag_prompt(question, hits)
-                sensitive_hit = any(check_sensitive(m.get('content', '')) for m in messages)
 
                 # 更新查询日志的 hits 信息
                 log.hit_count = len(hits)
@@ -1040,17 +1041,22 @@ class VoiceAskView(APIView):
                 for chunk in llm_client.chat_stream(messages):
                     full_answer += chunk
                     yield _format_sse('token', {'content': chunk})
+                references = build_references_events(
+                    hits, user.role, user.id, user_context=user_context,
+                )
+                persisted_refs = references.get('references_detail', [])
                 ai_msg = ChatMessage.objects.create(
                     conversation=conv, role='assistant', content=full_answer,
-                    references={'hits': hits, 'sensitive': sensitive_hit},
+                    references=persisted_refs,
                 )
                 ai_msg_ref[0] = ai_msg
                 log.response_ms = int((time.time() - t0) * 1000)
                 log.save()
+                if 'references' in references:
+                    yield _format_sse('references', references['references'])
+                if 'references_detail' in references and user.role in ('admin', 'super_admin'):
+                    yield _format_sse('references_detail', references['references_detail'])
                 yield _format_sse('done', {'message_id': ai_msg.id})
-                refs = build_references_events(hits, user.role, user.id)
-                if 'references' in refs:
-                    yield _format_sse('references', refs['references'])
             except GeneratorExit:
                 raise
             except Exception as e:

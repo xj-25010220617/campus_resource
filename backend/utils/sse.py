@@ -201,75 +201,97 @@ def build_references_events(
     search_results: list,
     user_role: str,
     user_id: int = None,
+    user_context: dict = None,
 ) -> dict:
-    """
-    根据用户角色构造 references / references_detail 事件数据。
+    """构造来源事件，并在生成签名 URL 前完成文档授权校验。
 
-    设计文档第 14.2 节⑬⑭:
-    - user: 仅返回 count + summary
-    - admin: 看自己上传文档的引用详情
-    - super_admin: 看全部引用详情
-
-    Args:
-        search_results: retrieve() 返回的检索结果列表
-        user_role: 用户角色 ('user' | 'admin' | 'super_admin')
-        user_id: 当前用户 ID（admin 需据此过滤）
-
-    Returns:
-        {'references': {...}} 或 {'references_detail': [...]}
+    KnowledgeDoc 来源会返回文件元数据；网页、FAQ 等非文件来源只返回
+    经过校验的来源 URL，不会把检索结果中的任意 OSS key 当作可信输入。
     """
     if not search_results:
         return {'references': {'count': 0, 'summary': '未找到相关参考资料'}}
 
-    # 过滤 score >= 0.7 的作为引用
-    from .rag import RAG_REFERENCE_THRESHOLD
-    qualified = [r for r in search_results if r.get('score', 0) >= RAG_REFERENCE_THRESHOLD]
+    from .rag import RAG_REFERENCE_THRESHOLD, authorized_knowledge_docs
 
+    # 引用阈值独立于向量融合分数，避免 0.7 权重把相关来源全部过滤掉。
+    qualified = [
+        result for result in search_results
+        if result.get('score', 0) >= min(RAG_REFERENCE_THRESHOLD, 0.35)
+    ]
+    if not qualified:
+        return {'references': {'count': 0, 'summary': '暂无高相关度参考资料'}}
+
+    context = dict(user_context or {})
+    context.setdefault('role', user_role or 'user')
+    context.setdefault('user_id', user_id)
+    doc_ids = {int(r['doc_id']) for r in qualified if r.get('doc_id')}
+    docs_by_id = {}
+    if doc_ids:
+        docs_by_id = {
+            doc.id: doc for doc in authorized_knowledge_docs(context).filter(
+                id__in=doc_ids,
+            )
+        }
+
+    # 普通用户只看到授权后的数量摘要。
     if user_role == 'user':
+        count = sum(1 for result in qualified if result.get('doc_id') in docs_by_id)
         return {
             'references': {
-                'count': len(qualified),
-                'summary': f'参考了{len(qualified)}份文档' if qualified else '暂无高相关度参考资料',
+                'count': count,
+                'summary': f'参考了{count}份文档' if count else '暂无高相关度参考资料',
             }
         }
 
-    # admin / super_admin: 构建引用详情
+    from urllib.parse import urlparse
+    from .oss import oss_client
+
     detail = []
-    for r in qualified:
-        entry = {
-            'doc_id': r['doc_id'],
-            'doc_title': r['doc_title'],
-            'page': r.get('page', 0),
-            'score': r['score'],
-            'content_snippet': r.get('content', '')[:200],
-        }
-        # 生成 OSS 签名下载 URL
-        try:
-            from .oss import oss_client
-            from apps.knowledge.models import KnowledgeDoc
-            doc = KnowledgeDoc.objects.filter(id=r['doc_id']).first()
-            if doc and doc.oss_key:
-                entry['download_url'] = oss_client.get_download_url(
-                    doc.oss_key, expires=300, file_name=doc.file_name,
-                )
-        except (ImportError, Exception):
-            pass
-        detail.append(entry)
+    for result in qualified:
+        doc_id = result.get('doc_id')
+        doc = docs_by_id.get(int(doc_id)) if doc_id else None
+        if doc is not None:
+            entry = {
+                'doc_id': doc.id,
+                'doc_title': doc.title,
+                'source_type': doc.source_type,
+                'file_name': doc.file_name,
+                'page': result.get('page', 0),
+                'chunk_index': result.get('chunk_index'),
+                'score': result.get('score', 0),
+                'content_snippet': result.get('content', '')[:200],
+                'source_url': doc.source_url or '',
+            }
+            if doc.oss_key:
+                try:
+                    entry['download_url'] = oss_client.get_download_url(
+                        doc.oss_key, expires=300, file_name=doc.file_name,
+                    ) or ''
+                except Exception as exc:
+                    logger.warning('生成文档下载链接失败 doc_id=%s: %s', doc.id, exc)
+                    entry['download_url'] = ''
+            detail.append(entry)
+            continue
 
-    # admin 进一步过滤：只能看自己上传的
-    if user_role == 'admin' and user_id:
-        try:
-            from apps.knowledge.models import KnowledgeDoc
-            own_doc_ids = set(
-                KnowledgeDoc.objects.filter(
-                    uploader_id=user_id, id__in=[d['doc_id'] for d in detail]
-                ).values_list('id', flat=True)
-            )
-            detail = [d for d in detail if d['doc_id'] in own_doc_ids]
-        except ImportError:
-            pass
+        # Non-file source: preserve it only as a safe web/labelled source.
+        source_url = result.get('source_url') or ''
+        parsed = urlparse(source_url)
+        if source_url and parsed.scheme in ('http', 'https') and parsed.netloc:
+            detail.append({
+                'doc_id': None,
+                'doc_title': result.get('doc_title', '外部网页'),
+                'source_type': result.get('source_type') or 'web',
+                'file_name': '',
+                'page': result.get('page', 0),
+                'score': result.get('score', 0),
+                'content_snippet': result.get('content', '')[:200],
+                'source_url': source_url,
+                'download_url': '',
+            })
 
-    return {'references_detail': detail}
+    return {'references_detail': detail} if detail else {
+        'references': {'count': 0, 'summary': '暂无可展示的授权参考资料'},
+    }
 
 
 def build_images_events(image_results: list) -> dict:

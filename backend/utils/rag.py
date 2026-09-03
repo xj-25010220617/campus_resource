@@ -438,6 +438,7 @@ def _keyword_search(
     question: str,
     top_k: int = 10,
     doc_ids: Optional[List[int]] = None,
+    user_context: Optional[dict] = None,
 ) -> List[dict]:
     """在 KnowledgeDoc 元数据中进行关键词匹配。"""
     try:
@@ -452,7 +453,6 @@ def _keyword_search(
         return []
 
     from django.db.models import Q
-    from apps.knowledge.models import KnowledgeDoc
 
     kw_query = Q()
     for kw in keywords:
@@ -460,12 +460,18 @@ def _keyword_search(
             kw_query |= Q(title__icontains=kw)
             kw_query |= Q(description__icontains=kw)
 
-    qs = KnowledgeDoc.objects.filter(kw_query, status='indexed')
+    # The same authorization scope is used by vector, keyword, and title search.
+    qs = authorized_knowledge_docs(user_context).filter(
+        kw_query, status='indexed',
+    )
     if doc_ids is not None:
         qs = qs.filter(id__in=[doc_id for doc_id in doc_ids if doc_id > 0])
 
     results = []
-    for doc in qs.values('id', 'title', 'description')[:top_k]:
+    for doc in qs.values(
+        'id', 'title', 'description', 'source_type', 'source_url',
+        'file_name', 'oss_key',
+    )[:top_k]:
         excerpt = (doc['description'] or '')[:300]
         results.append({
             'doc_id': doc['id'],
@@ -473,6 +479,10 @@ def _keyword_search(
             'content': f"{doc['title']} {excerpt}".strip(),
             'score': 0.55,
             'page': 0,
+            'source_type': doc['source_type'],
+            'source_url': doc['source_url'],
+            'file_name': doc['file_name'],
+            'oss_key': doc['oss_key'],
         })
     return results
 
@@ -523,21 +533,39 @@ def _merge_and_rerank(
             'vector_id': hit.get('vector_id'),
             'content': hit.get('chunk_text', ''),
             'page': hit.get('page_number', 0),
+            'doc_title': hit.get('doc_title', ''),
+            'source_type': hit.get('source_type', ''),
+            'source_url': hit.get('source_url', ''),
+            'file_name': hit.get('file_name', ''),
+            'oss_key': hit.get('oss_key', ''),
             'score': hit['score'] * vector_weight,
         }
 
     for hit in keyword_hits:
-        key = f"kw_{hit.get('doc_id')}"
-        existing = merged.get(key)
+        # Merge keyword evidence into the best existing hit for the same document;
+        # vector chunks remain separate so useful passages are not discarded.
+        existing = next(
+            (item for item in merged.values() if item.get('doc_id') == hit.get('doc_id')),
+            None,
+        )
         if existing:
             existing['score'] += hit['score'] * (1 - vector_weight)
+            for field in ('doc_title', 'source_type', 'source_url', 'file_name', 'oss_key'):
+                if hit.get(field) and not existing.get(field):
+                    existing[field] = hit[field]
         else:
+            key = f"kw_{hit.get('doc_id')}"
             merged[key] = {
                 'doc_id': hit.get('doc_id'),
+                'doc_title': hit.get('doc_title', ''),
                 'content': hit.get('content', ''),
                 'page': hit.get('page', 0),
                 'vector_id': '',
                 'score': hit['score'] * (1 - vector_weight),
+                'source_type': hit.get('source_type', ''),
+                'source_url': hit.get('source_url', ''),
+                'file_name': hit.get('file_name', ''),
+                'oss_key': hit.get('oss_key', ''),
             }
 
     # 关键词权重加成
@@ -554,6 +582,45 @@ def _merge_and_rerank(
 
 
 # ------------------------------------------------------------------
+# 文档授权范围（所有检索路径共用）
+# ------------------------------------------------------------------
+def authorized_knowledge_docs(user_context: Optional[dict] = None):
+    """返回当前用户可检索的 KnowledgeDoc QuerySet。
+
+    授权逻辑必须在召回和引用签名前保持一致。超管可查看全部文档，
+    其他角色仅可查看公开的学校/本部门或本人上传文档。
+    """
+    from django.db.models import Q
+    from apps.knowledge.models import KnowledgeDoc
+
+    user_context = user_context or {}
+    role = user_context.get('role', 'user')
+    user_id = user_context.get('user_id')
+    college_id = user_context.get('college_id')
+    department_id = user_context.get('department_id')
+
+    qs = KnowledgeDoc.objects.all()
+    if role == 'super_admin':
+        return qs
+
+    qs = qs.filter(visibility='public')
+    school_level = Q(college_id__isnull=True, department_id__isnull=True)
+    if role in ('admin', 'college_admin'):
+        return qs.filter(school_level | Q(college_id=college_id) | Q(uploader_id=user_id))
+    if role == 'dept_admin':
+        return qs.filter(school_level | Q(department_id=department_id) | Q(uploader_id=user_id))
+
+    conditions = school_level
+    if college_id:
+        conditions |= Q(college_id=college_id)
+    if department_id:
+        conditions |= Q(department_id=department_id)
+    if user_id:
+        conditions |= Q(uploader_id=user_id)
+    return qs.filter(conditions)
+
+
+# ------------------------------------------------------------------
 # 硬过滤（SQL WHERE 缩范围）
 # ------------------------------------------------------------------
 def _apply_hard_filters(
@@ -562,44 +629,19 @@ def _apply_hard_filters(
     top_k: int = 500,
 ) -> List[int]:
     """对 KnowledgeDoc 执行 SQL 硬过滤并返回候选文档 ID。"""
-    from datetime import timedelta
-    from django.db.models import Q
-    from django.utils import timezone
     from apps.knowledge.models import KnowledgeDoc
 
     time_range = filters.get('time_range')
-    need_history = filters.get('need_history', False)
-    one_year_ago = None
-    if not time_range and not need_history:
-        one_year_ago = timezone.now() - timedelta(days=365)
+    qs = authorized_knowledge_docs(user_context).filter(status='indexed')
 
-    qs = KnowledgeDoc.objects.filter(status='indexed')
-    if one_year_ago:
-        qs = qs.filter(created_at__gte=one_year_ago)
-
-    role = user_context.get('role', 'user')
-    user_id = user_context.get('user_id')
-    college_id = user_context.get('college_id')
-    department_id = user_context.get('department_id')
-    school_level = Q(college_id__isnull=True, department_id__isnull=True)
-
-    # AI 检索仅允许公开文档；管理员按其管理范围可见，超管全量。
-    qs = qs.filter(visibility='public')
-    if role == 'super_admin':
-        pass
-    elif role in ('admin', 'college_admin'):
-        qs = qs.filter(school_level | Q(college_id=college_id) | Q(uploader_id=user_id))
-    elif role == 'dept_admin':
-        qs = qs.filter(school_level | Q(department_id=department_id) | Q(uploader_id=user_id))
-    else:
-        conditions = school_level
-        if college_id:
-            conditions |= Q(college_id=college_id)
-        if department_id:
-            conditions |= Q(department_id=department_id)
-        if user_id:
-            conditions |= Q(uploader_id=user_id)
-        qs = qs.filter(conditions)
+    # 不再默认只检索近一年；只有用户明确给出时间范围时才过滤。
+    if time_range:
+        import re
+        if re.match(r'^\d{4}$', time_range):
+            qs = qs.filter(created_at__year=int(time_range))
+        elif re.match(r'^\d{4}-\d{2}$', time_range):
+            year, month = time_range.split('-')
+            qs = qs.filter(created_at__year=int(year), created_at__month=int(month))
 
     if (cid := filters.get('college_id')):
         qs = qs.filter(college_id=cid)
@@ -609,13 +651,6 @@ def _apply_hard_filters(
         qs = qs.filter(category_id__in=cat_ids)
     if (ft := filters.get('file_type')):
         qs = qs.filter(file_type=ft)
-    if (tr := filters.get('time_range')):
-        import re
-        if re.match(r'^\d{4}$', tr):
-            qs = qs.filter(created_at__year=int(tr))
-        elif re.match(r'^\d{4}-\d{2}$', tr):
-            year, month = tr.split('-')
-            qs = qs.filter(created_at__year=int(year), created_at__month=int(month))
 
     return list(qs.values_list('id', flat=True)[:top_k])
 
@@ -633,44 +668,15 @@ def _filter_by_permission(
     if not hits:
         return []
 
-    from apps.knowledge.models import KnowledgeDoc
-    from django.db.models import Q
-
-    role = user_context.get('role', 'user')
-    user_id = user_context.get('user_id')
-    user_college_id = user_context.get('college_id')
-    doc_ids = list(set(h['doc_id'] for h in hits if h.get('doc_id')))
+    doc_ids = list({h.get('doc_id') for h in hits if h.get('doc_id')})
     if not doc_ids:
         return []
-
-    school_level = Q(college_id__isnull=True, department_id__isnull=True)
-    qs = KnowledgeDoc.objects.filter(
-        id__in=doc_ids, visibility='public',
+    allowed_ids = set(
+        authorized_knowledge_docs(user_context)
+        .filter(id__in=doc_ids)
+        .values_list('id', flat=True)
     )
-    if role == 'super_admin':
-        pass
-    elif role in ('college_admin', 'admin'):
-        qs = qs.filter(
-            school_level | Q(college_id=user_college_id) | Q(uploader_id=user_id),
-        )
-    elif role == 'dept_admin':
-        qs = qs.filter(
-            school_level
-            | Q(department_id=user_context.get('department_id'))
-            | Q(uploader_id=user_id),
-        )
-    else:
-        conditions = school_level
-        if user_college_id:
-            conditions |= Q(college_id=user_college_id)
-        if user_context.get('department_id'):
-            conditions |= Q(department_id=user_context['department_id'])
-        if user_id:
-            conditions |= Q(uploader_id=user_id)
-        qs = qs.filter(conditions)
-
-    allowed_ids = set(qs.values_list('id', flat=True))
-    return [h for h in hits if h.get('doc_id') in allowed_ids][:5]
+    return [h for h in hits if h.get('doc_id') in allowed_ids][:RAG_TOP_K]
 
 
 # ------------------------------------------------------------------
@@ -688,8 +694,9 @@ def _enrich_with_doc_meta(hits: List[dict], min_score: float) -> List[dict]:
 
     doc_ids = list({int(h['doc_id']) for h in hits if h.get('doc_id')})
     doc_title_map = {
-        row['id']: row['title']
-        for row in KnowledgeDoc.objects.filter(id__in=doc_ids).values('id', 'title')
+        row['id']: row for row in KnowledgeDoc.objects.filter(id__in=doc_ids).values(
+            'id', 'title', 'source_type', 'source_url', 'file_name', 'oss_key',
+        )
     }
 
     results = []
@@ -699,12 +706,19 @@ def _enrich_with_doc_meta(hits: List[dict], min_score: float) -> List[dict]:
         if not hit.get('content'):
             continue
         did = int(hit['doc_id'])
+        meta = doc_title_map.get(did, {})
         results.append({
             'doc_id': did,
-            'doc_title': doc_title_map.get(did, '未知文档'),
+            'doc_title': meta.get('title') or hit.get('doc_title', '未知文档'),
             'content': hit['content'],
             'score': round(hit['score'], 4),
             'page': hit.get('page', 0),
+            'chunk_index': hit.get('chunk_index'),
+            'vector_id': hit.get('vector_id', ''),
+            'source_type': meta.get('source_type') or hit.get('source_type', ''),
+            'source_url': meta.get('source_url') or hit.get('source_url', ''),
+            'file_name': meta.get('file_name') or hit.get('file_name', ''),
+            'oss_key': meta.get('oss_key') or hit.get('oss_key', ''),
         })
         if len(results) >= 5:
             break
@@ -727,7 +741,7 @@ def _fallback_title_search(
     """
     import re
     from django.db.models import Q
-    from apps.knowledge.models import KnowledgeDoc, DocChunk
+    from apps.knowledge.models import DocChunk
 
     # 提取关键词：去疑问词，取有意义的词
     stop_words = {"什么", "怎么", "如何", "为什么", "吗", "呢", "吧", "嘛",
@@ -759,23 +773,12 @@ def _fallback_title_search(
         kw_query |= Q(title__icontains=kw)
         kw_query |= Q(description__icontains=kw)
 
-    # 权限过滤（同 retrieve 逻辑：超管全量，管理员本学院，用户自己的）
-    role = user_context.get('role', 'user')
-    college_id = user_context.get('college_id')
-    user_id = user_context.get('user_id')
+    from django.db.models import Q
+    from apps.knowledge.models import DocChunk
 
-    if role == 'super_admin':
-        docs = KnowledgeDoc.objects.filter(kw_query)
-    elif role == 'admin' and college_id:
-        docs = KnowledgeDoc.objects.filter(
-            kw_query, Q(uploader_id=user_id) | Q(college_id=college_id)
-        )
-    elif user_id:
-        docs = KnowledgeDoc.objects.filter(kw_query, uploader_id=user_id)
-    else:
-        return []
-
-    docs = docs.filter(status='indexed').order_by('-created_at')[:top_k]
+    # Apply the same authorization scope as every other retrieval path.
+    docs = authorized_knowledge_docs(user_context).filter(kw_query, status='indexed')
+    docs = docs.order_by('-created_at')[:top_k]
 
     # 取每篇文档的第一个 chunk 作为内容预览
     results = []
@@ -788,6 +791,10 @@ def _fallback_title_search(
             'content': content,
             'score': 0.5,  # 固定中等分，低于向量检索的分数
             'page': 0,
+            'source_type': doc.source_type,
+            'source_url': doc.source_url,
+            'file_name': doc.file_name,
+            'oss_key': doc.oss_key,
         })
     return results
 
@@ -824,10 +831,6 @@ def retrieve_images(
     """
     user_context = user_context or {'role': 'user'}
     parsed_filters = parsed_filters or {}
-    role = user_context.get('role', 'user')
-    user_id = user_context.get('user_id')
-    college_id = user_context.get('college_id')
-    department_id = user_context.get('department_id')
 
     # 关键词提取（复用 _keyword_search 的 jieba + 同义词扩展）
     try:
@@ -850,35 +853,9 @@ def retrieve_images(
     # 兼容存量数据：file_type 可能是类别 'image'，也可能是历史存的原始扩展名（jpg/png 等）
     image_types = ['image'] + sorted(IMAGE_FILE_TYPES)
 
-    # 权限过滤（复刻 _apply_hard_filters 的 KnowledgeDoc 段）
-    SCHOOL_LEVEL = Q(college_id__isnull=True, department_id__isnull=True)
-    qs = KnowledgeDoc.objects.filter(
-        file_type__in=image_types, visibility='public',
-    )
-
-    is_admin_query = role in ('admin', 'college_admin', 'dept_admin', 'super_admin')
-    if not is_admin_query:
-        conditions = SCHOOL_LEVEL
-        if college_id:
-            conditions |= Q(college_id=college_id)
-        if department_id:
-            conditions |= Q(department_id=department_id)
-        if user_id:
-            conditions |= Q(uploader_id=user_id)
-        qs = qs.filter(conditions)
-    elif role in ('college_admin', 'admin'):
-        qs = qs.filter(
-            SCHOOL_LEVEL
-            | Q(college_id=college_id)
-            | Q(uploader_id=user_id),
-        )
-    elif role == 'dept_admin':
-        qs = qs.filter(
-            SCHOOL_LEVEL
-            | Q(department_id=department_id)
-            | Q(uploader_id=user_id),
-        )
-    # super_admin：不过滤
+    # Images are authorized by the same document scope; unlike text documents,
+    # they do not require indexed status because they have no text chunks.
+    qs = authorized_knowledge_docs(user_context).filter(file_type__in=image_types)
 
     # 权限过滤后的基准集合（不含关键词/学科/分类筛选），供图片意图兜底使用
     base_qs = qs
@@ -992,6 +969,7 @@ def retrieve(
 
     keyword_hits = _keyword_search(
         question, top_k=top_k, doc_ids=candidate_ids,
+        user_context=user_context,
     )
 
     # 3. 合并 + 关键词权重加成
