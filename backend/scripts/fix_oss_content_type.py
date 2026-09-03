@@ -17,6 +17,10 @@ application/octet-stream；而签名 URL 又不能覆盖 response-content-type�
 import os
 import sys
 
+# 允许在任意目录直接运行本脚本：直跑 python scripts/xxx.py 时 sys.path[0] 是 scripts/，
+# 需把 backend 根目录补进去才能 import config.* / apps.*
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
 
 import django  # noqa: E402
