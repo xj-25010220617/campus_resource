@@ -131,6 +131,24 @@ def _parse_xlsx(file_path: str) -> str:
         return ''
 
 
+def _parse_csv(file_path: str) -> str:
+    """CSV 解析：兼容 UTF-8/GBK，按行转换为可检索文本。"""
+    import csv
+
+    for encoding in ('utf-8-sig', 'utf-8', 'gb18030'):
+        try:
+            with open(file_path, 'r', encoding=encoding, newline='') as f:
+                rows = csv.reader(f)
+                return '\n'.join('\t'.join(row) for row in rows)
+        except UnicodeDecodeError:
+            continue
+        except Exception as e:
+            logger.warning(f'CSV 解析失败: {e}')
+            return ''
+    logger.warning('CSV 解析失败：不支持的字符编码')
+    return ''
+
+
 def _parse_xls(file_path: str) -> str:
     """XLS 旧格式解析（xlrd 回退方案）"""
     try:
@@ -211,6 +229,7 @@ _EXTRACTORS = {
     'pptx': _parse_pptx,    # PPTX
     'xls': _parse_xls,      # 旧格式 XLS
     'xlsx': _parse_xlsx,    # 新格式 XLSX
+    'csv': _parse_csv,      # CSV 文本表格
     'txt': lambda p: open(p, 'r', encoding='utf-8', errors='ignore').read(),
     'md': lambda p: open(p, 'r', encoding='utf-8', errors='ignore').read(),
     'html': lambda p: open(p, 'r', encoding='utf-8', errors='ignore').read(),
@@ -218,9 +237,22 @@ _EXTRACTORS = {
 }
 
 
-def extract_text_from_oss(oss_key: str, file_type: str) -> str:
+def resolve_file_extension(file_type: str, file_name: str = '') -> str:
+    """从原始文件名恢复真实扩展名，避免 xlsx/docx 被类别字段覆盖。"""
+    extension = os.path.splitext(file_name or '')[1].lower().lstrip('.')
+    if extension in _EXTRACTORS:
+        return extension
+    # file_type 是类别字段；仅在没有可靠文件名扩展名时使用安全默认值。
+    defaults = {'pdf': 'pdf', 'doc': 'doc', 'ppt': 'pptx', 'xls': 'xls',
+                'txt': 'txt', 'md': 'md', 'html': 'html'}
+    return defaults.get((file_type or '').lower(), '')
+
+
+def extract_text_from_oss(oss_key: str, file_type: str, file_name: str = '') -> str:
     """
     从 OSS 下载文件并抽取文本。
+
+    file_type 保存的是归一化类别，解析时优先使用原始文件名扩展名。
     """
     from utils.http_client import ExternalClient
 
@@ -234,7 +266,8 @@ def extract_text_from_oss(oss_key: str, file_type: str) -> str:
         return ''
 
     # 2. 下载到临时文件
-    suffix = f'.{file_type}' if file_type else '.bin'
+    extension = resolve_file_extension(file_type, file_name)
+    suffix = f'.{extension or "bin"}'
     fd, tmp_path = tempfile.mkstemp(suffix=suffix)
     os.close(fd)
     try:
@@ -244,7 +277,7 @@ def extract_text_from_oss(oss_key: str, file_type: str) -> str:
             f.write(resp.content)
 
         # 3. 抽取文本
-        extractor = _EXTRACTORS.get(file_type.lower())
+        extractor = _EXTRACTORS.get(extension)
         if not extractor:
             # 纯文本类型：移除截断限制，读取全部内容
             with open(tmp_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -398,7 +431,7 @@ def extract_freshness_for_doc(doc_id: int) -> Optional[FreshnessResult]:
         return FreshnessResult(None, 'none', '该文档没有可下载的文件', {})
 
     # 1. 抽文本
-    text = extract_text_from_oss(doc.oss_key, doc.file_type)
+    text = extract_text_from_oss(doc.oss_key, doc.file_type, doc.file_name)
     if not text.strip():
         # 不支持的类型（图片/视频/音频），直接记 none
         result = FreshnessResult(None, 'none', f'文件类型 {doc.file_type} 暂不支持文本提取', {})

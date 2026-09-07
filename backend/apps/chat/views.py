@@ -12,6 +12,8 @@ from rest_framework.views import APIView
 from rest_framework.viewsets import ModelViewSet
 
 from apps.knowledge.models import KnowledgeDoc
+from apps.knowledge.serializers import KnowledgeDocListSerializer
+from apps.knowledge.views import KnowledgeDocListView
 
 from utils import rag
 from utils.llm import llm_client, LLMTimeoutError
@@ -117,6 +119,14 @@ class MessageViewSet(ModelViewSet):
     serializer_class = ChatMessageSerializer
     permission_classes = [permissions.IsAuthenticated]
 
+    def get_queryset(self):
+        # 仅查询当前用户可访问的会话，避免通过消息 ID 跨会话读取引用。
+        if self.request.user.is_anonymous:
+            return ChatMessage.objects.none()
+        return ChatMessage.objects.filter(
+            conversation__user=self.request.user,
+        ).select_related('conversation')
+
     @action(detail=True, methods=['post'], url_path='rate')
     def rate(self, request, pk=None):
         """
@@ -177,7 +187,7 @@ class MessageViewSet(ModelViewSet):
         POST /api/knowledge/docs/{doc_id}/extract-freshness/ 主动触发提取。
         """
         # 权限检查
-        if request.user.role not in ('admin', 'super_admin'):
+        if request.user.role not in ('admin', 'college_admin', 'dept_admin', 'super_admin'):
             return Response(
                 {'detail': '仅管理员可查看引用来源'},
                 status=status.HTTP_403_FORBIDDEN
@@ -203,10 +213,10 @@ class MessageViewSet(ModelViewSet):
             snippet_map = {}
 
         # 查询 KnowledgeDoc（doc_id 即 KnowledgeDoc.id，不是 Resource.id）
-        queryset = KnowledgeDoc.objects.filter(id__in=doc_ids)
-        if request.user.role == 'admin':
-            # admin 只能看自己上传的文档引用
-            queryset = queryset.filter(uploader=request.user)
+        queryset = KnowledgeDocListView._admin_scope_filter(
+            KnowledgeDoc.objects.filter(id__in=doc_ids, status='indexed'),
+            request.user,
+        )
 
         # 用列表序列化器作为基础字段，再叠加 content_snippet / freshness_date
         base_data = KnowledgeDocListSerializer(queryset, many=True).data

@@ -28,7 +28,8 @@ class KnowledgeDocSerializer(serializers.ModelSerializer):
             'category', 'category_name',
             'college', 'college_name',
             'uploader', 'uploader_name',
-            'status', 'chunk_count', 'is_sensitive', 'sensitive_checked',
+            'status', 'index_error', 'index_attempts', 'index_started_at', 'failed_at',
+            'chunk_count', 'is_sensitive', 'sensitive_checked',
             'freshness_date',
             'created_at', 'updated_at', 'indexed_at',
         ]
@@ -36,6 +37,7 @@ class KnowledgeDocSerializer(serializers.ModelSerializer):
             'id', 'source_type', 'oss_key', 'file_name', 'file_type',
             'file_size', 'md5_hash', 'page_count', 'uploader',
             'chunk_count', 'created_at', 'updated_at', 'indexed_at',
+            'index_error', 'index_attempts', 'index_started_at', 'failed_at',
         ]
 
     def get_download_url(self, obj) -> str:
@@ -70,6 +72,7 @@ class KnowledgeDocListSerializer(serializers.ModelSerializer):
         model = KnowledgeDoc
         fields = [
             'id', 'title', 'file_type', 'file_size', 'status',
+            'index_error', 'index_attempts', 'index_started_at', 'failed_at',
             'college_name', 'discipline_name', 'uploader_name',
             'uploader_college_name', 'uploader_department_name',
             'chunk_count', 'created_at',

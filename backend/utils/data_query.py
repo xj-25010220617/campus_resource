@@ -25,12 +25,22 @@ def count_user_docs(user) -> dict:
     user_role = getattr(user, 'role', None) if user else None
     if user_role == 'super_admin':
         qs = KnowledgeDoc.objects.all()
-    elif user_role == 'admin':
+    elif user_role in ('admin', 'college_admin'):
         qs = KnowledgeDoc.objects.filter(
-            Q(uploader=user) | Q(college_id=user.college_id)
+            Q(college_id__isnull=True, department_id__isnull=True)
+            | Q(college_id=user.college_id)
+            | Q(uploader=user)
         )
-    else:
+    elif user_role == 'dept_admin':
+        qs = KnowledgeDoc.objects.filter(
+            Q(college_id__isnull=True, department_id__isnull=True)
+            | Q(department_id=user.department_id)
+            | Q(uploader=user)
+        )
+    elif user_role:
         qs = KnowledgeDoc.objects.filter(uploader=user)
+    else:
+        qs = KnowledgeDoc.objects.none()
 
     total = qs.count()
     by_status = dict(qs.values_list("status").annotate(count=Count("id")))
@@ -67,12 +77,22 @@ def list_user_recent_docs(
     user_role = getattr(user, 'role', None) if user else None
     if user_role == 'super_admin':
         qs = KnowledgeDoc.objects.all()
-    elif user_role == 'admin':
+    elif user_role in ('admin', 'college_admin'):
         qs = KnowledgeDoc.objects.filter(
-            Q(uploader=user) | Q(college_id=user.college_id)
+            Q(college_id__isnull=True, department_id__isnull=True)
+            | Q(college_id=user.college_id)
+            | Q(uploader=user)
         )
-    else:
+    elif user_role == 'dept_admin':
+        qs = KnowledgeDoc.objects.filter(
+            Q(college_id__isnull=True, department_id__isnull=True)
+            | Q(department_id=user.department_id)
+            | Q(uploader=user)
+        )
+    elif user_role:
         qs = KnowledgeDoc.objects.filter(uploader=user)
+    else:
+        qs = KnowledgeDoc.objects.none()
 
     if days:
         since = timezone.now() - timedelta(days=days)
@@ -192,12 +212,22 @@ def find_user_docs(
     user_role = getattr(user, 'role', None) if user else None
     if user_role == 'super_admin':
         qs = KnowledgeDoc.objects.all()
-    elif user_role == 'admin':
+    elif user_role in ('admin', 'college_admin'):
         qs = KnowledgeDoc.objects.filter(
-            Q(uploader=user) | Q(college_id=user.college_id)
+            Q(college_id__isnull=True, department_id__isnull=True)
+            | Q(college_id=user.college_id)
+            | Q(uploader=user)
         )
-    else:
+    elif user_role == 'dept_admin':
+        qs = KnowledgeDoc.objects.filter(
+            Q(college_id__isnull=True, department_id__isnull=True)
+            | Q(department_id=user.department_id)
+            | Q(uploader=user)
+        )
+    elif user_role:
         qs = KnowledgeDoc.objects.filter(uploader=user)
+    else:
+        qs = KnowledgeDoc.objects.none()
 
     if keywords:
         kw_query = Q()

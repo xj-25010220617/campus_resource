@@ -411,8 +411,19 @@ class KnowledgeDocDownloadView(generics.RetrieveAPIView):
         instance = self.get_object()
         download_url = oss_client.get_download_url(
             instance.oss_key, file_name=instance.file_name,
-        )
-        return Response({'download_url': download_url})
+        ) if instance.oss_key else ''
+        if not download_url:
+            return Response(
+                {'detail': '源文件暂不可用', 'id': instance.id,
+                 'file_name': instance.file_name, 'status': instance.status},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response({
+            'id': instance.id,
+            'file_name': instance.file_name,
+            'status': instance.status,
+            'download_url': download_url,
+        })
 
 
 @extend_schema(
@@ -1054,13 +1065,16 @@ class ExtractFreshnessView(APIView):
     permission_classes = [IsLoginUser]
 
     def post(self, request, pk):
-        doc = get_object_or_404(KnowledgeDoc, pk=pk)
+        doc = get_object_or_404(
+            KnowledgeDocListView._admin_scope_filter(
+                KnowledgeDoc.objects.all(), request.user,
+            ),
+            pk=pk,
+        )
 
-        # 权限校验：超管全放行，admin 仅限自己上传的文档
-        if request.user.role not in ('super_admin', 'admin'):
+        # 权限校验：超管可对全部文档操作；其他管理角色仅限其管理范围内文档
+        if request.user.role not in ('super_admin', 'admin', 'college_admin', 'dept_admin'):
             self._raise_permission_error('只有管理员可以触发 AI 日期提取')
-        if request.user.role == 'admin' and doc.uploader_id != request.user.id:
-            self._raise_permission_error('只能对自己上传的文档触发 AI 日期提取')
 
         # 是否走异步
         run_async = request.query_params.get('async', 'true').lower() != 'false'

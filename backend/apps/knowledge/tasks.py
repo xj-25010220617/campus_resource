@@ -140,17 +140,31 @@ def index_document_task(self, doc_id: int):
         logger.warning(f'index_document_task: doc_id={doc_id} 不存在')
         return None
 
+    # Celery 绑定任务提供 request.retries；本地同步降级时使用 0 次重试作为默认值。
+    task_request = getattr(self, 'request', None)
+    retries = getattr(task_request, 'retries', 0)
+    max_retries = getattr(self, 'max_retries', 2) if self is not None else 0
+
     try:
         # 1. 解析：提取文本
         logger.info(f'开始索引 doc_id={doc_id} title="{doc.title}"')
         doc.status = 'parsing'
-        doc.save(update_fields=['status', 'updated_at'])
+        doc.index_attempts = retries + 1
+        doc.index_started_at = timezone.now()
+        doc.index_error = ''
+        doc.failed_at = None
+        doc.save(update_fields=[
+            'status', 'index_attempts', 'index_started_at', 'index_error',
+            'failed_at', 'updated_at',
+        ])
 
-        text = extract_text_from_oss(doc.oss_key, doc.file_type)
+        text = extract_text_from_oss(doc.oss_key, doc.file_type, doc.file_name)
         if not text or not text.strip():
             logger.warning(f'doc_id={doc_id} 文本提取为空，跳过索引')
             doc.status = 'failed'
-            doc.save(update_fields=['status', 'updated_at'])
+            doc.index_error = '解析结果为空：未提取到可检索文本'
+            doc.failed_at = timezone.now()
+            doc.save(update_fields=['status', 'index_error', 'failed_at', 'updated_at'])
             return None
 
         # 2. 分块
@@ -161,7 +175,9 @@ def index_document_task(self, doc_id: int):
         if not raw_chunks:
             logger.warning(f'doc_id={doc_id} 分块结果为空，跳过索引')
             doc.status = 'failed'
-            doc.save(update_fields=['status', 'updated_at'])
+            doc.index_error = '分块结果为空：未生成可检索片段'
+            doc.failed_at = timezone.now()
+            doc.save(update_fields=['status', 'index_error', 'failed_at', 'updated_at'])
             return None
 
         # 3. Embedding
@@ -212,9 +228,14 @@ def index_document_task(self, doc_id: int):
 
         # 6. 更新状态
         doc.status = 'indexed'
+        doc.index_error = ''
+        doc.failed_at = None
         doc.chunk_count = len(raw_chunks)
         doc.indexed_at = timezone.now()
-        doc.save(update_fields=['status', 'chunk_count', 'indexed_at', 'updated_at'])
+        doc.save(update_fields=[
+            'status', 'index_error', 'failed_at', 'chunk_count',
+            'indexed_at', 'updated_at',
+        ])
 
         logger.info(
             '索引完成: doc_id=%d  %d 块 → Milvus + MySQL',
@@ -225,11 +246,23 @@ def index_document_task(self, doc_id: int):
     except Exception as e:
         logger.error(f'index_document_task doc_id={doc_id} 失败: {e}')
         try:
-            doc.status = 'failed'
-            doc.save(update_fields=['status', 'updated_at'])
+            final_failure = retries >= max_retries
+            if final_failure:
+                doc.status = 'failed'
+                doc.index_error = f'索引失败：{type(e).__name__}: {str(e)[:500]}'
+                doc.failed_at = timezone.now()
+                doc.save(update_fields=[
+                    'status', 'index_error', 'failed_at', 'updated_at',
+                ])
+            else:
+                # 保留当前阶段，避免重试尚未开始时被误报为最终失败。
+                doc.index_error = f'第 {retries + 1} 次尝试失败，将自动重试：{str(e)[:500]}'
+                doc.save(update_fields=['index_error', 'updated_at'])
         except Exception:
             pass
-        raise self.retry(exc=e)
+        if retries < max_retries and self is not None:
+            raise self.retry(exc=e)
+        raise
 
 
 @shared_task(bind=True, ignore_result=True)

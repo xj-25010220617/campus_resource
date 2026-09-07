@@ -229,7 +229,7 @@ def build_references_events(
     if doc_ids:
         docs_by_id = {
             doc.id: doc for doc in authorized_knowledge_docs(context).filter(
-                id__in=doc_ids,
+                id__in=doc_ids, status='indexed',
             )
         }
 

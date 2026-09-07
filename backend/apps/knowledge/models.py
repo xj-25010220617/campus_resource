@@ -111,6 +111,18 @@ class KnowledgeDoc(models.Model):
         max_length=16, choices=STATUS_CHOICES, default='uploaded',
         db_index=True, verbose_name='状态',
     )
+    index_error = models.TextField(
+        blank=True, default='', verbose_name='索引错误信息',
+    )
+    index_attempts = models.PositiveIntegerField(
+        default=0, verbose_name='索引尝试次数',
+    )
+    index_started_at = models.DateTimeField(
+        null=True, blank=True, verbose_name='索引开始时间',
+    )
+    failed_at = models.DateTimeField(
+        null=True, blank=True, verbose_name='最终失败时间',
+    )
     chunk_count = models.IntegerField(default=0, verbose_name='分块数量')
     is_sensitive = models.BooleanField(default=False, verbose_name='敏感内容标记')
     sensitive_checked = models.BooleanField(default=False, verbose_name='是否已做敏感检查')

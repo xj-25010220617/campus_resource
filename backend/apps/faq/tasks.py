@@ -282,7 +282,7 @@ def generate_faq_from_website(self, log_id=None, max_pages=None, max_docs=None):
             # immutable for this pipeline; do not generate a second draft.
             if doc.id in processed_doc_ids:
                 continue
-            text = extract_text_from_oss(doc.oss_key, doc.file_type)
+            text = extract_text_from_oss(doc.oss_key, doc.file_type, doc.file_name)
             result = generate_faq_from_source(doc.title, text, doc.source_url)
             if not result or result['question'] in existing_questions:
                 continue

@@ -673,7 +673,7 @@ def _filter_by_permission(
         return []
     allowed_ids = set(
         authorized_knowledge_docs(user_context)
-        .filter(id__in=doc_ids)
+        .filter(id__in=doc_ids, status='indexed')
         .values_list('id', flat=True)
     )
     return [h for h in hits if h.get('doc_id') in allowed_ids][:RAG_TOP_K]
@@ -694,7 +694,9 @@ def _enrich_with_doc_meta(hits: List[dict], min_score: float) -> List[dict]:
 
     doc_ids = list({int(h['doc_id']) for h in hits if h.get('doc_id')})
     doc_title_map = {
-        row['id']: row for row in KnowledgeDoc.objects.filter(id__in=doc_ids).values(
+        row['id']: row for row in KnowledgeDoc.objects.filter(
+            id__in=doc_ids, status='indexed',
+        ).values(
             'id', 'title', 'source_type', 'source_url', 'file_name', 'oss_key',
         )
     }
@@ -853,9 +855,10 @@ def retrieve_images(
     # 兼容存量数据：file_type 可能是类别 'image'，也可能是历史存的原始扩展名（jpg/png 等）
     image_types = ['image'] + sorted(IMAGE_FILE_TYPES)
 
-    # Images are authorized by the same document scope; unlike text documents,
-    # they do not require indexed status because they have no text chunks.
-    qs = authorized_knowledge_docs(user_context).filter(file_type__in=image_types)
+    # 图片也必须处于 indexed，避免失败文档进入问答引用。
+    qs = authorized_knowledge_docs(user_context).filter(
+        file_type__in=image_types, status='indexed',
+    )
 
     # 权限过滤后的基准集合（不含关键词/学科/分类筛选），供图片意图兜底使用
     base_qs = qs
