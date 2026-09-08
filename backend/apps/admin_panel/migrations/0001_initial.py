@@ -56,16 +56,26 @@ COMMENT='管理后台超管操作审计日志'
 """
 
 
+def create_audit_tables(apps, schema_editor):
+    if schema_editor.connection.vendor != 'mysql':
+        return
+    with schema_editor.connection.cursor() as cursor:
+        cursor.execute(_ADMIN_LOGIN_LOG_SQL)
+        cursor.execute(_ADMIN_OPERATION_LOG_SQL)
+
+
+def drop_audit_tables(apps, schema_editor):
+    if schema_editor.connection.vendor != 'mysql':
+        return
+    with schema_editor.connection.cursor() as cursor:
+        cursor.execute('DROP TABLE IF EXISTS `admin_operation_log`;')
+        cursor.execute('DROP TABLE IF EXISTS `admin_login_log`;')
+
+
 class Migration(migrations.Migration):
 
     dependencies = []
 
     operations = [
-        migrations.RunSQL(
-            sql=[_ADMIN_LOGIN_LOG_SQL, _ADMIN_OPERATION_LOG_SQL],
-            reverse_sql=[
-                'DROP TABLE IF EXISTS `admin_operation_log`;',
-                'DROP TABLE IF EXISTS `admin_login_log`;',
-            ],
-        ),
+        migrations.RunPython(create_audit_tables, drop_audit_tables),
     ]

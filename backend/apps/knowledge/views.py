@@ -112,7 +112,7 @@ class KnowledgeDocListView(generics.ListAPIView):
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     filterset_class = KnowledgeDocFilter
-    search_fields = ['title', 'description']
+    search_fields = ['title', 'description', 'file_name']
 
     def get_queryset(self):
         user = self.request.user
