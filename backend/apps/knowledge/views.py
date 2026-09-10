@@ -1260,36 +1260,52 @@ class FileUploadView(APIView):
         # multipart 兼容：前端可能以 JSON 字符串 / 重复字段 / keywords[] 等多种形式发送关键词
         raw_keywords = _normalize_keywords(request, data.get('keywords', []))
 
-        needs_ai = (
-            not user_title
-            or not user_description
-            or not raw_keywords  # 直接检查列表是否为空
-            or not user_provided_visibility
+        # 空文件检测：0 字节，或文本/文档类提取不到任何内容
+        is_empty_file = (
+            len(file_bytes) == 0
+            or (
+                (ext in self.TEXT_EXTRACTABLE_TYPES or ext in self.DOCUMENT_EXTRACTABLE_TYPES)
+                and not extracted_text.strip()
+            )
         )
-        if needs_ai:
-            image_bytes = file_bytes if ext in IMAGE_FILE_TYPES else None
-            ai_result = _ai_classify(title, extracted_text, image_bytes=image_bytes)
-            if ai_result:
-                title = user_title or ai_result['title'] or fallback_title
-                description = user_description or ai_result['description'] or ''
-                visibility = data['visibility'] if user_provided_visibility else ai_result['visibility']
-                # 关键词：用户提供的优先
-                if raw_keywords:
-                    pass  # 用户已提供关键词，保留
-                else:
-                    raw_keywords = ai_result['keywords']
-            else:
-                # AI 不可用降级
-                title = title or fallback_title
-                description = user_description
-                visibility = data['visibility']
-        else:
-            description = user_description
+        if is_empty_file:
+            # 空文件跳过 AI，标题固定「空文件」，描述/关键词留空，分类保留真实格式
+            title = '空文件'
+            description = ''
+            raw_keywords = []
             visibility = data['visibility']
 
-        # 二次归一：确保变量有值
-        title = title or fallback_title
-        description = description or ''
+        if not is_empty_file:
+            needs_ai = (
+                not user_title
+                or not user_description
+                or not raw_keywords  # 直接检查列表是否为空
+                or not user_provided_visibility
+            )
+            if needs_ai:
+                image_bytes = file_bytes if ext in IMAGE_FILE_TYPES else None
+                ai_result = _ai_classify(title, extracted_text, image_bytes=image_bytes)
+                if ai_result:
+                    title = user_title or ai_result['title'] or fallback_title
+                    description = user_description or ai_result['description'] or ''
+                    visibility = data['visibility'] if user_provided_visibility else ai_result['visibility']
+                    # 关键词：用户提供的优先
+                    if raw_keywords:
+                        pass  # 用户已提供关键词，保留
+                    else:
+                        raw_keywords = ai_result['keywords']
+                else:
+                    # AI 不可用降级
+                    title = title or fallback_title
+                    description = user_description
+                    visibility = data['visibility']
+            else:
+                description = user_description
+                visibility = data['visibility']
+
+            # 二次归一：确保变量有值
+            title = title or fallback_title
+            description = description or ''
 
         # 文档归属根据上传者角色自动确定
         if request.user.role == 'super_admin':
@@ -1503,17 +1519,23 @@ class BatchFileUploadView(APIView):
 
                 # 4d. AI 自动生成标题、描述、关键词
                 fallback_title = file_name.rsplit('.', 1)[0] if '.' in file_name else file_name
-                image_bytes = file_bytes if ext in IMAGE_FILE_TYPES else None
-                ai_result = _ai_classify(fallback_title, extracted_text, image_bytes=image_bytes)
-                if ai_result:
-                    title = ai_result.get('title') or fallback_title
-                    description = ai_result.get('description') or ''
-                    raw_keywords = ai_result.get('keywords', [])
-                else:
-                    # AI 不可用降级：使用文件名作为标题
-                    title = fallback_title
+                if len(file_bytes) == 0:
+                    # 空文件跳过 AI，标题固定「空文件」，描述/关键词留空，分类保留真实格式
+                    title = '空文件'
                     description = ''
                     raw_keywords = []
+                else:
+                    image_bytes = file_bytes if ext in IMAGE_FILE_TYPES else None
+                    ai_result = _ai_classify(fallback_title, extracted_text, image_bytes=image_bytes)
+                    if ai_result:
+                        title = ai_result.get('title') or fallback_title
+                        description = ai_result.get('description') or ''
+                        raw_keywords = ai_result.get('keywords', [])
+                    else:
+                        # AI 不可用降级：使用文件名作为标题
+                        title = fallback_title
+                        description = ''
+                        raw_keywords = []
 
                 # 4e. 创建 KnowledgeDoc 记录
                 new_doc = KnowledgeDoc.objects.create(
