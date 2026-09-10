@@ -203,6 +203,68 @@ ALIYUN_EMBED_BASE_URL = config(
 LOCAL_EMBED_MODEL = config('LOCAL_EMBED_MODEL', default='paraphrase-multilingual-MiniLM-L12-v2')
 
 # ------------------------------------------------------------------
+# 内容安全审核服务（P1-2C）
+#
+# 全部走配置，不在代码里散落字面量。安全相关默认值一律取**最严格**的一侧：
+# 检测器默认全部启用且必需——宁可让文档停在 unavailable，也不放行未审核内容。
+# ------------------------------------------------------------------
+# 策略版本：写入 ContentModeration.policy_version / ModerationAttempt.policy_version，
+# 规则或检测器变化后必须递增，才能区分"同一内容在不同策略下的结论"。
+CONTENT_MODERATION_POLICY_VERSION = config(
+    'CONTENT_MODERATION_POLICY_VERSION', default='content-moderation-v1',
+)
+
+# 必需检测器：其中任何一个没能给出结论，本次审核只能是 unavailable / error。
+# 要放宽必须显式修改这里（有记录的评审决定），而不是让代码静默跳过。
+CONTENT_MODERATION_REQUIRED_DETECTORS = ('clamav', 'rule', 'llm')
+# 可选检测器：缺席不阻断放行；但一旦给出非 clean 结论，依然计入判决。
+CONTENT_MODERATION_OPTIONAL_DETECTORS = ('vision',)
+# 图片没有任何可抽文本，视觉检测器缺席等于图片完全没被检查 → 默认必须。
+CONTENT_MODERATION_VISION_REQUIRED_FOR_IMAGES = True
+
+# 重试与租约
+CONTENT_MODERATION_MAX_ATTEMPTS = config('CONTENT_MODERATION_MAX_ATTEMPTS', default=3, cast=int)
+CONTENT_MODERATION_RETRY_BACKOFF_SECONDS = config(
+    'CONTENT_MODERATION_RETRY_BACKOFF_SECONDS', default=300, cast=int)
+CONTENT_MODERATION_LEASE_SECONDS = config(
+    'CONTENT_MODERATION_LEASE_SECONDS', default=600, cast=int)
+
+# ClamAV（clamd INSTREAM）。默认启用且必需：未部署时应表现为
+# moderation_state=unavailable，而不是"跳过扫描后放行"。
+CLAMAV_ENABLED = config('CLAMAV_ENABLED', default=True, cast=bool)
+CLAMAV_HOST = config('CLAMAV_HOST', default='127.0.0.1')
+CLAMAV_PORT = config('CLAMAV_PORT', default=3310, cast=int)
+CLAMAV_TIMEOUT = config('CLAMAV_TIMEOUT', default=30, cast=int)
+
+# 模型审核
+LLM_MODERATION_ENABLED = config('LLM_MODERATION_ENABLED', default=True, cast=bool)
+LLM_MODERATION_TIMEOUT = config('LLM_MODERATION_TIMEOUT', default=60, cast=int)
+# 送模型的字符上限：绝不允许把文件全文直接发给模型
+MODERATION_MAX_LLM_INPUT_CHARS = config(
+    'MODERATION_MAX_LLM_INPUT_CHARS', default=12000, cast=int)
+
+# 视觉审核
+VISION_MODERATION_ENABLED = config('VISION_MODERATION_ENABLED', default=True, cast=bool)
+VISION_MODERATION_TIMEOUT = config('VISION_MODERATION_TIMEOUT', default=120, cast=int)
+
+# 读取 / 抽取上限
+MODERATION_MAX_DOWNLOAD_BYTES = config(
+    'MODERATION_MAX_DOWNLOAD_BYTES', default=50 * 1024 * 1024, cast=int)
+MODERATION_MAX_MEDIA_BYTES = config(
+    'MODERATION_MAX_MEDIA_BYTES', default=20 * 1024 * 1024, cast=int)
+MODERATION_MAX_EXTRACT_CHARS = config(
+    'MODERATION_MAX_EXTRACT_CHARS', default=2000000, cast=int)
+
+# 旧格式 DOC 解析（antiword）。不使用 soffice：它会以完整文档方式在本机
+# 打开上传文件，风险面显著更大，且当前部署未验证可用。
+MODERATION_DOC_ANTIWORD_ENABLED = config(
+    'MODERATION_DOC_ANTIWORD_ENABLED', default=True, cast=bool)
+MODERATION_SUBPROCESS_TIMEOUT_SECONDS = config(
+    'MODERATION_SUBPROCESS_TIMEOUT_SECONDS', default=20, cast=int)
+MODERATION_SUBPROCESS_MAX_OUTPUT_BYTES = config(
+    'MODERATION_SUBPROCESS_MAX_OUTPUT_BYTES', default=8 * 1024 * 1024, cast=int)
+
+# ------------------------------------------------------------------
 # Milvus / ChromaDB
 # ------------------------------------------------------------------
 MILVUS_HOST = config('MILVUS_HOST', default='localhost')

@@ -1,14 +1,45 @@
 import json
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db import IntegrityError, transaction
 from django.test import TestCase
+from django.utils import timezone
 from rest_framework.test import APIClient
 
-from apps.accounts.models import College, User
+import oss2
 
-from .models import ChunkedUploadSession, DocChunk, Keyword, KnowledgeDoc
+from apps.accounts.models import College, User
+from utils.oss import (
+    OFFICIAL_KEY_PREFIX,
+    QUARANTINE_KEY_PREFIX,
+    OSSOperationError,
+    build_quarantine_key,
+    oss_client,
+)
+
+from .models import (
+    ChunkedUploadSession,
+    ContentModeration,
+    DocChunk,
+    Keyword,
+    KnowledgeDoc,
+    ModerationAttempt,
+)
+from .moderation import (
+    INDEXABLE_MODERATION_STATES,
+    INDEXABLE_OSS_KEY_PREFIX,
+    MAX_EXCERPT_LENGTH,
+    MAX_FINDINGS,
+    MAX_FINDINGS_JSON_BYTES,
+    MODERATION_STATE_CHOICES,
+    STORAGE_STATE_CHOICES,
+    VERDICT_CHOICES,
+    is_indexable_moderation_state,
+    normalize_findings,
+)
 
 
 class KnowledgeDocSearchTests(TestCase):
@@ -546,6 +577,13 @@ class AdminScopeVisibilityTests(TestCase):
     """R26：private 文档仅上传者本人与 super_admin 可见。"""
 
     def setUp(self):
+        # 删除接口在删除记录后会调用 oss_client.delete 清理 OSS 对象。本类只验证
+        # 可见性 / 权限，不验证 OSS 清理，必须把该调用挡掉——否则一旦 .env 里配置了
+        # 真实 AK，测试就会向生产 OSS 发出真实的 DELETE 请求。
+        delete_patcher = patch.object(oss_client, 'delete', return_value=True)
+        delete_patcher.start()
+        self.addCleanup(delete_patcher.stop)
+
         self.college_a = College.objects.create(name='计算机与软件学院', code='CS')
         self.owner = User.objects.create_user(
             username='scope_owner', password='testpass123',
@@ -969,3 +1007,615 @@ class IndexTaskSecurityTests(TestCase):
         doc.refresh_from_db()
         self.assertEqual(doc.status, 'failed')
         self.assertIn('索引前置校验未通过', doc.index_error)
+
+
+# ===========================================================================
+# P1-2A：Moderation 数据模型 + Quarantine OSS 基础设施
+#
+# OSS 相关测试全部使用替身 Bucket（patch oss_client._bucket），
+# 不产生任何真实 OSS 请求：不 GET、不 PUT、不 COPY、不 DELETE。
+# ===========================================================================
+
+
+def _make_doc(user, title='审核测试文档'):
+    """构造一份最小可用的 KnowledgeDoc。"""
+    return KnowledgeDoc.objects.create(
+        title=title,
+        source_type='upload',
+        file_name='测试资料.pdf',
+        file_type='pdf',
+        uploader=user,
+        status='uploaded',
+    )
+
+
+class _FakeHeadResult:
+    """模拟 oss2 HEAD 返回值（只需 head_object 包装层用到的属性）。"""
+
+    def __init__(self, size, content_type='application/octet-stream',
+                 etag='d41d8cd98f00b204e9800998ecf8427e'):
+        self.content_length = size
+        self.headers = {'Content-Type': content_type}
+        self.etag = etag
+
+
+class _FakeGetResult:
+    """模拟 oss2 的 GetObjectResult：支持 read(n) 与 close()。"""
+
+    def __init__(self, payload):
+        self._payload = payload
+        self._pos = 0
+        self.closed = False
+
+    def read(self, amt=None):
+        if self._pos >= len(self._payload):
+            return b''
+        if amt is None:
+            chunk = self._payload[self._pos:]
+        else:
+            chunk = self._payload[self._pos:self._pos + amt]
+        self._pos += len(chunk)
+        return chunk
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeOSSBucket:
+    """测试用 OSS Bucket 替身——不产生任何网络请求。
+
+    用 copy_transform 模拟两种真实故障：
+    - 返回 None：复制静默未生效（源对象一直都在，但目标对象没出现）
+    - 返回被改写的字节：复制后内容与源不一致
+    """
+
+    def __init__(self):
+        self.objects = {}
+        self.copy_calls = []
+        self.deleted_keys = []
+        self.get_results = []
+        self.copy_side_effect = None
+        self.get_side_effect = None
+        self.copy_transform = None
+
+    def head_object(self, key):
+        if key not in self.objects:
+            raise oss2.exceptions.OssError(404, {}, b'Not Found', {})
+        return _FakeHeadResult(len(self.objects[key]))
+
+    def copy_object(self, source_bucket_name, source_key, target_key, headers=None):
+        self.copy_calls.append((source_bucket_name, source_key, target_key, headers))
+        if self.copy_side_effect is not None:
+            raise self.copy_side_effect
+        if source_key not in self.objects:
+            raise oss2.exceptions.OssError(404, {}, b'Not Found', {})
+        payload = self.objects[source_key]
+        if self.copy_transform is not None:
+            payload = self.copy_transform(payload)
+            if payload is None:
+                return
+        self.objects[target_key] = payload
+
+    def get_object(self, key, **kwargs):
+        if self.get_side_effect is not None:
+            raise self.get_side_effect
+        if key not in self.objects:
+            raise oss2.exceptions.OssError(404, {}, b'Not Found', {})
+        result = _FakeGetResult(self.objects[key])
+        self.get_results.append(result)
+        return result
+
+    def delete_object(self, key):
+        self.deleted_keys.append(key)
+        self.objects.pop(key, None)
+
+
+class ContentModerationModelTests(TestCase):
+    """ContentModeration 模型：1:1 关系、默认值、白名单判定。"""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username='moderator_admin', password='testpass123', role='super_admin',
+        )
+        self.doc = _make_doc(self.user)
+
+    def test_one_to_one_defaults(self):
+        moderation = ContentModeration.objects.create(doc=self.doc)
+
+        self.assertEqual(moderation.state, 'pending')
+        self.assertEqual(moderation.verdict, '')
+        self.assertEqual(moderation.storage_state, 'quarantine')
+        self.assertEqual(moderation.applied_seq, 0)
+        self.assertEqual(moderation.attempt_count, 0)
+        self.assertEqual(moderation.promotion_retry, 0)
+        self.assertEqual(moderation.categories, [])
+        self.assertEqual(moderation.findings, [])
+        self.assertIsNone(moderation.checked_at)
+        self.assertEqual(moderation.quarantine_key, '')
+        self.assertEqual(moderation.promoted_key, '')
+
+    def test_second_moderation_for_same_doc_is_rejected(self):
+        ContentModeration.objects.create(doc=self.doc)
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                ContentModeration.objects.create(doc=self.doc)
+
+    def test_reverse_accessor_returns_the_same_record(self):
+        moderation = ContentModeration.objects.create(doc=self.doc)
+        self.assertEqual(self.doc.moderation.pk, moderation.pk)
+
+    def test_oss_key_semantics_are_not_implicitly_approved(self):
+        """KnowledgeDoc.oss_key 存在 ≠ 已通过审核（P1-2A 核心安全不变量）。"""
+        self.doc.oss_key = 'knowledge/college/1/2026-09/test.pdf'
+        self.doc.status = 'indexed'
+        self.doc.save(update_fields=['oss_key', 'status'])
+
+        # 文档"看起来正常"，但根本不存在审核记录，绝不能推导出放行
+        self.assertFalse(ContentModeration.objects.filter(doc=self.doc).exists())
+
+    def test_confirmed_fields_default_to_unconfirmed(self):
+        moderation = ContentModeration.objects.create(doc=self.doc)
+
+        self.assertIsNone(moderation.confirmed_by)
+        self.assertIsNone(moderation.confirmed_at)
+        self.assertEqual(moderation.confirmation_reason, '')
+
+    def test_is_approved_follows_the_whitelist_only(self):
+        moderation = ContentModeration.objects.create(doc=self.doc)
+
+        for state in ('pending', 'scanning', 'rejected', 'unavailable', 'error', ''):
+            moderation.state = state
+            self.assertFalse(moderation.is_approved, f'state={state!r} 不应放行')
+
+        for state in ('approved', 'confirmed_unchecked'):
+            moderation.state = state
+            self.assertTrue(moderation.is_approved, f'state={state!r} 应放行')
+
+    def test_is_promoted_follows_storage_state_only(self):
+        moderation = ContentModeration.objects.create(doc=self.doc)
+
+        self.assertFalse(moderation.is_promoted)
+        for state in ('promoting', 'promotion_failed', 'deleted'):
+            moderation.storage_state = state
+            self.assertFalse(moderation.is_promoted, f'storage_state={state!r} 不算已提升')
+        moderation.storage_state = 'promoted'
+        self.assertTrue(moderation.is_promoted)
+
+    def test_json_fields_round_trip(self):
+        moderation = ContentModeration.objects.create(
+            doc=self.doc,
+            categories=['virus'],
+            findings=[{'category': 'virus', 'reason': '检出测试样本', 'source': 'clamav'}],
+        )
+        moderation.refresh_from_db()
+
+        self.assertEqual(moderation.categories, ['virus'])
+        self.assertEqual(moderation.findings[0]['source'], 'clamav')
+
+
+class ModerationAttemptModelTests(TestCase):
+    """ModerationAttempt 模型：1:N 关系与 (moderation, attempt_seq) 唯一约束。"""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username='attempt_admin', password='testpass123', role='super_admin',
+        )
+        self.doc = _make_doc(self.user)
+        self.moderation = ContentModeration.objects.create(doc=self.doc)
+
+    def test_attempts_are_many_to_one(self):
+        ModerationAttempt.objects.create(moderation=self.moderation, attempt_seq=1)
+        ModerationAttempt.objects.create(moderation=self.moderation, attempt_seq=2)
+
+        self.assertEqual(self.moderation.attempts.count(), 2)
+
+    def test_attempt_seq_is_unique_within_one_moderation(self):
+        ModerationAttempt.objects.create(moderation=self.moderation, attempt_seq=1)
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                ModerationAttempt.objects.create(moderation=self.moderation, attempt_seq=1)
+
+    def test_same_attempt_seq_is_allowed_across_moderations(self):
+        other_doc = _make_doc(self.user, title='另一份测试文档')
+        other = ContentModeration.objects.create(doc=other_doc)
+
+        ModerationAttempt.objects.create(moderation=self.moderation, attempt_seq=1)
+        ModerationAttempt.objects.create(moderation=other, attempt_seq=1)
+
+        self.assertEqual(ModerationAttempt.objects.filter(attempt_seq=1).count(), 2)
+
+    def test_defaults_and_json_round_trip(self):
+        attempt = ModerationAttempt.objects.create(
+            moderation=self.moderation,
+            attempt_seq=1,
+            detector_results=[{'detector': 'rule', 'verdict': 'clean', 'confidence': 1.0}],
+            policy_version='p1-2a-dev',
+            worker_id='worker-1',
+        )
+        attempt.refresh_from_db()
+
+        self.assertEqual(attempt.state_at_start, 'pending')
+        self.assertEqual(attempt.verdict, '')
+        self.assertEqual(attempt.error, '')
+        self.assertEqual(attempt.detector_results[0]['detector'], 'rule')
+        self.assertEqual(attempt.policy_version, 'p1-2a-dev')
+        self.assertEqual(attempt.worker_id, 'worker-1')
+        self.assertIsNotNone(attempt.created_at)
+
+    def test_attempts_are_ordered_by_creation_desc(self):
+        first = ModerationAttempt.objects.create(moderation=self.moderation, attempt_seq=1)
+        second = ModerationAttempt.objects.create(moderation=self.moderation, attempt_seq=2)
+        # auto_now_add 让同一事务内的两条记录时间可能完全相同，而并列时顺序未定义；
+        # 这里显式错开时间，验证 ordering = ['-created_at'] 确实生效。
+        ModerationAttempt.objects.filter(pk=first.pk).update(
+            created_at=timezone.now() - timedelta(minutes=5),
+        )
+
+        self.assertEqual(list(self.moderation.attempts.all()), [second, first])
+
+
+class ModerationSchemaMigrationTests(TestCase):
+    """migration 只建 schema：不得为历史文档自动制造审核结论。"""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username='migration_admin', password='testpass123', role='super_admin',
+        )
+
+    def test_existing_docs_get_no_moderation_record(self):
+        doc = _make_doc(self.user)
+
+        self.assertFalse(ContentModeration.objects.filter(doc=doc).exists())
+        self.assertEqual(ContentModeration.objects.count(), 0)
+
+    def test_no_document_is_automatically_approved_or_clean(self):
+        for index, status in enumerate(['uploaded', 'indexed', 'failed']):
+            KnowledgeDoc.objects.create(
+                title=f'历史文档{index}', source_type='upload', uploader=self.user, status=status,
+            )
+
+        self.assertFalse(
+            ContentModeration.objects.filter(
+                state__in=('approved', 'confirmed_unchecked'),
+            ).exists()
+        )
+        self.assertFalse(ContentModeration.objects.filter(verdict='clean').exists())
+
+    def test_new_docs_do_not_gain_moderation_records_either(self):
+        """P1-2A 未改上传链路，因此新建文档同样不会自动产生审核记录。"""
+        _make_doc(self.user)
+
+        self.assertEqual(ContentModeration.objects.count(), 0)
+
+    def test_deleting_doc_cascades_to_moderation_and_attempts(self):
+        doc = _make_doc(self.user)
+        moderation = ContentModeration.objects.create(doc=doc)
+        ModerationAttempt.objects.create(moderation=moderation, attempt_seq=1)
+
+        doc.delete()
+
+        self.assertFalse(ContentModeration.objects.exists())
+        self.assertFalse(ModerationAttempt.objects.exists())
+
+
+class ModerationStateInvariantTests(TestCase):
+    """状态常量与白名单不变量。"""
+
+    def test_indexable_states_is_an_exact_whitelist(self):
+        self.assertEqual(
+            INDEXABLE_MODERATION_STATES, frozenset({'approved', 'confirmed_unchecked'}),
+        )
+
+    def test_unknown_and_empty_states_are_not_indexable(self):
+        for state in (None, '', 'PENDING', 'Approved', 'pending', 'scanning',
+                      'rejected', 'unavailable', 'error'):
+            self.assertFalse(is_indexable_moderation_state(state), f'state={state!r}')
+
+    def test_state_choices_are_exactly_the_agreed_set(self):
+        self.assertEqual(
+            [choice[0] for choice in MODERATION_STATE_CHOICES],
+            ['pending', 'scanning', 'approved', 'rejected',
+             'unavailable', 'confirmed_unchecked', 'error'],
+        )
+
+    def test_verdict_choices_are_exactly_the_agreed_set(self):
+        self.assertEqual(
+            [choice[0] for choice in VERDICT_CHOICES],
+            ['clean', 'virus', 'sensitive', 'harmful',
+             'negative_guidance', 'mixed', 'unavailable', 'error'],
+        )
+
+    def test_storage_state_choices_are_exactly_the_agreed_set(self):
+        self.assertEqual(
+            [choice[0] for choice in STORAGE_STATE_CHOICES],
+            ['quarantine', 'promoting', 'promoted', 'promotion_failed', 'deleted'],
+        )
+
+    def test_models_share_the_single_source_of_truth(self):
+        self.assertIs(ContentModeration.STATE_CHOICES, MODERATION_STATE_CHOICES)
+        self.assertIs(ContentModeration.VERDICT_CHOICES, VERDICT_CHOICES)
+        self.assertIs(ContentModeration.STORAGE_STATE_CHOICES, STORAGE_STATE_CHOICES)
+        self.assertIs(ModerationAttempt.VERDICT_CHOICES, VERDICT_CHOICES)
+
+    def test_official_prefix_matches_the_index_gate_prefix(self):
+        """knowledge/ 这个命名空间必须与索引门的前缀常量保持一致。"""
+        self.assertEqual(OFFICIAL_KEY_PREFIX, INDEXABLE_OSS_KEY_PREFIX)
+
+    def test_quarantine_is_parallel_not_nested(self):
+        self.assertEqual(QUARANTINE_KEY_PREFIX, 'quarantine/')
+        self.assertFalse(QUARANTINE_KEY_PREFIX.startswith(OFFICIAL_KEY_PREFIX))
+
+
+class QuarantineKeyTests(TestCase):
+    """隔离区 Key 形态：与 knowledge/ 平级，且结构与正式 Key 一致。"""
+
+    def test_key_uses_the_quarantine_namespace(self):
+        key = build_quarantine_key('college', 12, '课件.pdf')
+
+        self.assertTrue(key.startswith('quarantine/'))
+        self.assertFalse(key.startswith('knowledge/'))
+        self.assertFalse(key.startswith('knowledge/quarantine/'))
+
+    def test_key_layout_is_scope_owner_month_uuid_ext(self):
+        key = build_quarantine_key('college', 12, '课件.pdf')
+
+        parts = key.split('/')
+        self.assertEqual(parts[0], 'quarantine')
+        self.assertEqual(parts[1], 'college')
+        self.assertEqual(parts[2], '12')
+        self.assertRegex(parts[3], r'^\d{4}-\d{2}$')
+        self.assertRegex(parts[4], r'^[0-9a-f]{12}\.pdf$')
+
+    def test_key_preserves_normalized_extension(self):
+        self.assertTrue(build_quarantine_key('school', 0, 'A.PDF').endswith('.pdf'))
+        self.assertTrue(build_quarantine_key('school', 0, 'noext').endswith('.bin'))
+
+    def test_quarantine_keys_are_unique(self):
+        keys = {build_quarantine_key('school', 0, 'a.txt') for _ in range(50)}
+
+        self.assertEqual(len(keys), 50)
+
+    def test_school_scope_uses_owner_zero(self):
+        key = build_quarantine_key('school', 0, 'a.txt')
+
+        self.assertEqual(key.split('/')[2], '0')
+
+
+class FindingsConstraintTests(TestCase):
+    """findings 结构约束：条数、片段长度、总字节数。"""
+
+    def test_none_returns_empty_list(self):
+        self.assertEqual(normalize_findings(None), [])
+        self.assertEqual(normalize_findings([]), [])
+
+    def test_non_dict_entries_are_dropped(self):
+        result = normalize_findings(['not-a-dict', 42, None, {'reason': 'ok'}])
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]['reason'], 'ok')
+
+    def test_findings_count_is_capped(self):
+        raw = [{'reason': f'命中{index}'} for index in range(MAX_FINDINGS + 20)]
+
+        self.assertEqual(len(normalize_findings(raw)), MAX_FINDINGS)
+
+    def test_long_excerpt_is_truncated(self):
+        result = normalize_findings([{'excerpt': 'x' * 500}])
+
+        self.assertEqual(len(result[0]['excerpt']), MAX_EXCERPT_LENGTH + 1)   # 含省略号
+        self.assertTrue(result[0]['excerpt'].endswith('…'))
+
+    def test_short_excerpt_is_left_untouched(self):
+        result = normalize_findings([{'excerpt': '短片段'}])
+
+        self.assertEqual(result[0]['excerpt'], '短片段')
+
+    def test_total_bytes_stay_bounded(self):
+        raw = [{'reason': 'y' * 5000} for _ in range(MAX_FINDINGS)]
+
+        result = normalize_findings(raw)
+
+        self.assertLessEqual(
+            len(json.dumps(result, ensure_ascii=False).encode('utf-8')),
+            MAX_FINDINGS_JSON_BYTES,
+        )
+
+    def test_input_is_not_mutated(self):
+        raw = [{'excerpt': 'x' * 500}]
+        normalize_findings(raw)
+
+        self.assertEqual(len(raw[0]['excerpt']), 500)
+
+
+class OSSPrimitiveBaseTests(TestCase):
+    """OSS 原语测试基类：把 oss_client 的 bucket 换成内存替身。"""
+
+    def setUp(self):
+        self.bucket = _FakeOSSBucket()
+        patcher = patch.object(oss_client, '_bucket', self.bucket)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+class OSSCopyObjectTests(OSSPrimitiveBaseTests):
+    """copy_object：服务端复制 + 复制后 HEAD 校验。"""
+
+    def test_copy_returns_destination_metadata(self):
+        self.bucket.objects['quarantine/college/1/a.pdf'] = b'payload'
+
+        result = oss_client.copy_object(
+            'quarantine/college/1/a.pdf', 'knowledge/college/1/a.pdf',
+        )
+
+        self.assertEqual(result['dst_key'], 'knowledge/college/1/a.pdf')
+        self.assertEqual(result['size'], len(b'payload'))
+        self.assertEqual(self.bucket.objects['knowledge/college/1/a.pdf'], b'payload')
+
+    def test_copy_uses_server_side_copy_on_the_configured_bucket(self):
+        self.bucket.objects['quarantine/a.bin'] = b'x'
+
+        oss_client.copy_object('quarantine/a.bin', 'knowledge/a.bin')
+
+        bucket_name, src, dst, _ = self.bucket.copy_calls[-1]
+        self.assertEqual(bucket_name, oss_client.bucket_name)
+        self.assertEqual(src, 'quarantine/a.bin')
+        self.assertEqual(dst, 'knowledge/a.bin')
+
+    def test_content_type_sets_replace_directive(self):
+        self.bucket.objects['quarantine/a.bin'] = b'x'
+
+        oss_client.copy_object('quarantine/a.bin', 'knowledge/a.pdf',
+                               content_type='application/pdf')
+
+        headers = self.bucket.copy_calls[-1][3]
+        self.assertEqual(headers['Content-Type'], 'application/pdf')
+        self.assertEqual(headers['x-oss-metadata-directive'], 'REPLACE')
+
+    def test_no_content_type_sends_no_headers(self):
+        self.bucket.objects['quarantine/a.bin'] = b'x'
+
+        oss_client.copy_object('quarantine/a.bin', 'knowledge/a.bin')
+
+        self.assertIsNone(self.bucket.copy_calls[-1][3])
+
+    def test_copy_raises_when_oss_call_fails(self):
+        self.bucket.objects['quarantine/a.bin'] = b'x'
+        self.bucket.copy_side_effect = oss2.exceptions.OssError(500, {}, b'boom', {})
+
+        with self.assertRaises(OSSOperationError):
+            oss_client.copy_object('quarantine/a.bin', 'knowledge/a.bin')
+
+    def test_copy_raises_when_destination_missing_after_copy(self):
+        """复制调用没报错、但目标对象没出现——必须报错，不能当作成功。"""
+        self.bucket.objects['quarantine/a.bin'] = b'x'
+        self.bucket.copy_transform = lambda payload: None
+
+        with self.assertRaises(OSSOperationError):
+            oss_client.copy_object('quarantine/a.bin', 'knowledge/a.bin')
+
+    def test_copy_rejects_traversal_keys(self):
+        self.bucket.objects['quarantine/a.bin'] = b'x'
+
+        for src, dst in (('quarantine/../etc/passwd', 'knowledge/x'),
+                         ('quarantine/a.bin', '/knowledge/x'),
+                         ('', 'knowledge/x')):
+            with self.assertRaises(OSSOperationError):
+                oss_client.copy_object(src, dst)
+
+        self.assertEqual(self.bucket.copy_calls, [])
+
+
+class OSSStreamReadTests(OSSPrimitiveBaseTests):
+    """iter_object_chunks：流式读取，不整文件进内存，且有硬性字节上限。"""
+
+    def test_streams_in_chunks(self):
+        self.bucket.objects['quarantine/big.bin'] = b'abcdefghij'
+
+        chunks = list(oss_client.iter_object_chunks('quarantine/big.bin', chunk_size=4))
+
+        self.assertEqual(chunks, [b'abcd', b'efgh', b'ij'])
+        self.assertEqual(b''.join(chunks), b'abcdefghij')
+
+    def test_raises_when_exceeding_max_bytes(self):
+        self.bucket.objects['quarantine/big.bin'] = b'x' * 100
+
+        with self.assertRaises(OSSOperationError):
+            list(oss_client.iter_object_chunks('quarantine/big.bin', chunk_size=10, max_bytes=25))
+
+    def test_reads_object_exactly_at_max_bytes(self):
+        self.bucket.objects['quarantine/big.bin'] = b'x' * 30
+
+        chunks = list(oss_client.iter_object_chunks('quarantine/big.bin', chunk_size=10, max_bytes=30))
+
+        self.assertEqual(sum(len(chunk) for chunk in chunks), 30)
+
+    def test_rejects_non_positive_max_bytes(self):
+        for max_bytes in (0, -1, None):
+            with self.assertRaises(OSSOperationError):
+                list(oss_client.iter_object_chunks('quarantine/a.bin', max_bytes=max_bytes))
+
+        self.assertEqual(self.bucket.get_results, [])
+
+    def test_rejects_non_positive_chunk_size(self):
+        for chunk_size in (0, -5):
+            with self.assertRaises(OSSOperationError):
+                list(oss_client.iter_object_chunks('quarantine/a.bin', chunk_size=chunk_size))
+
+    def test_raises_when_object_cannot_be_opened(self):
+        self.bucket.get_side_effect = oss2.exceptions.OssError(403, {}, b'denied', {})
+
+        with self.assertRaises(OSSOperationError):
+            list(oss_client.iter_object_chunks('quarantine/a.bin'))
+
+    def test_closes_the_read_stream(self):
+        self.bucket.objects['quarantine/a.bin'] = b'abc'
+
+        list(oss_client.iter_object_chunks('quarantine/a.bin'))
+
+        self.assertTrue(self.bucket.get_results[0].closed)
+
+
+class OSSPromotionTests(OSSPrimitiveBaseTests):
+    """promote_object：quarantine → knowledge，带前缀限制与大小校验，且不删源。"""
+
+    def setUp(self):
+        super().setUp()
+        self.user = User.objects.create_user(
+            username='promote_admin', password='testpass123', role='super_admin',
+        )
+        self.src = 'quarantine/college/1/2026-09/abc123.pdf'
+        self.dst = 'knowledge/college/1/2026-09/abc123.pdf'
+        self.bucket.objects[self.src] = b'quarantine-payload'
+
+    def test_promote_success_returns_verified_metadata(self):
+        result = oss_client.promote_object(self.src, self.dst)
+
+        self.assertTrue(result['verified'])
+        self.assertEqual(result['size'], result['src_size'])
+        self.assertEqual(result['dst_key'], self.dst)
+        self.assertEqual(self.bucket.objects[self.dst], b'quarantine-payload')
+
+    def test_promote_rejects_source_outside_quarantine(self):
+        self.bucket.objects['knowledge/x.pdf'] = b'x'
+
+        for src in ('knowledge/x.pdf', 'other/x.pdf', 'quarantine', '', None):
+            with self.assertRaises(OSSOperationError):
+                oss_client.promote_object(src, self.dst)
+
+    def test_promote_rejects_destination_outside_official_prefix(self):
+        for dst in ('quarantine/x.pdf', 'other/x.pdf', 'knowledge', 'knowledgex/a.pdf', '', None):
+            with self.assertRaises(OSSOperationError):
+                oss_client.promote_object(self.src, dst)
+
+    def test_promote_raises_on_size_mismatch(self):
+        self.bucket.copy_transform = lambda payload: payload[:3]
+
+        with self.assertRaises(OSSOperationError):
+            oss_client.promote_object(self.src, self.dst)
+
+    def test_promote_raises_when_source_is_missing(self):
+        with self.assertRaises(OSSOperationError):
+            oss_client.promote_object('quarantine/not-there.pdf', self.dst)
+
+    def test_promote_raises_when_copy_silently_fails(self):
+        self.bucket.copy_transform = lambda payload: None
+
+        with self.assertRaises(OSSOperationError):
+            oss_client.promote_object(self.src, self.dst)
+
+    def test_promote_never_deletes_the_source(self):
+        oss_client.promote_object(self.src, self.dst)
+
+        self.assertIn(self.src, self.bucket.objects)
+        self.assertEqual(self.bucket.deleted_keys, [])
+
+    def test_promote_does_not_touch_the_database(self):
+        """promotion 是纯 OSS 原语：不建文档、不改审核状态、不触发索引。"""
+        _make_doc(self.user)
+        docs_before = KnowledgeDoc.objects.count()
+
+        oss_client.promote_object(self.src, self.dst)
+
+        self.assertEqual(ContentModeration.objects.count(), 0)
+        self.assertEqual(ModerationAttempt.objects.count(), 0)
+        self.assertEqual(KnowledgeDoc.objects.count(), docs_before)
