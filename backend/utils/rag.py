@@ -732,6 +732,18 @@ def _merge_and_rerank(
     keywords_boost = keywords_boost or {}
     merged = {}
 
+    # 关键词通道（元数据/关键词表/分块）按文档聚合：同文档多 chunk 逐条累加
+    # 会造成分数虚高（如同一文档 10 个 chunk 命中叠加到 7.0），排序失真。
+    # 每文档只保留最高分一条作为文档级证据；同文档多块由向量通道提供。
+    best_by_doc = {}
+    for hit in keyword_hits:
+        did = hit.get('doc_id')
+        if did not in best_by_doc or hit['score'] > best_by_doc[did]['score']:
+            best_by_doc[did] = hit
+    keyword_hits = sorted(
+        best_by_doc.values(), key=lambda h: h['score'], reverse=True,
+    )
+
     # 无向量命中时关键词分数不衰减：vector_weight 缩放本意是双通道
     # 量纲对齐，向量为空时再乘 (1-0.7) 会把 0.55 压到 0.165，
     # 被 min_score 全部过滤掉。
@@ -982,6 +994,44 @@ def _fallback_title_search(
 
     # 取每篇文档的最相关 chunk 作为内容预览（首块兜底）
     return _build_doc_results(docs, keywords, score=0.5)
+
+
+def find_pending_index_docs(
+    question: str,
+    user_context: Optional[dict] = None,
+    top_k: int = 3,
+) -> List[dict]:
+    """检索无结果时的诊断查询：查找匹配查询词但尚未完成索引的文档。
+
+    用于向前端明确提示"知识库存在相关文件但暂不可检索"，
+    与"没有匹配文件"区分开。仅返回用户有权访问的文档，
+    未索引文档不得作为正常来源传给 LLM。
+
+    Returns:
+        [{'doc_id': int, 'doc_title': str, 'status': str}, ...]
+    """
+    keywords = _extract_query_terms(question, max_terms=5)
+    if not keywords:
+        return []
+
+    from django.db.models import Q
+
+    kw_query = Q()
+    for kw in keywords:
+        kw_query |= Q(title__icontains=kw)
+        kw_query |= Q(description__icontains=kw)
+        kw_query |= Q(file_name__icontains=kw)
+
+    docs = (
+        authorized_knowledge_docs(user_context)
+        .filter(kw_query)
+        .exclude(status='indexed')
+        .order_by('-created_at')[:top_k]
+    )
+    return [
+        {'doc_id': doc.id, 'doc_title': doc.title, 'status': doc.status}
+        for doc in docs
+    ]
 
 
 # ------------------------------------------------------------------

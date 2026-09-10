@@ -19,7 +19,10 @@ lxml>=5.0.0
 # - 若不需要 FAQ 自动生成，可以省略；接口调用时会因 import 失败 500
 numpy>=1.26.0
 # 本地向量数据库（开发环境 Milvus 降级方案）
-chromadb>=1.5.0
+# - 固定 0.6.3：chromadb 1.5.x 的 Rust hnsw 在 Windows 上新进程读取崩溃；
+#   0.6.3 需搭配 chroma-hnswlib==0.7.3（0.7.6 写出的索引互不兼容）
+chromadb==0.6.3
+chroma-hnswlib==0.7.3
 # 异步任务（可选）
 # - 生产/定时任务场景需要 celery + redis 作为 broker
 # - 本地开发不安装也能跑，utils.shared_task_compat 会自动降级为同步执行
@@ -28,3 +31,12 @@ redis>=5.0.0
 imageio-ffmpeg
 # 图片缩放（视觉模型读图前压缩），图片智能分类依赖
 Pillow>=10.0.0
+# 文档文本提取（文件上传解析正文，供 AI 自动分类 / 检索索引使用）
+# - apps/knowledge/extractor.py 的 _EXTRACTORS 依赖，未装会导致 PDF/PPT/Excel/DOC 提取正文为空
+PyMuPDF>=1.24.0
+python-docx>=1.0.0
+python-pptx>=1.0.0
+openpyxl>=3.1.0
+# xlrd 必须固定 1.2.0：2.0+ 移除 .xlsx 支持且 API 变化，_parse_xls 依赖旧版接口
+xlrd==1.2.0
+docx2txt>=0.8
