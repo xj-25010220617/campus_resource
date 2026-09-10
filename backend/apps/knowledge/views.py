@@ -1271,8 +1271,15 @@ class FileUploadView(APIView):
             or not user_provided_visibility
         )
         if needs_ai:
-            image_bytes = file_bytes if ext in IMAGE_FILE_TYPES else None
-            ai_result = _ai_classify(title, extracted_text, image_bytes=image_bytes)
+            # 无有效文本内容（空文件 / 空文档等）且非图片时，跳过 AI，
+            # 避免仅凭文件名「乱读取、乱填信息」
+            has_text_content = bool(extracted_text and extracted_text.strip())
+            is_image = ext in IMAGE_FILE_TYPES
+            if has_text_content or is_image:
+                image_bytes = file_bytes if is_image else None
+                ai_result = _ai_classify(title, extracted_text, image_bytes=image_bytes)
+            else:
+                ai_result = None
             if ai_result:
                 title = user_title or ai_result['title'] or fallback_title
                 description = user_description or ai_result['description'] or ''
@@ -1515,8 +1522,15 @@ class BatchFileUploadView(APIView):
 
                 # 4d. AI 自动生成标题、描述、关键词
                 fallback_title = file_name.rsplit('.', 1)[0] if '.' in file_name else file_name
-                image_bytes = file_bytes if ext in IMAGE_FILE_TYPES else None
-                ai_result = _ai_classify(fallback_title, extracted_text, image_bytes=image_bytes)
+                # 无有效文本内容（空文件/空文档/无文本提取）且非图片时，跳过 AI，
+                # 避免仅凭文件名「乱读取、乱填信息」
+                has_text_content = bool(extracted_text and extracted_text.strip())
+                is_image = ext in IMAGE_FILE_TYPES
+                if has_text_content or is_image:
+                    image_bytes = file_bytes if is_image else None
+                    ai_result = _ai_classify(fallback_title, extracted_text, image_bytes=image_bytes)
+                else:
+                    ai_result = None
                 if ai_result:
                     title = ai_result.get('title') or fallback_title
                     description = ai_result.get('description') or ''
