@@ -353,7 +353,10 @@ class TextUploadSerializer(serializers.Serializer):
 class FileUploadSerializer(serializers.Serializer):
     """文件上传请求参数（multipart/form-data）"""
 
-    file = serializers.FileField(help_text='上传的文件')
+    file = serializers.FileField(
+        help_text='上传的文件',
+        error_messages={'empty': '不能上传空文件（文件内容为空）'},
+    )
     title = serializers.CharField(
         max_length=512, required=False, default='',
         help_text='文档标题（可选，默认使用文件名，或由 AI 自动生成）',

@@ -111,6 +111,10 @@ class ChunkUploadInitView(APIView):
         except (TypeError, ValueError):
             file_size = 0
 
+        # 拒绝 0 字节空文件
+        if file_size == 0:
+            raise ValidationError({'file_size': '不能上传空文件（文件内容为空）'})
+
         if len(file_md5) != 32 or any(c not in '0123456789abcdef' for c in file_md5):
             raise ValidationError({'file_md5': 'MD5 格式不合法'})
         if not filename:
