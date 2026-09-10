@@ -1162,6 +1162,10 @@ class FileUploadView(APIView):
                 {'file': f'不支持的文件类型 ".{ext}"，支持的类型：{", ".join(sorted(ALLOWED_FILE_TYPES))}'}
             )
 
+        # 校验空文件：0 字节文件无内容可分类/索引，直接拒绝，避免 AI 仅凭文件名乱填信息
+        if uploaded_file.size == 0:
+            raise ValidationError({'file': '不能上传空文件（文件内容为空）'})
+
         # 校验文件大小
         max_size = FILE_SIZE_LIMITS.get(ext, FILE_SIZE_LIMITS['other'])
         if uploaded_file.size > max_size:
@@ -1450,7 +1454,15 @@ class BatchFileUploadView(APIView):
                     })
                     continue
 
-                # 4a2. 校验文件大小
+                # 4a2. 校验空文件：0 字节文件无内容可分类/索引，直接拒绝，避免 AI 仅凭文件名乱填信息
+                if uploaded_file.size == 0:
+                    failed_results.append({
+                        'file_name': file_name,
+                        'error': '不能上传空文件（文件内容为空）',
+                    })
+                    continue
+
+                # 4a3. 校验文件大小
                 max_size = FILE_SIZE_LIMITS.get(ext, FILE_SIZE_LIMITS['other'])
                 if uploaded_file.size > max_size:
                     max_mb = max_size // (1024 * 1024)
