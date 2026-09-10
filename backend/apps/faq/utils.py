@@ -167,15 +167,44 @@ def filter_by_ratio(
     return [c for c, _ in top]
 
 
+def get_faq_category_names() -> List[str]:
+    """获取全部 FAQ 分类名（用于约束 LLM 输出），按 sort_order 排序。"""
+    from .models import FAQCategory
+    return list(FAQCategory.objects.order_by('sort_order', 'id').values_list('name', flat=True))
+
+
+def resolve_category_id(category_name) -> Optional[int]:
+    """将 LLM 返回的分类名解析为 FAQCategory.id，匹配不上返回 None。"""
+    if not category_name:
+        return None
+    try:
+        from .models import FAQCategory
+        name = str(category_name).strip()
+        category = FAQCategory.objects.filter(name=name).first()
+        if not category:
+            category = FAQCategory.objects.filter(name__icontains=name).first()
+        return category.id if category else None
+    except Exception as e:
+        logger.warning(f'解析 FAQ 分类名失败: {e}')
+        return None
+
+
 def generate_faq_from_source(title: str, content: str, source_url: str = '') -> Optional[dict]:
     """根据官网文档生成单条 FAQ 草稿，答案必须有来源依据。"""
     if not content or not content.strip():
         return None
 
-    system_prompt = """你是校园官网 FAQ 编辑。只能依据用户提供的文档内容生成一条 FAQ。
+    category_names = get_faq_category_names()
+    category_rule = ''
+    category_field = ''
+    if category_names:
+        category_rule = f"分类必须从以下名称中选一个并原样输出：{'、'.join(category_names)}。\n"
+        category_field = '"category_name":"分类名",'
+
+    system_prompt = f"""你是校园官网 FAQ 编辑。只能依据用户提供的文档内容生成一条 FAQ。
 不得补充文档中没有的事实、电话、网址、时间或政策；信息不足时返回 null。
-输出严格 JSON，不要 Markdown 或其他文字：
-{"question":"标准化问题","answer":"依据原文整理的答案","tags":["标签"],"college_name":"学院名称或全局"}
+{category_rule}输出严格 JSON，不要 Markdown 或其他文字：
+{{"question":"标准化问题","answer":"依据原文整理的答案",{category_field}"tags":["标签"],"college_name":"学院名称或全局"}}
 问题应是学生或教职工会实际提出的办事问题，答案简洁、可执行；答案中不得声称文档未提及的内容。"""
     user_prompt = (
         f"文档标题：{title[:300]}\\n来源：{source_url[:500]}\\n"
@@ -208,6 +237,7 @@ def generate_faq_from_source(title: str, content: str, source_url: str = '') -> 
             'question': question[:500],
             'answer': answer,
             'tags': result.get('tags', []) if isinstance(result.get('tags', []), list) else [],
+            'category_name': str(result.get('category_name') or '').strip(),
             'college_name': str(result.get('college_name') or '全局'),
         }
     except Exception as exc:
@@ -227,6 +257,7 @@ def generate_faq_draft(cluster: QuestionCluster) -> Optional[dict]:
             'question': str,           # 标准化问题
             'answer': str,             # 标准答案
             'tags': List[str],         # 关键词标签
+            'category_id': int | None, # 所属分类ID，None=未分类
             'college_id': int | None,  # 推断的学院ID，None=全局
         }
         失败返回 None
@@ -235,7 +266,16 @@ def generate_faq_draft(cluster: QuestionCluster) -> Optional[dict]:
     questions_text = '\n'.join(f'- {q}' for q in cluster.questions[:10])
     answers_text = '\n'.join(f'- {a[:200]}' for a in cluster.answers[:5] if a)
 
-    system_prompt = """你是一个 FAQ 生成助手。请根据用户反复询问的同类问题变体和已有回答，
+    category_names = get_faq_category_names()
+    category_rule = ''
+    category_field = ''
+    if category_names:
+        category_rule = (
+            f"5. 从以下 FAQ 分类中选择最匹配的一个，必须原样输出分类名称：{'、'.join(category_names)}\n"
+        )
+        category_field = '    "category_name": "分类名称",\n'
+
+    system_prompt = f"""你是一个 FAQ 生成助手。请根据用户反复询问的同类问题变体和已有回答，
 生成一份标准化的 FAQ 条目。
 
 要求：
@@ -245,7 +285,7 @@ def generate_faq_draft(cluster: QuestionCluster) -> Optional[dict]:
 4. 判断是否与特定学院相关：
    - 如果问题明确提到某个学院名称，输出该学院名称
    - 如果是通用问题（如"如何重置密码"），输出"全局"
-5. 以 JSON 格式输出，不要包含其他内容"""
+{category_rule}{'6' if category_names else '5'}. 以 JSON 格式输出，不要包含其他内容"""
 
     user_prompt = f"""问题变体（共 {cluster.size} 条，以下展示前 10 条）：
 {questions_text}
@@ -257,7 +297,7 @@ def generate_faq_draft(cluster: QuestionCluster) -> Optional[dict]:
 {{
     "question": "标准化后的问题",
     "answer": "完整的标准答案",
-    "tags": ["标签1", "标签2", "标签3"],
+{category_field}    "tags": ["标签1", "标签2", "标签3"],
     "college_name": "学院名称 或 '全局'"
 }}"""
 
@@ -298,13 +338,66 @@ def generate_faq_draft(cluster: QuestionCluster) -> Optional[dict]:
             except Exception as e:
                 logger.warning(f'解析学院名称失败: {e}')
 
+        # 解析 category_id（分类表为空时跳过）
+        category_id = resolve_category_id(result.get('category_name')) if category_names else None
+
         return {
             'question': result.get('question', cluster.questions[0][:500]),
             'answer': result.get('answer', ''),
             'tags': result.get('tags', []),
+            'category_id': category_id,
             'college_id': college_id,
         }
 
     except Exception as e:
         logger.error(f'LLM 生成 FAQ 草稿失败: {e}')
+        return None
+
+
+def classify_faq_category(question: str, answer: str = '') -> Optional[str]:
+    """
+    调用 LLM 为单条 FAQ 判定分类（存量数据回填用）。
+
+    Args:
+        question: FAQ 问题
+        answer: FAQ 答案（可空）
+
+    Returns:
+        分类名（限定 faq_category 表内的名称），不匹配返回 None
+    """
+    category_names = get_faq_category_names()
+    if not category_names or not question or not question.strip():
+        return None
+
+    system_prompt = """你是校园 FAQ 分类助手。根据给定的问题和答案，从候选分类中选出最匹配的一个。
+只能原样输出候选分类中的名称，若都不匹配则输出 null。
+输出严格 JSON，不要 Markdown 或其他文字：
+{"category_name":"分类名"}"""
+    user_prompt = (
+        f"候选分类：{'、'.join(category_names)}\n\n"
+        f"问题：{question[:500]}\n答案：{(answer or '')[:1000]}"
+    )
+
+    try:
+        import json as _json
+        response = llm_client.chat(
+            messages=[
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': user_prompt},
+            ],
+            temperature=0.1,
+            max_tokens=100,
+        )
+        if not response:
+            return None
+        text = response.strip()
+        if text.lower() == 'null':
+            return None
+        if '```' in text:
+            text = text.split('```json')[-1].split('```')[0].strip()
+        result = _json.loads(text)
+        name = str(result.get('category_name') or '').strip()
+        return name if name in category_names else None
+    except Exception as exc:
+        logger.warning('FAQ 分类判定失败 question=%s: %s', question[:50], exc)
         return None
