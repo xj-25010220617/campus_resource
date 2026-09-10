@@ -29,6 +29,7 @@ CATEGORIES = [
     {'name': '信息技术', 'icon': 'monitor', 'sort_order': 4},
     {'name': '校园生活', 'icon': 'home', 'sort_order': 5},
     {'name': '后勤服务', 'icon': 'settings', 'sort_order': 6},
+    {'name': '学习资源', 'icon': 'folder', 'sort_order': 7},
 ]
 
 # 东软学院 13 个学院的 id->name 映射（来自 accounts.models College 表注释）

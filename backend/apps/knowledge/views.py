@@ -627,10 +627,6 @@ class UploadSTSView(APIView):
         serializer = UploadSTSRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        # 拒绝 0 字节空文件
-        if serializer.validated_data.get('file_size', 0) == 0:
-            raise ValidationError({'file_size': '不能上传空文件（文件内容为空）'})
-
         md5_hash = serializer.validated_data['md5']
         file_name = serializer.validated_data['file_name']
         college_id = request.user.college_id or 0
@@ -698,10 +694,6 @@ class UploadCallbackView(APIView):
         serializer = UploadCallbackSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-
-        # 拒绝 0 字节空文件
-        if data.get('file_size', 0) == 0:
-            raise ValidationError({'file_size': '不能上传空文件（文件内容为空）'})
 
         # 校验 oss_key 格式合法性（防止路径穿越攻击）
         self._validate_oss_key(data['oss_key'])
@@ -1182,10 +1174,6 @@ class FileUploadView(APIView):
                 {'file': f'不支持的文件类型 ".{ext}"，支持的类型：{", ".join(sorted(ALLOWED_FILE_TYPES))}'}
             )
 
-        # 校验空文件：0 字节文件无内容可分类/索引，直接拒绝，避免 AI 仅凭文件名乱填信息
-        if uploaded_file.size == 0:
-            raise ValidationError({'file': '不能上传空文件（文件内容为空）'})
-
         # 校验文件大小
         max_size = FILE_SIZE_LIMITS.get(ext, FILE_SIZE_LIMITS['other'])
         if uploaded_file.size > max_size:
@@ -1276,15 +1264,6 @@ class FileUploadView(APIView):
             except ImportError:
                 logger.warning('无法导入文档解析器，跳过文档文本提取')
 
-        # 空文件判断：应含文本的类型（纯文本 + Office 文档 + PDF）提取不到任何有效文本 → 拒绝
-        if ext in self.TEXT_EXTRACTABLE_TYPES or ext in self.DOCUMENT_EXTRACTABLE_TYPES:
-            if not (extracted_text and extracted_text.strip()):
-                # PDF 特判：扫描件（含图片但无文字层）不算空文件
-                if ext == 'pdf' and _pdf_has_content(file_bytes):
-                    pass
-                else:
-                    raise ValidationError({'file': '不能上传空文件（文件内容为空）'})
-
         # 判断用户是否显式传了 visibility（检查原始请求，排除序列化器默认值）
         user_provided_visibility = 'visibility' in request.data
 
@@ -1293,43 +1272,52 @@ class FileUploadView(APIView):
         # multipart 兼容：前端可能以 JSON 字符串 / 重复字段 / keywords[] 等多种形式发送关键词
         raw_keywords = _normalize_keywords(request, data.get('keywords', []))
 
-        needs_ai = (
-            not user_title
-            or not user_description
-            or not raw_keywords  # 直接检查列表是否为空
-            or not user_provided_visibility
+        # 空文件检测：0 字节，或文本/文档类提取不到任何内容
+        is_empty_file = (
+            len(file_bytes) == 0
+            or (
+                (ext in self.TEXT_EXTRACTABLE_TYPES or ext in self.DOCUMENT_EXTRACTABLE_TYPES)
+                and not extracted_text.strip()
+            )
         )
-        if needs_ai:
-            # 无有效文本内容（空文件 / 空文档等）且非图片时，跳过 AI，
-            # 避免仅凭文件名「乱读取、乱填信息」
-            has_text_content = bool(extracted_text and extracted_text.strip())
-            is_image = ext in IMAGE_FILE_TYPES
-            if has_text_content or is_image:
-                image_bytes = file_bytes if is_image else None
-                ai_result = _ai_classify(title, extracted_text, image_bytes=image_bytes)
-            else:
-                ai_result = None
-            if ai_result:
-                title = user_title or ai_result['title'] or fallback_title
-                description = user_description or ai_result['description'] or ''
-                visibility = data['visibility'] if user_provided_visibility else ai_result['visibility']
-                # 关键词：用户提供的优先
-                if raw_keywords:
-                    pass  # 用户已提供关键词，保留
-                else:
-                    raw_keywords = ai_result['keywords']
-            else:
-                # AI 不可用降级
-                title = title or fallback_title
-                description = user_description
-                visibility = data['visibility']
-        else:
-            description = user_description
+        if is_empty_file:
+            # 空文件跳过 AI，标题固定「空文件」，描述/关键词留空，分类保留真实格式
+            title = '空文件'
+            description = ''
+            raw_keywords = []
             visibility = data['visibility']
 
-        # 二次归一：确保变量有值
-        title = title or fallback_title
-        description = description or ''
+        if not is_empty_file:
+            needs_ai = (
+                not user_title
+                or not user_description
+                or not raw_keywords  # 直接检查列表是否为空
+                or not user_provided_visibility
+            )
+            if needs_ai:
+                image_bytes = file_bytes if ext in IMAGE_FILE_TYPES else None
+                ai_result = _ai_classify(title, extracted_text, image_bytes=image_bytes)
+                if ai_result:
+                    title = user_title or ai_result['title'] or fallback_title
+                    description = user_description or ai_result['description'] or ''
+                    visibility = data['visibility'] if user_provided_visibility else ai_result['visibility']
+                    # 关键词：用户提供的优先
+                    if raw_keywords:
+                        pass  # 用户已提供关键词，保留
+                    else:
+                        raw_keywords = ai_result['keywords']
+                else:
+                    # AI 不可用降级
+                    title = title or fallback_title
+                    description = user_description
+                    visibility = data['visibility']
+            else:
+                description = user_description
+                visibility = data['visibility']
+
+            # 二次归一：确保变量有值
+            title = title or fallback_title
+            description = description or ''
 
         # 文档归属根据上传者角色自动确定
         if request.user.role == 'super_admin':
@@ -1490,15 +1478,7 @@ class BatchFileUploadView(APIView):
                     })
                     continue
 
-                # 4a2. 校验空文件：0 字节文件无内容可分类/索引，直接拒绝，避免 AI 仅凭文件名乱填信息
-                if uploaded_file.size == 0:
-                    failed_results.append({
-                        'file_name': file_name,
-                        'error': '不能上传空文件（文件内容为空）',
-                    })
-                    continue
-
-                # 4a3. 校验文件大小
+                # 4a2. 校验文件大小
                 max_size = FILE_SIZE_LIMITS.get(ext, FILE_SIZE_LIMITS['other'])
                 if uploaded_file.size > max_size:
                     max_mb = max_size // (1024 * 1024)
@@ -1549,34 +1529,25 @@ class BatchFileUploadView(APIView):
                     except Exception:
                         pass
 
-                # 4c2. 纯文本类型空文件判断：提取不到任何有效文本 → 拒绝
-                if ext in self.TEXT_EXTRACTABLE_TYPES and not (extracted_text and extracted_text.strip()):
-                    failed_results.append({
-                        'file_name': file_name,
-                        'error': '不能上传空文件（文件内容为空）',
-                    })
-                    continue
-
                 # 4d. AI 自动生成标题、描述、关键词
                 fallback_title = file_name.rsplit('.', 1)[0] if '.' in file_name else file_name
-                # 无有效文本内容（空文件/空文档/无文本提取）且非图片时，跳过 AI，
-                # 避免仅凭文件名「乱读取、乱填信息」
-                has_text_content = bool(extracted_text and extracted_text.strip())
-                is_image = ext in IMAGE_FILE_TYPES
-                if has_text_content or is_image:
-                    image_bytes = file_bytes if is_image else None
-                    ai_result = _ai_classify(fallback_title, extracted_text, image_bytes=image_bytes)
-                else:
-                    ai_result = None
-                if ai_result:
-                    title = ai_result.get('title') or fallback_title
-                    description = ai_result.get('description') or ''
-                    raw_keywords = ai_result.get('keywords', [])
-                else:
-                    # AI 不可用降级：使用文件名作为标题
-                    title = fallback_title
+                if len(file_bytes) == 0:
+                    # 空文件跳过 AI，标题固定「空文件」，描述/关键词留空，分类保留真实格式
+                    title = '空文件'
                     description = ''
                     raw_keywords = []
+                else:
+                    image_bytes = file_bytes if ext in IMAGE_FILE_TYPES else None
+                    ai_result = _ai_classify(fallback_title, extracted_text, image_bytes=image_bytes)
+                    if ai_result:
+                        title = ai_result.get('title') or fallback_title
+                        description = ai_result.get('description') or ''
+                        raw_keywords = ai_result.get('keywords', [])
+                    else:
+                        # AI 不可用降级：使用文件名作为标题
+                        title = fallback_title
+                        description = ''
+                        raw_keywords = []
 
                 # 4e. 创建 KnowledgeDoc 记录
                 new_doc = KnowledgeDoc.objects.create(
@@ -1701,29 +1672,6 @@ def _normalize_keywords(request, validated_value) -> list:
 
     # 归整为非空字符串列表
     return [str(k).strip() for k in candidates if str(k).strip()]
-
-
-def _pdf_has_content(file_bytes: bytes) -> bool:
-    """判断 PDF 是否有实质内容（文本或图片）。
-
-    用于区分「空 PDF」与「扫描件 PDF」：空 PDF 无文本也无图片；
-    扫描件 PDF 无文本层但有图片。返回 True 表示有内容、不应被当作空文件拒绝。
-    """
-    try:
-        import fitz  # PyMuPDF
-        doc = fitz.open(stream=file_bytes, filetype='pdf')
-        try:
-            for page in doc:
-                if page.get_text().strip():
-                    return True
-                if page.get_images(full=True):
-                    return True
-            return False
-        finally:
-            doc.close()
-    except Exception:
-        # 解析失败时保守放行（不误伤），交给后续逻辑处理
-        return True
 
 
 def _decode_image_base64(image_str: str) -> Optional[bytes]:
