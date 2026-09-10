@@ -298,6 +298,12 @@ class KnowledgeDocDeleteView(generics.DestroyAPIView):
             deleted = oss_client.delete(instance.oss_key)
             if not deleted:
                 logger.warning(f'OSS 文件删除失败 oss_key={instance.oss_key}，跳过')
+        # 清理向量库（Milvus/Chroma），防止孤儿向量挤占检索召回窗口
+        try:
+            from utils.milvus import milvus_client
+            milvus_client.delete_by_doc(instance.id)
+        except Exception as e:
+            logger.warning(f'向量清理失败 doc_id={instance.id}: {e}')
         with transaction.atomic():
             instance.delete()
 
@@ -364,6 +370,12 @@ class KnowledgeDocBatchDeleteView(APIView):
                 doc = next(d for d in deletable if d.id == doc_id)
                 if doc.oss_key:
                     oss_client.delete(doc.oss_key)
+                # 清理向量库，防止孤儿向量（与单条删除一致）
+                try:
+                    from utils.milvus import milvus_client
+                    milvus_client.delete_by_doc(doc_id)
+                except Exception as e:
+                    logger.warning(f'向量清理失败 doc_id={doc_id}: {e}')
                 with transaction.atomic():
                     doc.delete()
                 deleted += 1

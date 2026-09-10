@@ -221,6 +221,20 @@ def build_references_events(
     if not qualified:
         return {'references': {'count': 0, 'summary': '暂无高相关度参考资料'}}
 
+    # 按文档去重：同一文档的多个分块只展示一条（保留分数最高的分块），
+    # 避免"同一文件在参考列表出现多次"的展示问题。
+    qualified.sort(key=lambda r: r.get('score', 0), reverse=True)
+    seen_doc_ids = set()
+    deduped = []
+    for result in qualified:
+        did = result.get('doc_id')
+        if did:
+            if did in seen_doc_ids:
+                continue
+            seen_doc_ids.add(did)
+        deduped.append(result)
+    qualified = deduped
+
     context = dict(user_context or {})
     context.setdefault('role', user_role or 'user')
     context.setdefault('user_id', user_id)

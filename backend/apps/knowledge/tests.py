@@ -203,6 +203,36 @@ class RagRetrievalTests(TestCase):
         self.assertEqual(results[0]['chunk_index'], 1)
 
     # ------------------------------------------------------------------
+    # 未索引文档诊断提示
+    # ------------------------------------------------------------------
+    def test_find_pending_index_docs(self):
+        """检索无结果时能识别出匹配但未完成索引的文档（含状态）。"""
+        self._create_doc(status='embedding')
+
+        from utils.rag import find_pending_index_docs
+
+        pending = find_pending_index_docs('贡嘎杯 跳绳', self.admin_ctx)
+
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]['status'], 'embedding')
+
+    def test_find_pending_excludes_indexed(self):
+        """已索引文档不进入 pending 提示。"""
+        self._create_doc(status='indexed')
+
+        from utils.rag import find_pending_index_docs
+
+        self.assertEqual(find_pending_index_docs('贡嘎杯 跳绳', self.admin_ctx), [])
+
+    def test_find_pending_respects_permissions(self):
+        """普通用户不能通过 pending 提示感知私有文档存在。"""
+        self._create_doc(visibility='private', status='embedding')
+
+        from utils.rag import find_pending_index_docs
+
+        self.assertEqual(find_pending_index_docs('贡嘎杯 跳绳', self.user_ctx), [])
+
+    # ------------------------------------------------------------------
     # retrieve() 集成：多通道合并 + 来源元数据
     # ------------------------------------------------------------------
     def test_retrieve_integrates_new_channels(self):
