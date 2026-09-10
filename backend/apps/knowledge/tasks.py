@@ -130,6 +130,7 @@ def index_document_task(self, doc_id: int):
 
     from apps.knowledge.extractor import extract_text_from_oss
     from apps.knowledge.models import DocChunk, KnowledgeDoc
+    from apps.knowledge.moderation import check_indexable
     from apps.knowledge.utils import chunk_document
     from utils.llm import llm_client
     from utils.milvus import milvus_client
@@ -138,6 +139,18 @@ def index_document_task(self, doc_id: int):
         doc = KnowledgeDoc.objects.get(id=doc_id)
     except KnowledgeDoc.DoesNotExist:
         logger.warning(f'index_document_task: doc_id={doc_id} 不存在')
+        return None
+
+    # 索引前置安全校验（集中式唯一入口，见 apps.knowledge.moderation）。
+    # 必须放在任务体内：本任务还可能被 safe_delay 同步降级、脚本 task.run()、
+    # 爬虫 safe_delay、broker 残留消息等路径直接调用，只加在视图层会被绕过。
+    allowed, reason = check_indexable(doc)
+    if not allowed:
+        logger.warning(f'index_document_task doc_id={doc_id} 未通过索引前置校验: {reason}')
+        doc.status = 'failed'
+        doc.index_error = f'索引前置校验未通过：{reason}'
+        doc.failed_at = timezone.now()
+        doc.save(update_fields=['status', 'index_error', 'failed_at', 'updated_at'])
         return None
 
     # Celery 绑定任务提供 request.retries；本地同步降级时使用 0 次重试作为默认值。

@@ -11,6 +11,7 @@ import os
 import time
 import uuid as _uuid
 from datetime import datetime
+from typing import Optional
 from urllib.parse import quote
 
 import oss2
@@ -245,6 +246,56 @@ class OSSClient:
         except Exception as e:
             logger.error(f'生成预览 URL 失败 oss_key={oss_key}: {e}')
             return ''
+
+    # ------------------------------------------------------------------
+    # 对象元数据（服务端权威事实）
+    # ------------------------------------------------------------------
+    def head_object(self, oss_key: str) -> Optional[dict]:
+        """
+        读取 OSS 对象的服务端权威元数据（只发 HEAD 请求，不下载内容）。
+
+        用于上传回调等场景校验客户端声明值——客户端的 oss_key / file_size /
+        content-type 都是不可信输入，必须以 OSS 侧的实际状态为准。
+
+        Args:
+            oss_key: OSS 对象 Key
+
+        Returns:
+            None               — OSS 不可用或查询失败（**无法验证**，调用方应拒绝）
+            {'exists': False}  — 对象不存在
+            {'exists': True, 'size': int, 'content_type': str, 'etag': str}
+
+        Note:
+            本函数只能证明"对象存在且元数据为何"，**不能**证明该对象由谁上传。
+            上传归属校验需要服务端上传凭证记录，当前数据模型不具备。
+        """
+        if not self.bucket:
+            logger.error(f'OSS Bucket 未初始化，无法读取对象元数据 oss_key={oss_key}')
+            return None
+        missing = {'exists': False, 'size': 0, 'content_type': '', 'etag': ''}
+        try:
+            result = self.bucket.head_object(oss_key)
+        except oss2.exceptions.NoSuchKey:
+            return missing
+        except oss2.exceptions.OssError as e:
+            # 不同 OSS 版本对 404 的异常类型不一致，按 status 兜底判断
+            if getattr(e, 'status', None) == 404:
+                return missing
+            logger.error(f'读取对象元数据失败 oss_key={oss_key}: {e}')
+            return None
+        except Exception as e:
+            logger.error(f'读取对象元数据异常 oss_key={oss_key}: {e}')
+            return None
+
+        headers = result.headers or {}
+        content_type = headers.get('Content-Type') or headers.get('content-type') or ''
+        return {
+            'exists': True,
+            'size': int(result.content_length or 0),
+            'content_type': str(content_type),
+            # 简单 PUT 的 ETag 即对象 MD5；分片上传形如 "<md5>-<n>"，不能直接比对
+            'etag': str(result.etag or '').strip('"'),
+        }
 
     # ------------------------------------------------------------------
     # MD5 去重检查

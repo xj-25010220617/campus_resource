@@ -28,7 +28,7 @@ from apps.accounts.models import College
 from apps.classify.models import Department, Discipline
 from apps.resources.models import UploadLog
 from config.permissions import CanUploadDocument, IsAdminOrSuperAdmin, IsLoginUser
-from utils.oss import guess_content_type, oss_client
+from utils.oss import DEFAULT_MIME_TYPE, guess_content_type, oss_client
 from utils.error_codes import ErrorCode
 from utils.parsers import CleanJSONParser
 
@@ -37,6 +37,7 @@ from .models import Keyword, KnowledgeDoc
 from .serializers import (
     AIClassifySerializer,
     ALLOWED_FILE_TYPES,
+    check_file_size,
     FILE_SIZE_LIMITS,
     IMAGE_FILE_TYPES,
     FileUploadSerializer,
@@ -146,23 +147,28 @@ class KnowledgeDocListView(generics.ListAPIView):
         - dept_admin：校级文档 + 本部门文档 + 自己上传的
         - user：仅本人上传的文档（对齐接口文档「普通用户仅能查看/下载自己上传的文档」，
           避免泄露他人私密/未完成文档）
+
+        所有非 super_admin 角色额外受 visibility 约束：**private 文档仅上传者本人可见**。
+        否则同学院/同部门的管理员能在列表与详情里拿到他人私密文档的元数据，
+        以及 7 天有效期的签名 URL（download_url / oss_url），即真实内容泄露。
+        该语义与 `_rag_scope_filter` 保持一致（后者完全不检索 private 文档）。
         """
         # 校级文档：college_id 和 department_id 均为 null
         SCHOOL_LEVEL = Q(college_id__isnull=True, department_id__isnull=True)
+        # 非 private，或本人上传（private 只对上传者本人放行）
+        NOT_PRIVATE_OR_OWN = ~Q(visibility='private') | Q(uploader_id=user.id)
 
         if user.role == 'super_admin':
             return queryset
         if user.role in ('college_admin', 'admin'):
             return queryset.filter(
-                SCHOOL_LEVEL
-                | Q(college_id=user.college_id)
-                | Q(uploader_id=user.id),
+                (SCHOOL_LEVEL | Q(college_id=user.college_id) | Q(uploader_id=user.id))
+                & NOT_PRIVATE_OR_OWN,
             )
         if user.role == 'dept_admin':
             return queryset.filter(
-                SCHOOL_LEVEL
-                | Q(department_id=user.department_id)
-                | Q(uploader_id=user.id),
+                (SCHOOL_LEVEL | Q(department_id=user.department_id) | Q(uploader_id=user.id))
+                & NOT_PRIVATE_OR_OWN,
             )
         # user（普通用户）：仅本人上传
         return queryset.filter(uploader_id=user.id)
@@ -255,10 +261,18 @@ class KnowledgeDocDetailView(generics.RetrieveUpdateAPIView):
         return KnowledgeDocListView._admin_scope_filter(queryset, user)
 
     def perform_update(self, serializer):
-        """仅允许超管或文档所有者编辑"""
+        """仅允许超管或文档所有者编辑；文档归属字段仅超管可改"""
         instance = self.get_object()
-        if self.request.user.role != 'super_admin' and instance.uploader_id != self.request.user.id:
-            raise PermissionDenied('只能编辑自己上传的文档')
+        user = self.request.user
+        if user.role != 'super_admin':
+            if instance.uploader_id != user.id:
+                raise PermissionDenied('只能编辑自己上传的文档')
+            # college 决定文档的可见范围（校级/院级）。上传路径一律由服务端按
+            # 上传者角色强制赋值，更新路径若不限制，非超管可把自己的文档改成
+            # 「校级」（college_id=null）从而对全校管理员可见，属越权扩大范围。
+            if 'college' in serializer.validated_data and \
+                    serializer.validated_data['college'] != instance.college:
+                raise PermissionDenied('无权修改文档归属学院')
         serializer.save()
 
 
@@ -308,23 +322,27 @@ class KnowledgeDocDeleteView(generics.DestroyAPIView):
 
     @staticmethod
     def _filter_deletable(queryset, user):
-        """按角色过滤可删除的文档（通过 college_id/department_id 判断归属）"""
+        """按角色过滤可删除的文档（通过 college_id/department_id 判断归属）
+
+        与 `KnowledgeDocListView._admin_scope_filter` 保持同一 visibility 语义：
+        private 文档仅上传者本人与 super_admin 可删——否则会出现"看不见该文档
+        却仍能按 ID 删除它"的不一致状态，且删除本身是破坏性操作。
+        """
         # 校级文档：college_id 和 department_id 均为 null
         SCHOOL_LEVEL = Q(college_id__isnull=True, department_id__isnull=True)
+        NOT_PRIVATE_OR_OWN = ~Q(visibility='private') | Q(uploader_id=user.id)
 
         if user.role == 'super_admin':
             return queryset
         if user.role in ('college_admin', 'admin'):
             return queryset.filter(
-                SCHOOL_LEVEL
-                | Q(college_id=user.college_id)
-                | Q(uploader_id=user.id),
+                (SCHOOL_LEVEL | Q(college_id=user.college_id) | Q(uploader_id=user.id))
+                & NOT_PRIVATE_OR_OWN,
             )
         if user.role == 'dept_admin':
             return queryset.filter(
-                SCHOOL_LEVEL
-                | Q(department_id=user.department_id)
-                | Q(uploader_id=user.id),
+                (SCHOOL_LEVEL | Q(department_id=user.department_id) | Q(uploader_id=user.id))
+                & NOT_PRIVATE_OR_OWN,
             )
         return queryset.none()
 
@@ -686,17 +704,32 @@ class UploadCallbackView(APIView):
         # 校验 oss_key 格式合法性（防止路径穿越攻击）
         self._validate_oss_key(data['oss_key'])
 
+        # 校验 oss_key 落在当前用户的合法上传范围内
+        self._validate_oss_key_scope(request.user, data['oss_key'])
+
+        # 校验 OSS 对象真实存在且与客户端声明一致，取回服务端权威元数据
+        actual_size = self._verify_oss_object(data)
+
         # 校验分类关联数据合法性
         self._validate_classification(data)
+
+        # 同一 oss_key 重复登记：直接返回既有文档。
+        # 不拦的话会创建第二条 KnowledgeDoc 指向同一个 OSS 对象，
+        # 之后删除任意一条都会 delete_object 掉另一条正在使用的文件。
+        existing_by_key = KnowledgeDoc.objects.filter(oss_key=data['oss_key']).first()
+        if existing_by_key:
+            if self._visible_to(request.user, existing_by_key):
+                return Response({
+                    'id': existing_by_key.id,
+                    'status': existing_by_key.status,
+                    'duplicate': True,
+                })
+            raise ValidationError({'oss_key': '该 OSS 对象已被登记，请重新上传'})
 
         # 再次 MD5 去重（防止并发上传导致重复）
         # 仅当已存在文档对当前上传者可见时才提示重复，避免泄露他人文档存在性
         duplicate_doc = oss_client.check_duplicate(data['md5'])
-        if duplicate_doc and (
-            request.user.role == 'super_admin'
-            or duplicate_doc.uploader_id == request.user.id
-            or duplicate_doc.visibility == 'public'
-        ):
+        if self._visible_to(request.user, duplicate_doc):
             return Response({
                 'id': duplicate_doc.id,
                 'status': duplicate_doc.status,
@@ -717,7 +750,8 @@ class UploadCallbackView(APIView):
             title=data['title'],
             description=data.get('description', ''),
             file_name=data['file_name'],
-            file_size=data['file_size'],
+            # 以 OSS 实测大小为准，不使用客户端声明值
+            file_size=actual_size,
             file_type=normalize_file_type(data['file_type']),
             md5_hash=data['md5'],
             source_type='upload',
@@ -774,6 +808,103 @@ class UploadCallbackView(APIView):
         if not oss_key.startswith('knowledge/'):
             raise ValidationError({'oss_key': 'OSS Key 格式不合法，必须以 "knowledge/" 开头'})
 
+    @staticmethod
+    def _validate_oss_key_scope(user, oss_key: str) -> None:
+        """校验 oss_key 落在当前用户的合法上传范围内。
+
+        Key 规则（见 utils.oss._generate_oss_key 与 UploadSTSView）：
+            knowledge/{scope}/{owner_id}/{YYYY-MM}/{uuid}.{ext}
+
+        只校验 `knowledge/` 前缀是不够的——任意管理员都能借此认领其他学院 /
+        其他部门上传的对象。这里按角色把 scope 与 owner_id 一并锁定。
+
+        Args:
+            user: 当前请求用户
+            oss_key: 客户端提交的对象 Key
+        """
+        if user.role == 'super_admin':
+            allowed = (
+                'knowledge/school/',
+                'knowledge/college/',
+                'knowledge/department/',
+            )
+        elif user.role == 'dept_admin' and user.department_id:
+            allowed = (f'knowledge/department/{user.department_id}/',)
+        else:
+            allowed = (f'knowledge/college/{user.college_id or 0}/',)
+
+        if not oss_key.startswith(allowed):
+            raise ValidationError({'oss_key': 'OSS Key 不属于当前用户的上传范围'})
+
+    @staticmethod
+    def _visible_to(user, doc) -> bool:
+        """重复文件提示的可见性判断，避免泄露他人文档存在性"""
+        return bool(doc) and (
+            user.role == 'super_admin'
+            or doc.uploader_id == user.id
+            or doc.visibility == 'public'
+        )
+
+    @staticmethod
+    def _verify_oss_object(data: dict) -> int:
+        """校验 OSS 对象真实存在且与客户端声明一致，返回其实际大小。
+
+        客户端提交的 oss_key / file_size / file_name 均为**不可信输入**，
+        这里以 OSS `head_object` 的服务端结果为准，不一致即拒绝。
+
+        Args:
+            data: UploadCallbackSerializer 校验后的数据
+
+        Returns:
+            int: OSS 对象的实际字节数（服务端权威值）
+
+        Raises:
+            ValidationError: 对象不存在、无法校验、或与声明不一致
+
+        Note:
+            本校验只能证明"该对象存在且元数据与声明一致"，**不能**证明该对象
+            由本次请求的发起者上传——那需要服务端上传凭证（pending upload）
+            记录，当前数据模型不具备。STS 直传回调路径因此仍存在归属校验缺口，
+            详见 Phase 1-1 报告的 callback ownership = BLOCKED。
+        """
+        meta = oss_client.head_object(data['oss_key'])
+        if meta is None:
+            # OSS 不可用 / 查询失败：无法验证即拒绝，不放行
+            raise ValidationError({'oss_key': '无法校验 OSS 对象状态，请稍后重试'})
+        if not meta['exists']:
+            raise ValidationError({'oss_key': 'OSS 对象不存在，上传可能未完成'})
+
+        actual_size = meta['size']
+        declared_size = data['file_size']
+        if actual_size != declared_size:
+            raise ValidationError({
+                'file_size': f'文件大小与 OSS 对象不一致（声明 {declared_size}B，实际 {actual_size}B）',
+            })
+        # 按文件类型分档限制，以实测大小为准（防止登记超大对象）
+        size_error = check_file_size(actual_size, data['file_type'])
+        if size_error:
+            raise ValidationError({'file_size': size_error})
+
+        # Content-Type 一致性：仅在双方都是具体类型时比对。
+        # 对象为通用类型（空 / application/octet-stream）时放行——前端 PUT
+        # 未显式指定 Content-Type 时会写入通用值，硬比对会误伤正常上传。
+        declared_ct = guess_content_type(data['file_name'])
+        actual_ct = (meta['content_type'] or '').split(';')[0].strip().lower()
+        if (actual_ct and actual_ct != DEFAULT_MIME_TYPE
+                and declared_ct and declared_ct != DEFAULT_MIME_TYPE
+                and actual_ct != declared_ct):
+            raise ValidationError({
+                'file_name': f'文件真实类型与文件名后缀不符（OSS 记录 {actual_ct}，后缀推断 {declared_ct}）',
+            })
+
+        # ETag 与 MD5 一致性：STS 直传为简单 PUT，ETag 即对象 MD5；
+        # 分片上传的 ETag 形如 "<md5>-<n>"，无法直接比对，此时跳过。
+        etag = (meta['etag'] or '').lower()
+        if len(etag) == 32 and all(c in '0123456789abcdef' for c in etag):
+            if etag != data['md5'].lower():
+                raise ValidationError({'md5': 'MD5 与 OSS 对象不一致，文件内容可能已被替换'})
+
+        return actual_size
 
 
 class TextUploadView(APIView):

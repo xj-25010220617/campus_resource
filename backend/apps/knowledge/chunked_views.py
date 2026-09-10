@@ -24,13 +24,21 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from django.db import transaction
+
 from config.permissions import IsAdminOrSuperAdmin
 from utils.celery_dispatcher import safe_delay
 from utils.error_codes import ErrorCode
 from utils.oss import guess_content_type, oss_client
 
 from .models import ChunkedUploadSession, Keyword, KnowledgeDoc
-from .serializers import ALLOWED_FILE_TYPES, normalize_file_type
+from .serializers import (
+    ALLOWED_FILE_TYPES,
+    check_file_size,
+    MAX_CHUNK_SIZE,
+    MAX_FILE_SIZE,
+    normalize_file_type,
+)
 from .tasks import extract_freshness_task, index_document_task
 
 logger = logging.getLogger(__name__)
@@ -106,8 +114,12 @@ class ChunkUploadInitView(APIView):
     def post(self, request):
         file_md5 = str(request.data.get('file_md5', '')).strip().lower()
         filename = str(request.data.get('filename', '')).strip()
+        # 区分"未提供"与"确实为 0"：两者都解析为 0，但 0 必须是一个明确值，
+        # 不能变成"跳过大小校验"的语义。真正的大小上限在 merge 时按 OSS 实测
+        # 总大小强制（见 ChunkMergeView），这里只做提前拒绝。
+        raw_size = request.data.get('file_size')
         try:
-            file_size = int(request.data.get('file_size') or 0)
+            file_size = int(raw_size) if raw_size not in (None, '') else 0
         except (TypeError, ValueError):
             file_size = 0
 
@@ -121,6 +133,18 @@ class ChunkUploadInitView(APIView):
             raise ValidationError(
                 {'file': f'不支持的文件类型 ".{ext}"，支持的类型：{", ".join(sorted(ALLOWED_FILE_TYPES))}'}
             )
+
+        # 大小上限（声明值仅用于提前拒绝，merge 时会以实测值再校验一次）
+        if file_size < 0:
+            raise ValidationError({'file_size': '文件大小不能为负数'})
+        if file_size > MAX_FILE_SIZE:
+            raise ValidationError(
+                {'file_size': f'文件大小不能超过 {MAX_FILE_SIZE // (1024 * 1024)}MB'}
+            )
+        if file_size > 0:
+            size_error = check_file_size(file_size, ext)
+            if size_error:
+                raise ValidationError({'file_size': size_error})
 
         if not oss_client.bucket:
             return Response(
@@ -205,6 +229,11 @@ class ChunkUploadView(APIView):
             raise ValidationError({'chunk_index': '分片序号必须为整数'})
         if not 0 <= chunk_index < 10000:
             raise ValidationError({'chunk_index': '分片序号超出范围 (0-9999)'})
+        # 单分片上限以 Django 实测的 chunk_file.size 判断，不信任客户端声明
+        if chunk_file.size > MAX_CHUNK_SIZE:
+            raise ValidationError(
+                {'chunk_file': f'单个分片不能超过 {MAX_CHUNK_SIZE // (1024 * 1024)}MB'}
+            )
 
         session = ChunkedUploadSession.objects.filter(
             upload_id=upload_id, user=request.user, status='uploading',
@@ -246,104 +275,126 @@ class ChunkMergeView(APIView):
         upload_id = str(request.data.get('upload_id', '')).strip()
         file_md5 = str(request.data.get('file_md5', '')).strip().lower()
 
-        session = ChunkedUploadSession.objects.filter(
-            upload_id=upload_id, user=request.user, status='uploading',
-        ).first()
-        if not session:
-            return Response(
-                {'detail': '上传会话不存在或已结束', 'code': ErrorCode.NOT_FOUND.value},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-        if file_md5 and file_md5 != session.file_md5:
-            raise ValidationError({'file_md5': 'MD5 与初始化时不一致'})
+        # 整个合并过程放在事务 + 行级锁内：同一会话的并发 / 重复 merge 在此串行化，
+        # 否则两个请求会同时通过 status 检查、各自 complete 一次并各建一条
+        # KnowledgeDoc（重复文档 + 重复索引）。
+        with transaction.atomic():
+            session = ChunkedUploadSession.objects.select_for_update().filter(
+                upload_id=upload_id, user=request.user,
+            ).first()
+            # 会话不存在、不属于当前用户、或已结束（completed / aborted）一律拒绝。
+            # 错误响应与原先保持一致，前端无需改动。
+            if not session or session.status != 'uploading':
+                return Response(
+                    {'detail': '上传会话不存在或已结束', 'code': ErrorCode.NOT_FOUND.value},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+            if file_md5 and file_md5 != session.file_md5:
+                raise ValidationError({'file_md5': 'MD5 与初始化时不一致'})
 
-        try:
-            parts = _list_uploaded_parts(session.oss_key, session.upload_id)
-        except oss2.exceptions.NoSuchUpload:
-            return Response(
-                {'detail': '上传会话已失效，请重新初始化', 'code': ErrorCode.UPLOAD_FAILED.value},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        if not parts:
-            raise ValidationError({'detail': '没有任何分片，无法合并'})
+            try:
+                parts = _list_uploaded_parts(session.oss_key, session.upload_id)
+            except oss2.exceptions.NoSuchUpload:
+                return Response(
+                    {'detail': '上传会话已失效，请重新初始化', 'code': ErrorCode.UPLOAD_FAILED.value},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if not parts:
+                raise ValidationError({'detail': '没有任何分片，无法合并'})
 
-        total_size = sum(p[2] for p in parts)
-        if session.file_size and total_size != session.file_size:
-            raise ValidationError(
-                {'detail': f'分片总大小({total_size}B)与文件大小({session.file_size}B)不一致，可能存在分片缺失'}
-            )
+            # 实际大小以 OSS 已传分片的实测总大小为准，不使用客户端声明值
+            total_size = sum(p[2] for p in parts)
+            ext = session.file_name.rsplit('.', 1)[-1].lower() if '.' in session.file_name else 'other'
+            if total_size > MAX_FILE_SIZE:
+                raise ValidationError({
+                    'detail': f'分片总大小({total_size}B)超过上限 {MAX_FILE_SIZE // (1024 * 1024)}MB',
+                })
+            size_error = check_file_size(total_size, ext)
+            if size_error:
+                raise ValidationError({'detail': f'合并后{size_error}'})
+            # file_size=0 表示客户端未提供声明值，此时跳过一致性比对；
+            # 但上面的上限校验无条件生效，0 不再意味着"不做任何大小校验"。
+            if session.file_size and total_size != session.file_size:
+                raise ValidationError(
+                    {'detail': f'分片总大小({total_size}B)与文件大小({session.file_size}B)不一致，可能存在分片缺失'}
+                )
 
-        # OSS 服务端合并
-        try:
-            oss_client.bucket.complete_multipart_upload(
-                session.oss_key, session.upload_id, [(p[0], p[1]) for p in parts],
-            )
-        except oss2.exceptions.OssError as e:
-            logger.error(f'合并分片失败 upload_id={upload_id}: {e}')
-            return Response(
-                {'detail': '合并分片失败', 'code': ErrorCode.OSS_SERVER_ERROR.value},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
+            # OSS 服务端合并
+            try:
+                oss_client.bucket.complete_multipart_upload(
+                    session.oss_key, session.upload_id, [(p[0], p[1]) for p in parts],
+                )
+            except oss2.exceptions.OssError as e:
+                logger.error(f'合并分片失败 upload_id={upload_id}: {e}')
+                return Response(
+                    {'detail': '合并分片失败', 'code': ErrorCode.OSS_SERVER_ERROR.value},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
 
-        session.status = 'completed'
-        session.save(update_fields=['status', 'updated_at'])
+            session.status = 'completed'
+            session.save(update_fields=['status', 'updated_at'])
 
-        # 二次 MD5 去重
-        duplicate_doc = oss_client.check_duplicate(session.file_md5)
-        if _md5_visible_duplicate(request.user, duplicate_doc):
-            oss_client.delete(session.oss_key)
-            return Response({
-                'id': duplicate_doc.id,
-                'status': duplicate_doc.status,
-                'duplicate': True,
-            })
+            # 二次 MD5 去重
+            duplicate_doc = oss_client.check_duplicate(session.file_md5)
+            if _md5_visible_duplicate(request.user, duplicate_doc):
+                oss_client.delete(session.oss_key)
+                return Response({
+                    'id': duplicate_doc.id,
+                    'status': duplicate_doc.status,
+                    'duplicate': True,
+                })
 
-        # 创建知识文档记录
-        ext = session.file_name.rsplit('.', 1)[-1].lower() if '.' in session.file_name else 'other'
-        file_type = normalize_file_type(ext)
-        visibility = request.data.get('visibility', 'public')
-        if visibility not in ('public', 'private'):
-            visibility = 'public'
-        title = str(request.data.get('title', '')).strip() or (
-            session.file_name.rsplit('.', 1)[0] if '.' in session.file_name else session.file_name
-        )
-
-        if request.user.role == 'super_admin':
-            doc_college_id = request.data.get('college_id') or None
-            doc_department_id = request.data.get('department_id') or None
-        else:
-            doc_college_id = request.user.college_id
-            doc_department_id = request.user.department_id
-
-        new_doc = KnowledgeDoc.objects.create(
-            oss_key=session.oss_key,
-            title=title,
-            description=str(request.data.get('description', '')).strip(),
-            file_name=session.file_name,
-            file_size=total_size,
-            file_type=file_type,
-            md5_hash=session.file_md5,
-            source_type='upload',
-            uploader=request.user,
-            status='uploaded',
-            college_id=doc_college_id,
-            department_id=doc_department_id,
-            discipline_id=request.data.get('discipline_id') or None,
-            visibility=visibility,
-        )
-
-        for phrase in _parse_keywords(request.data.get('keywords')):
-            Keyword.objects.create(
-                doc=new_doc, phrase=phrase,
-                match_type='fuzzy', weight=1, created_by=request.user,
+            # 创建知识文档记录
+            file_type = normalize_file_type(ext)
+            visibility = request.data.get('visibility', 'public')
+            if visibility not in ('public', 'private'):
+                visibility = 'public'
+            title = str(request.data.get('title', '')).strip() or (
+                session.file_name.rsplit('.', 1)[0] if '.' in session.file_name else session.file_name
             )
 
-        safe_delay(extract_freshness_task, new_doc.id)
-        safe_delay(index_document_task, new_doc.id)
+            if request.user.role == 'super_admin':
+                doc_college_id = request.data.get('college_id') or None
+                doc_department_id = request.data.get('department_id') or None
+            else:
+                doc_college_id = request.user.college_id
+                doc_department_id = request.user.department_id
 
-        return Response({
-            'id': new_doc.id,
-            'status': new_doc.status,
-            'file_name': session.file_name,
-            'file_size': total_size,
-        })
+            new_doc = KnowledgeDoc.objects.create(
+                oss_key=session.oss_key,
+                title=title,
+                description=str(request.data.get('description', '')).strip(),
+                file_name=session.file_name,
+                file_size=total_size,
+                file_type=file_type,
+                md5_hash=session.file_md5,
+                source_type='upload',
+                uploader=request.user,
+                status='uploaded',
+                college_id=doc_college_id,
+                department_id=doc_department_id,
+                discipline_id=request.data.get('discipline_id') or None,
+                visibility=visibility,
+            )
+
+            for phrase in _parse_keywords(request.data.get('keywords')):
+                Keyword.objects.create(
+                    doc=new_doc, phrase=phrase,
+                    match_type='fuzzy', weight=1, created_by=request.user,
+                )
+
+            result = {
+                'id': new_doc.id,
+                'status': new_doc.status,
+                'file_name': session.file_name,
+                'file_size': total_size,
+            }
+            new_doc_id = new_doc.id
+
+        # 事务提交后再触发异步任务：safe_delay 在 Celery/Redis 不可用时会同步
+        # 执行整条索引链路（下载 OSS → 解析 → Embedding → 写 Milvus），
+        # 留在事务内会长时间持锁并拖垮并发上传。
+        safe_delay(extract_freshness_task, new_doc_id)
+        safe_delay(index_document_task, new_doc_id)
+
+        return Response(result)
