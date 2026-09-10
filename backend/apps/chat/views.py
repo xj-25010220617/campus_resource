@@ -454,9 +454,17 @@ class AskView(APIView):
             parsed_filters=parsed,
         )
 
-        # 3.2b 知识库无结果 → 联网搜索兜底
+        # 3.2b 知识库无结果 → 检查未索引文档 + 联网搜索兜底
         web_search_used = False
+        pending_docs = []
         if not results:
+            # 区分"文件存在但未索引"和"没有匹配文件"（未索引文档不传给 LLM）
+            pending_docs = rag.find_pending_index_docs(question, user_context)
+            if pending_docs:
+                logger.info(
+                    '知识库存在未索引的匹配文档 %d 个: %s',
+                    len(pending_docs), [d['doc_title'] for d in pending_docs],
+                )
             logger.info('知识库无结果，启动联网搜索兜底: %s', question[:50])
             from utils.web_search import search_school
             search_results = search_school(question, max_results=5)
@@ -567,6 +575,17 @@ class AskView(APIView):
                 suggested = rag.generate_suggested_questions(question, full_answer)
                 if suggested:
                     yield _format_sse('suggested', suggested)
+
+                # 未索引文档提示（知识库有匹配文件但暂不可检索，不作为 LLM 来源）
+                if pending_docs:
+                    yield _format_sse('pending_docs', {
+                        'count': len(pending_docs),
+                        'summary': (
+                            '已找到相关知识库文件，但尚未完成索引，'
+                            '暂时无法基于正文回答'
+                        ),
+                        'docs': pending_docs,
+                    })
 
                 # 引用溯源
                 refs = build_references_events(
@@ -1047,6 +1066,11 @@ class VoiceAskView(APIView):
                 log.hit_count = len(hits)
                 log.top_doc_ids = [h['doc_id'] for h in hits]
 
+                # 检索无结果时检查未索引文档（与文本通道 AskView 行为一致）
+                pending_docs = []
+                if not hits:
+                    pending_docs = rag.find_pending_index_docs(question, user_context)
+
                 # 3. LLM 流式输出
                 for chunk in llm_client.chat_stream(messages):
                     full_answer += chunk
@@ -1066,6 +1090,16 @@ class VoiceAskView(APIView):
                     yield _format_sse('references', references['references'])
                 if 'references_detail' in references and user.role in ('admin', 'super_admin'):
                     yield _format_sse('references_detail', references['references_detail'])
+                # 未索引文档提示（知识库有匹配文件但暂不可检索，不作为 LLM 来源）
+                if pending_docs:
+                    yield _format_sse('pending_docs', {
+                        'count': len(pending_docs),
+                        'summary': (
+                            '已找到相关知识库文件，但尚未完成索引，'
+                            '暂时无法基于正文回答'
+                        ),
+                        'docs': pending_docs,
+                    })
                 yield _format_sse('done', {'message_id': ai_msg.id})
             except GeneratorExit:
                 raise

@@ -92,7 +92,8 @@ DATABASES = {
             'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
         },
         'TEST': {
-            'NAME': 'campus_resource',
+            # 测试库必须与开发库不同名，避免跑测试时误删开发库 campus_resource
+            'NAME': config('DB_TEST_NAME', default='test_campus_resource'),
             'DEPENDENCIES': [],
         },
     }
@@ -207,7 +208,11 @@ LOCAL_EMBED_MODEL = config('LOCAL_EMBED_MODEL', default='paraphrase-multilingual
 # ------------------------------------------------------------------
 MILVUS_HOST = config('MILVUS_HOST', default='localhost')
 MILVUS_PORT = config('MILVUS_PORT', default='19530')
-CHROMA_DB_PATH = BASE_DIR / 'chroma_db'
+# 注意：chroma-hnswlib 的 C++ 层无法打开含中文的 Windows 路径
+# （"Cannot open header file" / "Error loading hnsw index"），
+# 项目目录含中文，因此 Chroma 库默认放在用户主目录下（纯 ASCII 路径）。
+from pathlib import Path as _Path
+CHROMA_DB_PATH = _Path(config('CHROMA_DB_PATH', default=str(_Path.home() / '.campus_chroma_db')))
 
 # ------------------------------------------------------------------
 # Celery

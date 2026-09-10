@@ -257,10 +257,19 @@ class MilvusClient:
         # 检索时若限定了 doc_id 范围，过滤后可能数量不足，
         # 因此多取 5 倍以保证在过滤后仍有 top_k 条命中
         fetch_k = top_k * 5 if filter_ids else top_k
-        results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=fetch_k,
-        )
+        try:
+            results = collection.query(
+                query_embeddings=[query_embedding],
+                n_results=fetch_k,
+            )
+        except Exception as e:
+            # chromadb 1.5.x Rust hnsw 查询存在已知崩溃
+            # （Error loading hnsw index / backfill to compactor），
+            # insert/count 均正常但 query 失败时降级为暴力余弦检索
+            logger.warning(f'Chroma hnsw 查询失败，降级暴力检索: {e}')
+            return self._brute_force_chroma(
+                collection, query_embedding, top_k, filter_ids,
+            )
 
         hits = []
         if results and results['ids'] and results['ids'][0]:
@@ -286,6 +295,54 @@ class MilvusClient:
                 })
         return hits
 
+    @staticmethod
+    def _brute_force_chroma(collection, query_embedding, top_k, filter_ids):
+        """hnsw 索引不可用时的暴力余弦检索（全量向量内存计算）。
+
+        开发环境 Chroma 规模（万条以内）下毫秒级完成，且结果精确。
+        """
+        try:
+            got = collection.get(include=['embeddings', 'metadatas', 'documents'])
+        except Exception as e:
+            logger.error(f'Chroma 暴力检索取数失败: {e}')
+            return []
+
+        ids = got.get('ids') or []
+        embs = got.get('embeddings')
+        if not ids or embs is None:
+            return []
+
+        import numpy as np
+        embs = np.asarray(embs, dtype='float32')
+        q = np.asarray(query_embedding, dtype='float32')
+        q_norm = float(np.linalg.norm(q)) or 1.0
+        norms = np.linalg.norm(embs, axis=1)
+        norms[norms == 0] = 1.0
+        sims = embs @ q / (norms * q_norm)
+
+        metas = got.get('metadatas') or [{}] * len(ids)
+        docs = got.get('documents') or [''] * len(ids)
+        filter_set = set(filter_ids) if filter_ids else None
+
+        hits = []
+        for idx in np.argsort(-sims):
+            if len(hits) >= top_k:
+                break
+            meta = metas[int(idx)]
+            doc_id = meta.get('doc_id')
+            if filter_set is not None and doc_id not in filter_set:
+                continue
+            hits.append({
+                'vector_id': ids[int(idx)],
+                'doc_id': doc_id,
+                'chunk_index': meta.get('chunk_index'),
+                'chunk_text': docs[int(idx)],
+                'page_number': meta.get('page_number', 0),
+                'seq_order': meta.get('seq_order', 0),
+                'score': float(sims[idx]),
+            })
+        return hits
+
     # ------------------------------------------------------------------
     # 删除向量
     # ------------------------------------------------------------------
@@ -296,7 +353,22 @@ class MilvusClient:
             collection = Collection(name=self.COLLECTION_NAME)
             collection.delete(f'doc_id == {doc_id}')
             return True
-        return True  # ChromaDB 不支持按条件删，后续重建即可
+        try:
+            import chromadb
+            client = chromadb.PersistentClient(
+                path=str(getattr(settings, 'CHROMA_DB_PATH', './chroma_db'))
+            )
+            collection = client.get_or_create_collection(
+                name=self.COLLECTION_NAME,
+                metadata={'hnsw:space': 'cosine'},
+            )
+            # Chroma 支持 where 条件删除；不清理会残留孤儿向量，
+            # 挤占向量检索召回窗口（fetch_k 内被 filter_ids 过滤后有效命中变少）
+            collection.delete(where={'doc_id': doc_id})
+            return True
+        except Exception as e:
+            logger.warning(f'Chroma 删除向量失败 doc_id={doc_id}: {e}')
+            return False
 
 
 # 全局单例
