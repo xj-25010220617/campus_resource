@@ -17,12 +17,14 @@ class KnowledgeDocSerializer(serializers.ModelSerializer):
     download_url = serializers.SerializerMethodField()
     # 预览：签名 URL（无 Content-Disposition，浏览器内联显示 PDF/图片/音视频）
     oss_url = serializers.SerializerMethodField()
+    # 真实扩展名（docx/pptx/jpg…），由 file_name 解析，见 get_file_ext
+    file_ext = serializers.SerializerMethodField()
 
     class Meta:
         model = KnowledgeDoc
         fields = [
             'id', 'title', 'description', 'source_type', 'source_url',
-            'oss_key', 'oss_url', 'download_url', 'file_name', 'file_type', 'file_size',
+            'oss_key', 'oss_url', 'download_url', 'file_name', 'file_type', 'file_ext', 'file_size',
             'md5_hash', 'page_count',
             'discipline', 'discipline_name',
             'category', 'category_name',
@@ -54,6 +56,10 @@ class KnowledgeDocSerializer(serializers.ModelSerializer):
             return ''
         return oss_client.get_preview_url(obj.oss_key, expires=604800)
 
+    def get_file_ext(self, obj) -> str:
+        """真实扩展名（docx/pptx/jpg…）"""
+        return get_file_ext(obj.file_name, obj.file_type)
+
 
 class KnowledgeDocListSerializer(serializers.ModelSerializer):
     """知识文档列表序列化器（简化版，用于列表页展示）"""
@@ -67,16 +73,22 @@ class KnowledgeDocListSerializer(serializers.ModelSerializer):
     uploader_department_name = serializers.CharField(
         source='uploader.department.name', read_only=True, default='',
     )
+    # 真实扩展名（docx/pptx/jpg…），由 file_name 解析，见 get_file_ext
+    file_ext = serializers.SerializerMethodField()
 
     class Meta:
         model = KnowledgeDoc
         fields = [
-            'id', 'title', 'file_type', 'file_size', 'status',
+            'id', 'title', 'file_name', 'file_type', 'file_ext', 'file_size', 'status',
             'index_error', 'index_attempts', 'index_started_at', 'failed_at',
             'college_name', 'discipline_name', 'uploader_name',
             'uploader_college_name', 'uploader_department_name',
             'chunk_count', 'created_at',
         ]
+
+    def get_file_ext(self, obj) -> str:
+        """真实扩展名（docx/pptx/jpg…）"""
+        return get_file_ext(obj.file_name, obj.file_type)
 
 
 # 文件大小限制常量（字节）
@@ -196,6 +208,24 @@ def normalize_file_type(file_type: str) -> str:
     if ft in dict(KnowledgeDoc.FILE_TYPE_CHOICES):
         return ft
     return EXT_TO_FILE_TYPE.get(ft, 'other')
+
+
+def get_file_ext(file_name: str, file_type: str) -> str:
+    """从原始文件名解析真实扩展名（docx/pptx/xlsx/jpg…）。
+
+    KnowledgeDoc.file_type 存的是归一化后的「类别」（docx → doc、jpg → image），
+    真实扩展名只在 file_name 里，此函数把它还原出来供展示用。
+
+    无法解析时（爬虫来源等 file_name 无后缀，或后缀明显不是扩展名，
+    如「会议记录.2026」）兜底返回 file_type 类别码，保证字段非空。
+    """
+    name = (file_name or '').strip()
+    if '.' in name:
+        ext = name.rsplit('.', 1)[-1].strip().lower()
+        # 形如扩展名：字母数字、非纯数字、长度合理
+        if ext and ext.isalnum() and not ext.isdigit() and len(ext) <= 16:
+            return ext
+    return (file_type or 'other').strip().lower()
 
 
 # 图片类扩展名集合（由 EXT_TO_FILE_TYPE 派生，单一数据源，随映射自动同步）
