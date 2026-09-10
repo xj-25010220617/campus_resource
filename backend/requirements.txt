@@ -28,3 +28,12 @@ redis>=5.0.0
 imageio-ffmpeg
 # 图片缩放（视觉模型读图前压缩），图片智能分类依赖
 Pillow>=10.0.0
+# 文档文本提取（文件上传解析正文，供 AI 自动分类 / 检索索引使用）
+# - apps/knowledge/extractor.py 的 _EXTRACTORS 依赖，未装会导致 PDF/PPT/Excel/DOC 提取正文为空
+PyMuPDF>=1.24.0
+python-docx>=1.0.0
+python-pptx>=1.0.0
+openpyxl>=3.1.0
+# xlrd 必须固定 1.2.0：2.0+ 移除 .xlsx 支持且 API 变化，_parse_xls 依赖旧版接口
+xlrd==1.2.0
+docx2txt>=0.8

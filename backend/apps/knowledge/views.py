@@ -1260,11 +1260,13 @@ class FileUploadView(APIView):
         # multipart 兼容：前端可能以 JSON 字符串 / 重复字段 / keywords[] 等多种形式发送关键词
         raw_keywords = _normalize_keywords(request, data.get('keywords', []))
 
-        # 空文件检测：0 字节，或文本/文档类提取不到任何内容
+        # 空文件检测：0 字节，或文本类（直接 decode 文件字节，不依赖解析库）提取不到任何内容。
+        # 文档类（pdf/docx 等）不通过「提取不到文本」判空：解析库缺失/失败同样会返回空，
+        # 会把有内容的正常文档误判为「空文件」（PDF/PPT/Excel 解析库未安装时尤甚）。
         is_empty_file = (
             len(file_bytes) == 0
             or (
-                (ext in self.TEXT_EXTRACTABLE_TYPES or ext in self.DOCUMENT_EXTRACTABLE_TYPES)
+                ext in self.TEXT_EXTRACTABLE_TYPES
                 and not extracted_text.strip()
             )
         )
