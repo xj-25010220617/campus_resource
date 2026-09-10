@@ -432,6 +432,130 @@ def generate_suggested_questions(
 
 
 # ------------------------------------------------------------------
+# 查询词提取（元数据 / Keyword 表 / 分块检索共用）
+# ------------------------------------------------------------------
+_STOP_WORDS = {
+    "什么", "怎么", "如何", "为什么", "吗", "呢", "吧", "嘛",
+    "哪个", "哪些", "谁", "何时", "哪里", "是否", "有", "没有",
+    "的", "了", "我", "你", "他", "她", "它", "们", "这个", "那个",
+    "是什么", "请问", "关于",
+}
+
+
+def _extract_query_terms(question: str, max_terms: int = 8) -> List[str]:
+    """从用户问题中提取用于数据库匹配的查询词。
+
+    与传给向量检索的完整 question 不同，query_terms 用于
+    icontains 匹配，须过滤停用词和单字，并对中英混合词做拆解。
+
+    Returns:
+        去重后的查询词列表（含同义词扩展），最多 max_terms 个。
+    """
+    import re
+
+    if not question or not question.strip():
+        return []
+
+    terms: List[str] = []
+    for word in re.findall(r'[一-鿿\w]+', question):
+        word = word.lower()
+        if word in _STOP_WORDS or len(word) < 2 or len(word) > 20:
+            continue
+        if word not in terms:
+            terms.append(word)
+        # 拆解混合词：如 "MySQL第二版" → "mysql" + "第二版"
+        parts = re.findall(r'[a-z]+|[一-鿿]+', word)
+        if len(parts) > 1:
+            for part in parts:
+                if (
+                    len(part) >= 2
+                    and part not in _STOP_WORDS
+                    and part not in terms
+                ):
+                    terms.append(part)
+
+    # jieba 分词补充（可缺失，缺失时正则词已够用）
+    try:
+        import jieba
+        for token in jieba.cut(question):
+            token = token.strip().lower()
+            if (
+                len(token) >= 2
+                and len(token) <= 20
+                and token not in _STOP_WORDS
+                and token not in terms
+            ):
+                terms.append(token)
+    except ImportError:
+        pass
+
+    from utils.synonym import expand_keywords
+    terms = expand_keywords(terms)
+    return terms[:max_terms]
+
+
+def _select_relevant_chunk(doc, keywords: List[str]):
+    """选择与查询词最相关的分块：相关分块优先，首块兜底。
+
+    数据库初筛（icontains OR）后按命中次数排序，避免读取全部正文。
+    """
+    from django.db.models import Q
+    from apps.knowledge.models import DocChunk
+
+    chunks = DocChunk.objects.filter(doc=doc).order_by('chunk_index')
+    if not keywords:
+        return chunks.first()
+
+    chunk_query = Q()
+    for kw in keywords:
+        chunk_query |= Q(content__icontains=kw)
+    matching = list(chunks.filter(chunk_query)[:10])
+    if not matching:
+        return chunks.first()
+
+    def _hit_rank(chunk):
+        content = chunk.content.lower()
+        return (
+            -sum(content.count(kw.lower()) for kw in keywords),
+            chunk.chunk_index,
+        )
+
+    matching.sort(key=_hit_rank)
+    return matching[0]
+
+
+def _build_doc_results(docs, keywords: List[str], score: float) -> List[dict]:
+    """把文档 QuerySet 统一构造为检索结果（相关分块正文 + 来源元数据）。"""
+    results = []
+    for doc in docs:
+        chunk = _select_relevant_chunk(doc, keywords)
+        if chunk is not None:
+            content = chunk.content
+            page = chunk.page_start or 0
+            chunk_index = chunk.chunk_index
+            vector_id = chunk.vector_id
+        else:
+            content = f"{doc.title} {(doc.description or '')[:300]}".strip()
+            page = 0
+            chunk_index = None
+            vector_id = ''
+        results.append({
+            'doc_id': doc.id,
+            'doc_title': doc.title,
+            'content': content,
+            'score': score,
+            'page': page,
+            'chunk_index': chunk_index,
+            'vector_id': vector_id,
+            'source_type': doc.source_type,
+            'source_url': doc.source_url,
+            'file_name': doc.file_name,
+            'oss_key': doc.oss_key,
+        })
+    return results
+
+
+# ------------------------------------------------------------------
 # 关键词搜索
 # ------------------------------------------------------------------
 def _keyword_search(
@@ -440,15 +564,8 @@ def _keyword_search(
     doc_ids: Optional[List[int]] = None,
     user_context: Optional[dict] = None,
 ) -> List[dict]:
-    """在 KnowledgeDoc 元数据中进行关键词匹配。"""
-    try:
-        import jieba
-        keywords = list(jieba.cut(question))[:10]
-    except ImportError:
-        keywords = question.split()[:10]
-
-    from utils.synonym import expand_keywords
-    keywords = expand_keywords(keywords)
+    """在 KnowledgeDoc 元数据（标题/描述/文件名）中进行关键词匹配。"""
+    keywords = _extract_query_terms(question)
     if not keywords:
         return []
 
@@ -456,9 +573,9 @@ def _keyword_search(
 
     kw_query = Q()
     for kw in keywords:
-        if len(kw) >= 2:
-            kw_query |= Q(title__icontains=kw)
-            kw_query |= Q(description__icontains=kw)
+        kw_query |= Q(title__icontains=kw)
+        kw_query |= Q(description__icontains=kw)
+        kw_query |= Q(file_name__icontains=kw)
 
     # The same authorization scope is used by vector, keyword, and title search.
     qs = authorized_knowledge_docs(user_context).filter(
@@ -485,6 +602,96 @@ def _keyword_search(
             'oss_key': doc['oss_key'],
         })
     return results
+
+
+def _keyword_table_search(
+    keywords: List[str],
+    user_context: Optional[dict] = None,
+    top_k: int = 5,
+    doc_ids: Optional[List[int]] = None,
+) -> List[dict]:
+    """Keyword 表检索通道：按人工标注的关键词反查文档。
+
+    先查 Keyword.phrase 得到 doc_id 集合，再统一经过
+    authorized_knowledge_docs() 权限过滤和 status='indexed' 限制，
+    不能把 Keyword 查询结果直接返回。
+    """
+    if not keywords:
+        return []
+
+    from django.db.models import Q
+    from apps.knowledge.models import Keyword
+
+    keyword_query = Q()
+    for kw in keywords:
+        keyword_query |= Q(phrase__icontains=kw)
+
+    doc_id_qs = Keyword.objects.filter(keyword_query).values('doc_id')
+    docs = authorized_knowledge_docs(user_context).filter(
+        id__in=doc_id_qs, status='indexed',
+    )
+    if doc_ids is not None:
+        docs = docs.filter(id__in=[d for d in doc_ids if d > 0])
+    docs = docs.order_by('-created_at')[:top_k]
+
+    return _build_doc_results(docs, keywords, score=0.6)
+
+
+def _chunk_content_search(
+    keywords: List[str],
+    user_context: Optional[dict] = None,
+    top_k: int = 5,
+    doc_ids: Optional[List[int]] = None,
+) -> List[dict]:
+    """正文分块检索通道：按 DocChunk.content 匹配查询词。
+
+    解决标题/文件名/Keyword 表都不含查询词、但正文提到的情况。
+    必须先限制在授权且已索引的文档范围内，防止越权泄露。
+    """
+    if not keywords:
+        return []
+
+    from django.db.models import Q
+    from apps.knowledge.models import DocChunk
+
+    allowed_docs = authorized_knowledge_docs(user_context).filter(
+        status='indexed',
+    )
+    if doc_ids is not None:
+        allowed_docs = allowed_docs.filter(id__in=[d for d in doc_ids if d > 0])
+
+    chunk_query = Q()
+    for kw in keywords:
+        chunk_query |= Q(content__icontains=kw)
+
+    chunks = (
+        DocChunk.objects
+        .filter(doc__in=allowed_docs)
+        .filter(chunk_query)
+        .select_related('doc')
+        .order_by('doc_id', 'chunk_index')[:top_k * 3]
+    )
+
+    results = []
+    for chunk in chunks:
+        content_lower = chunk.content.lower()
+        hit_count = sum(content_lower.count(kw.lower()) for kw in keywords)
+        results.append({
+            'doc_id': chunk.doc_id,
+            'doc_title': chunk.doc.title,
+            'content': chunk.content,
+            'score': min(0.6, 0.4 + 0.05 * hit_count),
+            'page': chunk.page_start or 0,
+            'chunk_index': chunk.chunk_index,
+            'vector_id': chunk.vector_id,
+            'source_type': chunk.doc.source_type,
+            'source_url': chunk.doc.source_url,
+            'file_name': chunk.doc.file_name,
+            'oss_key': chunk.doc.oss_key,
+        })
+
+    results.sort(key=lambda r: r['score'], reverse=True)
+    return results[:top_k]
 
 
 def _keywords_boost_from_filters(filters: dict) -> dict:
@@ -525,6 +732,11 @@ def _merge_and_rerank(
     keywords_boost = keywords_boost or {}
     merged = {}
 
+    # 无向量命中时关键词分数不衰减：vector_weight 缩放本意是双通道
+    # 量纲对齐，向量为空时再乘 (1-0.7) 会把 0.55 压到 0.165，
+    # 被 min_score 全部过滤掉。
+    kw_weight = (1 - vector_weight) if vector_hits else 1.0
+
     for hit in vector_hits:
         key = hit.get('vector_id') or f"v_{hit.get('doc_id')}_{hit.get('chunk_index')}"
         merged[key] = {
@@ -549,7 +761,16 @@ def _merge_and_rerank(
             None,
         )
         if existing:
-            existing['score'] += hit['score'] * (1 - vector_weight)
+            existing['score'] += hit['score'] * kw_weight
+            # 有正文分块命中的结果优先于"标题+描述摘录"作为 LLM 上下文
+            if (
+                hit.get('chunk_index') is not None
+                and existing.get('chunk_index') is None
+            ):
+                existing['content'] = hit.get('content', '')
+                existing['page'] = hit.get('page', 0)
+                existing['chunk_index'] = hit.get('chunk_index')
+                existing['vector_id'] = hit.get('vector_id', '')
             for field in ('doc_title', 'source_type', 'source_url', 'file_name', 'oss_key'):
                 if hit.get(field) and not existing.get(field):
                     existing[field] = hit[field]
@@ -561,7 +782,7 @@ def _merge_and_rerank(
                 'content': hit.get('content', ''),
                 'page': hit.get('page', 0),
                 'vector_id': '',
-                'score': hit['score'] * (1 - vector_weight),
+                'score': hit['score'] * kw_weight,
                 'source_type': hit.get('source_type', ''),
                 'source_url': hit.get('source_url', ''),
                 'file_name': hit.get('file_name', ''),
@@ -736,69 +957,31 @@ def _fallback_title_search(
     user_context: dict,
     top_k: int = 5,
 ) -> List[dict]:
-    """当向量检索无结果时，从 KnowledgeDoc 标题/描述中按关键词匹配。
+    """当向量检索无结果时，从 KnowledgeDoc 标题/描述/文件名中按关键词匹配。
 
     Returns:
         [{'doc_id': int, 'doc_title': str, 'content': str, 'score': float, 'page': int}, ...]
     """
-    import re
     from django.db.models import Q
-    from apps.knowledge.models import DocChunk
 
-    # 提取关键词：去疑问词，取有意义的词
-    stop_words = {"什么", "怎么", "如何", "为什么", "吗", "呢", "吧", "嘛",
-                  "哪个", "哪些", "谁", "何时", "哪里", "是否", "有", "没有",
-                  "的", "了", "我", "你", "他", "她", "它", "们", "这个", "那个"}
-    words = re.findall(r'[一-鿿\w]+', question)
-    keywords = []
-    for w in words:
-        w = w.lower()
-        if w in stop_words or len(w) < 2:
-            continue
-        # 拆解混合词：如 "MySQL第二版" → "MySQL" + "第二版"
-        parts = re.findall(r'[a-z]+|[一-鿿]+', w)
-        for p in parts:
-            if len(p) >= 2 and p not in stop_words and p not in keywords:
-                keywords.append(p)
-    keywords = keywords[:5]
-
-    # 同义词扩展
-    from utils.synonym import expand_keywords as _expand_kw
-    keywords = _expand_kw(keywords)
-
+    # 提取关键词：去疑问词，取有意义的词（元数据/分块检索共用同一提取逻辑）
+    keywords = _extract_query_terms(question, max_terms=5)
     if not keywords:
         return []
 
-    # 按关键词匹配标题/描述
+    # 按关键词匹配标题/描述/文件名
     kw_query = Q()
     for kw in keywords:
         kw_query |= Q(title__icontains=kw)
         kw_query |= Q(description__icontains=kw)
-
-    from django.db.models import Q
-    from apps.knowledge.models import DocChunk
+        kw_query |= Q(file_name__icontains=kw)
 
     # Apply the same authorization scope as every other retrieval path.
     docs = authorized_knowledge_docs(user_context).filter(kw_query, status='indexed')
     docs = docs.order_by('-created_at')[:top_k]
 
-    # 取每篇文档的第一个 chunk 作为内容预览
-    results = []
-    for doc in docs:
-        first_chunk = DocChunk.objects.filter(doc=doc).order_by('chunk_index').first()
-        content = first_chunk.content[:500] if first_chunk else (doc.description or doc.title)
-        results.append({
-            'doc_id': doc.id,
-            'doc_title': doc.title,
-            'content': content,
-            'score': 0.5,  # 固定中等分，低于向量检索的分数
-            'page': 0,
-            'source_type': doc.source_type,
-            'source_url': doc.source_url,
-            'file_name': doc.file_name,
-            'oss_key': doc.oss_key,
-        })
-    return results
+    # 取每篇文档的最相关 chunk 作为内容预览（首块兜底）
+    return _build_doc_results(docs, keywords, score=0.5)
 
 
 # ------------------------------------------------------------------
@@ -975,10 +1158,20 @@ def retrieve(
         user_context=user_context,
     )
 
+    # 2b. 关键词表通道 + 正文分块通道（与元数据检索共用统一查询词，
+    #     全部经过 authorized_knowledge_docs() 权限过滤）
+    query_terms = _extract_query_terms(question)
+    keyword_table_hits = _keyword_table_search(
+        query_terms, user_context, top_k=top_k, doc_ids=candidate_ids,
+    )
+    chunk_hits = _chunk_content_search(
+        query_terms, user_context, top_k=top_k, doc_ids=candidate_ids,
+    )
+
     # 3. 合并 + 关键词权重加成
     merged = _merge_and_rerank(
         vector_hits,
-        keyword_hits,
+        keyword_hits + keyword_table_hits + chunk_hits,
         keywords_boost=_keywords_boost_from_filters(parsed_filters),
     )
 
@@ -1001,15 +1194,17 @@ def retrieve(
     if results:
         top3_scores = [round(r.get('score', 0), 3) for r in results[:3]]
         logger.info(
-            '[RAG监控] 候选=%d 向量=%d 关键词=%d Rerank后Top3=%s 返回=%d',
+            '[RAG监控] 候选=%d 向量=%d 关键词=%d 关键词表=%d 分块=%d Rerank后Top3=%s 返回=%d',
             len(candidate_ids), len(vector_hits), len(keyword_hits),
+            len(keyword_table_hits), len(chunk_hits),
             top3_scores, len(results),
         )
     else:
         logger.warning(
-            '[RAG监控] 零召回 q=%s 候选=%d 向量=%d 关键词=%d',
+            '[RAG监控] 零召回 q=%s 候选=%d 向量=%d 关键词=%d 关键词表=%d 分块=%d',
             question[:50], len(candidate_ids),
             len(vector_hits), len(keyword_hits),
+            len(keyword_table_hits), len(chunk_hits),
         )
 
     # 6. 兜底：向量检索无结果时，按标题/描述关键词搜索
