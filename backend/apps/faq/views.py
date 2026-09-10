@@ -72,12 +72,12 @@ class FAQItemListView(generics.ListAPIView):
                 q |= models.Q(college_id=user.college_id)
             qs = FAQItem.objects.filter(q)
 
-        # 按状态筛选：非 FAQ 管理员默认只见已发布；管理员可传 status 查看草稿/驳回
+        # 按状态筛选：仅 FAQ 管理员可传 status 查看草稿/驳回；其他角色（含游客）固定只见已发布
         status_filter = self.request.query_params.get('status', '').strip()
-        if status_filter:
-            qs = qs.filter(status=status_filter)
-        elif not IsFAQAdmin().has_permission(self.request, self):
+        if not IsFAQAdmin().has_permission(self.request, self):
             qs = qs.filter(status='published')
+        elif status_filter:
+            qs = qs.filter(status=status_filter)
 
         # 搜索功能：支持按问题、答案、标签、分类名称模糊搜索
         search_query = self.request.query_params.get('q', '').strip()
