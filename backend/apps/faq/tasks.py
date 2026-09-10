@@ -26,6 +26,7 @@ from .utils import (
     filter_by_ratio,
     generate_faq_draft,
     generate_faq_from_source,
+    resolve_category_id,
     cosine_similarity,
 )
 
@@ -194,6 +195,7 @@ def generate_faq_weekly(self, log_id=None):
                         question=result['question'][:500],
                         answer=result['answer'],
                         tags=result.get('tags', []),
+                        category_id=result.get('category_id'),
                         college_id=result.get('college_id'),
                         status='draft',
                         frequency=round((cluster.size / total_questions) * 100, 2),
@@ -291,6 +293,7 @@ def generate_faq_from_website(self, log_id=None, max_pages=None, max_docs=None):
                 answer=result['answer'],
                 tags=result['tags'],
                 status='draft',
+                category_id=resolve_category_id(result.get('category_name')),
                 college_id=_resolve_college_id(result['college_name']),
                 related_doc_ids=[doc.id],
                 source_period_start=doc.created_at,
