@@ -14,8 +14,6 @@
 """
 import json
 import logging
-import uuid
-from datetime import datetime
 
 import oss2
 from drf_spectacular.utils import extend_schema
@@ -27,11 +25,12 @@ from rest_framework.views import APIView
 from django.db import transaction
 
 from config.permissions import IsAdminOrSuperAdmin
-from utils.celery_dispatcher import safe_delay
 from utils.error_codes import ErrorCode
 from utils.oss import guess_content_type, oss_client
 
+from . import upload_service
 from .models import ChunkedUploadSession, Keyword, KnowledgeDoc
+from .upload_intent import UploadIntentError
 from .serializers import (
     ALLOWED_FILE_TYPES,
     check_file_size,
@@ -39,7 +38,6 @@ from .serializers import (
     MAX_FILE_SIZE,
     normalize_file_type,
 )
-from .tasks import extract_freshness_task, index_document_task
 
 logger = logging.getLogger(__name__)
 
@@ -47,18 +45,10 @@ logger = logging.getLogger(__name__)
 SESSION_EXPIRE_HOURS = 24
 
 
-def _build_oss_key(user, file_name: str) -> str:
-    """按上传者角色生成 OSS Key，规则与 FileUploadView 保持一致"""
-    ext = file_name.rsplit('.', 1)[-1].lower() if '.' in file_name else 'bin'
-    safe_filename = f'{uuid.uuid4().hex[:12]}.{ext}'
-    now = datetime.now()
-    if user.role == 'super_admin':
-        oss_scope, owner_id = 'school', 0
-    elif user.role == 'dept_admin' and user.department_id:
-        oss_scope, owner_id = 'department', user.department_id
-    else:
-        oss_scope, owner_id = 'college', user.college_id or 0
-    return f'knowledge/{oss_scope}/{owner_id}/{now:%Y-%m}/{safe_filename}'
+# P1-2D STEP 4-A：原先的 `_build_oss_key()`（按角色拼 `knowledge/{scope}/...`）
+# 已删除。分片上传的最终对象现在由 UploadIntent 决定，落在 `quarantine/` 下，
+# Key 只能由服务端通过 `build_quarantine_key()` 生成。保留旧函数只会让"客户端
+# 能间接影响最终路径"的可能性重新出现。
 
 
 def _list_uploaded_parts(oss_key: str, upload_id: str) -> list:
@@ -180,8 +170,15 @@ class ChunkUploadInitView(APIView):
                 session.save(update_fields=['status', 'updated_at'])
                 session = None
 
-        # 新建：初始化 OSS Multipart Upload
-        oss_key = _build_oss_key(request.user, filename)
+        # 新建：先创建上传意图（隔离区 Key 由服务端生成），再初始化 OSS 分片上传。
+        # P1-2D STEP 4-A 起，分片上传的最终对象同样落在 quarantine/，
+        # session.intent 记录这次上传的归属与凭证，客户端无法指定 Key。
+        intent = upload_service.begin_upload(
+            request.user, filename,
+            content_type=guess_content_type(filename),
+            expected_size=file_size or None,
+        )
+        oss_key = intent.quarantine_key
         try:
             result = oss_client.bucket.init_multipart_upload(
                 oss_key, headers={'Content-Type': guess_content_type(filename)},
@@ -200,6 +197,7 @@ class ChunkUploadInitView(APIView):
             file_size=file_size,
             file_md5=file_md5,
             oss_key=oss_key,
+            intent=intent,
         )
         return Response({'status': 'new', 'upload_id': session.upload_id, 'uploaded_chunks': []})
 
@@ -266,7 +264,9 @@ class ChunkMergeView(APIView):
     POST /api/knowledge/upload/chunk/merge/
     参数：upload_id, file_md5；可选 title / description / visibility /
           discipline_id / college_id / department_id / keywords
-    OSS 服务端合并分片 → MD5 二次去重 → 创建 KnowledgeDoc → 触发异步索引
+    OSS 服务端合并分片 → MD5 二次去重 → 创建 KnowledgeDoc（指向 quarantine/ 对象）
+    → 交给统一审核编排（审核 → 提升 → 索引）。本视图**不直接触发索引**，
+    STEP 4-A 删掉的那条"合并即索引"路径不会恢复。
     """
     permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
     parser_classes = [parsers.MultiPartParser, parsers.FormParser, parsers.JSONParser]
@@ -334,9 +334,31 @@ class ChunkMergeView(APIView):
             session.status = 'completed'
             session.save(update_fields=['status', 'updated_at'])
 
+            # 合并成功后把上传意图推进到 completed（记录实测大小）。
+            # 这一步与建文档同为"该次上传已完成"的两个事实，失败即整体失败：
+            # 意图停在 issued 会在过期后回收，不会留下"对象在隔离区但状态不明"的中间态。
+            if session.intent_id:
+                try:
+                    upload_service.finalize_callback_intent(
+                        request.user, session.intent_id,
+                        oss_key=session.oss_key, actual_size=total_size,
+                    )
+                except UploadIntentError as e:
+                    logger.error(
+                        '分片合并后上传意图状态推进失败 upload_id=%s intent=%s: %s',
+                        upload_id, session.intent_id, e.reason,
+                    )
+                    return Response(
+                        {'detail': upload_service.intent_error_detail(e),
+                         'code': ErrorCode.UPLOAD_FAILED.value},
+                        status=upload_service.intent_error_status(e),
+                    )
+
             # 二次 MD5 去重
             duplicate_doc = oss_client.check_duplicate(session.file_md5)
             if _md5_visible_duplicate(request.user, duplicate_doc):
+                # 重复文件：丢弃刚合并出的隔离区副本（同一次上传的冗余对象，
+                # 不是审核结论，也不涉及promotion）
                 oss_client.delete(session.oss_key)
                 return Response({
                     'id': duplicate_doc.id,
@@ -389,12 +411,10 @@ class ChunkMergeView(APIView):
                 'file_name': session.file_name,
                 'file_size': total_size,
             }
-            new_doc_id = new_doc.id
 
-        # 事务提交后再触发异步任务：safe_delay 在 Celery/Redis 不可用时会同步
-        # 执行整条索引链路（下载 OSS → 解析 → Embedding → 写 Milvus），
-        # 留在事务内会长时间持锁并拖垮并发上传。
-        safe_delay(extract_freshness_task, new_doc_id)
-        safe_delay(index_document_task, new_doc_id)
+        # P1-2D STEP 4-B：合并后的对象位于 quarantine/，交给统一审核编排。
+        # 这里**仍然不直接触发索引**——4-A 删掉的那条"合并即索引"路径不会恢复。
+        # 本调用在事务内注册 on_commit，因此审核一定发生在建文档事务提交之后。
+        upload_service.schedule_moderation(new_doc.id)
 
         return Response(result)

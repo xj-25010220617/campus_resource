@@ -76,6 +76,12 @@ else:
                         return None
                     raise
 
+            # 标记：`delay` 不是真正的队列投递，而是**就地同步执行**。
+            # `celery_dispatcher.dispatch_async()` 靠这个标记判断"任务是否
+            # 真的被异步派发了"——否则在没有 Celery 的环境里，`task.delay()`
+            # 会静默地同步跑完整条审核链，P-4 的解耦就形同虚设。
+            _inline_runner._inline_fallback = True  # type: ignore[attr-defined]
+
             fn.delay = _inline_runner       # type: ignore[attr-defined]
             fn.apply_async = _inline_runner  # type: ignore[attr-defined]
             return fn

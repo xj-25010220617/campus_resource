@@ -3,7 +3,7 @@
 包含：文档 CRUD、上传（STS 回调 / 文本录入 / 文件直传）、预览、关键词管理。
 """
 import logging
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Optional
 
 import django_filters
@@ -28,12 +28,20 @@ from apps.accounts.models import College
 from apps.classify.models import Department, Discipline
 from apps.resources.models import UploadLog
 from config.permissions import CanUploadDocument, IsAdminOrSuperAdmin, IsLoginUser
-from utils.oss import DEFAULT_MIME_TYPE, guess_content_type, oss_client
+from utils.oss import (
+    DEFAULT_MIME_TYPE,
+    OSSOperationError,
+    guess_content_type,
+    is_official_oss_key,
+    oss_client,
+)
 from utils.error_codes import ErrorCode
 from utils.parsers import CleanJSONParser
 
+from . import upload_service
 from .extractor import extract_freshness_for_doc
 from .models import Keyword, KnowledgeDoc
+from .upload_intent import UploadIntentError
 from .serializers import (
     AIClassifySerializer,
     ALLOWED_FILE_TYPES,
@@ -439,6 +447,15 @@ class KnowledgeDocDownloadView(generics.RetrieveAPIView):
 
     def retrieve(self, request, *args, **kwargs):
         instance = self.get_object()
+        # P1-2D STEP 4-A：隔离区对象不得对外提供。
+        # 新上传的文件在审核通过并 promotion 之前一直留在 quarantine/，
+        # 这里必须 fail-closed —— 否则任何人都能通过本接口把未审核文件取回。
+        if not is_official_oss_key(instance.oss_key):
+            return Response(
+                {'detail': '文档尚未通过安全审核，暂不可下载',
+                 'id': instance.id, 'status': instance.status},
+                status=status.HTTP_404_NOT_FOUND,
+            )
         download_url = oss_client.get_download_url(
             instance.oss_key, file_name=instance.file_name,
         ) if instance.oss_key else ''
@@ -626,17 +643,26 @@ class KeywordDeleteView(APIView):
 )
 class UploadSTSView(APIView):
     """
-    获取 OSS 直传 STS 凭证（含 MD5 去重检查）
+    获取 OSS 直传凭证（含 MD5 去重检查）
 
     POST /api/knowledge/upload/sts/
-    功能：校验文件 MD5 去重后，签发阿里云 OSS STS 临时凭证供前端直传
+    功能：校验文件 MD5 去重后，创建**上传意图**并签发直传凭证供前端直传。
+          P1-2D STEP 4-A 起，服务端不再把对象的最终位置交给客户端决定：
+          quarantine key 由服务端生成并记在 UploadIntent 上，回调时必须携带
+          该 intent 的 id，且提交的 oss_key 必须与之**精确相等**。
     参数：
         - file_name (str, required): 原始文件名
         - file_size (int, required): 文件大小（字节）
         - md5 (str, required): 文件 MD5 哈希值
     返回：
         - 重复文件: {"duplicate": true, "knowledge_doc_id": <doc.id>}
-        - 正常凭证: {"oss_key": "...", "upload_url": "...", "sts_credentials": {...}, "dev_mode": false, "duplicate": false}
+        - 正常凭证: {"intent_id", "oss_key", "upload_url", "sts_credentials",
+                    "dev_mode", "expires_at", "duplicate": false}
+
+    Note:
+        `oss_key` 仍然返回给客户端——直传必须知道往哪个 key PUT——但客户端
+        **无法改写**它：回调阶段服务端以 intent 上记录的值作为唯一权威，
+        客户端回传值只用于比对，不一致即拒绝。
     """
     permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
 
@@ -647,7 +673,6 @@ class UploadSTSView(APIView):
 
         md5_hash = serializer.validated_data['md5']
         file_name = serializer.validated_data['file_name']
-        college_id = request.user.college_id or 0
 
         # MD5 去重检查
         duplicate_doc = oss_client.check_duplicate(md5_hash)
@@ -657,23 +682,25 @@ class UploadSTSView(APIView):
                 'knowledge_doc_id': duplicate_doc.id,
             })
 
-        # 获取 STS 临时凭证（scope 根据上传者角色自动确定）
-        user = request.user
-        if user.role == 'super_admin':
-            scope = 'school'
-            owner_id = 0
-        elif user.role == 'dept_admin' and user.department_id:
-            scope = 'department'
-            owner_id = user.department_id
-        else:
-            scope = 'college'
-            owner_id = user.college_id or 0
-        credentials = oss_client.get_sts_credentials(file_name, scope, owner_id)
+        # 创建上传意图：scope / owner_id 由服务端按角色推导，
+        # quarantine key 由 build_quarantine_key() 生成（客户端不可指定）
+        intent = upload_service.begin_upload(
+            request.user, file_name,
+            content_type=guess_content_type(file_name),
+            expected_size=serializer.validated_data.get('file_size'),
+        )
+
+        # 只为该 intent 的隔离区 Key 签发直传凭证
+        credentials = oss_client.get_sts_credentials(
+            file_name, intent.scope, intent.owner_id, oss_key=intent.quarantine_key,
+        )
         return Response({
+            'intent_id': intent.pk,
             'oss_key': credentials['oss_key'],
             'upload_url': credentials['upload_url'],
             'sts_credentials': credentials.get('sts_credentials'),
             'dev_mode': credentials.get('dev_mode', False),
+            'expires_at': intent.expires_at,
             'duplicate': False,
         })
 
@@ -689,9 +716,13 @@ class UploadCallbackView(APIView):
     OSS 上传完成回调，创建知识文档记录
 
     POST /api/knowledge/upload/callback/
-    功能：OSS 前端直传完成后回调，校验 oss_key 安全性、MD5 去重后创建知识文档记录
+    功能：OSS 前端直传完成后回调。P1-2D STEP 4-A 起必须先做**归属校验**：
+          intent_id 必须是当前用户的、未过期、未消费；提交的 oss_key 必须与
+          服务端在 intent 上记录的 quarantine key **完全一致**，且对象确实存在、
+          大小与声明相符。校验通过后创建指向隔离区对象的文档记录。
     参数：
-        - oss_key (str, required): OSS 对象 Key
+        - intent_id (int, required): 上传凭证ID（/upload/sts/ 返回）
+        - oss_key (str, required): OSS 对象 Key（必须与 intent 记录一致）
         - title (str, optional): 文档标题（未提供时 AI 生成）
         - description (str, optional): 文档描述（未提供时 AI 生成）
         - file_name (str, required): 原始文件名
@@ -716,14 +747,59 @@ class UploadCallbackView(APIView):
         # 校验 oss_key 格式合法性（防止路径穿越攻击）
         self._validate_oss_key(data['oss_key'])
 
-        # 校验 oss_key 落在当前用户的合法上传范围内
-        self._validate_oss_key_scope(request.user, data['oss_key'])
-
-        # 校验 OSS 对象真实存在且与客户端声明一致，取回服务端权威元数据
-        actual_size = self._verify_oss_object(data)
-
         # 校验分类关联数据合法性
         self._validate_classification(data)
+
+        # 1. 归属校验：intent 必须存在、属于当前用户、未过期、未消费。
+        #    取回的 intent.quarantine_key 是**服务端权威值**。
+        try:
+            intent = upload_service.get_upload_intent(request.user, data['intent_id'])
+        except UploadIntentError as e:
+            logger.warning(
+                '上传回调被拒 intent=%s user=%s reason=%s',
+                data['intent_id'], getattr(request.user, 'pk', None), e.reason,
+            )
+            return Response(
+                {'detail': upload_service.intent_error_detail(e),
+                 'code': ErrorCode.NOT_FOUND.value},
+                status=upload_service.intent_error_status(e),
+            )
+
+        # 2. Key 精确绑定：客户端提交的 oss_key 必须与 intent 上记录的值
+        #    **完全相等**。不做前缀匹配、不做 scope 匹配——只认这一条，
+        #    因此无法通过回传别人的 key 来挂载他人对象。
+        if data['oss_key'] != intent.quarantine_key:
+            logger.warning(
+                '上传回调 Key 不匹配 intent=%s expected=%s got=%s user=%s',
+                intent.pk, intent.quarantine_key, data['oss_key'],
+                getattr(request.user, 'pk', None),
+            )
+            raise ValidationError({'oss_key': 'OSS Key 与该上传凭证记录的对象不一致'})
+
+        # 3. 校验 OSS 对象真实存在且与客户端声明一致，取回服务端权威元数据
+        actual_size = self._verify_oss_object(data)
+
+        # 4. 原子推进意图状态：并发的重复回调里只有一个能成功，
+        #    失败的那次不会继续往下创建文档 —— 这是防重放的关键一步。
+        try:
+            upload_service.finalize_callback_intent(
+                request.user, intent.pk,
+                oss_key=data['oss_key'], actual_size=actual_size,
+            )
+        except UploadIntentError as e:
+            existing = KnowledgeDoc.objects.filter(oss_key=intent.quarantine_key).first()
+            if existing is not None and self._visible_to(request.user, existing):
+                # 重放：该上传此前已处理完成，直接返回既有文档，不产生第二个文档、
+                # 不重复触发任何任务。
+                return Response({
+                    'id': existing.id,
+                    'status': existing.status,
+                    'duplicate': True,
+                })
+            return Response(
+                {'detail': upload_service.intent_error_detail(e)},
+                status=upload_service.intent_error_status(e),
+            )
 
         # 同一 oss_key 重复登记：直接返回既有文档。
         # 不拦的话会创建第二条 KnowledgeDoc 指向同一个 OSS 对象，
@@ -787,15 +863,10 @@ class UploadCallbackView(APIView):
                     defaults={'match_type': 'fuzzy', 'weight': 1, 'created_by': request.user},
                 )
 
-        # TODO: 调用 Celery 异步索引任务（甲同学完成后集成）
-        # index_document.delay(doc_id=new_doc.id)
-
-        # 自动触发 AI 日期提取（异步，不阻塞上传主链路）
-        # 遵循 CONVENTIONS.md 第 9 节：异常处理下沉到 utils 层，视图层不写 try/except
-        from utils.celery_dispatcher import safe_delay
-        from .tasks import extract_freshness_task, index_document_task
-        safe_delay(extract_freshness_task, new_doc.id)
-        safe_delay(index_document_task, new_doc.id)
+        # P1-2D STEP 4-B：把该文档交给统一审核编排（审核 → 提升 → 索引）。
+        # 对象此刻仍在 quarantine/，只有审核给出 approved/confirmed_unchecked
+        # 且 promotion 成功之后才可能被索引。入口不做任何审核判定。
+        upload_service.schedule_moderation(new_doc.id)
 
         return Response({
             'id': new_doc.id,
@@ -812,41 +883,23 @@ class UploadCallbackView(APIView):
 
     @staticmethod
     def _validate_oss_key(oss_key: str) -> None:
-        """校验 oss_key 格式合法性，防止路径穿越攻击"""
+        """校验 oss_key 的**格式**合法性，防止路径穿越。
+
+        P1-2D STEP 4-A 起，直传的对象一律落在隔离区，因此这里要求
+        `quarantine/` 前缀。但这只是廉价的前置格式检查——真正的归属判定靠
+        `oss_key == intent.quarantine_key` 的**精确比对**（见 post 第 2 步）。
+
+        原先的 `_validate_oss_key_scope()`（按角色限制 `knowledge/{scope}/{owner}`
+        前缀）已删除：它只能证明"对象落在我的 scope 目录下"，而同一 scope 目录下
+        可能是**别人**上传的对象——这正是本阶段要关闭的挂载缺口。intent 的精确
+        比对严格更强，保留旧校验只会给出"已经安全了"的错觉。
+        """
         if '..' in oss_key:
             raise ValidationError({'oss_key': '包含非法路径字符 ".."'})
         if oss_key.startswith('/'):
             raise ValidationError({'oss_key': '不能以 "/" 开头'})
-        if not oss_key.startswith('knowledge/'):
-            raise ValidationError({'oss_key': 'OSS Key 格式不合法，必须以 "knowledge/" 开头'})
-
-    @staticmethod
-    def _validate_oss_key_scope(user, oss_key: str) -> None:
-        """校验 oss_key 落在当前用户的合法上传范围内。
-
-        Key 规则（见 utils.oss._generate_oss_key 与 UploadSTSView）：
-            knowledge/{scope}/{owner_id}/{YYYY-MM}/{uuid}.{ext}
-
-        只校验 `knowledge/` 前缀是不够的——任意管理员都能借此认领其他学院 /
-        其他部门上传的对象。这里按角色把 scope 与 owner_id 一并锁定。
-
-        Args:
-            user: 当前请求用户
-            oss_key: 客户端提交的对象 Key
-        """
-        if user.role == 'super_admin':
-            allowed = (
-                'knowledge/school/',
-                'knowledge/college/',
-                'knowledge/department/',
-            )
-        elif user.role == 'dept_admin' and user.department_id:
-            allowed = (f'knowledge/department/{user.department_id}/',)
-        else:
-            allowed = (f'knowledge/college/{user.college_id or 0}/',)
-
-        if not oss_key.startswith(allowed):
-            raise ValidationError({'oss_key': 'OSS Key 不属于当前用户的上传范围'})
+        if not upload_service.is_quarantine_key(oss_key):
+            raise ValidationError({'oss_key': 'OSS Key 格式不合法，必须以 "quarantine/" 开头'})
 
     @staticmethod
     def _visible_to(user, doc) -> bool:
@@ -874,10 +927,11 @@ class UploadCallbackView(APIView):
             ValidationError: 对象不存在、无法校验、或与声明不一致
 
         Note:
-            本校验只能证明"该对象存在且元数据与声明一致"，**不能**证明该对象
-            由本次请求的发起者上传——那需要服务端上传凭证（pending upload）
-            记录，当前数据模型不具备。STS 直传回调路径因此仍存在归属校验缺口，
-            详见 Phase 1-1 报告的 callback ownership = BLOCKED。
+            本函数只证明"该对象存在且元数据与声明一致"，**不负责归属校验**。
+            归属校验已由调用方 `UploadCallbackView.post()` 完成：先经
+            `get_upload_intent()` 取回服务端签发、绑定到当前用户的 intent，再要求
+            提交的 oss_key 与 `intent.quarantine_key` **完全相等**，才可能走到这里。
+            因此 Phase 1-1 报告的 callback ownership 缺口已由 UploadIntent 关闭。
         """
         meta = oss_client.head_object(data['oss_key'])
         if meta is None:
@@ -943,7 +997,6 @@ class TextUploadView(APIView):
     def post(self, request):
         """处理文本录入请求"""
         import hashlib
-        import uuid
 
         # 填充默认值：学院ID和部门ID默认使用上传者的
         req_data = request.data.copy()
@@ -997,32 +1050,34 @@ class TextUploadView(APIView):
         title = title or '未命名文档'
         description = description or ''
 
-        # 生成 OSS 对象 Key（根据上传者角色确定路径）
-        now = datetime.now()
-        if request.user.role == 'super_admin':
-            oss_scope = 'school'
-            owner_id = 0
-        elif request.user.role == 'dept_admin' and request.user.department_id:
-            oss_scope = 'department'
-            owner_id = request.user.department_id
-        else:
-            oss_scope = 'college'
-            owner_id = request.user.college_id or 0
-        oss_key = f'knowledge/{oss_scope}/{owner_id}/{now:%Y-%m}/{uuid.uuid4().hex[:12]}.txt'
+        content_bytes = content.encode('utf-8')
 
-        # 上传文本到 OSS
-        success = oss_client.upload_text(content, oss_key)
-        if not success:
+        # 创建上传意图：文本上传同样走隔离区，安全边界与文件上传保持一致。
+        # quarantine key 由服务端生成（客户端无法指定）。
+        intent = upload_service.begin_upload(
+            request.user, f'{title}.txt',
+            content_type='text/plain; charset=utf-8',
+            expected_size=len(content_bytes),
+        )
+
+        # 写入 OSS —— 目标是隔离区，不是正式区
+        try:
+            stored = upload_service.put_quarantine_object(
+                intent, content_bytes, content_type='text/plain; charset=utf-8',
+            )
+        except (OSSOperationError, oss2.exceptions.OssError) as e:
+            logger.error(f'文本上传到 OSS 失败 intent={intent.pk}: {e}')
             return Response(
                 {'detail': '文本上传到 OSS 失败，请稍后重试', 'code': ErrorCode.UPLOAD_FAILED.value},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
         # 计算 MD5
-        md5_hash = hashlib.md5(content.encode('utf-8')).hexdigest()
+        md5_hash = hashlib.md5(content_bytes).hexdigest()
 
-        # 生成 OSS 访问 URL
-        oss_url = f'https://{oss_client.bucket_name}.{oss_client.endpoint}/{oss_key}'
+        # 文档记录指向**隔离区**对象（审核通过前不索引、不可下载）
+        oss_key = stored['oss_key']
+        oss_url = stored['oss_url']
 
         # 文档归属根据上传者角色自动确定
         if request.user.role == 'super_admin':
@@ -1041,7 +1096,7 @@ class TextUploadView(APIView):
             oss_url=oss_url,
             file_name=f'{title}.txt',
             file_type='txt',
-            file_size=len(content.encode('utf-8')),
+            file_size=len(content_bytes),
             md5_hash=md5_hash,
             college_id=doc_college_id,
             department_id=doc_department_id,
@@ -1062,11 +1117,9 @@ class TextUploadView(APIView):
                     defaults={'match_type': 'fuzzy', 'weight': 1, 'created_by': request.user},
                 )
 
-        # 触发异步索引（切片 + 向量化），使文档可被 AI 智能问答检索
-        from utils.celery_dispatcher import safe_delay
-        from .tasks import extract_freshness_task, index_document_task
-        safe_delay(extract_freshness_task, new_doc.id)
-        safe_delay(index_document_task, new_doc.id)
+        # P1-2D STEP 4-B：文本对象与文件对象走**完全相同**的链路，
+        # 同样先进隔离区走审核流程，没有"文本可以跳过审核"的特殊路径。
+        upload_service.schedule_moderation(new_doc.id)
 
         return Response({
             'id': new_doc.id,
@@ -1116,6 +1169,14 @@ class KnowledgeDocPreviewView(APIView):
             ),
             id=pk,
         )
+        # P1-2D STEP 4-A：隔离区对象不得对外提供（与下载接口同样的 fail-closed 门禁）。
+        # 未审核文件既不能返回签名 URL，也不能把原文直接吐给调用方。
+        if not is_official_oss_key(doc.oss_key):
+            return Response(
+                {'detail': '文档尚未通过安全审核，暂不可预览',
+                 'id': doc.id, 'status': doc.status},
+                status=status.HTTP_404_NOT_FOUND,
+            )
         ft = doc.file_type.lower() if doc.file_type else 'other'
 
         # 纯文本：返回原文（从 OSS 拉取）
@@ -1281,7 +1342,6 @@ class FileUploadView(APIView):
         import json
         import os
         import tempfile
-        import uuid
 
         # 填充默认值：学院ID和部门ID默认使用上传者的
         req_data = request.data.copy()
@@ -1314,51 +1374,57 @@ class FileUploadView(APIView):
                 {'file': f'{ext} 文件大小不能超过 {max_mb}MB，当前大小 {cur_mb}MB'}
             )
 
-        # 生成 OSS 对象 Key（根据上传者角色确定路径）
-        now = datetime.now()
-        safe_filename = f'{uuid.uuid4().hex[:12]}.{ext}'
-        if request.user.role == 'super_admin':
-            oss_scope = 'school'
-            owner_id = 0
-        elif request.user.role == 'dept_admin' and request.user.department_id:
-            oss_scope = 'department'
-            owner_id = request.user.department_id
-        else:
-            oss_scope = 'college'
-            owner_id = request.user.college_id or 0
-        oss_key = f'knowledge/{oss_scope}/{owner_id}/{now:%Y-%m}/{safe_filename}'
-
         # 读取文件二进制内容 + 计算 MD5
         file_bytes = uploaded_file.read()
         md5_hash = hashlib.md5(file_bytes).hexdigest()
 
-        # 上传到 OSS
-        try:
-            if not oss_client.bucket:
-                logger.error(f'OSS Bucket 未初始化，请检查 OSS 配置')
-                return Response(
-                    {'detail': 'OSS 配置异常，请联系管理员', 'code': ErrorCode.OSS_CONFIG_ERROR.value},
-                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                )
-
-            oss_client.bucket.put_object(
-                oss_key, file_bytes,
-                headers={'Content-Type': guess_content_type(safe_filename)},
+        # OSS 配置缺失在创建意图之前拦掉：保留原有的错误码与文案，且不留下
+        # 一个永远不会被写入的悬空 UploadIntent。
+        if not oss_client.bucket:
+            logger.error('OSS Bucket 未初始化，请检查 OSS 配置')
+            return Response(
+                {'detail': 'OSS 配置异常，请联系管理员', 'code': ErrorCode.OSS_CONFIG_ERROR.value},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
-            oss_url = f'https://{oss_client.bucket_name}.{oss_client.endpoint}/{oss_key}'
-            logger.info(f'OSS 上传成功 oss_key={oss_key}, size={len(file_bytes)}')
+
+        # 创建上传意图：quarantine key 由服务端生成，客户端无法指定。
+        # 归属规则（scope / owner_id）在 upload_intent.resolve_upload_scope 内统一实现。
+        intent = upload_service.begin_upload(
+            request.user, uploaded_file.name,
+            content_type=guess_content_type(uploaded_file.name),
+            expected_size=len(file_bytes),
+        )
+
+        # 上传到 OSS —— 目标是隔离区，不是正式区
+        try:
+            stored = upload_service.put_quarantine_object(
+                intent, file_bytes,
+                content_type=guess_content_type(uploaded_file.name),
+            )
+        except OSSOperationError as e:
+            logger.error(f'OSS 上传失败 intent={intent.pk}: {e}')
+            return Response(
+                {'detail': f'文件上传失败: {e}', 'code': ErrorCode.UPLOAD_FAILED.value},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
         except oss2.exceptions.OssError as e:
-            logger.error(f'OSS 服务端错误 oss_key={oss_key}: {e}')
+            logger.error(f'OSS 服务端错误 intent={intent.pk}: {e}')
             return Response(
                 {'detail': f'OSS 服务错误: {str(e)}', 'code': ErrorCode.OSS_SERVER_ERROR.value},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
         except Exception as e:
-            logger.error(f'OSS 文件上传失败 oss_key={oss_key}: {type(e).__name__}: {e}')
+            logger.error(f'文件上传失败 intent={intent.pk}: {type(e).__name__}: {e}')
             return Response(
                 {'detail': f'文件上传失败: {str(e)}', 'code': ErrorCode.UPLOAD_FAILED.value},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
+
+        # 文档记录指向**隔离区**对象：在审核通过并 promotion 之前，
+        # 它既不会被索引（check_indexable 要求 knowledge/ 前缀），
+        # 也不能通过下载/预览接口取回（见 is_official_oss_key 门禁）。
+        oss_key = stored['oss_key']
+        oss_url = stored['oss_url']
 
         # 确定初始 title：优先用户提供 → 文件名（去扩展名）
         user_title = data.get('title', '')
@@ -1507,12 +1573,9 @@ class FileUploadView(APIView):
                     defaults={'match_type': 'fuzzy', 'weight': 1, 'created_by': request.user},
                 )
 
-        # 触发异步索引（切片 + 向量化），使文档可被 AI 智能问答检索
-        # 遵循规范第 9 节：异常处理下沉到 utils 层，视图层不写 try/except
-        from utils.celery_dispatcher import safe_delay
-        from .tasks import extract_freshness_task, index_document_task
-        safe_delay(extract_freshness_task, new_doc.id)
-        safe_delay(index_document_task, new_doc.id)
+        # P1-2D STEP 4-B：把该文档交给统一审核编排（审核 → 提升 → 索引）。
+        # 4-A 在这里删掉的"直接索引"不会被恢复：新链路必须先过审核。
+        upload_service.schedule_moderation(new_doc.id)
 
         # 确保 raw_keywords 始终是列表（给前端返回用）
         if not isinstance(raw_keywords, list):
@@ -1562,7 +1625,6 @@ class BatchFileUploadView(APIView):
         """处理多文件批量上传"""
         import hashlib
         import json
-        import uuid
 
         # 1. 获取文件列表
         files = request.FILES.getlist('files')
@@ -1578,22 +1640,16 @@ class BatchFileUploadView(APIView):
             visibility = 'public'
 
         # 3. 根据上传者角色确定文档归属
+        # OSS Key 不再在这里生成：每个文件各自创建 UploadIntent，由
+        # upload_intent.resolve_upload_scope() 统一算出 scope/owner_id，
+        # 并生成隔离区 Key（客户端与视图都无法指定）。
         user = request.user
         if user.role == 'super_admin':
             doc_college_id = None
             doc_department_id = None
-            oss_scope = 'school'
-            owner_id = 0
-        elif user.role == 'dept_admin' and user.department_id:
-            doc_college_id = user.college_id
-            doc_department_id = user.department_id
-            oss_scope = 'department'
-            owner_id = user.department_id
         else:
             doc_college_id = user.college_id
             doc_department_id = user.department_id
-            oss_scope = 'college'
-            owner_id = user.college_id or 0
 
         # 4. 逐个处理文件
         success_results = []
@@ -1622,37 +1678,35 @@ class BatchFileUploadView(APIView):
                     })
                     continue
 
-                # 4b. 生成 OSS 对象 Key 并上传
-                now = datetime.now()
-                safe_filename = f'{uuid.uuid4().hex[:12]}.{ext}'
-                oss_key = f'knowledge/{oss_scope}/{owner_id}/{now:%Y-%m}/{safe_filename}'
-
-                # 读取文件二进制内容 + 计算 MD5
+                # 4b. 读取文件二进制内容 + 计算 MD5
                 file_bytes = uploaded_file.read()
                 md5_hash = hashlib.md5(file_bytes).hexdigest()
 
-                # 上传到 OSS
-                if not oss_client.bucket:
-                    logger.error('OSS Bucket 未初始化，批量上传中止')
-                    return Response(
-                        {'detail': 'OSS 配置异常，请联系管理员', 'code': ErrorCode.OSS_CONFIG_ERROR.value},
-                        status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    )
-
+                # 4b2. 每个文件一个独立的上传意图（绝不共用一个 intent），
+                # quarantine key 由服务端生成，文件之间互不影响 —— 某一个失败
+                # 不会让其它文件走到别的存储路径上去。
                 try:
-                    oss_client.bucket.put_object(
-                        oss_key, file_bytes,
-                        headers={'Content-Type': guess_content_type(safe_filename)},
+                    intent = upload_service.begin_upload(
+                        user, file_name,
+                        content_type=guess_content_type(file_name),
+                        expected_size=len(file_bytes),
                     )
-                    oss_url = f'https://{oss_client.bucket_name}.{oss_client.endpoint}/{oss_key}'
-                    logger.info(f'批量上传 OSS 成功 oss_key={oss_key}, size={len(file_bytes)}')
-                except oss2.exceptions.OssError as e:
-                    logger.error(f'OSS 服务端错误 oss_key={oss_key}: {e}')
-                    failed_results.append({
-                        'file_name': file_name,
-                        'error': f'OSS 服务错误: {str(e)}',
-                    })
+                    stored = upload_service.put_quarantine_object(
+                        intent, file_bytes,
+                        content_type=guess_content_type(file_name),
+                    )
+                except UploadIntentError as e:
+                    logger.error(f'批量上传创建凭证失败 file={file_name}: {e}')
+                    failed_results.append({'file_name': file_name, 'error': '上传凭证校验失败'})
                     continue
+                except (OSSOperationError, oss2.exceptions.OssError) as e:
+                    logger.error(f'批量上传 OSS 失败 file={file_name}: {e}')
+                    failed_results.append({'file_name': file_name, 'error': f'OSS 上传失败: {e}'})
+                    continue
+
+                oss_key = stored['oss_key']
+                oss_url = stored['oss_url']
+                logger.info(f'批量上传已进入隔离区 intent={intent.pk} key={oss_key}')
 
                 # 4c. 提取文本内容用于 AI 分析
                 extracted_text = ''
@@ -1728,11 +1782,10 @@ class BatchFileUploadView(APIView):
                 except Exception as e:
                     logger.error(f'批量上传创建日志失败 file={file_name}: {e}')
 
-                # 4g-2. 触发异步索引（切片 + 向量化），使文档可被 AI 智能问答检索
-                from utils.celery_dispatcher import safe_delay
-                from .tasks import extract_freshness_task, index_document_task
-                safe_delay(extract_freshness_task, new_doc.id)
-                safe_delay(index_document_task, new_doc.id)
+                # 4g-2. P1-2D STEP 4-B：逐个文件各自进入审核编排。
+                # 每个文件有独立的 UploadIntent 与 KnowledgeDoc，
+                # **不是**整批一个任务——某个文件被拒绝不影响其它文件。
+                upload_service.schedule_moderation(new_doc.id)
 
                 # 4h. 记录成功
                 success_results.append({

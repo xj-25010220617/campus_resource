@@ -175,12 +175,28 @@ class MilvusClient:
     # ------------------------------------------------------------------
     # 向量搜索
     # ------------------------------------------------------------------
+    def backend_name(self) -> str:
+        """当前可用的向量后端，供健康检查 / 监控探测。只读，不建连接。
+
+        Returns:
+            'milvus'      —— 已连上 Milvus
+            'chroma'      —— Milvus 不可用，但 ChromaDB 可导入（降级后端可用）
+            'unavailable' —— 两者都不可用：向量检索**无法执行**
+        """
+        if self._connected:
+            return 'milvus'
+        try:
+            import chromadb  # noqa: F401
+        except ImportError:
+            return 'unavailable'
+        return 'chroma'
+
     def search(
         self,
         query_embedding: List[float],
         top_k: int = 10,
         filter_ids: Optional[List[int]] = None,
-    ) -> List[dict]:
+    ) -> Optional[List[dict]]:
         """
         向量相似度搜索（支持按 doc_id 范围硬过滤）。
 
@@ -193,6 +209,16 @@ class MilvusClient:
             [{'vector_id': str, 'doc_id': int, 'chunk_index': int,
               'chunk_text': str, 'page_number': int, 'seq_order': int,
               'score': float}, ...]
+                —— 检索**执行成功**；空列表是合法的"确实没有匹配"
+            None
+                —— 向量后端**不可用**，检索根本没执行
+
+        Note（P1-2 Phase 1-2 / 审计报告 P-7）
+        -------------------------------------
+        这两种结果**必须区分**。此前两者都返回 `[]`，于是"向量库挂了"在
+        问答侧表现为"知识库里没有相关内容"——故障被伪装成正常的空结果，
+        运维与用户都无法察觉。调用方拿到 `None` 时必须按"服务不可用"处理，
+        绝不能 `or []` 吞掉。
         """
         if self._connected:
             return self._search_milvus(query_embedding, top_k, filter_ids)
@@ -243,16 +269,25 @@ class MilvusClient:
         query_embedding: List[float],
         top_k: int,
         filter_ids: Optional[List[int]],
-    ) -> List[dict]:
+    ) -> Optional[List[dict]]:
+        """Chroma 降级检索。**返回 None 表示后端不可用**（不是空结果）。"""
         try:
             import chromadb
         except ImportError:
-            logger.warning('chromadb 未安装，Chroma 向量检索不可用')
-            return []
+            # Milvus 也没连上 → 没有任何可用后端。返回 None 让上层区分
+            # "服务不可用"与"确实没有匹配"（审计报告 P-7）。
+            logger.error('chromadb 未安装且 Milvus 不可用：向量检索无法执行')
+            return None
         client = chromadb.PersistentClient(
             path=str(getattr(settings, 'CHROMA_DB_PATH', './chroma_db'))
         )
-        collection = client.get_collection(name=self.COLLECTION_NAME)
+        try:
+            collection = client.get_collection(name=self.COLLECTION_NAME)
+        except Exception as e:
+            # 集合不存在 / 索引文件损坏（chroma-hnswlib 在含中文的 Windows
+            # 路径下必崩）。这同样是"后端不可用"，不是"没有匹配"。
+            logger.error(f'Chroma 集合不可用，向量检索无法执行: {e}')
+            return None
 
         # 检索时若限定了 doc_id 范围，过滤后可能数量不足，
         # 因此多取 5 倍以保证在过滤后仍有 top_k 条命中
@@ -300,12 +335,13 @@ class MilvusClient:
         """hnsw 索引不可用时的暴力余弦检索（全量向量内存计算）。
 
         开发环境 Chroma 规模（万条以内）下毫秒级完成，且结果精确。
+        返回 None 表示**取数失败 = 后端不可用**（审计报告 P-7）。
         """
         try:
             got = collection.get(include=['embeddings', 'metadatas', 'documents'])
         except Exception as e:
             logger.error(f'Chroma 暴力检索取数失败: {e}')
-            return []
+            return None
 
         ids = got.get('ids') or []
         embs = got.get('embeddings')

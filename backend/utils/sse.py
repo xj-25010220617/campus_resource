@@ -258,7 +258,7 @@ def build_references_events(
         }
 
     from urllib.parse import urlparse
-    from .oss import oss_client
+    from .oss import is_official_oss_key, oss_client
 
     detail = []
     for result in qualified:
@@ -276,7 +276,11 @@ def build_references_events(
                 'content_snippet': result.get('content', '')[:200],
                 'source_url': doc.source_url or '',
             }
-            if doc.oss_key:
+            # P1-2D STEP 4-B：与 /download/、/preview/、序列化器同一道门禁。
+            # 这里的输入来自 RAG 检索结果（已按 status='indexed' 过滤），理论上
+            # 不可能是隔离区对象；但"签发 URL"的每个出口都必须自己 fail-closed，
+            # 不能把命名空间判定寄托在上一层过滤上。
+            if doc.oss_key and is_official_oss_key(doc.oss_key):
                 try:
                     entry['download_url'] = oss_client.get_download_url(
                         doc.oss_key, expires=300, file_name=doc.file_name,
@@ -317,7 +321,7 @@ def build_images_events(image_results: list) -> dict:
     Returns:
         {'images': [{'doc_id','doc_title','description','preview_url'}, ...]}
     """
-    from .oss import oss_client
+    from .oss import is_official_oss_key, oss_client
 
     images = []
     for r in image_results:
@@ -328,7 +332,9 @@ def build_images_events(image_results: list) -> dict:
             'preview_url': '',
         }
         oss_key = r.get('oss_key', '')
-        if oss_key:
+        # P1-2D STEP 4-B：与 references_detail 的 download_url 同一道门禁。
+        # 隔离区 / 非法 Key 一律不签名，preview_url 保持空字符串。
+        if oss_key and is_official_oss_key(oss_key):
             # 签名预览 URL（不带 attachment / content-type 覆盖，浏览器内联显示图片）。
             # 注意：阿里云 OSS 不支持 response-content-type 参数（400 InvalidRequest），
             # 图片 Content-Type 已在上传时写对（utils.oss.guess_content_type），<img> 亦会嗅探。

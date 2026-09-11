@@ -81,6 +81,21 @@ DEFAULT_STREAM_CHUNK_SIZE = 64 * 1024
 DEFAULT_MAX_STREAM_BYTES = 500 * 1024 * 1024
 
 
+def is_official_oss_key(oss_key) -> bool:
+    """对象是否位于**正式区**（`knowledge/`）命名空间。
+
+    P1-2D STEP 4-A 起，新上传的对象一律先落在 `quarantine/`，只有经过审核
+    （P1-2C `moderate_document()`）并明确 approved、再由 `promote_object()`
+    提升之后，才会出现在 `knowledge/` 下。因此"对象在正式区"是**对外提供内容**
+    的必要条件：下载 / 预览等会签发 URL 的接口必须先用本函数把关，
+    否则隔离区里未审核的内容会被直接取回。
+
+    这里只做命名空间判断，不做审核状态判断——审核结论属于 ContentModeration，
+    由后续阶段（STEP 4-B / P1-2E）叠加。
+    """
+    return bool(oss_key) and str(oss_key).startswith(OFFICIAL_KEY_PREFIX)
+
+
 def build_quarantine_key(scope: str, owner_id: int, file_name: str) -> str:
     """生成隔离区 OSS Key：`quarantine/{scope}/{owner_id}/{YYYY-MM}/{uuid12}.{ext}`
 
@@ -106,6 +121,74 @@ def build_quarantine_key(scope: str, owner_id: int, file_name: str) -> str:
     ext = file_name.rsplit('.', 1)[-1].lower() if file_name and '.' in file_name else 'bin'
     now = datetime.now()
     return f'{QUARANTINE_KEY_PREFIX}{scope}/{owner_id}/{now:%Y-%m}/{_uuid.uuid4().hex[:12]}.{ext}'
+
+
+def build_promoted_key(quarantine_key: str) -> str:
+    """由隔离区 Key 推出正式区 Key：`quarantine/` → `knowledge/`，**只换顶层前缀**。
+
+    与 `build_quarantine_key()` 互为逆操作：promotion 之后对象的
+    `scope / owner_id / YYYY-MM / uuid.ext` 全部保持原样，只有命名空间改变。
+
+    安全约束（不提供绕过开关）：
+    - 输入**必须**以 `quarantine/` 开头，否则抛异常
+    - 前缀之后必须是恰好 4 段非空路径（`{scope}/{owner}/{YYYY-MM}/{file}`），
+      与 `build_quarantine_key()` 生成的结构一致；段内不允许 `.` / `..`
+    - 拒绝 `..`、绝对路径、反斜杠、控制字符、空 Key
+
+    因此以下输入一律被拒绝（不会"猜测性地"转换）：
+        ''                       —— 空
+        'random/path/file.pdf'   —— 前缀不对
+        'knowledge-malicious/x'  —— 前缀不对
+        'knowledge/college/1/2026-09/a.pdf'  —— 已是正式区
+        'quarantine/'            —— 没有剩余路径
+        'quarantine/../knowledge/x'          —— 路径穿越
+        'quarantine/a/b/c'       —— 段数不足
+
+    Args:
+        quarantine_key: 隔离区对象 Key
+
+    Returns:
+        形如 `knowledge/college/12/2026-09/550e8400e29b.pdf` 的正式区 Key
+
+    Raises:
+        OSSOperationError: 输入不合法
+
+    Note:
+        本函数**只做字符串变换**：不读 OSS、不校验对象是否存在、不写数据库。
+        "目标对象真实存在且与源一致"由 `OSSClient.promote_object()` 的
+        copy + HEAD 校验负责，二者不可互相替代。
+    """
+    key = (quarantine_key or '').strip() if isinstance(quarantine_key, str) else ''
+    if not key:
+        raise OSSOperationError('promotion 源 Key 为空')
+    if not key.startswith(QUARANTINE_KEY_PREFIX):
+        raise OSSOperationError(
+            f'promotion 源必须位于 {QUARANTINE_KEY_PREFIX} 下，实际: {quarantine_key!r}'
+        )
+    # 控制字符 / 反斜杠：合法 Key 只由 build_quarantine_key 生成，不会含这些字符
+    if any(ch in key for ch in ('\\', '\r', '\n', '\x00')) or key.startswith('/'):
+        raise OSSOperationError(f'promotion 源 Key 含非法字符: {quarantine_key!r}')
+
+    suffix = key[len(QUARANTINE_KEY_PREFIX):]
+    if not suffix:
+        raise OSSOperationError(f'promotion 源 Key 缺少路径部分: {quarantine_key!r}')
+
+    segments = suffix.split('/')
+    if len(segments) != 4 or any(
+        not seg or seg in ('.', '..') for seg in segments
+    ):
+        raise OSSOperationError(
+            f'promotion 源 Key 路径结构不合法（应为 '
+            f'{{scope}}/{{owner}}/{{YYYY-MM}}/{{file}}）: {quarantine_key!r}'
+        )
+    if '..' in key:
+        raise OSSOperationError(f'promotion 源 Key 含路径穿越: {quarantine_key!r}')
+
+    dst_key = OFFICIAL_KEY_PREFIX + suffix
+    # 兜底：变换结果必须落在正式区且通过 OSS 原语的 Key 安全检查
+    if not is_official_oss_key(dst_key) or not OSSClient._is_safe_key(dst_key):
+        raise OSSOperationError(f'promotion 目标 Key 非法: {dst_key!r}')
+    return dst_key
 
 
 class OSSOperationError(Exception):
@@ -185,7 +268,7 @@ class OSSClient:
     # STS 临时凭证（前端直传 OSS）
     # ------------------------------------------------------------------
     def get_sts_credentials(self, file_name: str, scope: str = 'college',
-                            owner_id: int = 0) -> dict:
+                            owner_id: int = 0, oss_key: str = None) -> dict:
         """
         获取 STS 临时凭证，供前端直传 OSS。
         返回:
@@ -196,8 +279,12 @@ class OSSClient:
             file_name: 原始文件名
             scope: 归属范围（school/college/department）
             owner_id: 归属对象 ID
+            oss_key: **显式指定**要签发的对象 Key（P1-2D STEP 4-A 起由
+                UploadIntent 提供，落在 `quarantine/`）。为 None 时沿用旧的
+                `_generate_oss_key()` 行为（`knowledge/` 前缀）以保持兼容。
         """
-        oss_key = self._generate_oss_key(file_name, scope, owner_id)
+        if oss_key is None:
+            oss_key = self._generate_oss_key(file_name, scope, owner_id)
 
         if not self.access_key_id:
             # 本地开发：返回签名直传 URL（有效期 300 秒）

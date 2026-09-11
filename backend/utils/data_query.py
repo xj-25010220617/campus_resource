@@ -252,10 +252,13 @@ def find_user_docs(
 
     qs = qs.select_related("category").order_by("-created_at")[:limit]
 
-    from utils.oss import oss_client
+    from utils.oss import is_official_oss_key, oss_client
 
     def _get_dl_url(doc) -> str:
-        if doc.oss_key:
+        # P1-2D STEP 4-A：只有正式区（knowledge/）的对象才签发下载链接。
+        # 新上传的文件在审核通过并 promotion 之前位于 quarantine/，
+        # 这里必须 fail-closed，否则数据查询会把未审核文件的签名 URL 交出去。
+        if doc.oss_key and is_official_oss_key(doc.oss_key):
             url = oss_client.get_download_url(
                 doc.oss_key, expires=3600, file_name=doc.file_name,
             )

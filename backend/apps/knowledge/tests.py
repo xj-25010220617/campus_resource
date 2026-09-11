@@ -17,6 +17,7 @@ from utils.oss import (
     QUARANTINE_KEY_PREFIX,
     OSSOperationError,
     build_quarantine_key,
+    is_official_oss_key,
     oss_client,
 )
 
@@ -27,6 +28,12 @@ from .models import (
     Keyword,
     KnowledgeDoc,
     ModerationAttempt,
+    UploadIntent,
+)
+from .upload_intent import (
+    cancel_upload_intent,
+    create_upload_intent,
+    is_quarantine_key,
 )
 from .moderation import (
     INDEXABLE_MODERATION_STATES,
@@ -34,9 +41,12 @@ from .moderation import (
     MAX_EXCERPT_LENGTH,
     MAX_FINDINGS,
     MAX_FINDINGS_JSON_BYTES,
+    MODERATION_STATE_APPROVED,
     MODERATION_STATE_CHOICES,
     STORAGE_STATE_CHOICES,
+    STORAGE_STATE_PROMOTED,
     VERDICT_CHOICES,
+    VERDICT_CLEAN,
     is_indexable_moderation_state,
     normalize_findings,
 )
@@ -121,7 +131,22 @@ class RagRetrievalTests(TestCase):
             status='indexed',
         )
         defaults.update(overrides)
-        return KnowledgeDoc.objects.create(**defaults)
+        doc = KnowledgeDoc.objects.create(**defaults)
+        # P1-2 Phase 1-2 / 审计报告 P-3：RAG 读取侧已加审核门，
+        # `status='indexed'` 不再是"可被检索"的充分条件——还必须
+        # `state ∈ {approved, confirmed_unchecked}` 且 `storage_state=promoted`。
+        # 因此"已索引文档"的夹具必须同时给出审核记录，否则它代表的是一个
+        # STEP 4-B 之后**不可能存在**的状态（未审核却已索引）。
+        # 这是夹具修正，不是放宽安全判定：审核门本身未做任何改动。
+        if doc.status == 'indexed':
+            ContentModeration.objects.create(
+                doc=doc,
+                state=MODERATION_STATE_APPROVED,
+                verdict=VERDICT_CLEAN,
+                storage_state=STORAGE_STATE_PROMOTED,
+                promoted_key=doc.oss_key or '',
+            )
+        return doc
 
     def _create_chunks(self, doc, contents):
         for i, text in enumerate(contents):
@@ -324,6 +349,10 @@ DOC_LIST_URL = '/api/knowledge/docs/'
 CHUNK_INIT_URL = '/api/knowledge/upload/chunk/init/'
 CHUNK_URL = '/api/knowledge/upload/chunk/'
 CHUNK_MERGE_URL = '/api/knowledge/upload/chunk/merge/'
+FILE_UPLOAD_URL = '/api/knowledge/upload/file/'
+BATCH_UPLOAD_URL = '/api/knowledge/upload/batch/'
+TEXT_UPLOAD_URL = '/api/knowledge/upload/text/'
+STS_URL = '/api/knowledge/upload/sts/'
 
 MB = 1024 * 1024
 
@@ -336,7 +365,12 @@ def _oss_meta(size, content_type='application/pdf', etag='', exists=True):
 
 
 class UploadCallbackSecurityTests(TestCase):
-    """上传回调：客户端提交的 oss_key / 大小 / 类型不再被无条件信任。"""
+    """上传回调：oss_key 必须**精确绑定**服务端签发的 UploadIntent。
+
+    P1-2D STEP 4-A 之前，回调只校验"key 落在我的 scope 目录下"，同一目录下
+    别人上传的对象因此可以被认领；现在服务端在 /upload/sts/ 阶段生成
+    quarantine key 并记在 intent 上，回调用 intent_id 取回该值做**精确比对**。
+    """
 
     def setUp(self):
         self.client = APIClient()
@@ -346,10 +380,29 @@ class UploadCallbackSecurityTests(TestCase):
             role='college_admin', college=self.college,
         )
         self.client.force_authenticate(self.admin)
-        self.oss_key = f'knowledge/college/{self.college.id}/2026-09/abcdef123456.pdf'
+        self.intent = create_upload_intent(
+            self.admin, '课程设计报告.pdf',
+            content_type='application/pdf', expected_size=2048,
+        )
+        self.oss_key = self.intent.quarantine_key
+
+        # P1-2D STEP 4-B：回调建文档后必须派发统一审核编排。
+        # 派发发生在 on_commit 里，而 TestCase 全程包在事务中、回调默认不执行，
+        # 因此 `_post()` 用 captureOnCommitCallbacks(execute=True) 包住请求。
+        #
+        # 派发函数是 `dispatch_async`（只入队、绝不降级同步执行，见 P-4）。
+        # 同时 spy `safe_delay` 并断言未被调用，防止有人改回降级派发。
+        patcher = patch('utils.celery_dispatcher.dispatch_async')
+        self.dispatch_async = patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch('utils.celery_dispatcher.safe_delay')
+        self.safe_delay = patcher.start()
+        self.addCleanup(patcher.stop)
+        self.commit_callbacks = []
 
     def _payload(self, **overrides):
         data = {
+            'intent_id': self.intent.pk,
             'oss_key': self.oss_key,
             'file_name': '课程设计报告.pdf',
             'file_size': 2048,
@@ -360,15 +413,44 @@ class UploadCallbackSecurityTests(TestCase):
         return data
 
     def _post(self, data, meta):
-        """回调：head_object 与异步任务全 mock。
+        """回调：head_object 全 mock，测试不得触达真实 OSS。
 
-        UploadCallbackView 在 post() 内部才 import safe_delay，因此这里 patch
-        `utils.celery_dispatcher.safe_delay` 是生效的；测试中不得让任务同步
-        执行并真实访问 OSS。
+        P1-2D STEP 4-B 起回调建文档后会派发统一审核编排（on_commit），
+        因此必须把请求包进 `captureOnCommitCallbacks(execute=True)`。
         """
-        with patch('apps.knowledge.views.oss_client.head_object', return_value=meta), \
-                patch('utils.celery_dispatcher.safe_delay'):
-            return self.client.post(CALLBACK_URL, data, format='json')
+        # 每次请求前清空记录：断言只针对"这一次请求"派发了什么，
+        # 不受同一测试中先前请求的影响（如重放测试里的第一次回调）。
+        self.dispatch_async.reset_mock()
+        self.safe_delay.reset_mock()
+        with patch('apps.knowledge.views.oss_client.head_object', return_value=meta):
+            with self.captureOnCommitCallbacks(execute=True) as callbacks:
+                response = self.client.post(CALLBACK_URL, data, format='json')
+        self.commit_callbacks = callbacks
+        return response
+
+    def assertModerationScheduled(self):
+        """新建文档必须且只能派发一次统一审核编排任务。"""
+        from .tasks import index_document_task, moderate_and_promote_task
+
+        orchestration = [
+            call.args[1] for call in self.dispatch_async.call_args_list
+            if call.args and call.args[0] is moderate_and_promote_task
+        ]
+        self.assertEqual(
+            orchestration, [KnowledgeDoc.objects.get().id],
+            f'应恰好派发一次审核编排，实际 {orchestration}',
+        )
+        self.assertNotIn(
+            index_document_task,
+            [call.args[0] for call in self.dispatch_async.call_args_list if call.args],
+            '回调不得直接派发索引任务',
+        )
+        self.safe_delay.assert_not_called()
+
+    def assertModerationNotScheduled(self):
+        """未新建文档的返回路径（拒绝 / 去重命中）不得派发任何任务。"""
+        self.dispatch_async.assert_not_called()
+        self.assertEqual(self.commit_callbacks, [])
 
     # ------------------------------------------------------------------
     # 对象真实性
@@ -425,23 +507,30 @@ class UploadCallbackSecurityTests(TestCase):
         self.assertEqual(KnowledgeDoc.objects.count(), 0)
 
     # ------------------------------------------------------------------
-    # Key 归属范围
+    # Key 绑定：必须与 intent 上记录的 quarantine key 精确相等
     # ------------------------------------------------------------------
-    def test_rejects_key_of_other_college(self):
-        """不得认领其他学院前缀下的对象。"""
+    def _peer(self, username='cb_peer'):
+        return User.objects.create_user(
+            username=username, password='testpass123',
+            role='college_admin', college=self.college,
+        )
+
+    def test_rejects_key_of_another_intent(self):
+        """不得认领他人 intent 的 quarantine key（这正是旧 scope 校验漏掉的缺口）。"""
+        other_intent = create_upload_intent(self._peer(), '别人的报告.pdf')
+
         response = self._post(
-            self._payload(oss_key='knowledge/college/999/2026-09/other.pdf'),
-            _oss_meta(2048),
+            self._payload(oss_key=other_intent.quarantine_key), _oss_meta(2048),
         )
 
         self.assertEqual(response.status_code, 400)
         self.assertIn('oss_key', response.data)
         self.assertEqual(KnowledgeDoc.objects.count(), 0)
 
-    def test_rejects_key_outside_upload_scopes(self):
-        """knowledge/ 下非上传范围的前缀（如爬虫的 website/）同样拒绝。"""
+    def test_rejects_key_in_official_namespace(self):
+        """正式区（knowledge/）Key 一律拒绝：直传只允许落到隔离区。"""
         response = self._post(
-            self._payload(oss_key='knowledge/website/0/2026-09/crawled.pdf'),
+            self._payload(oss_key=f'knowledge/college/{self.college.id}/2026-09/old.pdf'),
             _oss_meta(2048),
         )
 
@@ -451,11 +540,62 @@ class UploadCallbackSecurityTests(TestCase):
     def test_rejects_relative_path_key(self):
         """路径穿越仍然被拦。"""
         response = self._post(
-            self._payload(oss_key='knowledge/college/1/../../etc/passwd'),
+            self._payload(oss_key='quarantine/college/1/../../etc/passwd'),
             _oss_meta(2048),
         )
 
         self.assertEqual(response.status_code, 400)
+        self.assertEqual(KnowledgeDoc.objects.count(), 0)
+
+    # ------------------------------------------------------------------
+    # 凭证归属 / 有效期
+    # ------------------------------------------------------------------
+    def test_rejects_missing_intent_id(self):
+        """没有 intent_id 就没有归属依据，序列化层直接拒绝。"""
+        payload = self._payload()
+        payload.pop('intent_id')
+
+        response = self._post(payload, _oss_meta(2048))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('intent_id', response.data)
+        self.assertEqual(KnowledgeDoc.objects.count(), 0)
+
+    def test_rejects_foreign_intent(self):
+        """不得凭他人的 intent_id 完成回调。
+
+        对外与"凭证不存在"返回同样的 404，避免枚举他人 intent id。
+        """
+        other_intent = create_upload_intent(self._peer(), '别人的报告.pdf')
+
+        response = self._post(
+            self._payload(
+                intent_id=other_intent.pk,
+                oss_key=other_intent.quarantine_key,
+            ),
+            _oss_meta(2048),
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(KnowledgeDoc.objects.count(), 0)
+
+    def test_rejects_expired_intent(self):
+        """Key 完全正确但凭证已过期时同样拒绝。"""
+        UploadIntent.objects.filter(pk=self.intent.pk).update(
+            expires_at=timezone.now() - timedelta(seconds=1),
+        )
+
+        response = self._post(self._payload(), _oss_meta(2048))
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(KnowledgeDoc.objects.count(), 0)
+
+    def test_rejects_cancelled_intent(self):
+        cancel_upload_intent(self.admin, self.intent.pk)
+
+        response = self._post(self._payload(), _oss_meta(2048))
+
+        self.assertEqual(response.status_code, 409)
         self.assertEqual(KnowledgeDoc.objects.count(), 0)
 
     # ------------------------------------------------------------------
@@ -469,6 +609,40 @@ class UploadCallbackSecurityTests(TestCase):
         doc = KnowledgeDoc.objects.get()
         self.assertEqual(doc.file_size, 2048)
         self.assertEqual(doc.uploader_id, self.admin.id)
+        self.assertModerationScheduled()
+
+    def test_created_document_points_at_quarantine_key(self):
+        """新建记录指向隔离区对象，不指向正式区。"""
+        response = self._post(self._payload(), _oss_meta(2048))
+
+        doc = KnowledgeDoc.objects.get(id=response.data['id'])
+        self.assertTrue(is_quarantine_key(doc.oss_key))
+        self.assertFalse(is_official_oss_key(doc.oss_key))
+
+    def test_callback_completes_the_intent(self):
+        """回调成功后 intent 推进到 completed（对象已确认落在隔离区）。"""
+        self._post(self._payload(), _oss_meta(2048))
+
+        self.intent.refresh_from_db()
+        self.assertEqual(self.intent.status, 'completed')
+        self.assertEqual(self.intent.actual_size, 2048)
+
+    def test_replay_returns_existing_document_without_duplicating(self):
+        """同一凭证重复回调（重放）只返回首次的文档，不产生第二条记录。
+
+        防重放依赖 UploadIntent 的状态机（issued→completed 的 CAS），
+        不需要另设一套并发控制。
+        """
+        first = self._post(self._payload(), _oss_meta(2048))
+        second = self._post(self._payload(), _oss_meta(2048))
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertTrue(second.data.get('duplicate'))
+        self.assertEqual(second.data['id'], first.data['id'])
+        self.assertEqual(KnowledgeDoc.objects.count(), 1)
+        # 重放不得重复派发审核编排（去重命中走的是"返回既有文档"分支）。
+        self.assertModerationNotScheduled()
 
     def test_duplicate_md5_returns_existing_document(self):
         """同 MD5 重复回调返回既有文档，不新建。"""
@@ -484,6 +658,7 @@ class UploadCallbackSecurityTests(TestCase):
         self.assertTrue(response.data.get('duplicate'))
         self.assertEqual(response.data['id'], existing.id)
         self.assertEqual(KnowledgeDoc.objects.count(), 1)
+        self.assertModerationNotScheduled()
 
     def test_same_key_does_not_create_second_document(self):
         """同一 oss_key 再次回调只返回既有文档，不新建第二条指向同一对象的记录。
@@ -503,6 +678,7 @@ class UploadCallbackSecurityTests(TestCase):
         self.assertTrue(response.data.get('duplicate'))
         self.assertEqual(response.data['id'], existing.id)
         self.assertEqual(KnowledgeDoc.objects.count(), 1)
+        self.assertModerationNotScheduled()
 
     def test_same_key_invisible_document_is_rejected(self):
         """对象已被他人私有登记时既不能新建记录，也不得泄露该文档详情。"""
@@ -520,6 +696,546 @@ class UploadCallbackSecurityTests(TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(KnowledgeDoc.objects.count(), 1)
+
+
+class _RecordingBucket:
+    """最小 OSS Bucket 替身：只记录 put_object，不产生任何网络请求。"""
+
+    def __init__(self):
+        self.puts = []
+
+    def put_object(self, key, payload, headers=None):
+        self.puts.append({'key': key, 'size': len(payload), 'headers': headers or {}})
+        return SimpleNamespace(etag='e' * 32)
+
+    def keys(self):
+        return [p['key'] for p in self.puts]
+
+
+class _FailingBucket:
+    """写入必定失败的 Bucket 替身（模拟 OSS 服务端错误）。"""
+
+    def put_object(self, key, payload, headers=None):
+        raise OSSOperationError('OSS 写入失败（测试注入）')
+
+
+class _QuarantineEntryPointBase(TestCase):
+    """5 个生产上传入口的公共夹具。
+
+    P1-2D STEP 4-A 的硬性验收：入口写入的对象必须在 `quarantine/`，
+    **不得**出现 `knowledge/`、不得创建审核记录、不得派发索引任务。
+
+    P1-2D STEP 4-B 追加验收：入口**必须**把每个新建文档交给统一审核编排
+    （`moderate_and_promote_task`），但审核 / 提升 / 索引全部异步发生——
+    请求返回时对象仍在隔离区、仍无审核记录、仍不是 `indexed`。
+
+    关于"入口是否派发了审核"的断言：`TestCase` 全程包在一个事务里，
+    `transaction.on_commit()` 的回调**默认永不执行**。若不加处理直接断言
+    派发函数的调用，会得到一个恒为真的空断言。因此所有入口请求都要
+    经 `_with_commit()` 包一层 `captureOnCommitCallbacks(execute=True)`。
+
+    派发函数是 `celery_dispatcher.dispatch_async` 而**不是** `safe_delay`
+    （P1-2 Phase 1-2 / 审计报告 P-4）：`safe_delay` 在 Celery 不可用时会
+    降级为**同步执行**，而上传链路必须只入队、绝不降级。本夹具据此 spy。
+    """
+
+    def setUp(self):
+        self.college = College.objects.create(name='计算机与软件学院', code='CS')
+        self.user = User.objects.create_user(
+            username='entry_admin', password='testpass123',
+            role='college_admin', college=self.college,
+        )
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+
+        # 记录 OSS 实际被要求写入的 Key（upload_service 与 views 共用同一个
+        # oss_client 实例，因此 patch 一次即可覆盖两者）。
+        # `bucket` 是只读 property（内部走 _bucket 缓存），必须 patch 私有字段。
+        self.bucket = _RecordingBucket()
+        bucket_patcher = patch.object(oss_client, '_bucket', self.bucket)
+        bucket_patcher.start()
+        self.addCleanup(bucket_patcher.stop)
+
+        # AI 分类：入口会调用，测试中直接降级为"AI 不可用"
+        ai_patcher = patch('apps.knowledge.views._ai_classify', return_value=None)
+        ai_patcher.start()
+        self.addCleanup(ai_patcher.stop)
+
+        # 编辑编排任务走 spy：真实派发需要 broker，且"派发到了哪个任务"才是
+        # 本组测试的关注点。审核函数本体同样只 spy——入口进程绝不直接调用它，
+        # 审核必须由 `moderate_and_promote_task` 在异步进程里执行。
+        #
+        # 这里 spy `dispatch_async`（入口实际使用的派发函数）而同时 spy
+        # `safe_delay` 并断言"未被调用"：如果哪天有人把入口改回 safe_delay，
+        # 异步性会被静默破坏，这两条断言能立刻发现。
+        self.dispatch_async = self._spy('utils.celery_dispatcher.dispatch_async')
+        self.safe_delay = self._spy('utils.celery_dispatcher.safe_delay')
+        self.moderate_document = self._spy('apps.knowledge.moderation.moderate_document')
+        # 最近一次 `_with_commit()` 捕获到的 on_commit 回调
+        self.commit_callbacks = []
+
+    def _spy(self, target):
+        patcher = patch(target)
+        mock = patcher.start()
+        self.addCleanup(patcher.stop)
+        return mock
+
+    def _with_commit(self, fn):
+        """在请求外层捕获并执行 on_commit 回调（TestCase 不会真正提交事务）。"""
+        with self.captureOnCommitCallbacks(execute=True) as callbacks:
+            result = fn()
+        self.commit_callbacks = callbacks
+        return result
+
+    def assertQuarantineOnly(self):
+        """公共断言：请求返回时所有 OSS 对象与文档记录都还在隔离区。
+
+        这是"审核尚未发生"的证明——入口若把对象直接写进 `knowledge/`，
+        或把文档标成 `indexed`，或就地写出审核结论，本断言立刻失败。
+        """
+        self.assertTrue(self.bucket.puts, '上传入口没有向 OSS 写入任何对象')
+        for entry in self.bucket.puts:
+            self.assertTrue(
+                is_quarantine_key(entry['key']),
+                f'对象落在了非隔离区路径: {entry["key"]}',
+            )
+        for doc in KnowledgeDoc.objects.all():
+            self.assertTrue(
+                is_quarantine_key(doc.oss_key),
+                f'文档记录指向非隔离区对象: {doc.oss_key}',
+            )
+            self.assertNotEqual(doc.status, 'indexed')
+        self.assertEqual(ContentModeration.objects.count(), 0)
+        self.assertEqual(ModerationAttempt.objects.count(), 0)
+        self.moderate_document.assert_not_called()
+
+    def assertModerationScheduled(self, expected=1):
+        """入口必须在事务提交后，把每个文档交给统一审核编排任务。
+
+        `expected` 为期望派发次数（批量上传按文件数计）。
+        """
+        from .tasks import index_document_task, moderate_and_promote_task
+
+        orchestration = [
+            call.args[1] for call in self.dispatch_async.call_args_list
+            if call.args and call.args[0] is moderate_and_promote_task
+        ]
+        self.assertEqual(
+            len(orchestration), expected,
+            f'审核编排派发次数应为 {expected}，实际 {orchestration}',
+        )
+        self.assertEqual(
+            sorted(orchestration),
+            sorted(KnowledgeDoc.objects.values_list('id', flat=True)),
+            '派发的 doc_id 与本次新建的文档不一致',
+        )
+        # 入口**不得**直接派发索引任务：索引只能由 promotion 成功后的
+        # on_commit 派发，否则等于绕过了"对象必须已在正式区"这一前置条件。
+        self.assertNotIn(
+            index_document_task,
+            [call.args[0] for call in self.dispatch_async.call_args_list if call.args],
+            '上传入口不得直接派发索引任务',
+        )
+        # 上传链路必须只入队、绝不降级同步执行（P-4）。safe_delay 一旦被
+        # 入口调用，就有"Celery 不可用时就地跑完整条审核链"的风险。
+        self.safe_delay.assert_not_called()
+        # 入口进程不执行审核，审核发生在异步任务里。
+        self.moderate_document.assert_not_called()
+
+    def assertModerationNotScheduled(self):
+        """失败请求的结果：没有留下任何待执行的审核回调。"""
+        self.dispatch_async.assert_not_called()
+        self.assertEqual(
+            self.commit_callbacks, [],
+            '请求失败回滚后不得留下待执行的审核回调',
+        )
+
+    def assertIntentCompleted(self, expected=1):
+        intents = list(UploadIntent.objects.all())
+        self.assertEqual(len(intents), expected)
+        for intent in intents:
+            self.assertEqual(intent.status, 'completed')
+            self.assertTrue(is_quarantine_key(intent.quarantine_key))
+
+
+class FileUploadEntryPointTests(_QuarantineEntryPointBase):
+    """§十七-A：单文件上传（POST /api/knowledge/upload/file/）。"""
+
+    def _post(self, file_name='课程设计报告.pdf', content=b'%PDF-1.4 hello'):
+        return self._with_commit(lambda: self.client.post(FILE_UPLOAD_URL, {
+            'file': SimpleUploadedFile(file_name, content, content_type='application/pdf'),
+        }, format='multipart'))
+
+    def test_file_upload_lands_in_quarantine(self):
+        response = self._post()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIntentCompleted()
+        self.assertQuarantineOnly()
+        self.assertModerationScheduled()
+
+    def test_file_upload_document_points_at_quarantine_key(self):
+        response = self._post()
+
+        doc = KnowledgeDoc.objects.get(id=response.data['id'])
+        self.assertTrue(is_quarantine_key(doc.oss_key))
+        self.assertEqual(doc.oss_key, self.bucket.keys()[0])
+        self.assertEqual(doc.status, 'uploaded')
+
+    def test_file_upload_never_writes_to_official_namespace(self):
+        self._post()
+
+        for key in self.bucket.keys():
+            self.assertFalse(is_official_oss_key(key), f'写入正式区: {key}')
+
+    def test_file_upload_failure_leaves_intent_issued(self):
+        """OSS 写入失败时不得建文档记录，意图停在 issued 等待过期回收。"""
+        with patch.object(oss_client, '_bucket', _FailingBucket()):
+            response = self._post()
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(KnowledgeDoc.objects.count(), 0)
+        self.assertEqual(UploadIntent.objects.get().status, 'issued')
+        # 没有文档就没有任何可编排的东西：不得派发审核，也不得留下悬空回调。
+        self.assertModerationNotScheduled()
+
+
+class TextUploadEntryPointTests(_QuarantineEntryPointBase):
+    """§十七-C：文本录入上传（POST /api/knowledge/upload/text/）。"""
+
+    def _post(self, content='课程设计报告正文内容', **extra):
+        data = {'title': '文本资料', 'content': content}
+        data.update(extra)
+        return self._with_commit(lambda: self.client.post(TEXT_UPLOAD_URL, data, format='json'))
+
+    def test_text_upload_lands_in_quarantine(self):
+        response = self._post()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIntentCompleted()
+        self.assertQuarantineOnly()
+        self.assertModerationScheduled()
+
+    def test_text_object_key_uses_txt_extension(self):
+        self._post()
+
+        self.assertTrue(self.bucket.keys()[0].endswith('.txt'))
+
+    def test_text_upload_content_is_written(self):
+        body = '正文内容-' * 20
+        self._post(content=body)
+
+        self.assertEqual(self.bucket.puts[0]['size'], len(body.encode('utf-8')))
+
+
+class BatchUploadEntryPointTests(_QuarantineEntryPointBase):
+    """§十七-B：批量上传 —— 每个文件一个独立 UploadIntent。"""
+
+    def _post(self, names=('a.pdf', 'b.pdf')):
+        files = [
+            SimpleUploadedFile(n, b'%PDF-1.4 ' + n.encode(), content_type='application/pdf')
+            for n in names
+        ]
+        return self._with_commit(
+            lambda: self.client.post(BATCH_UPLOAD_URL, {'files': files}, format='multipart')
+        )
+
+    def test_each_file_gets_its_own_intent(self):
+        response = self._post(names=('a.pdf', 'b.pdf', 'c.pdf'))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIntentCompleted(expected=3)
+        self.assertEqual(KnowledgeDoc.objects.count(), 3)
+        self.assertQuarantineOnly()
+        # 每个文件一条独立编排任务：某个文件被拒不影响同批其它文件。
+        self.assertModerationScheduled(expected=3)
+
+    def test_batch_keys_are_distinct(self):
+        self._post(names=('a.pdf', 'b.pdf'))
+
+        keys = self.bucket.keys()
+        self.assertEqual(len(keys), len(set(keys)))
+
+    def test_batch_never_writes_to_official_namespace(self):
+        self._post()
+
+        for key in self.bucket.keys():
+            self.assertFalse(is_official_oss_key(key), f'写入正式区: {key}')
+
+
+class STSRequestEntryPointTests(_QuarantineEntryPointBase):
+    """§十七-D：STS 直传凭证签发（POST /api/knowledge/upload/sts/）。"""
+
+    def setUp(self):
+        super().setUp()
+        self.credentials = {
+            'oss_key': '', 'upload_url': 'https://example.invalid/upload',
+            'sts_credentials': {'AccessKeyId': 'fake'}, 'dev_mode': True,
+        }
+
+        def _fake_get_sts_credentials(file_name, scope='college', owner_id=0, oss_key=None):
+            self.credentials['oss_key'] = oss_key
+            return dict(self.credentials)
+
+        patcher = patch.object(oss_client, 'get_sts_credentials', _fake_get_sts_credentials)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _post(self, **overrides):
+        data = {
+            'file_name': '课程设计报告.pdf', 'file_size': 2048, 'md5': 'a' * 32,
+        }
+        data.update(overrides)
+        return self._with_commit(lambda: self.client.post(STS_URL, data, format='json'))
+
+    def test_sts_returns_intent_and_quarantine_key(self):
+        response = self._post()
+
+        self.assertEqual(response.status_code, 200)
+        intent = UploadIntent.objects.get()
+        self.assertEqual(response.data['intent_id'], intent.pk)
+        self.assertEqual(response.data['oss_key'], intent.quarantine_key)
+        self.assertTrue(is_quarantine_key(response.data['oss_key']))
+
+    def test_sts_signs_credentials_for_the_intent_key_only(self):
+        """签发的凭证必须绑定 intent 的隔离区 Key，而不是 knowledge/ 路径。"""
+        self._post()
+
+        intent = UploadIntent.objects.get()
+        self.assertEqual(self.credentials['oss_key'], intent.quarantine_key)
+        self.assertFalse(is_official_oss_key(self.credentials['oss_key']))
+
+    def test_sts_does_not_write_anything(self):
+        """签发凭证阶段不产生 OSS 写入，也不建文档记录。"""
+        self._post()
+
+        self.assertEqual(self.bucket.puts, [])
+        self.assertEqual(KnowledgeDoc.objects.count(), 0)
+
+    def test_sts_issues_no_moderation_or_index(self):
+        """STS 签发凭证只是"允许上传"，对象还不存在，因此无可编排之物。
+
+        P1-2D STEP 4-B 起其余 4 个入口都会派发 `moderate_and_promote_task`；
+        STS 入口是唯一例外——它连 KnowledgeDoc 都还没建。
+        """
+        self._post()
+
+        self.assertEqual(ContentModeration.objects.count(), 0)
+        self.assertModerationNotScheduled()
+
+    def test_sts_intent_stays_issued_until_callback(self):
+        """凭证签发后意图是 issued —— 必须等回调确认对象存在才推进。"""
+        self._post()
+
+        self.assertEqual(UploadIntent.objects.get().status, 'issued')
+
+
+class QuarantineAccessGateTests(TestCase):
+    """§十六：隔离区对象不得通过下载 / 预览 / 数据查询泄露。"""
+
+    def setUp(self):
+        self.college = College.objects.create(name='计算机与软件学院', code='CS')
+        self.user = User.objects.create_user(
+            username='gate_admin', password='testpass123',
+            role='college_admin', college=self.college,
+        )
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+
+    def _doc(self, oss_key, **overrides):
+        defaults = dict(
+            title='文档', source_type='upload', file_name='a.pdf',
+            file_type='pdf', uploader=self.user, college=self.college,
+            status='uploaded', visibility='public', oss_key=oss_key,
+        )
+        defaults.update(overrides)
+        return KnowledgeDoc.objects.create(**defaults)
+
+    def test_download_of_quarantine_doc_is_rejected(self):
+        doc = self._doc('quarantine/college/1/2026-09/abc123.pdf')
+
+        with patch.object(oss_client, 'get_download_url') as mock_url:
+            response = self.client.get(f'/api/knowledge/docs/{doc.id}/download/')
+
+        self.assertEqual(response.status_code, 404)
+        mock_url.assert_not_called()
+
+    def test_preview_of_quarantine_doc_is_rejected(self):
+        doc = self._doc('quarantine/college/1/2026-09/abc123.txt', file_type='txt')
+
+        response = self.client.get(f'/api/knowledge/docs/{doc.id}/preview/')
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_download_of_promoted_doc_still_works(self):
+        """正式区（knowledge/）对象不受影响 —— 门禁只针对隔离区。"""
+        doc = self._doc('knowledge/college/1/2026-09/abc123.pdf', status='indexed')
+
+        with patch.object(oss_client, 'get_download_url', return_value='https://signed'):
+            response = self.client.get(f'/api/knowledge/docs/{doc.id}/download/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['download_url'], 'https://signed')
+
+    def test_data_query_withholds_quarantine_download_url(self):
+        """数据查询（find_docs）不得为隔离区对象签发下载链接。"""
+        from utils.data_query import find_user_docs
+
+        self._doc('quarantine/college/1/2026-09/abc123.pdf')
+
+        with patch.object(oss_client, 'get_download_url') as mock_url:
+            results = find_user_docs(self.user)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]['download_url'], '')
+        mock_url.assert_not_called()
+
+    def test_data_query_still_signs_official_download_url(self):
+        from utils.data_query import find_user_docs
+
+        self._doc('knowledge/college/1/2026-09/abc123.pdf', status='indexed')
+
+        with patch.object(oss_client, 'get_download_url', return_value='https://signed'):
+            results = find_user_docs(self.user)
+
+        self.assertEqual(results[0]['download_url'], 'https://signed')
+
+    # ------------------------------------------------------------------
+    # 详情序列化器（P1-2D STEP 4-A.2）
+    #
+    # 修复前：KnowledgeDocSerializer 的 download_url / oss_url 只判断 oss_key
+    # 是否为空，对 quarantine/ 对象同样签发 7 天有效的签名 URL，使
+    # /download/ 与 /preview/ 上的 is_official_oss_key() 门禁形同虚设。
+    # ------------------------------------------------------------------
+    def _serialize(self, doc):
+        from .serializers import KnowledgeDocSerializer
+
+        return KnowledgeDocSerializer(doc).data
+
+    def test_serializer_signs_official_urls(self):
+        """正式区对象仍然正常签发两种 URL（回归要求）。"""
+        doc = self._doc('knowledge/college/1/2026-09/abc123.pdf', status='indexed')
+
+        with patch.object(oss_client, 'get_download_url', return_value='https://dl'), \
+                patch.object(oss_client, 'get_preview_url', return_value='https://pv'):
+            data = self._serialize(doc)
+
+        self.assertEqual(data['download_url'], 'https://dl')
+        self.assertEqual(data['oss_url'], 'https://pv')
+
+    def test_serializer_blanks_quarantine_urls_without_signing(self):
+        """隔离区对象：两个字段都必须为空，且**不得触发任何签名调用**。"""
+        doc = self._doc('quarantine/college/1/2026-09/abc123.pdf')
+
+        with patch.object(oss_client, 'get_download_url') as mock_dl, \
+                patch.object(oss_client, 'get_preview_url') as mock_pv:
+            data = self._serialize(doc)
+
+        self.assertEqual(data['download_url'], '')
+        self.assertEqual(data['oss_url'], '')
+        mock_dl.assert_not_called()
+        mock_pv.assert_not_called()
+
+    def test_serializer_blanks_keys_outside_official_namespace(self):
+        """非 knowledge/ 的任意 Key 一律 fail-closed（不止 quarantine/）。
+
+        用 is_official_oss_key() 而不是 startswith('knowledge')，
+        因此 `knowledge-malicious/` 这类相似前缀不会被误判为正式区。
+        """
+        for oss_key in ('random/path/file.pdf',
+                        'knowledge-malicious/file.pdf',
+                        'knowledge',
+                        'quarantine',
+                        'official/x.pdf'):
+            with self.subTest(oss_key=oss_key):
+                doc = self._doc(oss_key)
+
+                with patch.object(oss_client, 'get_download_url') as mock_dl, \
+                        patch.object(oss_client, 'get_preview_url') as mock_pv:
+                    data = self._serialize(doc)
+
+                self.assertEqual(data['download_url'], '')
+                self.assertEqual(data['oss_url'], '')
+                mock_dl.assert_not_called()
+                mock_pv.assert_not_called()
+
+    def test_serializer_keeps_empty_key_behavior(self):
+        """空 oss_key 仍返回 ''，原有行为不回归。"""
+        doc = self._doc('')
+
+        with patch.object(oss_client, 'get_download_url') as mock_dl, \
+                patch.object(oss_client, 'get_preview_url') as mock_pv:
+            data = self._serialize(doc)
+
+        self.assertEqual(data['download_url'], '')
+        self.assertEqual(data['oss_url'], '')
+        mock_dl.assert_not_called()
+        mock_pv.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # 详情接口集成（GET /api/knowledge/docs/{id}/）
+    # ------------------------------------------------------------------
+    def test_detail_api_hides_signed_urls_for_quarantine_doc(self):
+        """本接口此前会为 quarantine 文档返回 7 天签名 URL（审计发现的漏洞）。"""
+        doc = self._doc('quarantine/college/1/2026-09/abc123.pdf')
+
+        with patch.object(oss_client, 'get_download_url') as mock_dl, \
+                patch.object(oss_client, 'get_preview_url') as mock_pv:
+            response = self.client.get(f'/api/knowledge/docs/{doc.id}/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['download_url'], '')
+        self.assertEqual(response.data['oss_url'], '')
+        mock_dl.assert_not_called()
+        mock_pv.assert_not_called()
+
+        # 整体断言：响应体内不存在任何可访问的签名 URL。
+        # （唯一允许出现的 URL 形态是 source_url —— 爬虫来源的网页地址，
+        # 不是 OSS 对象；本用例的 source_type='upload'，故不应出现。）
+        body = json.dumps(response.data, ensure_ascii=False)
+        self.assertNotIn('http://', body)
+        self.assertNotIn('https://', body)
+
+        # oss_key 仍然按原样返回（最小修复：只堵 URL，不动 schema / 前端契约）。
+        # 单独的 Key 不构成访问凭证 —— 桶为 private，签名由服务端掌握。
+        self.assertEqual(response.data['oss_key'], doc.oss_key)
+
+    def test_detail_api_hides_urls_from_other_admin_in_scope(self):
+        """同学院另一位管理员能看到元数据，但拿不到任何签名 URL。
+
+        可见范围（_admin_scope_filter）与"可否取内容"是两件事：前者按
+        学院/部门放行，后者必须由 is_official_oss_key() 把关。上传默认
+        visibility='public'，因此这条路径正是审计指出的实际攻击面。
+        """
+        peer = User.objects.create_user(
+            username='gate_peer', password='testpass123',
+            role='college_admin', college=self.college,
+        )
+        doc = self._doc('quarantine/college/1/2026-09/abc123.pdf')
+        peer_client = APIClient()
+        peer_client.force_authenticate(peer)
+
+        with patch.object(oss_client, 'get_download_url') as mock_dl, \
+                patch.object(oss_client, 'get_preview_url') as mock_pv:
+            response = peer_client.get(f'/api/knowledge/docs/{doc.id}/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['download_url'], '')
+        self.assertEqual(response.data['oss_url'], '')
+        mock_dl.assert_not_called()
+        mock_pv.assert_not_called()
+
+    def test_detail_api_still_returns_signed_urls_for_official_doc(self):
+        """正式区文档在详情接口上的行为不得回归。"""
+        doc = self._doc('knowledge/college/1/2026-09/abc123.pdf', status='indexed')
+
+        with patch.object(oss_client, 'get_download_url', return_value='https://dl'), \
+                patch.object(oss_client, 'get_preview_url', return_value='https://pv'):
+            response = self.client.get(f'/api/knowledge/docs/{doc.id}/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['download_url'], 'https://dl')
+        self.assertEqual(response.data['oss_url'], 'https://pv')
 
 
 class KnowledgeDocSerializerSecurityTests(TestCase):
@@ -717,6 +1433,17 @@ class ChunkedUploadSecurityTests(TestCase):
         self.client.force_authenticate(self.user)
         self.oss_key = f'knowledge/college/{self.college.id}/2026-09/chunk.pdf'
 
+        # P1-2D STEP 4-B：合并建文档后必须派发统一审核编排（详见 `_merge`）。
+        # 派发函数是 `dispatch_async`（只入队、绝不降级同步执行，见 P-4）；
+        # 同时 spy `safe_delay` 并断言未被调用，防止有人改回降级派发。
+        patcher = patch('utils.celery_dispatcher.dispatch_async')
+        self.dispatch_async = patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch('utils.celery_dispatcher.safe_delay')
+        self.safe_delay = patcher.start()
+        self.addCleanup(patcher.stop)
+        self.commit_callbacks = []
+
     def _session(self, user=None, **overrides):
         defaults = dict(
             upload_id='up-test-1', user=user or self.user, file_name='chunk.pdf',
@@ -735,16 +1462,46 @@ class ChunkedUploadSecurityTests(TestCase):
             return self.client.post(CHUNK_INIT_URL, data, format='json')
 
     def _merge(self, data):
-        """合并分片：OSS 与异步任务全 mock，返回响应。
+        """合并分片：OSS 全 mock，返回响应。
 
-        注意 patch 目标是 `apps.knowledge.chunked_views.safe_delay` 而不是
-        `utils.celery_dispatcher.safe_delay`：前者在模块导入时已绑定，改后者
-        不会生效，Celery 缺失时索引任务会同步执行并真的去访问 OSS。
+        P1-2D STEP 4-B 起，合并成功后视图会把文档交给统一审核编排。派发发生在
+        `transaction.on_commit()` 里，而 TestCase 从不真正提交事务，因此必须用
+        `captureOnCommitCallbacks(execute=True)` 捕获并执行回调，否则
+        "有没有派发"根本观察不到。合并视图仍**不直接触发索引**。
         """
-        with patch('apps.knowledge.chunked_views.oss_client') as mock_oss, \
-                patch('apps.knowledge.chunked_views.safe_delay'):
+        with patch('apps.knowledge.chunked_views.oss_client') as mock_oss:
             mock_oss.check_duplicate.return_value = None
-            return self.client.post(CHUNK_MERGE_URL, data, format='json')
+            # 每次合并前清空记录：断言只针对本次请求（重复合并测试会调两次）。
+            self.dispatch_async.reset_mock()
+            self.safe_delay.reset_mock()
+            with self.captureOnCommitCallbacks(execute=True) as callbacks:
+                response = self.client.post(CHUNK_MERGE_URL, data, format='json')
+        self.commit_callbacks = callbacks
+        return response
+
+    def assertModerationScheduled(self):
+        """合并出的文档必须且只能派发一次统一审核编排任务。"""
+        from .tasks import index_document_task, moderate_and_promote_task
+
+        orchestration = [
+            call.args[1] for call in self.dispatch_async.call_args_list
+            if call.args and call.args[0] is moderate_and_promote_task
+        ]
+        self.assertEqual(
+            orchestration, [KnowledgeDoc.objects.get().id],
+            f'应恰好派发一次审核编排，实际 {orchestration}',
+        )
+        self.assertNotIn(
+            index_document_task,
+            [call.args[0] for call in self.dispatch_async.call_args_list if call.args],
+            '合并视图不得直接派发索引任务（4-A 删掉的"合并即索引"不得恢复）',
+        )
+        self.safe_delay.assert_not_called()
+
+    def assertModerationNotScheduled(self):
+        """未建文档的返回路径（校验失败 / 重复合并）不得派发任何任务。"""
+        self.dispatch_async.assert_not_called()
+        self.assertEqual(self.commit_callbacks, [])
 
     # ------------------------------------------------------------------
     # 初始化：大小上限
@@ -789,6 +1546,29 @@ class ChunkedUploadSecurityTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(ChunkedUploadSession.objects.get().file_size, 0)
+
+    # ------------------------------------------------------------------
+    # 初始化：隔离区 Key 与 UploadIntent 绑定（P1-2D STEP 4-A）
+    # ------------------------------------------------------------------
+    def test_init_puts_object_in_quarantine(self):
+        """初始化即由服务端定下隔离区 Key，并把它挂到会话的 intent 上。"""
+        response = self._init({
+            'file_md5': 'a' * 32, 'filename': 'report.pdf', 'file_size': 2048,
+        })
+
+        self.assertEqual(response.status_code, 200)
+        session = ChunkedUploadSession.objects.get(upload_id='up-new-1')
+        self.assertTrue(is_quarantine_key(session.oss_key))
+        self.assertIsNotNone(session.intent_id)
+        self.assertEqual(session.intent.status, 'issued')
+
+    def test_init_response_does_not_leak_quarantine_key(self):
+        """响应体里不出现隔离区 Key（客户端无需知道往哪写）。"""
+        response = self._init({
+            'file_md5': 'a' * 32, 'filename': 'report.pdf', 'file_size': 2048,
+        })
+
+        self.assertNotIn('quarantine/', json.dumps(response.data, ensure_ascii=False))
 
     # ------------------------------------------------------------------
     # 分片：单分片上限与序号范围
@@ -854,6 +1634,7 @@ class ChunkedUploadSecurityTests(TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(KnowledgeDoc.objects.count(), 0)
+        self.assertModerationNotScheduled()
 
     def test_merge_rejects_total_over_type_limit(self):
         """实测总大小未超绝对上限但超过该类型分档上限时拒绝。"""
@@ -888,6 +1669,7 @@ class ChunkedUploadSecurityTests(TestCase):
         self.assertEqual(response.status_code, 200)
         doc = KnowledgeDoc.objects.get()
         self.assertEqual(doc.file_size, 2048)
+        self.assertModerationScheduled()
 
     def test_merge_rejects_duplicate_merge(self):
         """同一会话不得被合并两次（第二次必须被安全拒绝）。"""
@@ -905,6 +1687,8 @@ class ChunkedUploadSecurityTests(TestCase):
             ChunkedUploadSession.objects.get(upload_id='up-test-1').status,
             'completed',
         )
+        # 第二次合并被拒绝，因此**没有**派发任何东西（记录已被 _merge 清空）。
+        self.assertModerationNotScheduled()
 
     def test_merge_rejects_other_users_session(self):
         """用户 A 不得合并用户 B 的会话。"""
@@ -915,6 +1699,51 @@ class ChunkedUploadSecurityTests(TestCase):
             response = self._merge({'upload_id': 'up-test-1', 'file_md5': 'a' * 32})
 
         self.assertEqual(response.status_code, 404)
+        self.assertEqual(KnowledgeDoc.objects.count(), 0)
+
+    # ------------------------------------------------------------------
+    # 合并：与 UploadIntent 的联动（P1-2D STEP 4-A）
+    # ------------------------------------------------------------------
+    def _session_with_intent(self, size=2048, **overrides):
+        """建一个带 UploadIntent 的会话（模拟 STEP 4-A 之后的新流程）。"""
+        intent = create_upload_intent(
+            overrides.pop('user', self.user), 'chunk.pdf',
+            content_type='application/pdf', expected_size=size,
+        )
+        session = self._session(
+            file_size=size, oss_key=intent.quarantine_key, intent=intent, **overrides,
+        )
+        return session, intent
+
+    def test_merge_completes_linked_intent(self):
+        """合并成功后 intent 推进到 completed，文档指向隔离区对象。"""
+        session, intent = self._session_with_intent()
+
+        with patch('apps.knowledge.chunked_views._list_uploaded_parts',
+                   return_value=[(1, 'etag1', 2048)]):
+            response = self._merge({'upload_id': session.upload_id, 'file_md5': 'a' * 32})
+
+        self.assertEqual(response.status_code, 200)
+        intent.refresh_from_db()
+        self.assertEqual(intent.status, 'completed')
+        self.assertEqual(intent.actual_size, 2048)
+        doc = KnowledgeDoc.objects.get()
+        self.assertTrue(is_quarantine_key(doc.oss_key))
+        self.assertFalse(is_official_oss_key(doc.oss_key))
+        self.assertModerationScheduled()
+
+    def test_merge_rejects_expired_intent(self):
+        """凭证已过期时不得为隔离区对象建文档记录（fail-closed）。"""
+        session, intent = self._session_with_intent()
+        UploadIntent.objects.filter(pk=intent.pk).update(
+            expires_at=timezone.now() - timedelta(seconds=1),
+        )
+
+        with patch('apps.knowledge.chunked_views._list_uploaded_parts',
+                   return_value=[(1, 'etag1', 2048)]):
+            response = self._merge({'upload_id': session.upload_id, 'file_md5': 'a' * 32})
+
+        self.assertEqual(response.status_code, 409)
         self.assertEqual(KnowledgeDoc.objects.count(), 0)
 
 
@@ -976,8 +1805,9 @@ class IndexTaskSecurityTests(TestCase):
     def test_central_check_does_not_use_dead_moderation_fields(self):
         """is_sensitive / sensitive_checked 是死字段，绝不能被当作审核结论。
 
-        这里刻意把两个字段设成"看起来已审核通过"的值，校验函数仍应放行
-        （而不是把它们当成审核门）——真正的内容审核门属于 P1-2。
+        这里刻意把两个字段设成"看起来已审核通过"的值，校验函数**仍然拒绝**：
+        STEP 4-B 起真正的审核门是 ContentModeration，而这两个字段是全仓库
+        无任何写入点的死字段，把它们当成放行依据只会制造虚假的安全感。
         """
         from .moderation import check_indexable
 
@@ -988,7 +1818,8 @@ class IndexTaskSecurityTests(TestCase):
 
         allowed, reason = check_indexable(doc)
 
-        self.assertTrue(allowed, reason)
+        self.assertFalse(allowed)
+        self.assertIn('审核记录', reason)
 
     def test_dispatch_path_lands_on_guarded_task(self):
         """上传链路使用的 safe_delay 分发路径同样落在受校验的任务体内。
@@ -1409,6 +2240,35 @@ class QuarantineKeyTests(TestCase):
         key = build_quarantine_key('school', 0, 'a.txt')
 
         self.assertEqual(key.split('/')[2], '0')
+
+
+class OfficialKeyPredicateTests(TestCase):
+    """`is_official_oss_key`：下载 / 预览门禁的唯一判据（P1-2D STEP 4-A）。"""
+
+    def test_official_keys_are_accepted(self):
+        for key in ('knowledge/a.pdf', 'knowledge/college/1/2026-09/a.pdf'):
+            self.assertTrue(is_official_oss_key(key), key)
+
+    def test_quarantine_keys_are_rejected(self):
+        for key in ('quarantine/a.pdf', 'quarantine/college/1/2026-09/a.pdf'):
+            self.assertFalse(is_official_oss_key(key), key)
+
+    def test_quarantine_keys_are_not_official(self):
+        """两个命名空间互斥：没有任何 Key 同时属于隔离区与正式区。"""
+        key = build_quarantine_key('college', 1, 'a.pdf')
+
+        self.assertTrue(is_quarantine_key(key))
+        self.assertFalse(is_official_oss_key(key))
+
+    def test_lookalike_prefixes_are_rejected(self):
+        """`knowledgex/`、`quarantinex/` 这类前缀相似路径不得被误判。"""
+        self.assertFalse(is_official_oss_key('knowledgex/a.pdf'))
+        self.assertFalse(is_quarantine_key('quarantinex/a.pdf'))
+
+    def test_empty_and_none_are_rejected(self):
+        for value in ('', None):
+            self.assertFalse(is_official_oss_key(value))
+            self.assertFalse(is_quarantine_key(value))
 
 
 class FindingsConstraintTests(TestCase):

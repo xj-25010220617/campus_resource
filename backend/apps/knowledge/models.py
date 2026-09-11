@@ -10,6 +10,10 @@ from .moderation import (
     VERDICT_CHOICES,
     is_indexable_moderation_state,
 )
+from .upload_intent import (
+    UPLOAD_INTENT_ISSUED,
+    UPLOAD_INTENT_STATUS_CHOICES,
+)
 
 
 class KnowledgeDoc(models.Model):
@@ -233,6 +237,95 @@ class DocChunk(models.Model):
         return f'{self.doc.title} - 切片#{self.chunk_index}'
 
 
+class UploadIntent(models.Model):
+    """上传意图——服务端签发的**上传凭证**，把"谁在传 / 传到哪个隔离区对象"钉死。
+
+    存在意义（对应 P1-2D 的安全边界）
+    ---------------------------------
+    没有这张表时，STS 直传回调只能校验客户端回传 oss_key 的**格式与 scope 前缀**，
+    无法证明该对象由本次请求的发起者上传——同一 scope 目录下可以直接挂载他人的对象。
+    UploadIntent 让服务端在签发阶段就写下 `(user, quarantine_key)` 的绑定关系，
+    回调阶段只认 intent id，key 与归属都以库里的记录为准。
+
+    生命周期
+    --------
+        issued ──complete──> completed ──consume──> consumed
+          │                      │
+          └────────expire────────┴──> expired
+          └────────cancel────────────> cancelled
+
+    - `completed_at` 与 `consumed_at` 语义不重叠，故两个字段都保留：
+      `completed_at` = 对象已确认存在于隔离区（尚未建任何业务记录）；
+      `consumed_at`  = 业务已基于该对象建过记录，此 intent 不能再次消费。
+    - 状态**只能由服务端**在 `apps.knowledge.upload_intent` 内变更；
+      客户端提交的任何状态字段都必须被忽略。
+
+    Key 约定
+    --------
+    `quarantine_key` 由 `utils.oss.build_quarantine_key()` 生成，**必须**是
+    `quarantine/` 命名空间下的对象，**不得**是 `knowledge/`。
+    设计上不提供任何"客户端指定 key"的入口，且该字段在 service 层无更新路径。
+    """
+
+    scope = models.CharField(
+        max_length=16, choices=KnowledgeDoc.SCOPE_CHOICES,
+        verbose_name='归属范围',
+    )
+    owner_id = models.PositiveIntegerField(
+        default=0, verbose_name='归属对象ID（与 scope 配合，school 为 0）',
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='upload_intents', verbose_name='上传用户',
+    )
+    quarantine_key = models.CharField(
+        max_length=512, unique=True, verbose_name='隔离区对象 Key（服务端生成）',
+    )
+    original_filename = models.CharField(max_length=256, verbose_name='原始文件名')
+    content_type = models.CharField(
+        max_length=128, blank=True, default='', verbose_name='声明的 MIME 类型',
+    )
+    expected_size = models.BigIntegerField(
+        null=True, blank=True, verbose_name='声明的大小（字节）',
+    )
+    actual_size = models.BigIntegerField(
+        null=True, blank=True, verbose_name='服务端核实到的大小（字节）',
+    )
+    status = models.CharField(
+        max_length=16, choices=UPLOAD_INTENT_STATUS_CHOICES,
+        default=UPLOAD_INTENT_ISSUED, db_index=True, verbose_name='状态',
+    )
+    expires_at = models.DateTimeField(db_index=True, verbose_name='过期时间')
+    completed_at = models.DateTimeField(
+        null=True, blank=True, verbose_name='上传完成时间',
+    )
+    consumed_at = models.DateTimeField(
+        null=True, blank=True, verbose_name='被业务消费时间',
+    )
+    created_at = models.DateTimeField(
+        auto_now_add=True, db_index=True, verbose_name='创建时间',
+    )
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        db_table = 'upload_intent'
+        verbose_name = '上传意图'
+        verbose_name_plural = verbose_name
+        ordering = ['-created_at']
+        db_table_comment = (
+            '上传意图表：服务端签发的隔离区上传凭证；(user, quarantine_key) 绑定'
+            '在上传初始化时确定，客户端不可改写；过期记录保留供审计'
+        )
+        indexes = [
+            models.Index(fields=['user', 'status'], name='idx_ui_user_status'),
+            models.Index(fields=['status', 'expires_at'], name='idx_ui_status_expires'),
+        ]
+
+    def __str__(self):
+        return f'上传意图#{self.pk} [{self.status}] {self.original_filename}'
+
+
 class ChunkedUploadSession(models.Model):
     """分片上传会话——大文件分片上传的状态记录，分片数据存于 OSS Multipart Upload"""
     STATUS_CHOICES = [
@@ -254,6 +347,21 @@ class ChunkedUploadSession(models.Model):
         max_length=32, db_index=True, verbose_name='文件MD5哈希',
     )
     oss_key = models.CharField(max_length=512, verbose_name='OSS对象Key')
+    # P1-2D STEP 4-A 起，分片上传与其余 4 个入口走同一条链路：本字段记录的
+    # intent 就是该会话的归属凭证，而上面的 oss_key **就是** intent 上的
+    # quarantine key（服务端经 upload_service.begin_upload() 生成，客户端无法
+    # 指定），两步 merge 出来的 KnowledgeDoc 也指向这个隔离区对象。之后只有
+    # 审核给出 approved / confirmed_unchecked 且 promotion 成功，对象才会被复制到
+    # knowledge/ 并允许索引。
+    # 可空：历史上已存在的会话没有 intent；STEP 4-A 之前创建的会话也不会带 intent。
+    # OneToOne + null=True 允许存在多个 NULL，因此对存量数据无影响；
+    # on_delete=PROTECT：仍被会话引用的 intent 不允许删除，避免留下指向已删
+    # 意图的孤儿会话（会话是上传行为的审计证据，宁可拒绝删除也不静默置空）。
+    intent = models.OneToOneField(
+        UploadIntent, on_delete=models.PROTECT,
+        null=True, blank=True,
+        related_name='chunked_session', verbose_name='关联上传意图',
+    )
     status = models.CharField(
         max_length=16, choices=STATUS_CHOICES, default='uploading',
         db_index=True, verbose_name='状态',
@@ -311,13 +419,16 @@ class ContentModeration(models.Model):
        绝不能因为"扫描失败"就当作干净放行。
     3. `confirmed_unchecked` 不能自动产生，只允许由
        `unavailable` + 显式人工动作产生，且必须同时具备 `confirmed_by`、
-       `confirmed_at`、非空 `confirmation_reason` 三者。本阶段只建立字段，
-       不实现确认接口。
+       `confirmed_at`、非空 `confirmation_reason` 三者。确认接口见
+       `apps/knowledge/confirmation.py`（仅 `ADMIN_ROLES` 可调用）。
 
-    P1-2A 范围
-    ----------
-    本模型只建立数据结构。**尚未接入**任何检测器（ClamAV / Rule / LLM /
-    Vision），**尚未**在上传链路创建记录，**尚未**启用访问门。
+    接入现状（P1-2D STEP 4-B 已完成）
+    --------------------------------
+    P1-2A 只建立本模型的数据结构；到 STEP 4-B 为止三项都已接入：
+    检测器（ClamAV / Rule / LLM / Vision，见 `detectors.py` + `moderation.py`）、
+    上传链路创建记录（5 个入口建完 KnowledgeDoc 后都调用
+    `upload_service.schedule_moderation()`）、访问门（索引门 `check_indexable()`，
+    下载 / 预览门 `is_official_oss_key()`）。
     """
 
     # choices 唯一来源见 apps/knowledge/moderation.py

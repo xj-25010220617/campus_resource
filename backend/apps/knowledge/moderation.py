@@ -140,8 +140,10 @@ def check_indexable(doc) -> tuple:
         (False, reason)  拒绝索引，reason 为可直接展示的原因说明
 
     Note:
-        P1-2 的 ContentModeration 落地后，在下方标注的接入点内追加审核状态判断
-        即可，无需改动任何调用方。
+        本函数是索引准入的**唯一**集中式入口，命名空间检查与审核门都在这里，
+        调用方（`index_document_task`、脚本、未来的后台任务）只需相信其返回值。
+        P1-2D STEP 4-B 起审核门已启用，判定委托给
+        `is_document_indexable_by_moderation()`，改造调用方无需改动。
     """
     oss_key = (doc.oss_key or '').strip()
     if not oss_key:
@@ -149,18 +151,20 @@ def check_indexable(doc) -> tuple:
     if not oss_key.startswith(INDEXABLE_OSS_KEY_PREFIX):
         return False, 'OSS 对象不在知识库路径下'
 
-    # --- P1-2 接入点：内容安全审核门 ---------------------------------
-    # ContentModeration 模型落地后在此处启用，例如：
+    # --- P1-2D STEP 4-B：内容安全审核门（已启用） ----------------------
+    # 索引准入必须同时满足三个条件，缺一不可：
     #
-    #     from .models import ContentModeration
-    #     finding = ContentModeration.objects.filter(doc=doc).first()
-    #     if finding is None or finding.state != 'approved':
-    #         return False, '文档尚未通过安全审核'
+    #     1. 对象位于正式区（knowledge/）        —— 上面的前缀检查
+    #     2. ContentModeration.storage_state == promoted  —— 已完成 promotion
+    #     3. ContentModeration.state ∈ INDEXABLE_MODERATION_STATES（白名单）
     #
-    # 在此之前不得以 is_sensitive / sensitive_checked 冒充审核结论。
-    # ---------------------------------------------------------------
-
-    return True, ''
+    # 复用 is_document_indexable_by_moderation()，不在此处复制判断逻辑，
+    # 避免同一个安全语义出现第二份实现后各自漂移。
+    #
+    # ⚠️ 兼容性后果（STEP 4-B 报告 §9 已记录）：尚无 ContentModeration 记录的
+    # 历史文档与爬虫文档会被判为不可索引。这是**故意**的 fail-closed ——
+    # 绝不能为了兼容存量数据而让 `knowledge/` 前缀本身变成放行依据。
+    return is_document_indexable_by_moderation(doc)
 
 
 # ---------------------------------------------------------------------------
@@ -847,21 +851,19 @@ def moderate_document(doc_id, oss_key=None, file_type=None, file_name=None,
 
 
 def is_document_indexable_by_moderation(doc) -> tuple:
-    """P1-2D 索引门的**预备**判定（本阶段不被任何生产路径调用）。
+    """内容安全审核门：对象是否已完成审核 + promotion。
 
-    返回 `(allowed, reason)`，语义与 `check_indexable` 一致，供后续阶段把
-    `check_indexable` 的接入点替换为本函数：
+    返回 `(allowed, reason)`。STEP 4-B 起由 `check_indexable()` 调用，
+    是索引准入的**唯一**审核判据（与命名空间检查合起来构成完整索引门）：
 
         storage_state == promoted
         AND moderation_state in INDEXABLE_MODERATION_STATES
 
-    **本阶段刻意不接入**：现有生产数据全部没有 ContentModeration 记录，
-    一旦接入会让所有文档立刻不可索引。接入属于上传流水线（P1-2D）的工作，
-    必须与 quarantine → moderate → promote 一起上线。
-
     Note:
         记录不存在必须判为**拒绝**（`legacy_unchecked` 语义），绝不能因为
         "查不到记录"就默认放行——那会把全部历史文档默认当成已审核。
+        该断言意味着**没有 ContentModeration 记录的历史文档与爬虫文档
+        将无法被索引**，这是 STEP 4-B 有意选择的 fail-closed 方向。
     """
     ContentModeration = _ContentModerationModel()
     record = ContentModeration.objects.filter(doc=doc).first()
@@ -872,3 +874,38 @@ def is_document_indexable_by_moderation(doc) -> tuple:
     if record.storage_state != STORAGE_STATE_PROMOTED:
         return False, f'文档尚未提升到正式区（当前存储状态：{record.storage_state}）'
     return True, ''
+
+
+def filter_indexable_docs(qs):
+    """把 KnowledgeDoc QuerySet 收窄到**通过审核门 + 存储门**的文档。
+
+    这是 `is_document_indexable_by_moderation()` 的 queryset 形态，服务于
+    **读取侧**（RAG 检索）的纵深防御第二层：
+
+        写入侧 —— index_document_task 调 check_indexable()，逐文档判定
+        读取侧 —— utils.rag 的三条检索路径调本函数，批量 SQL 过滤
+
+    两侧共用 `INDEXABLE_MODERATION_STATES` 与 `STORAGE_STATE_PROMOTED`
+    两个常量，**不存在第二份白名单**。`tests` 中有断言固定"queryset 版与
+    单文档版对同一份数据给出相同结论"，防止两者将来各自漂移。
+
+    语义（与单文档版逐条对应）：
+        - 没有 ContentModeration 记录        → 不通过（历史文档 fail-closed）
+        - state 不在白名单                    → 不通过
+        - storage_state != promoted           → 不通过
+
+    Args:
+        qs: KnowledgeDoc 的 QuerySet
+
+    Returns:
+        收窄后的 QuerySet（用 Exists 子查询，不产生 N+1）
+    """
+    from django.db.models import Exists, OuterRef
+
+    ContentModeration = _ContentModerationModel()
+    gated = ContentModeration.objects.filter(
+        doc_id=OuterRef('pk'),
+        state__in=sorted(INDEXABLE_MODERATION_STATES),
+        storage_state=STORAGE_STATE_PROMOTED,
+    )
+    return qs.filter(Exists(gated))

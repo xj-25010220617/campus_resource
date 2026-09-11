@@ -51,6 +51,14 @@ app.conf.beat_schedule = {
         'task': 'apps.knowledge.tasks.cleanup_expired_upload_sessions_task',
         'schedule': crontab(hour=3, minute=30),  # 每天 03:30
     },
+    # P1-2D STEP 4-B：审核未完成（unavailable / error）文档的重试调度。
+    # 只挑 next_retry_at 已到期且 attempt_count < MAX_ATTEMPTS 的记录，
+    # 达到上限的文档保持原状态，绝不自动放行。10 分钟一轮与默认退避
+    # （CONTENT_MODERATION_RETRY_BACKOFF_SECONDS=300s）同量级，属低频轮询。
+    'retry-failed-moderations': {
+        'task': 'apps.knowledge.tasks.retry_failed_moderations_task',
+        'schedule': crontab(minute='*/10'),
+    },
 }
 
 

@@ -1504,10 +1504,12 @@ class FutureIndexGateTests(TestCase):
 
         self.assertFalse(allowed)
 
-    def test_check_indexable_is_intentionally_unchanged_in_p1_2c(self):
-        """P1-2C 刻意不接入索引门：现在接入会让全部存量文档立刻不可索引。
+    def test_check_indexable_now_enforces_the_moderation_gate(self):
+        """P1-2D STEP 4-B 起，`check_indexable()` 已接入审核门（本测试已改写）。
 
-        本测试锁住这一边界。P1-2D 接入后本测试**应当**被改写。
+        P1-2C 时这里断言"审核结论被忽略"——那是当时的阶段边界。STEP 4-B 把
+        上传流水线接通后，同样的输入**必须**被拒绝，否则 `rejected` 文档只要
+        在正式区就能进索引。
         """
         from .moderation import check_indexable
 
@@ -1516,5 +1518,5 @@ class FutureIndexGateTests(TestCase):
 
         allowed, reason = check_indexable(self.doc)
 
-        self.assertTrue(allowed)
-        self.assertEqual(reason, '')
+        self.assertFalse(allowed)
+        self.assertIn(MODERATION_STATE_REJECTED, reason)
