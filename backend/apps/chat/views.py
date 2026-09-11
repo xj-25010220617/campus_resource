@@ -457,7 +457,7 @@ class AskView(APIView):
         # 3.2b 知识库无结果 → 检查未索引文档 + 联网搜索兜底
         web_search_used = False
         pending_docs = []
-        if not results:
+        if not results and not rag._is_time_question(question):
             # 区分"文件存在但未索引"和"没有匹配文件"（未索引文档不传给 LLM）
             pending_docs = rag.find_pending_index_docs(question, user_context)
             if pending_docs:
@@ -1068,7 +1068,7 @@ class VoiceAskView(APIView):
 
                 # 检索无结果时检查未索引文档（与文本通道 AskView 行为一致）
                 pending_docs = []
-                if not hits:
+                if not hits and not rag._is_time_question(question):
                     pending_docs = rag.find_pending_index_docs(question, user_context)
 
                 # 3. LLM 流式输出

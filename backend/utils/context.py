@@ -27,6 +27,9 @@ def get_current_time_str(now: Optional[datetime] = None) -> str:
     """
     global _last_known_date
     t = now or timezone.now()
+    # USE_TZ=True 时 timezone.now() 返回 UTC；直接 strftime 会输出 UTC 墙钟时间，
+    # 比北京时间（TIME_ZONE=Asia/Shanghai）慢 8 小时。必须先转成本地时区。
+    t = timezone.localtime(t)
     date_str = t.strftime('%Y年%m月%d日')
     weekday = WEEKDAY_CN[t.weekday()]
     time_str = t.strftime('%H:%M')
@@ -47,16 +50,17 @@ def get_daily_briefing() -> str:
     """
     try:
         from apps.knowledge.models import KnowledgeDoc
-        from django.db.models import Max, Min
+        from django.db.models import Count, Max, Min
         agg = KnowledgeDoc.objects.aggregate(
-            doc_count=Max('id'),
+            doc_count=Count('id'),
             latest=Max('updated_at'),
             earliest=Min('updated_at'),
         )
         if not agg['latest']:
             return ""
-        latest = agg['latest'].strftime('%Y-%m-%d')
-        earliest = agg['earliest'].strftime('%Y-%m-%d') if agg['earliest'] else latest
+        # updated_at 在库中为 UTC，转本地时区后再取日期，避免跨天边界日期偏一天
+        latest = timezone.localtime(agg['latest']).strftime('%Y-%m-%d')
+        earliest = timezone.localtime(agg['earliest']).strftime('%Y-%m-%d') if agg['earliest'] else latest
         count = agg['doc_count'] or 0
         return (
             f'知识库最新文档日期：{latest}（最早 {earliest}，共 {count} 条）。'
