@@ -1128,13 +1128,14 @@ class FileUploadView(APIView):
     请求参数（form-data）：
         - file (file, required): 上传的文件
         - visibility (str, default=public): 可见性（public/private）
-        - title (str, optional): 文档标题（默认使用文件名，AI 可优化）
+        - title (str, optional): 文档标题（默认使用文件名；AI 生成的名字作为「推荐名」返回，供用户选择）
         - description (str, optional): 文档描述（未提供时 AI 生成）
         - college_id (int, optional): 学院 ID（默认使用上传者学院ID）
         - department_id (int, optional): 部门 ID（默认使用上传者部门ID）
         - discipline_id (int, optional): 学科方向 ID
         - keywords (str, optional): JSON 数组字符串，如 '["关键词1","关键词2"]'（未提供时 AI 提取）
-    返回：{"id": <doc.id>, "status": "uploaded", "file_name": "..."}
+    返回：{"id": <doc.id>, "status": "uploaded", "file_name": "...", "title": "<原文件名>",
+          "recommended_title": "<AI推荐名，可为空>", "description": "...", "keywords": [...]}
     """
     permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
     parser_classes = [parsers.MultiPartParser, parsers.FormParser]
@@ -1233,6 +1234,8 @@ class FileUploadView(APIView):
         user_title = data.get('title', '')
         fallback_title = uploaded_file.name.rsplit('.', 1)[0] if '.' in uploaded_file.name else uploaded_file.name
         title = user_title or fallback_title
+        # AI 生成的「推荐名」（默认空；AI 成功后回填，供前端展示在原文件名旁让用户选择）
+        recommended_title = ''
 
         # 提取文本内容（用于 AI 分析）
         extracted_text = ''
@@ -1300,7 +1303,9 @@ class FileUploadView(APIView):
                 image_bytes = file_bytes if ext in IMAGE_FILE_TYPES else None
                 ai_result = _ai_classify(title, extracted_text, image_bytes=image_bytes)
                 if ai_result:
-                    title = user_title or ai_result['title'] or fallback_title
+                    # 标题默认保留原文件名，AI 生成的名字仅作为「推荐名」返回，供前端让用户选择
+                    title = user_title or fallback_title
+                    recommended_title = ai_result['title'] or ''
                     description = user_description or ai_result['description'] or ''
                     visibility = data['visibility'] if user_provided_visibility else ai_result['visibility']
                     # 关键词：用户提供的优先
@@ -1392,6 +1397,7 @@ class FileUploadView(APIView):
             'status': new_doc.status,
             'file_name': new_doc.file_name,
             'title': new_doc.title,
+            'recommended_title': recommended_title,
             'description': new_doc.description,
             'keywords': raw_keywords,
         })
@@ -1402,15 +1408,15 @@ class BatchFileUploadView(APIView):
     多文件批量上传接口（multipart/form-data）
 
     POST /api/knowledge/upload/batch/
-    功能：一次性上传多个文件，每个文件独立调用 AI 自动生成标题/描述/关键词，
-          文档归属根据上传者角色自动确定。
+    功能：一次性上传多个文件，每个文件独立调用 AI 自动生成描述/关键词，
+          并给出「推荐名」（标题默认保留原文件名）；文档归属根据上传者角色自动确定。
     请求参数（form-data）：
         - files (file[], required): 上传的文件列表（支持拖拽多选）
         - visibility (str, default=public): 所有文件的统一可见性（public/private）
     权限规则：IsAdminOrSuperAdmin，仅管理员及以上可上传
     返回：
         {
-            "success": [{id, file_name, status, title, description, visibility, file_type, file_size}, ...],
+            "success": [{id, file_name, status, title, recommended_title, description, visibility, file_type, file_size}, ...],
             "failed": [{file_name, error}, ...],
             "total_count": N,
             "success_count": N,
@@ -1531,8 +1537,9 @@ class BatchFileUploadView(APIView):
                     except Exception:
                         pass
 
-                # 4d. AI 自动生成标题、描述、关键词
+                # 4d. AI 自动生成描述、关键词，并给出「推荐名」；标题默认保留原文件名
                 fallback_title = file_name.rsplit('.', 1)[0] if '.' in file_name else file_name
+                recommended_title = ''
                 if len(file_bytes) == 0:
                     # 空文件跳过 AI，标题固定「空文件」，描述/关键词留空，分类保留真实格式
                     title = '空文件'
@@ -1542,7 +1549,8 @@ class BatchFileUploadView(APIView):
                     image_bytes = file_bytes if ext in IMAGE_FILE_TYPES else None
                     ai_result = _ai_classify(fallback_title, extracted_text, image_bytes=image_bytes)
                     if ai_result:
-                        title = ai_result.get('title') or fallback_title
+                        title = fallback_title
+                        recommended_title = ai_result.get('title') or ''
                         description = ai_result.get('description') or ''
                         raw_keywords = ai_result.get('keywords', [])
                     else:
@@ -1609,6 +1617,7 @@ class BatchFileUploadView(APIView):
                     'file_name': new_doc.file_name,
                     'status': new_doc.status,
                     'title': new_doc.title,
+                    'recommended_title': recommended_title,
                     'description': description,
                     'visibility': new_doc.visibility,
                     'file_type': new_doc.file_type,
@@ -1764,13 +1773,13 @@ def _ai_classify(title: str = '', content: str = '', image_bytes: Optional[bytes
     if result is None:
         text_prompt = (
             f"你是校园知识库智能助手。请根据文档信息完成以下任务：\n"
-            f"1. 如果标题为空，根据内容生成一个简洁的文档标题（20字以内）\n"
+            f"1. 根据文档内容生成一个简洁的推荐标题（20字以内），不要直接照抄原文件名\n"
             f"2. 如果内容非空，生成一段100-200字的文档描述\n"
             f"3. 提取5-10个关键词\n"
             f"4. 推荐可见性（visibility）：\n"
             f"   - public: 公开（一般文档、教学资料等）\n"
             f"   - private: 私密（涉及人事、财务、敏感信息等）\n\n"
-            f"文档标题：{title or '（未提供，请根据内容生成）'}\n"
+            f"原文件名（仅供参考，生成推荐标题请基于内容而非照抄文件名）：{title or '（未提供）'}\n"
             f"文档内容：{content[:2000] or '（未提供）'}\n\n"
             f"{json_schema}"
         )
