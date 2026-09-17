@@ -75,7 +75,7 @@ class QueryLog(models.Model):
     parsed_filters = models.JSONField(null=True, blank=True, verbose_name='LLM解析出的硬过滤条件')
     hit_count = models.IntegerField(default=0, verbose_name='召回命中数')
     top_doc_ids = models.JSONField(null=True, blank=True, verbose_name='召回Top-K的doc_id列表')
-    response_ms = models.IntegerField(default=0, verbose_name='响应耗时（毫秒）')
+    response_ms = models.IntegerField(default=0, verbose_name='思考耗时（发送问题到输出首字，毫秒）')
     user_feedback = models.SmallIntegerField(
         default=-1, verbose_name='用户反馈（1=赞/0=踩/-1=无反馈）'
     )

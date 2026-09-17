@@ -46,7 +46,7 @@ CREATE INDEX `idx_qlog_feedback` ON `query_log`(`user_feedback`, `created_at`);
 | `parsed_filters` | `JSON` | 是 | `NULL` | LLM 解析出的硬过滤条件，例：`{"college_id": 1, "file_type": "pdf"}` |
 | `hit_count` | `INTEGER` | 否 | `0` | 召回命中数量 |
 | `top_doc_ids` | `JSON` | 是 | `NULL` | 召回 Top-K 的 doc_id 列表，例：`[12, 45, 89]` |
-| `response_ms` | `INTEGER` | 否 | `0` | 响应耗时（毫秒，SSE 流完成后回填） |
+| `response_ms` | `INTEGER` | 否 | `0` | 思考耗时（毫秒）：发送问题到 AI 输出首字的等待时间，流内回填；0=未收到首字（超时/异常/断连）。2026-09-17 前为整条回答生成耗时，存量行仍为旧口径 |
 | `user_feedback` | `TINYINT` | 否 | `-1` | 用户反馈：`1`=赞 / `0`=踩 / `-1`=无反馈 |
 | `created_at` | `DATETIME(6)` | 否 | — | 提问时间（自动） |
 

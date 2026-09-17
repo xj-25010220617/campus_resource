@@ -318,6 +318,9 @@ class AskView(APIView):
         serializer = AskSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
+        # 思考时长计时起点：用户发送问题 → AI 输出首字（含意图解析/知识检索/LLM 首 token 等待）
+        t0 = time.time()
+
         question = serializer.validated_data['question']
         conversation_id = serializer.validated_data.get('conversation_id')
 
@@ -497,8 +500,7 @@ class AskView(APIView):
         )
         images_events = build_images_events(images)  # 预计算，保持流内无异常
 
-        # 3.3 写 query_log（预创建，response_ms 在流结束后回填）
-        start_ts = time.time()
+        # 3.3 写 query_log（预创建，response_ms 在流内回填「思考时长」：请求进入 → 首个 token）
         query_log = QueryLog.objects.create(
             user=user,
             conversation=conversation,
@@ -535,6 +537,7 @@ class AskView(APIView):
             """生成 SSE 事件流（finally 保证 query_log 回填；断连时把已收内容落库后结束）。"""
             collected_tokens = []
             saved_len = 0
+            first_token_ts = None  # 思考时长终点：首个 token 到达时刻
 
             def _persist_partial():
                 """把当前已生成内容增量落库，避免客户端断连/切走后回答丢失。"""
@@ -555,6 +558,8 @@ class AskView(APIView):
                 stream = llm_client.chat_stream(messages)
                 for token in stream:
                     if token:
+                        if first_token_ts is None:
+                            first_token_ts = time.time()  # 思考时长终点：首字到达
                         collected_tokens.append(token)
                         yield _format_sse('token', {'content': token})
                         # 每 20 token 增量落库，防止切走/断连后内容丢失
@@ -625,7 +630,12 @@ class AskView(APIView):
                     _persist_partial()
                 except Exception:
                     pass
-                elapsed_ms = int((time.time() - start_ts) * 1000)
+                # 思考时长口径：请求进入 → 首个 token 到达；未收到任何 token
+                # （超时/异常/断连）回填 0，由统计端 response_ms>0 过滤排除
+                if first_token_ts is not None:
+                    elapsed_ms = int((first_token_ts - t0) * 1000)
+                else:
+                    elapsed_ms = 0
                 try:
                     QueryLog.objects.filter(id=query_log.id).update(response_ms=elapsed_ms)
                 except Exception:
@@ -1049,6 +1059,7 @@ class VoiceAskView(APIView):
 
         def generate():
             full_answer = ''
+            first_ts = None  # 思考时长终点：首个 token 到达时刻
             t0 = time.time()
             try:
                 # 1. 推送 ASR 识别结果（语音转文字）
@@ -1073,6 +1084,8 @@ class VoiceAskView(APIView):
 
                 # 3. LLM 流式输出
                 for chunk in llm_client.chat_stream(messages):
+                    if chunk and first_ts is None:
+                        first_ts = time.time()  # 思考时长终点：首字到达
                     full_answer += chunk
                     yield _format_sse('token', {'content': chunk})
                 references = build_references_events(
@@ -1084,7 +1097,8 @@ class VoiceAskView(APIView):
                     references=persisted_refs,
                 )
                 ai_msg_ref[0] = ai_msg
-                log.response_ms = int((time.time() - t0) * 1000)
+                # 思考时长口径：首 token 到达耗时；未收到任何 token 回填 0（统计端 >0 过滤）
+                log.response_ms = int((first_ts - t0) * 1000) if first_ts else 0
                 log.save()
                 if 'references' in references:
                     yield _format_sse('references', references['references'])
@@ -1105,7 +1119,7 @@ class VoiceAskView(APIView):
                 raise
             except Exception as e:
                 logger.error(f'LLM 流式输出失败: {e}')
-                log.response_ms = int((time.time() - t0) * 1000)
+                log.response_ms = int((first_ts - t0) * 1000) if first_ts else 0
                 try:
                     log.save()
                 except Exception:

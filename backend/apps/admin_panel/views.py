@@ -802,6 +802,7 @@ class QueryLogStatsView(APIView):
 
     GET /api/admin/logs/query/stats/
     返回：total/today/this_week/this_month + avg_hit_count / avg_response_ms / like_rate / by_feedback
+    口径：avg_response_ms 为平均思考时长（发送问题到 AI 输出首字，2026-09-17 起），非整条回答耗时
     """
     permission_classes = [permissions.IsAuthenticated, IsSuperAdmin]
 
@@ -1017,7 +1018,7 @@ class PublicStatsView(APIView):
             "storage_bytes": int | null,     # 存储总量（已收录资料占用字节）
             "docs": int | null,              # 资料总数（全部已上传资料）
             "queries": int | null,           # 查询总数（AI 问答累计）
-            "avg_response_sec": float | null, # 平均响应时长（秒，response_ms>0 的均值）
+            "avg_response_sec": float | null, # 平均思考时长（秒，response_ms>0 的均值；口径=发送问题到 AI 输出首字）
             "sensitive_blocks": int | null,   # 敏感拦截（命中敏感词累计）
             "logins": int | null,            # 登录次数（平台累计登录）
         }
@@ -1030,7 +1031,7 @@ class PublicStatsView(APIView):
     authentication_classes = []
     permission_classes = [permissions.AllowAny]
 
-    CACHE_KEY = 'public_platform_stats_v2'
+    CACHE_KEY = 'public_platform_stats_v3'  # v3：avg_response_sec 口径改为思考时长（2026-09-17），换 key 立即淘汰旧缓存
     CACHE_TTL = 120
 
     def get(self, request):

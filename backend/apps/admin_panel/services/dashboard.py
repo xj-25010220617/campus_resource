@@ -160,7 +160,11 @@ def compute_upload_block(start: datetime, end: datetime) -> dict:
 # 块 2：查询日志
 # ----------------------------------------------------------------------
 def compute_query_block(start: datetime, end: datetime) -> dict:
-    """查询日志统计块。"""
+    """查询日志统计块。
+
+    avg_response_ms 口径（2026-09-17 起）：平均思考时长（发送问题到 AI 输出首字），
+    非整条回答耗时，详见 QueryLog.response_ms 与 compute_public_stats。
+    """
     try:
         qs = QueryLog.objects.filter(created_at__range=(start, end))
         total = qs.count()
@@ -350,13 +354,17 @@ def compute_totals() -> dict:
 def compute_public_stats() -> dict:
     """首页「平台数据概览」公开七项指标（AllowAny，无 period，全量累计）。
 
-    对外口径（产品决策 2026-09-02；avg_response_sec 2026-09-02 增补）：
+    对外口径（产品决策 2026-09-02；avg_response_sec 2026-09-02 增补；2026-09-17 调整口径）：
     - users:            用户总数 = User.role='user' 的师生账号数（不含各类管理员）
     - storage_bytes:    存储总量 = 已收录资料占用字节 Sum(KnowledgeDoc.file_size)
     - docs:             资料总数 = KnowledgeDoc 全表计数（上传即算，删除随行消失）
     - queries:          查询总数 = QueryLog 累计（AI 问答次数）
-    - avg_response_sec: 平均响应时长（秒，保留 1 位小数）=
+    - avg_response_sec: 平均思考时长（秒，保留 1 位小数）=
                         Avg(QueryLog.response_ms，仅 response_ms>0) / 1000
+                        口径 2026-09-17 起为「思考时长」：用户发送问题到 AI 输出首字的
+                        等待时间（含意图解析/知识检索/LLM 首 token）；此前为整条回答的
+                        完整生成耗时（含推荐问题生成），均值虚高（约 7.5s）。
+                        历史存量行仍为旧口径，随时间自然稀释。
     - sensitive_blocks: 敏感拦截 = SensitiveLog 累计（敏感词命中拦截）
     - logins:           登录次数 = LoginLog 累计（平台登录次数）
 
@@ -382,7 +390,7 @@ def compute_public_stats() -> dict:
     _count('queries', lambda: QueryLog.objects.count())
 
     def _avg_response_seconds():
-        # 仅统计 response_ms>0 的真实响应，过滤掉正在流式/未回填的 0 值行
+        # 仅统计 response_ms>0 的真实思考耗时；0 = 未收到首字（超时/异常/断连），排除
         avg_ms = QueryLog.objects.filter(response_ms__gt=0).aggregate(a=Avg('response_ms'))['a']
         return round(avg_ms / 1000, 1) if avg_ms is not None else None
 
