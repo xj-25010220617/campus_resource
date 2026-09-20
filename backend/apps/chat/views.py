@@ -457,10 +457,22 @@ class AskView(APIView):
             parsed_filters=parsed,
         )
 
+        # 3.2a 分角色严谨度：管理员（需精准引用）知识库无可靠命中时直接拒答，
+        #      不调用 LLM、不联网兜底（联网摘要非知识库权威来源，不能作为管理员依据）。
+        should_refuse = False
+        if rag.is_strict_role(user_role):
+            top_score = max((r.get('score', 0) for r in results), default=0.0)
+            if not results or top_score < rag.ADMIN_MIN_SCORE:
+                should_refuse = True
+                logger.info(
+                    '管理员低置信拒答 role=%s top_score=%.3f results=%d q=%s',
+                    user_role, top_score, len(results), question[:50],
+                )
+
         # 3.2b 知识库无结果 → 检查未索引文档 + 联网搜索兜底
         web_search_used = False
         pending_docs = []
-        if not results and not rag._is_time_question(question):
+        if not should_refuse and not results and not rag._is_time_question(question):
             # 区分"文件存在但未索引"和"没有匹配文件"（未索引文档不传给 LLM）
             pending_docs = rag.find_pending_index_docs(question, user_context)
             if pending_docs:
@@ -554,17 +566,23 @@ class AskView(APIView):
                     'message_id': assistant_msg.id,
                 })
 
-                # 流式生成
-                stream = llm_client.chat_stream(messages)
-                for token in stream:
-                    if token:
-                        if first_token_ts is None:
-                            first_token_ts = time.time()  # 思考时长终点：首字到达
-                        collected_tokens.append(token)
-                        yield _format_sse('token', {'content': token})
-                        # 每 20 token 增量落库，防止切走/断连后内容丢失
-                        if len(collected_tokens) % 20 == 0:
-                            _persist_partial()
+                # 流式生成（管理员低置信时拒绝生成，直接返回固定提示，不调用 LLM）
+                if should_refuse:
+                    refuse_text = '知识库暂无相关资料，无法给出可靠回答。'
+                    first_token_ts = time.time()
+                    collected_tokens.append(refuse_text)
+                    yield _format_sse('token', {'content': refuse_text})
+                else:
+                    stream = llm_client.chat_stream(messages)
+                    for token in stream:
+                        if token:
+                            if first_token_ts is None:
+                                first_token_ts = time.time()  # 思考时长终点：首字到达
+                            collected_tokens.append(token)
+                            yield _format_sse('token', {'content': token})
+                            # 每 20 token 增量落库，防止切走/断连后内容丢失
+                            if len(collected_tokens) % 20 == 0:
+                                _persist_partial()
 
                 full_answer = ''.join(collected_tokens)
 
@@ -576,10 +594,11 @@ class AskView(APIView):
                         assistant_msg.id, conversation.id, len(collected_tokens),
                     )
 
-                # 生成相关推荐（调用 LLM 生成 3 个相关问题）
-                suggested = rag.generate_suggested_questions(question, full_answer)
-                if suggested:
-                    yield _format_sse('suggested', suggested)
+                # 生成相关推荐（调用 LLM 生成 3 个相关问题；拒答时跳过）
+                if not should_refuse:
+                    suggested = rag.generate_suggested_questions(question, full_answer)
+                    if suggested:
+                        yield _format_sse('suggested', suggested)
 
                 # 未索引文档提示（知识库有匹配文件但暂不可检索，不作为 LLM 来源）
                 if pending_docs:
