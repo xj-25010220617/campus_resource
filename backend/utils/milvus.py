@@ -15,11 +15,11 @@ logger = logging.getLogger(__name__)
 class MilvusClient:
     """
     Milvus 向量库客户端。
-    开发阶段可用 ChromaDB 替代降级运行。
+    唯一向量事实源；首次向量操作时懒连接，失败自动降级重试。
     """
 
     COLLECTION_NAME = 'campus_knowledge'
-    VECTOR_DIM = 1024  # text-embedding-v3 维度（与 llm.py _mock_embed 保持一致）
+    VECTOR_DIM = 768  # bge-base-zh-v1.5 维度
 
     def __init__(self):
         self._connected = False
@@ -28,7 +28,9 @@ class MilvusClient:
     # 连接管理
     # ------------------------------------------------------------------
     def connect(self) -> bool:
-        """连接 Milvus，失败时降级为 ChromaDB"""
+        """连接 Milvus（幂等）。失败保持未连接状态，下次调用重试。"""
+        if self._connected:
+            return True
         try:
             from pymilvus import connections
             connections.connect(
@@ -40,11 +42,11 @@ class MilvusClient:
             logger.info('Milvus connected')
             return True
         except ImportError:
-            logger.warning('pymilvus not installed, falling back to ChromaDB')
+            logger.warning('pymilvus not installed')
             self._connected = False
             return False
         except Exception as e:
-            logger.warning(f'Milvus connection failed: {e}, falling back to ChromaDB')
+            logger.warning(f'Milvus connection failed: {e}')
             self._connected = False
             return False
 
@@ -56,16 +58,15 @@ class MilvusClient:
     # Collection 管理
     # ------------------------------------------------------------------
     def ensure_collection(self) -> bool:
-        """确保 Collection 存在，不存在则创建"""
-        if self._connected:
-            return self._ensure_milvus_collection()
-        return self._ensure_chroma_collection()
+        if not self._connected:
+            self.connect()
+        return self._ensure_milvus_collection()
 
     def _ensure_milvus_collection(self) -> bool:
         try:
-            from pymilvus import Collection, CollectionSchema, FieldSchema, DataType
+            from pymilvus import Collection, CollectionSchema, FieldSchema, DataType, utility
 
-            if Collection.exists(self.COLLECTION_NAME):
+            if utility.has_collection(self.COLLECTION_NAME):
                 return True
 
             fields = [
@@ -81,7 +82,6 @@ class MilvusClient:
             schema = CollectionSchema(fields, description='校园知识库向量集合')
             collection = Collection(name=self.COLLECTION_NAME, schema=schema)
 
-            # 创建 IVF_FLAT 索引
             index_params = {
                 'metric_type': 'COSINE',
                 'index_type': 'IVF_FLAT',
@@ -93,26 +93,6 @@ class MilvusClient:
             return True
         except Exception as e:
             logger.error(f'Failed to create Milvus collection: {e}')
-            return False
-
-    def _ensure_chroma_collection(self) -> bool:
-        """ChromaDB 降级方案"""
-        try:
-            import chromadb
-            client = chromadb.PersistentClient(
-                path=str(getattr(settings, 'CHROMA_DB_PATH', './chroma_db'))
-            )
-            client.get_or_create_collection(
-                name=self.COLLECTION_NAME,
-                metadata={'hnsw:space': 'cosine'},
-            )
-            logger.info('ChromaDB collection ready')
-            return True
-        except ImportError:
-            logger.error('chromadb not installed')
-            return False
-        except Exception as e:
-            logger.error(f'ChromaDB setup failed: {e}')
             return False
 
     # ------------------------------------------------------------------
@@ -128,9 +108,9 @@ class MilvusClient:
         返回:
             vector_id 列表
         """
-        if self._connected:
-            return self._insert_milvus(chunks, embeddings)
-        return self._insert_chroma(chunks, embeddings)
+        if not self._connected:
+            self.connect()
+        return self._insert_milvus(chunks, embeddings)
 
     def _insert_milvus(self, chunks: List[dict], embeddings: List[List[float]]) -> List[str]:
         from pymilvus import Collection
@@ -147,30 +127,6 @@ class MilvusClient:
         collection.insert(data)
         collection.flush()
         return [c['vector_id'] for c in chunks]
-
-    def _insert_chroma(self, chunks: List[dict], embeddings: List[List[float]]) -> List[str]:
-        import chromadb
-        client = chromadb.PersistentClient(
-            path=str(getattr(settings, 'CHROMA_DB_PATH', './chroma_db'))
-        )
-        ids = [c['vector_id'] for c in chunks]
-        metadatas = [
-            {
-                'doc_id': c['doc_id'],
-                'chunk_index': c['chunk_index'],
-                'page_number': c.get('page_number', 0),
-                'seq_order': c.get('seq_order', 0),
-            }
-            for c in chunks
-        ]
-        # ChromaDB 存储文档文本
-        documents = [c.get('chunk_text', '') for c in chunks]
-        collection = client.get_or_create_collection(
-            name=self.COLLECTION_NAME,
-            metadata={'hnsw:space': 'cosine'},
-        )
-        collection.add(ids=ids, embeddings=embeddings, metadatas=metadatas, documents=documents)
-        return ids
 
     # ------------------------------------------------------------------
     # 向量搜索
@@ -194,9 +150,9 @@ class MilvusClient:
               'chunk_text': str, 'page_number': int, 'seq_order': int,
               'score': float}, ...]
         """
-        if self._connected:
-            return self._search_milvus(query_embedding, top_k, filter_ids)
-        return self._search_chroma(query_embedding, top_k, filter_ids)
+        if not self._connected:
+            self.connect()
+        return self._search_milvus(query_embedding, top_k, filter_ids)
 
     def _search_milvus(
         self,
@@ -208,10 +164,8 @@ class MilvusClient:
         collection = Collection(name=self.COLLECTION_NAME)
         collection.load()
 
-        # 硬过滤：只检索指定 doc_id 范围内的向量（来自 SQL 硬过滤）
         expr = None
         if filter_ids:
-            # doc_id 与 KnowledgeDoc 主键保持一致。
             valid_ids = [d for d in filter_ids if d > 0]
             if valid_ids:
                 expr = f'doc_id in {valid_ids}'
@@ -238,137 +192,19 @@ class MilvusClient:
             })
         return hits
 
-    def _search_chroma(
-        self,
-        query_embedding: List[float],
-        top_k: int,
-        filter_ids: Optional[List[int]],
-    ) -> List[dict]:
-        try:
-            import chromadb
-        except ImportError:
-            logger.warning('chromadb 未安装，Chroma 向量检索不可用')
-            return []
-        client = chromadb.PersistentClient(
-            path=str(getattr(settings, 'CHROMA_DB_PATH', './chroma_db'))
-        )
-        collection = client.get_collection(name=self.COLLECTION_NAME)
-
-        # 检索时若限定了 doc_id 范围，过滤后可能数量不足，
-        # 因此多取 5 倍以保证在过滤后仍有 top_k 条命中
-        fetch_k = top_k * 5 if filter_ids else top_k
-        try:
-            results = collection.query(
-                query_embeddings=[query_embedding],
-                n_results=fetch_k,
-            )
-        except Exception as e:
-            # chromadb 1.5.x Rust hnsw 查询存在已知崩溃
-            # （Error loading hnsw index / backfill to compactor），
-            # insert/count 均正常但 query 失败时降级为暴力余弦检索
-            logger.warning(f'Chroma hnsw 查询失败，降级暴力检索: {e}')
-            return self._brute_force_chroma(
-                collection, query_embedding, top_k, filter_ids,
-            )
-
-        hits = []
-        if results and results['ids'] and results['ids'][0]:
-            filter_set = set(filter_ids) if filter_ids else None
-            for i, vid in enumerate(results['ids'][0]):
-                meta = results['metadatas'][0][i] if results.get('metadatas') else {}
-                docs_list = results.get('documents')
-                doc_text = docs_list[0][i] if docs_list and docs_list[0] else ''
-                doc_id = meta.get('doc_id')
-
-                # doc_id 硬过滤（跨版本兼容性兜底）
-                if filter_set is not None and doc_id not in filter_set:
-                    continue
-
-                hits.append({
-                    'vector_id': vid,
-                    'doc_id': doc_id,
-                    'chunk_index': meta.get('chunk_index'),
-                    'chunk_text': doc_text,
-                    'page_number': meta.get('page_number', 0),
-                    'seq_order': meta.get('seq_order', 0),
-                    'score': 1 - (results['distances'][0][i] if results.get('distances') else 0),
-                })
-        return hits
-
-    @staticmethod
-    def _brute_force_chroma(collection, query_embedding, top_k, filter_ids):
-        """hnsw 索引不可用时的暴力余弦检索（全量向量内存计算）。
-
-        开发环境 Chroma 规模（万条以内）下毫秒级完成，且结果精确。
-        """
-        try:
-            got = collection.get(include=['embeddings', 'metadatas', 'documents'])
-        except Exception as e:
-            logger.error(f'Chroma 暴力检索取数失败: {e}')
-            return []
-
-        ids = got.get('ids') or []
-        embs = got.get('embeddings')
-        if not ids or embs is None:
-            return []
-
-        import numpy as np
-        embs = np.asarray(embs, dtype='float32')
-        q = np.asarray(query_embedding, dtype='float32')
-        q_norm = float(np.linalg.norm(q)) or 1.0
-        norms = np.linalg.norm(embs, axis=1)
-        norms[norms == 0] = 1.0
-        sims = embs @ q / (norms * q_norm)
-
-        metas = got.get('metadatas') or [{}] * len(ids)
-        docs = got.get('documents') or [''] * len(ids)
-        filter_set = set(filter_ids) if filter_ids else None
-
-        hits = []
-        for idx in np.argsort(-sims):
-            if len(hits) >= top_k:
-                break
-            meta = metas[int(idx)]
-            doc_id = meta.get('doc_id')
-            if filter_set is not None and doc_id not in filter_set:
-                continue
-            hits.append({
-                'vector_id': ids[int(idx)],
-                'doc_id': doc_id,
-                'chunk_index': meta.get('chunk_index'),
-                'chunk_text': docs[int(idx)],
-                'page_number': meta.get('page_number', 0),
-                'seq_order': meta.get('seq_order', 0),
-                'score': float(sims[idx]),
-            })
-        return hits
-
     # ------------------------------------------------------------------
     # 删除向量
     # ------------------------------------------------------------------
     def delete_by_doc(self, doc_id: int) -> bool:
         """删除某文档的所有向量"""
-        if self._connected:
-            from pymilvus import Collection
-            collection = Collection(name=self.COLLECTION_NAME)
-            collection.delete(f'doc_id == {doc_id}')
-            return True
-        try:
-            import chromadb
-            client = chromadb.PersistentClient(
-                path=str(getattr(settings, 'CHROMA_DB_PATH', './chroma_db'))
-            )
-            collection = client.get_or_create_collection(
-                name=self.COLLECTION_NAME,
-                metadata={'hnsw:space': 'cosine'},
-            )
-            # Chroma 支持 where 条件删除；不清理会残留孤儿向量，
-            # 挤占向量检索召回窗口（fetch_k 内被 filter_ids 过滤后有效命中变少）
-            collection.delete(where={'doc_id': doc_id})
-            return True
-        except Exception as e:
-            logger.warning(f'Chroma 删除向量失败 doc_id={doc_id}: {e}')
+        if not self._connected:
+            self.connect()
+        if not self._connected:
             return False
+        from pymilvus import Collection
+        collection = Collection(name=self.COLLECTION_NAME)
+        collection.delete(f'doc_id == {doc_id}')
+        return True
 
 
 # 全局单例
