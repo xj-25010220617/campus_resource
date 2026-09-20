@@ -23,9 +23,7 @@ pymilvus>=2.4.0
 # 本地 Embedding（bge-base-zh-v1.5，768 维）
 sentence-transformers>=2.7.0
 # 本地 OCR（中文扫描件识别，主）
-paddlepaddle>=2.6.0
-paddleocr>=2.7.0
-# 本地 OCR（兜底）
+# 弃用 paddlepaddle/paddleocr：Windows 下 hard-pin protobuf<=3.20.2，与 pymilvus 3.x 冲突
 easyocr>=1.7.0
 # 异步任务（可选）
 # - 生产/定时任务场景需要 celery + redis 作为 broker

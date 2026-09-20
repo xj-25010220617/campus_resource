@@ -67,51 +67,6 @@ def _get_easyocr_reader():
     return _easyocr_reader
 
 
-_paddle_ocr = None
-_paddle_ocr_failed = False
-
-
-def _get_paddle_ocr():
-    """PaddleOCR 懒加载单例（中文扫描件识别精度优于 easyocr，主通道）。"""
-    global _paddle_ocr, _paddle_ocr_failed
-    if _paddle_ocr is None and not _paddle_ocr_failed:
-        try:
-            from paddleocr import PaddleOCR
-            _paddle_ocr = PaddleOCR(use_angle_cls=True, lang='ch', show_log=False)
-        except Exception as e:
-            logger.error(f'PaddleOCR 初始化失败: {e}')
-            _paddle_ocr_failed = True
-    return _paddle_ocr
-
-
-def _ocr_image_paddle(image_bytes: bytes) -> str:
-    """PaddleOCR 识别单张图片（返回按行拼接文本）。"""
-    import io
-
-    import numpy as np
-    from PIL import Image
-
-    ocr = _get_paddle_ocr()
-    if ocr is None:
-        return ''
-    try:
-        img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-        arr = np.asarray(img)
-        result = ocr.ocr(arr, cls=True)
-        lines = []
-        for page in (result or []):
-            if not page:
-                continue
-            for line in page:
-                txt = line[1][0] if len(line) > 1 else ''
-                if txt:
-                    lines.append(txt)
-        return '\n'.join(lines).strip()
-    except Exception as e:
-        logger.warning(f'PaddleOCR 识别失败: {e}')
-        return ''
-
-
 def _render_page_to_image(page) -> Optional[bytes]:
     """把 fitz 页面渲染为 PNG 字节（200 DPI，供 OCR）。"""
     try:
@@ -122,25 +77,8 @@ def _render_page_to_image(page) -> Optional[bytes]:
         return None
 
 
-def _ocr_image_cloud(image_bytes: bytes) -> str:
-    """用 qwen-vl 视觉模型做 OCR（中文识别最准）。"""
-    from utils.llm import image_bytes_to_data_url, llm_client
-
-    data_url = image_bytes_to_data_url(image_bytes)
-    if not data_url:
-        return ''
-
-    prompt = (
-        '请逐字识别这张图片中的全部文字，按原始排版顺序完整输出。'
-        '要求：1. 不要添加任何解释、不要翻译；2. 表格用制表符分隔；'
-        '3. 换行保持原样；4. 图片中没有任何文字时只输出空。'
-    )
-    result = llm_client.chat_vision(prompt, [data_url], temperature=0.0, max_tokens=4000)
-    return (result or '').strip()
-
-
 def _ocr_image_local(image_bytes: bytes) -> str:
-    """本地 easyocr 识别（离线兜底）。"""
+    """本地 easyocr 识别（主通道）。"""
     reader = _get_easyocr_reader()
     if reader is None:
         return ''
@@ -160,11 +98,7 @@ def _ocr_image_local(image_bytes: bytes) -> str:
 
 
 def _ocr_image(image_bytes: bytes) -> str:
-    """单页 OCR：PaddleOCR 优先（本地，中文扫描件精度最高），失败回退 easyocr。"""
-    text = _ocr_image_paddle(image_bytes)
-    if text:
-        return text
-    logger.info('PaddleOCR 返回空，回退 easyocr')
+    """单页 OCR：easyocr 主通道。"""
     return _ocr_image_local(image_bytes)
 
 
