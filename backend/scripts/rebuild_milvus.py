@@ -28,7 +28,7 @@ def rebuild_collection():
     milvus_client.connect()
 
     if not milvus_client.connected:
-        print('ERROR: Milvus 连接失败，请检查 MILVUS_HOST / MILVUS_PORT 配置')
+        print('ERROR: Milvus 连接失败，请检查 MILVUS_URI 路径及 milvus-lite 安装')
         return
 
     print(f'检查 collection "{COLLECTION_NAME}" ...')

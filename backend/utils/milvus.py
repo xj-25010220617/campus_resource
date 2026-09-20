@@ -28,15 +28,14 @@ class MilvusClient:
     # 连接管理
     # ------------------------------------------------------------------
     def connect(self) -> bool:
-        """连接 Milvus（幂等）。失败保持未连接状态，下次调用重试。"""
+        """连接 Milvus Lite（幂等）。失败保持未连接状态，下次调用重试。"""
         if self._connected:
             return True
         try:
             from pymilvus import connections
             connections.connect(
                 alias='default',
-                host=getattr(settings, 'MILVUS_HOST', 'localhost'),
-                port=getattr(settings, 'MILVUS_PORT', '19530'),
+                uri=str(getattr(settings, 'MILVUS_URI', '.campus_milvus.db')),
             )
             self._connected = True
             logger.info('Milvus connected')
@@ -82,10 +81,12 @@ class MilvusClient:
             schema = CollectionSchema(fields, description='校园知识库向量集合')
             collection = Collection(name=self.COLLECTION_NAME, schema=schema)
 
+            # BRUTE_FORCE：精确检索（无近似，100% 召回），无需 faiss；
+            # 数据量 ~3k 量级时比 IVF_FLAT 更快且更准。
             index_params = {
                 'metric_type': 'COSINE',
-                'index_type': 'IVF_FLAT',
-                'params': {'nlist': 128},
+                'index_type': 'BRUTE_FORCE',
+                'params': {},
             }
             collection.create_index(field_name='embedding', index_params=index_params)
             collection.load()
@@ -173,7 +174,7 @@ class MilvusClient:
         results = collection.search(
             data=[query_embedding],
             anns_field='embedding',
-            param={'metric_type': 'COSINE', 'params': {'nprobe': 10}},
+            param={'metric_type': 'COSINE'},
             limit=top_k,
             expr=expr,
             output_fields=['vector_id', 'doc_id', 'chunk_index',

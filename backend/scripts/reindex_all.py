@@ -58,7 +58,7 @@ def rebuild_collection() -> bool:
 
     milvus_client.connect()
     if not milvus_client.connected:
-        logger.error('Milvus 连接失败，请确认 MILVUS_HOST/MILVUS_PORT 及服务是否已启动')
+        logger.error('Milvus 连接失败，请确认 MILVUS_URI 路径可写及 milvus-lite 已安装')
         return False
 
     name = milvus_client.COLLECTION_NAME

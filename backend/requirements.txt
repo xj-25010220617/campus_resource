@@ -18,8 +18,11 @@ lxml>=5.0.0
 # - 本地开发装了 venv 后必须装；未装会在加载 apps.faq.utils 时 ModuleNotFoundError
 # - 若不需要 FAQ 自动生成，可以省略；接口调用时会因 import 失败 500
 numpy>=1.26.0
-# Milvus 向量库客户端（唯一向量事实源）
-pymilvus>=2.4.0
+# Milvus 向量库（唯一向量事实源）
+# - pymilvus 固定 3.0.x：3.1 起移除 ORM 风格 API（Collection/connections），与本项目代码不兼容
+# - milvus-lite：嵌入式引擎（本地文件，无需 Docker/独立服务）；BRUTE_FORCE 精确检索不依赖 faiss
+pymilvus>=3.0.0,<3.1
+milvus-lite>=3.0
 # 本地 Embedding（bge-base-zh-v1.5，768 维）
 sentence-transformers>=2.7.0
 # 本地 OCR（中文扫描件识别，主）

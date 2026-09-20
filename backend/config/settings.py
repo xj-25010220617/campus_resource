@@ -206,16 +206,20 @@ ALIYUN_EMBED_BASE_URL = config(
     default='https://dashscope.aliyuncs.com/compatible-mode/v1',
 )
 LOCAL_EMBED_MODEL = config('LOCAL_EMBED_MODEL', default='BAAI/bge-base-zh-v1.5')
+# HuggingFace 下载镜像（国内直连 huggingface.co 不通时走 hf-mirror.com）
+# 需在 import huggingface_hub / sentence_transformers 之前写入环境变量，故在此导出
+_hf_endpoint = config('HF_ENDPOINT', default='')
+if _hf_endpoint:
+    os.environ['HF_ENDPOINT'] = _hf_endpoint
 
 # ------------------------------------------------------------------
 # Milvus / ChromaDB
 # ------------------------------------------------------------------
-MILVUS_HOST = config('MILVUS_HOST', default='localhost')
-MILVUS_PORT = config('MILVUS_PORT', default='19530')
-# 注意：chroma-hnswlib 的 C++ 层无法打开含中文的 Windows 路径
-# （"Cannot open header file" / "Error loading hnsw index"），
-# 项目目录含中文，因此 Chroma 库默认放在用户主目录下（纯 ASCII 路径）。
+# Milvus Lite 嵌入式向量库（本地文件，无需 Docker / 独立服务）。
+# 注意：向量/索引库的 C++ 层在 Windows 下无法打开含中文路径（同 chroma-hnswlib
+# 的 "Cannot open header file" 问题），项目目录含中文，故库默认放用户主目录（纯 ASCII）。
 from pathlib import Path as _Path
+MILVUS_URI = config('MILVUS_URI', default=str(_Path.home() / '.campus_milvus.db'))
 CHROMA_DB_PATH = _Path(config('CHROMA_DB_PATH', default=str(_Path.home() / '.campus_chroma_db')))
 
 # ------------------------------------------------------------------
