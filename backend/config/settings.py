@@ -193,6 +193,10 @@ QWEN_CHAT_MODEL = config('QWEN_CHAT_MODEL', default=config('DEEPSEEK_CHAT_MODEL'
 # 视觉（多模态）模型 — 图片内容识别/智能分类用，独立于文本对话模型
 QWEN_VL_MODEL = config('QWEN_VL_MODEL', default='qwen-vl-plus')
 
+# LLM Provider 切换（qwen=云端 OpenAI 兼容 / local=本地模型占位）
+# 后期本地部署问答模型时改 .env 的 LLM_PROVIDER=local 即可，不改代码。
+LLM_PROVIDER = config('LLM_PROVIDER', default='qwen')
+
 # Embedding 后端切换（aliyun / local / mock）
 EMBED_BACKEND = config('EMBED_BACKEND', default='local')
 ALIYUN_EMBED_API_KEY = config('ALIYUN_EMBED_API_KEY', default='')

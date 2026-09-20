@@ -1,36 +1,33 @@
 """
 大模型 API 调用封装
-- DeepSeek Chat（对话生成，同步 + 异步流式）
+- Chat（对话/视觉/流式）：经 LLMProvider 抽象分发（见 utils/llm_provider.py）
 - Embedding（文本向量化，支持多后端：阿里云百炼 / 本地 / Mock）
 - 失败重试（指数退避）
 """
 import logging
-import time
-from typing import AsyncGenerator, Dict, Generator, List, Optional
+from typing import List, Optional
 
-import requests
 from django.conf import settings
 
 from .http_client import ExternalClient
+from .llm_provider import (
+    LLMTimeoutError,
+    MAX_RETRIES,
+    _check_ascii,
+    _retry_sleep,
+    build_provider,
+)
 
 logger = logging.getLogger(__name__)
-
-# ------------------------------------------------------------------
-# 配置
-# ------------------------------------------------------------------
-QWEN_API_KEY = getattr(settings, 'QWEN_API_KEY', '')
-QWEN_BASE_URL = getattr(settings, 'QWEN_BASE_URL', 'https://dashscope.aliyuncs.com/compatible-mode')
-QWEN_CHAT_MODEL = getattr(settings, 'QWEN_CHAT_MODEL', 'qwen-flash')
-QWEN_VL_MODEL = getattr(settings, 'QWEN_VL_MODEL', 'qwen-vl-plus')
 
 # ------------------------------------------------------------------
 # Embedding 后端配置
 # ------------------------------------------------------------------
 # EMBED_BACKEND 可选值：
-#   aliyun: 阿里云百炼（生产推荐，OpenAI 兼容模式）
-#   local:  本地 sentence-transformers
+#   aliyun: 阿里云百炼（OpenAI 兼容模式）
+#   local:  本地 sentence-transformers（默认，bge-base-zh-v1.5）
 #   mock:   SHA256 伪向量（无语义，仅开发调试）
-EMBED_BACKEND = getattr(settings, 'EMBED_BACKEND', 'aliyun')
+EMBED_BACKEND = getattr(settings, 'EMBED_BACKEND', 'local')
 
 # 阿里云百炼 Embedding
 ALIYUN_EMBED_API_KEY = getattr(settings, 'ALIYUN_EMBED_API_KEY', '')
@@ -45,33 +42,6 @@ LOCAL_EMBED_MODEL = getattr(settings, 'LOCAL_EMBED_MODEL', 'BAAI/bge-base-zh-v1.
 
 # bge-v1.5 系列要求 query 侧加检索前缀，passage 侧不加
 BGE_QUERY_PREFIX = '为这个句子生成表示以用于检索相关文章：'
-
-# 重试配置
-MAX_RETRIES = 3
-RETRY_BACKOFF_BASE = 2  # 指数退避基数（秒）
-
-
-def _retry_sleep(attempt: int):
-    """指数退避等待"""
-    delay = RETRY_BACKOFF_BASE ** attempt
-    time.sleep(delay)
-
-
-def _check_ascii(name: str, value: str) -> bool:
-    """检查 API Key / Base URL 是否为纯 ASCII。
-
-    urllib3 用 latin-1 编码 HTTP 请求头，值里一旦混入非 ASCII 字符（中文、
-    emoji、不可见字符，通常是复制粘贴带入），请求会在发送前直接抛
-    `UnicodeEncodeError: 'latin-1' codec can't encode characters ...`。
-    这里提前校验，把"3 次重试后静默降级 Mock"变成一行可定位的错误日志。
-    """
-    if value and any(ord(ch) > 127 for ch in value):
-        logger.error(
-            f'{name} 含非 ASCII 字符: {value[:24]!r}。'
-            '通常是复制粘贴带入的中文/emoji/隐藏字符，请重新从控制台复制。'
-        )
-        return False
-    return True
 
 
 def image_bytes_to_data_url(image_bytes: bytes, max_size: int = 1280, quality: int = 85) -> Optional[str]:
@@ -121,27 +91,15 @@ def image_bytes_to_data_url(image_bytes: bytes, max_size: int = 1280, quality: i
         return None
 
 
-class LLMTimeoutError(Exception):
-    """LLM 请求超时或最终失败（已重试 MAX_RETRIES 次）。"""
-
-
 class LLMClient:
-    """DeepSeek Chat + 阿里云百炼 Embedding 封装"""
+    """Embedding + Chat 门面：Embedding 自持多后端，Chat 委托给 LLMProvider。"""
 
     VECTOR_DIM = 768  # bge-base-zh-v1.5 维度（768）
 
     def __init__(self):
-        self.chat_api_key = QWEN_API_KEY
-        self.chat_base_url = QWEN_BASE_URL
         self.embed_api_key = ALIYUN_EMBED_API_KEY
         self.embed_base_url = ALIYUN_EMBED_BASE_URL
-
-    @property
-    def chat_headers(self):
-        return {
-            'Authorization': f'Bearer {self.chat_api_key}',
-            'Content-Type': 'application/json',
-        }
+        self._provider = build_provider()
 
     @property
     def embed_headers(self):
@@ -158,12 +116,13 @@ class LLMClient:
         文本向量化（多后端自动降级）。
 
         优先顺序：
-        1. 阿里云百炼（OpenAI 兼容模式）
-        2. 本地 sentence-transformers（如果已安装且配置使用）
+        1. 阿里云百炼（已配置 API Key 时自动启用）
+        2. 本地 sentence-transformers（默认）
         3. Mock Embedding（hash 向量）
 
         Args:
             texts: 文本列表，每个元素一个 chunk
+            is_query: 是否为查询侧（bge 需要加检索前缀）
 
         Returns:
             对应的向量列表
@@ -265,7 +224,7 @@ class LLMClient:
         return results[0] if results else []
 
     def _mock_embed(self, texts: List[str]) -> List[List[float]]:
-        """开发阶段 Mock：生成 1024 维伪随机向量（与 text-embedding-v3 维度一致）"""
+        """开发阶段 Mock：生成 768 维伪随机向量（维度与 bge-base-zh-v1.5 一致）"""
         import hashlib
         results = []
         for text in texts:
@@ -278,297 +237,20 @@ class LLMClient:
         return results
 
     # ------------------------------------------------------------------
-    # Chat（对话生成）— 非流式
+    # Chat（对话/视觉/流式）— 委托给 LLMProvider
     # ------------------------------------------------------------------
-    def chat(
-        self,
-        messages: List[dict],
-        model: str = None,
-        temperature: float = 0.7,
-        max_tokens: int = 2048,
-    ) -> Optional[str]:
-        """
-        非流式对话（带重试），返回完整回复文本。
+    def chat(self, messages, model=None, temperature=0.7, max_tokens=2048):
+        return self._provider.chat(messages, model=model, temperature=temperature, max_tokens=max_tokens)
 
-        Args:
-            messages: 消息列表 [{'role': 'system'|'user'|'assistant', 'content': str}]
-            model: 模型名，默认 qwen-flash
-            temperature: 生成温度
-            max_tokens: 最大 token 数
+    def chat_vision(self, text, image_data_urls, model=None, temperature=0.0, max_tokens=800):
+        return self._provider.chat_vision(text, image_data_urls, model=model, temperature=temperature, max_tokens=max_tokens)
 
-        Returns:
-            完整回复文本，失败返回 None
-        """
-        if not self.chat_api_key:
-            return self._mock_chat(messages)
+    def chat_stream(self, messages, model=None, temperature=0.3, max_tokens=2048):
+        yield from self._provider.chat_stream(messages, model=model, temperature=temperature, max_tokens=max_tokens)
 
-        last_error = None
-        for attempt in range(MAX_RETRIES):
-            try:
-                resp = ExternalClient.post(
-                    'llm_chat',
-                    f'{self.chat_base_url}/v1/chat/completions',
-                    headers=self.chat_headers,
-                    json={
-                        'model': model or QWEN_CHAT_MODEL,
-                        'messages': messages,
-                        'temperature': temperature,
-                        'max_tokens': max_tokens,
-                        'stream': False,
-                    },
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                return data['choices'][0]['message']['content']
-            except requests.Timeout as e:
-                last_error = e
-                logger.warning(f'Chat 超时 (attempt {attempt+1}/{MAX_RETRIES})')
-            except requests.RequestException as e:
-                last_error = e
-                logger.warning(f'Chat 请求失败 (attempt {attempt+1}/{MAX_RETRIES}): {e}')
-
-            if attempt < MAX_RETRIES - 1:
-                _retry_sleep(attempt + 1)
-
-        logger.error(f'Chat 最终失败: {last_error}')
-        return None
-
-    # ------------------------------------------------------------------
-    # Chat（视觉 / 多模态）— 图片理解，非流式
-    # ------------------------------------------------------------------
-    def chat_vision(
-        self,
-        text: str,
-        image_data_urls: List[str],
-        model: str = None,
-        temperature: float = 0.0,
-        max_tokens: int = 800,
-    ) -> Optional[str]:
-        """
-        视觉（多模态）对话：把图片 + 文本一起发给视觉模型（默认 qwen-vl-plus）。
-
-        OpenAI 兼容格式：messages[0].content 为列表，元素含 type=text 与
-        type=image_url 两种。image_data_urls 为 'data:image/...;base64,...' 列表。
-
-        Args:
-            text: 提示词文本
-            image_data_urls: 图片 data URL 列表
-            model: 视觉模型名，默认 qwen-vl-plus
-            temperature: 生成温度
-            max_tokens: 最大 token 数
-
-        Returns:
-            完整回复文本，失败返回 None
-        """
-        if not image_data_urls:
-            return None
-        if not self.chat_api_key:
-            return self._mock_chat([{'role': 'user', 'content': text}])
-
-        content = [{'type': 'text', 'text': text}]
-        for data_url in image_data_urls:
-            content.append({'type': 'image_url', 'image_url': {'url': data_url}})
-
-        last_error = None
-        for attempt in range(MAX_RETRIES):
-            try:
-                resp = ExternalClient.post(
-                    'llm_vision',
-                    f'{self.chat_base_url}/v1/chat/completions',
-                    headers=self.chat_headers,
-                    json={
-                        'model': model or QWEN_VL_MODEL,
-                        'messages': [{'role': 'user', 'content': content}],
-                        'temperature': temperature,
-                        'max_tokens': max_tokens,
-                        'stream': False,
-                    },
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                return data['choices'][0]['message']['content']
-            except requests.Timeout as e:
-                last_error = e
-                logger.warning(f'Vision 超时 (attempt {attempt+1}/{MAX_RETRIES})')
-            except requests.RequestException as e:
-                last_error = e
-                logger.warning(f'Vision 请求失败 (attempt {attempt+1}/{MAX_RETRIES}): {e}')
-
-            if attempt < MAX_RETRIES - 1:
-                _retry_sleep(attempt + 1)
-
-        logger.error(f'Vision 最终失败: {last_error}')
-        return None
-
-    # ------------------------------------------------------------------
-    # Chat（流式）— 同步生成器
-    # ------------------------------------------------------------------
-    def chat_stream(
-        self,
-        messages: List[dict],
-        model: str = None,
-        temperature: float = 0.3,
-        max_tokens: int = 2048,
-    ) -> Generator[str, None, None]:
-        """
-        流式对话（同步），逐 token yield 文本。
-        适合 Django 同步 StreamingHttpResponse。
-
-        Args:
-            messages: 消息列表
-            model: 模型名
-            temperature: 生成温度（RAG 场景建议 0.3）
-            max_tokens: 最大 token 数
-        """
-        if not self.chat_api_key:
-            yield from self._mock_stream(messages)
-            return
-
-        if not _check_ascii('QWEN_API_KEY', self.chat_api_key):
-            raise LLMTimeoutError('QWEN_API_KEY 含非 ASCII 字符，请检查配置后重试')
-
-        import json as _json
-
-        last_error = None
-        for attempt in range(MAX_RETRIES):
-            try:
-                resp = ExternalClient.post(
-                    'llm_stream',
-                    f'{self.chat_base_url}/v1/chat/completions',
-                    headers=self.chat_headers,
-                    json={
-                        'model': model or QWEN_CHAT_MODEL,
-                        'messages': messages,
-                        'temperature': temperature,
-                        'max_tokens': max_tokens,
-                        'stream': True,
-                    },
-                    stream=True,
-                )
-                resp.raise_for_status()
-
-                for line in resp.iter_lines(decode_unicode=True):
-                    if not line or line.startswith(':'):
-                        continue
-                    if line.startswith('data: '):
-                        data_str = line[6:]
-                        if data_str.strip() == '[DONE]':
-                            return
-                        try:
-                            chunk = _json.loads(data_str)
-                            delta = chunk.get('choices', [{}])[0].get('delta', {})
-                            content = delta.get('content', '')
-                            if content:
-                                yield content
-                        except (_json.JSONDecodeError, KeyError, IndexError):
-                            continue
-                return  # 正常结束
-            except requests.Timeout as e:
-                last_error = e
-                logger.warning(f'Stream 超时 (attempt {attempt+1}/{MAX_RETRIES})')
-            except requests.RequestException as e:
-                last_error = e
-                logger.warning(f'Stream 请求失败 (attempt {attempt+1}/{MAX_RETRIES}): {e}')
-
-            if attempt < MAX_RETRIES - 1:
-                _retry_sleep(attempt + 1)
-
-        logger.error(f'Stream 最终失败: {last_error}')
-        raise LLMTimeoutError(f'AI 回答超时（已重试 {MAX_RETRIES} 次）：{last_error}')
-
-    # ------------------------------------------------------------------
-    # Chat（流式）— 异步生成器（httpx）
-    # ------------------------------------------------------------------
-    async def chat_stream_async(
-        self,
-        messages: List[dict],
-        model: str = None,
-        temperature: float = 0.3,
-        max_tokens: int = 2048,
-    ) -> AsyncGenerator[str, None]:
-        """
-        流式对话（异步），逐 token yield 文本。
-        适合 Django AsyncStreamingHttpResponse（生产环境推荐）。
-
-        需要: pip install httpx
-
-        Args:
-            messages: 消息列表
-            model: 模型名
-            temperature: 生成温度
-            max_tokens: 最大 token 数
-        """
-        if not self.chat_api_key:
-            for char in self._mock_chat(messages):
-                yield char
-            return
-
-        import json as _json
-
-        try:
-            import httpx
-        except ImportError:
-            logger.error('httpx 未安装，回退到同步 mock')
-            for char in self._mock_chat(messages):
-                yield char
-            return
-
-        last_error = None
-        for attempt in range(MAX_RETRIES):
-            try:
-                async with httpx.AsyncClient(timeout=120.0) as client:
-                    async with client.stream(
-                        'POST',
-                        f'{self.chat_base_url}/v1/chat/completions',
-                        headers=self.chat_headers,
-                        json={
-                            'model': model or QWEN_CHAT_MODEL,
-                            'messages': messages,
-                            'temperature': temperature,
-                            'max_tokens': max_tokens,
-                            'stream': True,
-                        },
-                    ) as resp:
-                        resp.raise_for_status()
-                        async for line in resp.aiter_lines():
-                            if not line or line.startswith(':'):
-                                continue
-                            if line.startswith('data: '):
-                                data_str = line[6:]
-                                if data_str.strip() == '[DONE]':
-                                    return
-                                try:
-                                    chunk = _json.loads(data_str)
-                                    delta = chunk.get('choices', [{}])[0].get('delta', {})
-                                    content = delta.get('content', '')
-                                    if content:
-                                        yield content
-                                except (_json.JSONDecodeError, KeyError, IndexError):
-                                    continue
-                return
-            except Exception as e:
-                last_error = e
-                logger.warning(f'Async stream 失败 (attempt {attempt+1}/{MAX_RETRIES}): {e}')
-
-            if attempt < MAX_RETRIES - 1:
-                _retry_sleep(attempt + 1)
-
-        logger.error(f'Async stream 最终失败: {last_error}')
-        for char in self._mock_chat(messages):
-            yield char
-
-    @staticmethod
-    def _mock_chat(messages: List[dict]) -> str:
-        """开发阶段 Mock 对话"""
-        last_msg = messages[-1]['content'] if messages else ''
-        return f'[Mock LLM Response] 您的问题是：「{last_msg[:50]}...」。当前为开发模式，请配置 QWEN_API_KEY 后获取真实回答。'
-
-    @staticmethod
-    def _mock_stream(messages: List[dict]) -> Generator[str, None, None]:
-        """开发阶段 Mock 流式对话"""
-        text = LLMClient._mock_chat(messages)
-        for char in text:
-            yield char
+    async def chat_stream_async(self, messages, model=None, temperature=0.3, max_tokens=2048):
+        async for token in self._provider.chat_stream_async(messages, model=model, temperature=temperature, max_tokens=max_tokens):
+            yield token
 
 
 # 全局单例
