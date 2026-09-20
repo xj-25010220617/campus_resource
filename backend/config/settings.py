@@ -194,14 +194,14 @@ QWEN_CHAT_MODEL = config('QWEN_CHAT_MODEL', default=config('DEEPSEEK_CHAT_MODEL'
 QWEN_VL_MODEL = config('QWEN_VL_MODEL', default='qwen-vl-plus')
 
 # Embedding 后端切换（aliyun / local / mock）
-EMBED_BACKEND = config('EMBED_BACKEND', default='aliyun')
+EMBED_BACKEND = config('EMBED_BACKEND', default='local')
 ALIYUN_EMBED_API_KEY = config('ALIYUN_EMBED_API_KEY', default='')
 ALIYUN_EMBED_MODEL = config('ALIYUN_EMBED_MODEL', default='text-embedding-v3')
 ALIYUN_EMBED_BASE_URL = config(
     'ALIYUN_EMBED_BASE_URL',
     default='https://dashscope.aliyuncs.com/compatible-mode/v1',
 )
-LOCAL_EMBED_MODEL = config('LOCAL_EMBED_MODEL', default='paraphrase-multilingual-MiniLM-L12-v2')
+LOCAL_EMBED_MODEL = config('LOCAL_EMBED_MODEL', default='BAAI/bge-base-zh-v1.5')
 
 # ------------------------------------------------------------------
 # Milvus / ChromaDB

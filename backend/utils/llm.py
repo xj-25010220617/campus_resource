@@ -41,7 +41,10 @@ ALIYUN_EMBED_BASE_URL = getattr(
 )
 
 # 本地模型（仅 EMBED_BACKEND=local 时生效）
-LOCAL_EMBED_MODEL = getattr(settings, 'LOCAL_EMBED_MODEL', 'paraphrase-multilingual-MiniLM-L12-v2')
+LOCAL_EMBED_MODEL = getattr(settings, 'LOCAL_EMBED_MODEL', 'BAAI/bge-base-zh-v1.5')
+
+# bge-v1.5 系列要求 query 侧加检索前缀，passage 侧不加
+BGE_QUERY_PREFIX = '为这个句子生成表示以用于检索相关文章：'
 
 # 重试配置
 MAX_RETRIES = 3
@@ -125,7 +128,7 @@ class LLMTimeoutError(Exception):
 class LLMClient:
     """DeepSeek Chat + 阿里云百炼 Embedding 封装"""
 
-    VECTOR_DIM = 1024  # text-embedding-v3 维度（1024）
+    VECTOR_DIM = 768  # bge-base-zh-v1.5 维度（768）
 
     def __init__(self):
         self.chat_api_key = QWEN_API_KEY
@@ -150,7 +153,7 @@ class LLMClient:
     # ------------------------------------------------------------------
     # Embedding（文本向量化）
     # ------------------------------------------------------------------
-    def embed(self, texts: List[str]) -> List[List[float]]:
+    def embed(self, texts: List[str], is_query: bool = False) -> List[List[float]]:
         """
         文本向量化（多后端自动降级）。
 
@@ -181,7 +184,7 @@ class LLMClient:
 
         # 后端 2: 本地 sentence-transformers
         if EMBED_BACKEND == 'local':
-            result = self._embed_via_local(texts)
+            result = self._embed_via_local(texts, is_query=is_query)
             if result:
                 return result
 
@@ -189,11 +192,13 @@ class LLMClient:
         logger.warning('所有 Embedding 后端不可用，降级为 Mock 向量')
         return self._mock_embed(texts)
 
-    def _embed_via_local(self, texts: List[str]) -> Optional[List[List[float]]]:
+    def _embed_via_local(self, texts: List[str], is_query: bool = False) -> Optional[List[List[float]]]:
         """通过本地 sentence-transformers 模型获取向量。"""
         try:
             from sentence_transformers import SentenceTransformer
             model = SentenceTransformer(LOCAL_EMBED_MODEL)
+            if is_query:
+                texts = [BGE_QUERY_PREFIX + t for t in texts]
             embeddings = model.encode(texts, show_progress_bar=False)
             logger.info(f'本地 Embedding OK: {len(embeddings)}条 dim={embeddings.shape[1]}')
             return embeddings.tolist()
@@ -254,9 +259,9 @@ class LLMClient:
             return all_embeddings
         return None
 
-    def embed_one(self, text: str) -> List[float]:
+    def embed_one(self, text: str, is_query: bool = False) -> List[float]:
         """单条文本向量化"""
-        results = self.embed([text])
+        results = self.embed([text], is_query=is_query)
         return results[0] if results else []
 
     def _mock_embed(self, texts: List[str]) -> List[List[float]]:

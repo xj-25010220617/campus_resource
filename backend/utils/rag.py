@@ -80,8 +80,8 @@ def _cached_embed(question: str) -> Optional[List[float]]:
                 return vec
             del _embedding_cache[question]
 
-    # 未命中，调用真实 API
-    vec = llm_client.embed_one(question)
+    # 未命中，调用真实 API（query 侧加 bge 检索前缀）
+    vec = llm_client.embed_one(question, is_query=True)
     if vec:
         with _embedding_cache_lock:
             # 超过容量限制时淘汰最旧的条目
