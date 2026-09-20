@@ -1295,19 +1295,23 @@ def retrieve(
     results = _filter_by_permission(enriched, user_context)
 
     # 5.5 检索质量监控日志（学校投入使用后用于诊断与告警）
+    # 向量命中率 = 向量命中的去重文档数 / 硬过滤候选数，反映向量通道覆盖率；
+    # 持续偏低说明向量库损坏/维度不匹配/Embedding 失效（曾因中文路径导致全失效）。
+    vector_hit_docs = len({h.get('doc_id') for h in vector_hits if h.get('doc_id')})
+    vector_hit_rate = (vector_hit_docs / len(candidate_ids)) if candidate_ids else 0.0
     if results:
         top3_scores = [round(r.get('score', 0), 3) for r in results[:3]]
         logger.info(
-            '[RAG监控] 候选=%d 向量=%d 关键词=%d 关键词表=%d 分块=%d Rerank后Top3=%s 返回=%d',
-            len(candidate_ids), len(vector_hits), len(keyword_hits),
-            len(keyword_table_hits), len(chunk_hits),
+            '[RAG监控] 候选=%d 向量=%d 向量命中率=%.3f 关键词=%d 关键词表=%d 分块=%d Rerank后Top3=%s 返回=%d',
+            len(candidate_ids), len(vector_hits), vector_hit_rate,
+            len(keyword_hits), len(keyword_table_hits), len(chunk_hits),
             top3_scores, len(results),
         )
     else:
         logger.warning(
-            '[RAG监控] 零召回 q=%s 候选=%d 向量=%d 关键词=%d 关键词表=%d 分块=%d',
+            '[RAG监控] 零召回 q=%s 候选=%d 向量=%d 向量命中率=%.3f 关键词=%d 关键词表=%d 分块=%d',
             question[:50], len(candidate_ids),
-            len(vector_hits), len(keyword_hits),
+            len(vector_hits), vector_hit_rate, len(keyword_hits),
             len(keyword_table_hits), len(chunk_hits),
         )
 
