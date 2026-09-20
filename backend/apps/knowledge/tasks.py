@@ -33,6 +33,19 @@ def _cleanse_for_mysql_utf8mb3(text: str) -> str:
     return ''.join(result)
 
 
+def _build_metadata_fallback_text(doc) -> str:
+    """正文与 OCR 都失败时，用标题/描述/文件名/关键词拼出可检索文本。
+
+    让扫描件等无法抽取正文的文档仍能被标题、文件名、人工关键词检索命中，
+    而不是直接判 failed 变成完全不可检索。
+    """
+    from apps.knowledge.models import Keyword
+
+    phrases = list(Keyword.objects.filter(doc=doc).values_list('phrase', flat=True))
+    parts = [doc.title, doc.description, doc.file_name] + [p for p in phrases]
+    return '\n'.join(p.strip() for p in parts if p and str(p).strip())
+
+
 @shared_task(bind=True, max_retries=2, default_retry_delay=30, ignore_result=True)
 def extract_freshness_task(self, doc_id: int):
     """异步提取文档发布日期。
@@ -160,12 +173,17 @@ def index_document_task(self, doc_id: int):
 
         text = extract_text_from_oss(doc.oss_key, doc.file_type, doc.file_name)
         if not text or not text.strip():
-            logger.warning(f'doc_id={doc_id} 文本提取为空，跳过索引')
-            doc.status = 'failed'
-            doc.index_error = '解析结果为空：未提取到可检索文本'
-            doc.failed_at = timezone.now()
-            doc.save(update_fields=['status', 'index_error', 'failed_at', 'updated_at'])
-            return None
+            # 正文与 OCR 均失败：用元数据（标题/描述/文件名/关键词）兜底，
+            # 保证文档仍能被标题、文件名、关键词检索命中。
+            text = _build_metadata_fallback_text(doc)
+            if not text:
+                logger.warning(f'doc_id={doc_id} 文本提取为空且无可用元数据，跳过索引')
+                doc.status = 'failed'
+                doc.index_error = '解析结果为空且无可用元数据'
+                doc.failed_at = timezone.now()
+                doc.save(update_fields=['status', 'index_error', 'failed_at', 'updated_at'])
+                return None
+            logger.warning(f'doc_id={doc_id} 正文/OCR 均失败，使用元数据兜底索引')
 
         # 2. 分块
         doc.status = 'chunking'

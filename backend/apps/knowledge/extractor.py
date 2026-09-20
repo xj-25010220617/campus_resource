@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 # 2. Django
+from django.conf import settings
 from django.utils import timezone
 
 # 3. 第三方
@@ -46,31 +47,152 @@ class FreshnessResult:
 # ------------------------------------------------------------------
 # 文本抽取（抽自 config/celery.py 的实现，复用之）
 # ------------------------------------------------------------------
+# ------------------------------------------------------------------
+# 扫描件 OCR（文字层抽取为空时的兜底）
+# ------------------------------------------------------------------
+_easyocr_reader = None
+_easyocr_reader_failed = False
+
+
+def _get_easyocr_reader():
+    """easyocr 懒加载单例：首次 OCR 才下载/加载模型，失败后不再重试。"""
+    global _easyocr_reader, _easyocr_reader_failed
+    if _easyocr_reader is None and not _easyocr_reader_failed:
+        try:
+            import easyocr
+            _easyocr_reader = easyocr.Reader(['ch_sim', 'en'], gpu=False, verbose=False)
+        except Exception as e:
+            logger.error(f'easyocr 初始化失败: {e}')
+            _easyocr_reader_failed = True
+    return _easyocr_reader
+
+
+def _render_page_to_image(page) -> Optional[bytes]:
+    """把 fitz 页面渲染为 PNG 字节（200 DPI，供 OCR）。"""
+    try:
+        pix = page.get_pixmap(dpi=200)
+        return pix.tobytes('png')
+    except Exception as e:
+        logger.warning(f'PDF 页面渲染失败: {e}')
+        return None
+
+
+def _ocr_image_cloud(image_bytes: bytes) -> str:
+    """用 qwen-vl 视觉模型做 OCR（中文识别最准）。"""
+    from utils.llm import image_bytes_to_data_url, llm_client
+
+    data_url = image_bytes_to_data_url(image_bytes)
+    if not data_url:
+        return ''
+
+    prompt = (
+        '请逐字识别这张图片中的全部文字，按原始排版顺序完整输出。'
+        '要求：1. 不要添加任何解释、不要翻译；2. 表格用制表符分隔；'
+        '3. 换行保持原样；4. 图片中没有任何文字时只输出空。'
+    )
+    result = llm_client.chat_vision(prompt, [data_url], temperature=0.0, max_tokens=4000)
+    return (result or '').strip()
+
+
+def _ocr_image_local(image_bytes: bytes) -> str:
+    """本地 easyocr 识别（离线兜底）。"""
+    reader = _get_easyocr_reader()
+    if reader is None:
+        return ''
+
+    import io
+    import numpy as np
+    from PIL import Image
+
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+        arr = np.asarray(img)
+        results = reader.readtext(arr, detail=0, paragraph=True)
+        return '\n'.join(str(t) for t in results).strip()
+    except Exception as e:
+        logger.warning(f'easyocr 识别失败: {e}')
+        return ''
+
+
+def _ocr_image(image_bytes: bytes) -> str:
+    """单页 OCR：云端优先（精准），失败回退本地 easyocr。"""
+    text = _ocr_image_cloud(image_bytes)
+    if text:
+        return text
+    logger.info('云端 OCR 返回空，回退本地 easyocr')
+    return _ocr_image_local(image_bytes)
+
+
+def _ocr_pdf(file_path: str) -> str:
+    """扫描件 PDF：逐页渲染为图并 OCR，返回拼接文本。"""
+    import fitz
+
+    max_pages = int(getattr(settings, 'OCR_MAX_PAGES', 20))
+    try:
+        doc = fitz.open(file_path)
+    except Exception as e:
+        logger.error(f'OCR 打开 PDF 失败: {e}')
+        return ''
+
+    parts = []
+    try:
+        total_pages = doc.page_count
+        for i, page in enumerate(doc):
+            if i >= max_pages:
+                logger.warning(
+                    f'PDF 共 {total_pages} 页，超过 OCR 上限 {max_pages}，仅识别前 {max_pages} 页'
+                )
+                break
+            img_bytes = _render_page_to_image(page)
+            if not img_bytes:
+                continue
+            text = _ocr_image(img_bytes)
+            if text:
+                parts.append(text)
+    finally:
+        doc.close()
+    return '\n'.join(parts).strip()
+
+
 def _parse_pdf(file_path: str) -> str:
-    # 先尝试 PyMuPDF（性能更好）
+    # 1. 先抽文字层（PyMuPDF，性能最好）
+    text = ''
     try:
         import fitz  # PyMuPDF
         doc = fitz.open(file_path)
         text = ''.join(page.get_text() + '\n' for page in doc)
         doc.close()
-        return text
     except Exception:
         pass
 
-    # 回退到 pdfplumber
+    min_chars = int(getattr(settings, 'OCR_MIN_TEXT_CHARS', 20))
+    if text and len(text.strip()) >= min_chars:
+        return text
+
+    # 2. 文字层为空/过少 → 扫描件，走 OCR（渲染页面 → 云端/本地识别）
+    if text.strip():
+        logger.info(f'PDF 文字层仅 {len(text.strip())} 字，尝试 OCR 补全')
+    else:
+        logger.info('PDF 无文字层，尝试 OCR 识别扫描件')
+    ocr_text = _ocr_pdf(file_path)
+    if ocr_text:
+        return ocr_text
+
+    # 3. OCR 也失败，回退 pdfplumber 再抽一次文字层（兼容部分 fitz 抽不出但 pdfplumber 能抽出的 PDF）
     try:
         import pdfplumber
-        text = ''
+        out = ''
         with pdfplumber.open(file_path) as pdf:
-            # 移除页数限制，读取全部内容
             for page in pdf.pages:
                 t = page.extract_text()
                 if t:
-                    text += t + '\n'
-        return text
+                    out += t + '\n'
+        if out.strip():
+            return out
     except Exception as e:
         logger.warning(f'PDF 解析失败: {e}')
-        return ''
+
+    return text
 
 
 def _parse_docx(file_path: str) -> str:
