@@ -61,6 +61,7 @@ def crawl_neusoft_website_task(
     uploader_id: int = 1,
     college_id: Optional[int] = None,
     discipline_id: int = None,
+    download_files: Optional[bool] = None,
 ):
     """
     爬取成都东软学院官网并索引到知识库。
@@ -70,6 +71,7 @@ def crawl_neusoft_website_task(
         uploader_id: 上传者用户 ID
         college_id: 所属学院 ID（默认 None=校级公开）
         discipline_id: 学科方向 ID（可选，默认自动推断）
+        download_files: 是否下载文档类附件（None=取设置 CRAWLER_DOWNLOAD_FILES）
     """
     from utils.crawler import crawl_and_index
 
@@ -79,6 +81,7 @@ def crawl_neusoft_website_task(
             uploader_id=uploader_id,
             college_id=college_id,
             discipline_id=discipline_id,
+            download_files=download_files,
         )
         logger.info(f'官网爬取任务完成: 保存 {saved} 篇文档')
         return saved

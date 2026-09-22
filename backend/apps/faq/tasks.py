@@ -261,7 +261,8 @@ def generate_faq_from_website(self, log_id=None, max_pages=None, max_docs=None):
         log = FAQGenerationLog.objects.create(status='running')
 
     try:
-        saved_count = crawl_and_index(max_pages=max_pages)
+        # FAQ 生成只需页面文本，显式关闭附件下载，避免每周任务重复下载全部附件
+        saved_count = crawl_and_index(max_pages=max_pages, download_files=False)
         docs = list(
             KnowledgeDoc.objects.filter(
                 source_type='website', visibility='public', status__in=['uploaded', 'indexed'],

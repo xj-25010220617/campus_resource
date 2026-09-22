@@ -321,6 +321,35 @@ class OSSClient:
             return False
 
     # ------------------------------------------------------------------
+    # 二进制直传（后端 PUT Object，官网爬虫附件下载等场景）
+    # ------------------------------------------------------------------
+    def upload_bytes(self, content: bytes, oss_key: str, content_type: str = '') -> bool:
+        """
+        将二进制内容直接上传到 OSS（后端直传）。
+
+        Args:
+            content: 二进制内容
+            oss_key: OSS 对象 Key
+            content_type: Content-Type；空则按 oss_key 扩展名推断（guess_content_type）
+
+        Returns:
+            True 表示上传成功，False 表示失败
+        """
+        if not self.bucket:
+            logger.error('OSS Bucket 未初始化，无法上传二进制内容')
+            return False
+        try:
+            self.bucket.put_object(
+                oss_key, content,
+                headers={'Content-Type': content_type or guess_content_type(oss_key)},
+            )
+            logger.info(f'二进制上传成功 oss_key={oss_key}, size={len(content)} bytes')
+            return True
+        except Exception as e:
+            logger.error(f'OSS 二进制上传失败 oss_key={oss_key}: {e}')
+            return False
+
+    # ------------------------------------------------------------------
     # 文件删除
     # ------------------------------------------------------------------
     def delete(self, oss_key: str) -> bool:

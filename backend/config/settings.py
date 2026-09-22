@@ -286,6 +286,15 @@ FAQ_WEBSITE_MAX_DOCS = config('FAQ_WEBSITE_MAX_DOCS', default=20, cast=int)
 NEUSOFT_WEBSITE_URL = config('NEUSOFT_WEBSITE_URL', default='https://www.neusoft.edu.cn')
 CRAWLER_MAX_PAGES = config('CRAWLER_MAX_PAGES', default=200, cast=int)
 CRAWLER_CRAWL_DELAY = config('CRAWLER_CRAWL_DELAY', default=0.5, cast=float)
+# 附件下载（爬虫扩展）：仅下载可解析的文档类附件，图片/音视频/压缩包不下载
+CRAWLER_DOWNLOAD_FILES = config('CRAWLER_DOWNLOAD_FILES', default=True, cast=bool)
+CRAWLER_FILE_TYPES = config('CRAWLER_FILE_TYPES', default='pdf,doc,docx,xls,xlsx,ppt,pptx,csv,txt,md')
+CRAWLER_MAX_FILE_SIZE_MB = config('CRAWLER_MAX_FILE_SIZE_MB', default=50, cast=int)
+CRAWLER_MAX_FILES = config('CRAWLER_MAX_FILES', default=100, cast=int)
+# 路径含这些关键词且无扩展名的 URL 视为候选附件（如 /system/_content/download.jsp），
+# 下载后按 Content-Type 二次确认；置空禁用
+CRAWLER_FILE_URL_HINTS = config('CRAWLER_FILE_URL_HINTS', default='download')
+CRAWLER_FILE_TIMEOUT = config('CRAWLER_FILE_TIMEOUT', default=60, cast=int)
 
 # ------------------------------------------------------------------
 # 启动健康检查
