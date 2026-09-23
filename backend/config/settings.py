@@ -283,7 +283,7 @@ FAQ_WEBSITE_MAX_DOCS = config('FAQ_WEBSITE_MAX_DOCS', default=20, cast=int)
 # ------------------------------------------------------------------
 # 官网爬虫配置
 # ------------------------------------------------------------------
-NEUSOFT_WEBSITE_URL = config('NEUSOFT_WEBSITE_URL', default='https://www.neusoft.edu.cn')
+NEUSOFT_WEBSITE_URL = config('NEUSOFT_WEBSITE_URL', default='https://www.nsu.edu.cn')
 CRAWLER_MAX_PAGES = config('CRAWLER_MAX_PAGES', default=200, cast=int)
 CRAWLER_CRAWL_DELAY = config('CRAWLER_CRAWL_DELAY', default=0.5, cast=float)
 # 附件下载（爬虫扩展）：仅下载可解析的文档类附件，图片/音视频/压缩包不下载

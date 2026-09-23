@@ -8,9 +8,10 @@
 同时支持附件下载：发现页面中的文档类附件（pdf/doc/xls 等，见 CRAWLER_FILE_TYPES），
 流式下载后经 OSS 直传，创建 KnowledgeDoc(source_type='website') 走与手动上传一致的索引链路。
 
-网站结构（基于 www.neusoft.edu.cn）：
-  列表页: /html/{section_id}/
-  详情页: /html/{section_id}/{date}/content-{number}.html
+网站结构（基于 www.nsu.edu.cn 成都东软学院官网）：
+  栏目列表页: /HTML/{section}/                          （section ∈ news/service/teach/intro/image/dept/recruit）
+  列表翻页页: /HTML/{section}/list_{N}.html
+  文章详情页: /HTML/{section}/article_{N}.html           （新闻类含日期子目录 /HTML/news/{year}/{month}/article_{N}.html）
 """
 import hashlib
 import logging
@@ -39,18 +40,15 @@ def _get_config(key: str, default):
 NEUSOFT_BASE_URL = _get_config("NEUSOFT_WEBSITE_URL", "https://www.nsu.edu.cn")
 CRAWL_DELAY = _get_config("CRAWLER_CRAWL_DELAY", 0.5)
 
-# 重要栏目路径片段
-# www.neusoft.edu.cn 结构（默认站点）+ www.nsu.edu.cn 结构（备用），匹配不区分大小写
+# 重要栏目路径片段（www.nsu.edu.cn 成都东软学院官网结构，匹配不区分大小写）
 IMPORTANT_SECTION_PATHS = [
-    "/html/984/",   # 通知公告（附件最集中）
-    "/html/977/",   # 校园时讯
-    "/html/978/",   # 媒体聚焦
-    "/html/985/",   # 活动讲座
-    "/html/975/",   # 头条新闻
-    "/HTML/service/",   # 通知公告 / 服务指南（nsu.edu.cn）
-    "/HTML/news/",      # 新闻动态
-    "/HTML/media/",     # 媒体关注
-    "/HTML/notice/",    # 通知公告
+    "/HTML/news/",     # 新闻动态
+    "/HTML/service/",  # 服务指南
+    "/HTML/teach/",    # 教学科研
+    "/HTML/intro/",    # 学校概况
+    "/HTML/image/",    # 影像东软
+    "/HTML/dept/",     # 院系设置
+    "/HTML/recruit/",  # 招生就业
 ]
 
 # 不需要爬取的路径片段（附件、外链等）
@@ -213,7 +211,7 @@ def _normalize_url(href: str, base: str) -> Optional[str]:
     full = urljoin(base, href)
     # 只保留同域链接（或子域）
     parsed = urlparse(full)
-    if not parsed.netloc.endswith("neusoft.edu.cn"):
+    if not parsed.netloc.endswith("nsu.edu.cn"):
         return None
     # 去掉 fragment
     clean = full.split("#")[0]
@@ -229,18 +227,22 @@ def _is_excluded(url: str) -> bool:
 
 
 def _is_detail_page(url: str) -> bool:
-    """判断是否为文章详情页（而非列表页/首页）。"""
-    return bool(re.search(r"/content-\d+\.html", url))
+    """判断是否为文章详情页（而非列表页/首页）。
+
+    nsu.edu.cn 详情页：/HTML/{section}/article_{N}.html
+    （新闻类含日期子目录，如 /HTML/news/2026/09/article_4924.html）
+    """
+    return bool(re.search(r"/article_\d+\.html", url, re.IGNORECASE))
 
 
 def _is_section_page(url: str) -> bool:
-    """判断是否为栏目列表页。"""
-    return bool(re.search(r"/html/\d+/$", url, re.IGNORECASE))
+    """判断是否为栏目列表页（/HTML/{section}/）。"""
+    return bool(re.search(r"/HTML/[a-z]+/$", url, re.IGNORECASE))
 
 
 def _is_page_list(url: str) -> bool:
-    """判断是否为列表翻页页（/html/{id}/list-N.html）。"""
-    return bool(re.search(r"/list-\d+\.html$", url, re.IGNORECASE))
+    """判断是否为列表翻页页（/HTML/{section}/list_N.html）。"""
+    return bool(re.search(r"/list_\d+\.html$", url, re.IGNORECASE))
 
 
 def _is_important_section(url: str) -> bool:
