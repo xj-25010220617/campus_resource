@@ -151,8 +151,10 @@ class MilvusClient:
               'chunk_text': str, 'page_number': int, 'seq_order': int,
               'score': float}, ...]
         """
-        if not self._connected:
-            self.connect()
+        # 集合不可用（不存在且创建失败）时降级为空结果，交由上层关键词检索兜底，
+        # 避免 Milvus 为空/损坏时把 SchemaNotReadyException 等裸异常抛给调用方。
+        if not self.ensure_collection():
+            return []
         return self._search_milvus(query_embedding, top_k, filter_ids)
 
     def _search_milvus(
@@ -162,36 +164,41 @@ class MilvusClient:
         filter_ids: Optional[List[int]],
     ) -> List[dict]:
         from pymilvus import Collection
-        collection = Collection(name=self.COLLECTION_NAME)
-        collection.load()
+        try:
+            collection = Collection(name=self.COLLECTION_NAME)
+            collection.load()
 
-        expr = None
-        if filter_ids:
-            valid_ids = [d for d in filter_ids if d > 0]
-            if valid_ids:
-                expr = f'doc_id in {valid_ids}'
+            expr = None
+            if filter_ids:
+                valid_ids = [d for d in filter_ids if d > 0]
+                if valid_ids:
+                    expr = f'doc_id in {valid_ids}'
 
-        results = collection.search(
-            data=[query_embedding],
-            anns_field='embedding',
-            param={'metric_type': 'COSINE'},
-            limit=top_k,
-            expr=expr,
-            output_fields=['vector_id', 'doc_id', 'chunk_index',
-                           'chunk_text', 'page_number', 'seq_order'],
-        )
-        hits = []
-        for hit in results[0]:
-            hits.append({
-                'vector_id': hit.entity.get('vector_id'),
-                'doc_id': hit.entity.get('doc_id'),
-                'chunk_index': hit.entity.get('chunk_index'),
-                'chunk_text': hit.entity.get('chunk_text', ''),
-                'page_number': hit.entity.get('page_number', 0),
-                'seq_order': hit.entity.get('seq_order', 0),
-                'score': hit.score,
-            })
-        return hits
+            results = collection.search(
+                data=[query_embedding],
+                anns_field='embedding',
+                param={'metric_type': 'COSINE'},
+                limit=top_k,
+                expr=expr,
+                output_fields=['vector_id', 'doc_id', 'chunk_index',
+                               'chunk_text', 'page_number', 'seq_order'],
+            )
+            hits = []
+            for hit in results[0]:
+                hits.append({
+                    'vector_id': hit.entity.get('vector_id'),
+                    'doc_id': hit.entity.get('doc_id'),
+                    'chunk_index': hit.entity.get('chunk_index'),
+                    'chunk_text': hit.entity.get('chunk_text', ''),
+                    'page_number': hit.entity.get('page_number', 0),
+                    'seq_order': hit.entity.get('seq_order', 0),
+                    'score': hit.score,
+                })
+            return hits
+        except Exception as e:
+            # 检索异常（collection 不存在/未加载等）降级为空结果，不阻断上层关键词兜底
+            logger.warning('Milvus 搜索失败，降级为空结果: %s', e)
+            return []
 
     # ------------------------------------------------------------------
     # 删除向量
