@@ -94,7 +94,7 @@ def image_bytes_to_data_url(image_bytes: bytes, max_size: int = 1280, quality: i
 class LLMClient:
     """Embedding + Chat 门面：Embedding 自持多后端，Chat 委托给 LLMProvider。"""
 
-    VECTOR_DIM = 768  # bge-base-zh-v1.5 维度（768）
+    VECTOR_DIM = getattr(settings, 'EMBED_VECTOR_DIM', 768)  # 唯一事实源见 settings.EMBED_VECTOR_DIM
 
     def __init__(self):
         self.embed_api_key = ALIYUN_EMBED_API_KEY

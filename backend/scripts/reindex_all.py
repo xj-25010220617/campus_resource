@@ -80,12 +80,15 @@ def rebuild_collection() -> bool:
 
 
 def milvus_is_empty() -> bool:
-    """判断 Milvus 是否为空：collection 不存在，或向量数为 0。
+    """判断 Milvus 是否需要重建：collection 不存在、向量数为 0，或维度与当前
+    Embedding 配置不兼容（旧后端创建的集合，插入会报 expected dim X, got Y）。
 
     CI/CD 用 --if-empty 调用时据此决定是否重建；判断过程异常时返回 True
     （按空处理），交由后续 rebuild_collection 重连并给出最终结论（连不上会非零退出）。
     """
     from pymilvus import Collection, utility
+
+    from utils.milvus import milvus_client
 
     try:
         milvus_client.connect()
@@ -94,7 +97,16 @@ def milvus_is_empty() -> bool:
         name = milvus_client.COLLECTION_NAME
         if not utility.has_collection(name):
             return True
-        return Collection(name).num_entities == 0
+        if Collection(name).num_entities == 0:
+            return True
+        existing_dim = milvus_client.get_collection_dim()
+        if existing_dim is not None and existing_dim != milvus_client.VECTOR_DIM:
+            logger.warning(
+                'Milvus 集合维度 %d 与当前 Embedding 配置 %d 维不一致，需重建',
+                existing_dim, milvus_client.VECTOR_DIM,
+            )
+            return True
+        return False
     except Exception as e:
         logger.warning('判断 Milvus 是否为空失败，按空处理: %s', e)
         return True
@@ -162,7 +174,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='全量重索引 Milvus 知识库')
     parser.add_argument(
         '--if-empty', action='store_true',
-        help='仅当 Milvus 为空时才重建（供 CI/CD 部署安全调用，已有数据时自动跳过，不重复灌库）',
+        help='仅当 Milvus 为空或维度与当前 Embedding 配置不兼容时才重建'
+             '（供 CI/CD 部署安全调用，已有兼容数据时自动跳过，不重复灌库）',
     )
     args = parser.parse_args()
 

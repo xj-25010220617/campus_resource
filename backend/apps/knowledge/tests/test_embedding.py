@@ -7,9 +7,20 @@ from django.test import SimpleTestCase
 
 
 class TestEmbedding(SimpleTestCase):
-    def test_vector_dim_768(self):
+    def test_vector_dim_matches_settings(self):
+        """VECTOR_DIM 必须与 settings.EMBED_VECTOR_DIM（由 EMBED_BACKEND 派生）一致。
+
+        历史教训：维度曾在 milvus.py / llm.py 各自硬编码 768，与服务器实际使用的
+        阿里云 text-embedding-v3（1024 维）不一致，导致全部插入报
+        MilvusException: expected dim 768, got 1024，文档索引静默卡死。
+        """
+        from django.conf import settings
+
         from utils.llm import LLMClient
-        assert LLMClient.VECTOR_DIM == 768
+        from utils.milvus import MilvusClient
+
+        assert LLMClient.VECTOR_DIM == settings.EMBED_VECTOR_DIM
+        assert MilvusClient.VECTOR_DIM == settings.EMBED_VECTOR_DIM
 
     def test_query_prefix_constant(self):
         from utils.llm import BGE_QUERY_PREFIX

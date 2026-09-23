@@ -206,6 +206,16 @@ ALIYUN_EMBED_BASE_URL = config(
     default='https://dashscope.aliyuncs.com/compatible-mode/v1',
 )
 LOCAL_EMBED_MODEL = config('LOCAL_EMBED_MODEL', default='BAAI/bge-base-zh-v1.5')
+
+# 向量维度：必须与 Embedding 后端实际输出一致，否则 Milvus 写入报维度不匹配
+# （MilvusException: expected dim X, got Y）导致文档永远到不了 indexed 状态。
+# 默认由 EMBED_BACKEND 派生：aliyun text-embedding-v3=1024；local bge-base-zh-v1.5 / mock=768。
+# 更换其他维度的模型时在 .env 用 EMBED_VECTOR_DIM 显式覆盖，并运行 reindex_all 重建向量库。
+_EMBED_DIM_BY_BACKEND = {'aliyun': 1024, 'local': 768, 'mock': 768}
+EMBED_VECTOR_DIM = int(config(
+    'EMBED_VECTOR_DIM',
+    default=_EMBED_DIM_BY_BACKEND.get(EMBED_BACKEND, 768),
+))
 # HuggingFace 下载镜像（国内直连 huggingface.co 不通时走 hf-mirror.com）
 # 需在 import huggingface_hub / sentence_transformers 之前写入环境变量，故在此导出
 _hf_endpoint = config('HF_ENDPOINT', default='')

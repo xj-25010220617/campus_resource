@@ -19,7 +19,9 @@ class MilvusClient:
     """
 
     COLLECTION_NAME = 'campus_knowledge'
-    VECTOR_DIM = 768  # bge-base-zh-v1.5 维度
+    # 向量维度唯一事实源：settings.EMBED_VECTOR_DIM（由 EMBED_BACKEND 派生，可 env 覆盖）。
+    # 禁止在各处硬编码维度——Embedding 后端与集合维度不一致时插入必然失败。
+    VECTOR_DIM = getattr(settings, 'EMBED_VECTOR_DIM', 768)
 
     def __init__(self):
         self._connected = False
@@ -53,6 +55,23 @@ class MilvusClient:
     def connected(self) -> bool:
         return self._connected
 
+    def get_collection_dim(self) -> Optional[int]:
+        """读取现有 collection 的向量维度；集合不存在或读取失败时返回 None。
+
+        供维度一致性校验使用（ensure_collection 守卫、reindex_all --if-empty 守卫）。
+        """
+        try:
+            from pymilvus import Collection, utility
+
+            if not utility.has_collection(self.COLLECTION_NAME):
+                return None
+            for field in Collection(name=self.COLLECTION_NAME).schema.fields:
+                if field.name == 'embedding':
+                    return int(field.params.get('dim', 0)) or None
+        except Exception as e:
+            logger.warning(f'读取 Milvus 集合维度失败: {e}')
+        return None
+
     # ------------------------------------------------------------------
     # Collection 管理
     # ------------------------------------------------------------------
@@ -66,6 +85,17 @@ class MilvusClient:
             from pymilvus import Collection, CollectionSchema, FieldSchema, DataType, utility
 
             if utility.has_collection(self.COLLECTION_NAME):
+                existing_dim = self.get_collection_dim()
+                if existing_dim is not None and existing_dim != self.VECTOR_DIM:
+                    # 集合是旧 Embedding 配置下创建的，直接插入会报
+                    # "expected dim X, got Y"。明确拒绝并给出修复动作，
+                    # 避免文档索引静默卡死在 embedding 阶段。
+                    logger.error(
+                        'Milvus 集合 "%s" 维度为 %d，与当前 Embedding 配置的 %d 维不一致；'
+                        '请运行 python scripts/reindex_all.py 重建向量库',
+                        self.COLLECTION_NAME, existing_dim, self.VECTOR_DIM,
+                    )
+                    return False
                 return True
 
             fields = [
@@ -106,9 +136,21 @@ class MilvusClient:
             chunks: [{'vector_id': str, 'doc_id': int, 'chunk_index': int,
                       'chunk_text': str, 'page_number': int, 'seq_order': int}, ...]
             embeddings: [[0.1, 0.2, ...], ...]
-        返回:
-            vector_id 列表
+        返回 vector_id 列表
         """
+        if not self.ensure_collection():
+            # 集合不可用（连接失败 / 维度与 Embedding 配置不匹配）：快速失败，
+            # 让 index_document_task 记录明确原因而不是插入时的裸 MilvusException。
+            raise RuntimeError(
+                'Milvus 集合不可用：连接失败，或集合维度与当前 Embedding 配置不一致'
+                '（请运行 python scripts/reindex_all.py 重建向量库）'
+            )
+        if embeddings and len(embeddings[0]) != self.VECTOR_DIM:
+            raise ValueError(
+                f'Embedding 后端产出 {len(embeddings[0])} 维向量，与配置的集合维度 '
+                f'{self.VECTOR_DIM} 维不一致：请检查 EMBED_BACKEND / EMBED_VECTOR_DIM 配置，'
+                '或运行 python scripts/reindex_all.py 重建向量库'
+            )
         if not self._connected:
             self.connect()
         return self._insert_milvus(chunks, embeddings)
