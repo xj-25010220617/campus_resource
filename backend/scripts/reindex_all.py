@@ -41,12 +41,21 @@ logging.getLogger('urllib3').setLevel(logging.WARNING)
 
 
 def _reindex_doc(doc_id: int):
-    """同步调用 index_document_task，兼容 Celery(bind=True) 与本地降级两种模式。"""
+    """同步调用 index_document_task，兼容真实 Celery 与本地降级两种模式。
+
+    - 真实 Celery：用 .apply(args=..., throw=True) 同步执行，bind=True 的 self
+      由 Celery 正确注入，任务内异常向上抛（重灌循环据此计 FAIL）。
+      注意不能用旧写法 .run(None, doc_id)：新版 Celery 的 task.run 已绑定
+      task 实例，再传 None 会多出一个位置参数，报
+      TypeError: index_document_task() takes 2 positional arguments but 3 were given
+      （2026-09-23 重灌全灭的直接原因）。
+    - 本地降级（未装 celery）：task 无 .apply，走 .delay 同步兼容层
+      （shared_task_compat 会自动补 None 占位 self）。
+    """
     from apps.knowledge.tasks import index_document_task
 
-    # Celery 模式：task.run(None, doc_id) 同步执行；降级模式无 .run，走 .delay
-    if hasattr(index_document_task, 'run'):
-        return index_document_task.run(None, doc_id)
+    if hasattr(index_document_task, 'apply'):
+        return index_document_task.apply(args=(doc_id,), throw=True)
     return index_document_task.delay(doc_id)
 
 

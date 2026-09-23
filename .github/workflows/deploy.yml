@@ -19,6 +19,12 @@ jobs:
           # torch/nvidia CUDA 依赖单个 wheel 达数百 MB，10 分钟默认超时不够
           command_timeout: 30m
           script: |
+            # 串行化部署：GitHub 偶发会对同一 push 重复触发两条流水线，
+            # 两个部署进程并发访问 Milvus Lite 单文件（嵌入式、不支持多进程并发）
+            # 会导致重灌互相踩踏；这里用 flock 排队，最多等 15 分钟
+            exec 9>/tmp/campus_deploy.lock
+            flock -w 900 9 || { echo "等待另一部署实例超时"; exit 1; }
+
             # 进入项目目录
             cd /www/wwwroot/campus_resource
 

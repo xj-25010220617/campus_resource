@@ -101,8 +101,12 @@ def index_all_docs():
         doc_start = time.time()
 
         try:
-            # 同步调用 index_document_task（使用 .run() 绕过 Celery __call__）
-            index_document_task.run(None, doc.id)
+            # 同步调用 index_document_task（.apply 同步执行；.run(None, ...) 在新版
+            # Celery 会因 run 已绑定 task 实例而多传一个位置参数，见 reindex_all._reindex_doc）
+            if hasattr(index_document_task, 'apply'):
+                index_document_task.apply(args=(doc.id,), throw=True)
+            else:
+                index_document_task.delay(doc.id)
             elapsed = time.time() - doc_start
 
             # 重新读取确认状态

@@ -22,7 +22,11 @@ print(f'3. 待索引: {uploaded.count()} 个文档')
 for doc in uploaded[:3]:
     print(f'   索引 #{doc.id}: {doc.title[:40]}...', end=' ')
     try:
-        index_document_task.run(None, doc.id)
+        # .apply 同步执行；.run(None, ...) 在新版 Celery 会多传一个位置参数
+        if hasattr(index_document_task, 'apply'):
+            index_document_task.apply(args=(doc.id,), throw=True)
+        else:
+            index_document_task.delay(doc.id)
         doc.refresh_from_db()
         print(f'-> {doc.status}')
     except Exception as e:
