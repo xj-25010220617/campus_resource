@@ -43,13 +43,44 @@ jobs:
             # 执行数据库迁移（含 admin_panel 审计表）
             python manage.py migrate
 
-            # Milvus 向量库为空时自动重灌：先停后端，避免 reindex 与运行中的后端
-            # 并发访问 Milvus Lite 文件（嵌入式单进程，不支持多进程并发），灌完再启动。
-            # --if-empty 保证已有数据时跳过；失败不阻断部署（后端仍会启动），但打印醒目告警。
-            systemctl stop campus-backend || true
-            python scripts/reindex_all.py --if-empty || echo "⚠️ Milvus 重索引失败，请登录服务器手动执行：python scripts/reindex_all.py"
-            systemctl start campus-backend
+            # ⚠️ 一次性修复（重灌完成后请删除这两行）：上一次部署的重灌在 SSH 会话内
+            # 同步执行，被 30 分钟 command_timeout 掐死，留下部分向量数据但没有
+            # 中断标记（旧版脚本无标记逻辑）。手动创建标记让本次 --if-empty 强制
+            # 全量重灌；reindex_all.py 正常跑完后会自动删除标记。
+            touch /tmp/campus_reindex_incomplete
 
-            # 健康检查：后端未起来则本次部署失败，避免"部署绿但服务挂"的静默失败
-            sleep 3
-            curl -sf http://127.0.0.1:3000/api/docs/ || { echo "后端启动失败"; exit 1; }
+            # Milvus 向量库自动重灌：改在后台（nohup）执行，不再占用 SSH 会话——
+            # 扫描件 OCR 单篇可达数分钟，全库重灌会超 30 分钟 command_timeout，
+            # 同步执行必被掐死且后端停在停机状态。后台单元灌完自动拉起后端。
+            # 先停后端：reindex 不能与运行中的后端并发访问 Milvus Lite 单文件。
+            # 后台单元持独立 reindex 锁：部署锁早已释放，后续部署的重灌单元在此
+            # 排队（最多 2 小时），不会并发踩踏 Milvus Lite。
+            # 注意：bash -c 内的 exec 9> 会替换继承自父 shell 的部署锁 fd，
+            # 因此部署锁仍会在主脚本退出后正常释放，不会形成死锁。
+            systemctl stop campus-backend || true
+            nohup bash -c '
+              exec 9>/tmp/campus_reindex.lock
+              flock -w 7200 9 || { echo "等待重灌锁超时，放弃本次重灌（后端由正在跑的重灌完成后拉起）"; exit 0; }
+              cd /www/wwwroot/campus_resource/backend
+              source venv/bin/activate
+              python scripts/reindex_all.py --if-empty || echo "⚠️ Milvus 重索引异常退出（exit $?），日志：/tmp/campus_reindex_bg.log"
+              systemctl start campus-backend
+            ' >> /tmp/campus_reindex_bg.log 2>&1 &
+
+            # 健康检查（双条件，满足其一即部署成功）：
+            #   a) 后台重灌正在进行（含排队等待，后端预期停机、灌完自动启动）
+            #   b) 后端已启动（重灌被跳过或已快速完成的场景）
+            # 循环最多 3 分钟，避免"部署绿但服务挂"的静默失败。
+            for i in $(seq 1 36); do
+              if pgrep -f "scripts/reindex_all.py" > /dev/null; then
+                echo "后台重灌进行中（完成后自动启动后端），部署成功"
+                exit 0
+              fi
+              if curl -sf http://127.0.0.1:3000/api/docs/ > /dev/null; then
+                echo "后端健康检查通过"
+                exit 0
+              fi
+              sleep 5
+            done
+            echo "后端未启动且无重灌进程运行，部署失败"
+            exit 1

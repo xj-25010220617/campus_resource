@@ -5,7 +5,8 @@
 会清空旧向量（含孤儿向量），再逐文档重新解析 → 分块 → Embedding → 入库。
 
 用法：
-    cd backend && python scripts/reindex_all.py
+    cd backend && python scripts/reindex_all.py            # 全量重建
+    cd backend && python scripts/reindex_all.py --if-empty # 仅当需要时重建（CI/CD）
 
 流程：
     1. 连接 Milvus（失败即退出）
@@ -13,10 +14,17 @@
     3. 遍历所有 KnowledgeDoc（排除正在上传的会话态），同步调用
        index_document_task 重新索引
     4. 打印进度与结果汇总
+
+中断自愈（2026-09-23）：
+    重灌循环开始前创建标记文件（/tmp/campus_reindex_incomplete），
+    仅在"正常跑完"时删除；被打断（超时/kill/异常）则标记留存。
+    下次 --if-empty 看到标记会强制全量重灌，避免"部分数据
+    （entities>0）让 --if-empty 永久跳过"的陷阱。
 """
 import logging
 import os
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -38,6 +46,10 @@ logger = logging.getLogger(__name__)
 logging.getLogger('pymilvus').setLevel(logging.WARNING)
 logging.getLogger('httpx').setLevel(logging.WARNING)
 logging.getLogger('urllib3').setLevel(logging.WARNING)
+
+# 中断标记：重灌循环开始前创建、正常完成后删除。
+# Linux 服务器上 tempfile.gettempdir() 即 /tmp，本地 Windows 开发环境也能跑通。
+REINDEX_MARKER = os.path.join(tempfile.gettempdir(), 'campus_reindex_incomplete')
 
 
 def _reindex_doc(doc_id: int):
@@ -183,17 +195,39 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='全量重索引 Milvus 知识库')
     parser.add_argument(
         '--if-empty', action='store_true',
-        help='仅当 Milvus 为空或维度与当前 Embedding 配置不兼容时才重建'
+        help='仅当 Milvus 为空、维度不兼容、或上次重灌留有中断标记时才重建'
              '（供 CI/CD 部署安全调用，已有兼容数据时自动跳过，不重复灌库）',
     )
     args = parser.parse_args()
 
-    # CI/CD 守卫：Milvus 已有向量数据时直接跳过
-    if args.if_empty and not milvus_is_empty():
-        print('Milvus 已有向量数据，跳过重索引（--if-empty）。')
-        sys.exit(0)
+    # CI/CD 守卫（--if-empty）：满足任一条件才重建——
+    #   1. Milvus 为空 / 维度与当前 Embedding 配置不兼容（milvus_is_empty）
+    #   2. 上次重灌被中断，标记文件还在（被超时/kill 打断的部分重灌必须续灌，
+    #      否则部分数据 entities>0 会让 --if-empty 永久跳过）
+    marker_existed = os.path.exists(REINDEX_MARKER)
+    if args.if_empty:
+        if not marker_existed and not milvus_is_empty():
+            print('Milvus 已有向量数据且无中断标记，跳过重索引（--if-empty）。')
+            sys.exit(0)
+        if marker_existed:
+            print(f'检测到未完成的重灌中断标记（{REINDEX_MARKER}），将强制全量重灌。')
 
     # 重建失败（Milvus 连不上等）以非零码退出，供部署流水线感知
     if not rebuild_collection():
         sys.exit(1)
-    reindex_all()
+
+    # 标记生命周期：循环前创建，仅在正常完成时删除；
+    # 异常/被杀（KeyboardInterrupt / SystemExit / SIGKILL）则留存，
+    # 下次 --if-empty 强制全量重灌。
+    with open(REINDEX_MARKER, 'w') as f:
+        f.write('reindex started at %s\n' % time.strftime('%Y-%m-%d %H:%M:%S'))
+    try:
+        reindex_all()
+    except BaseException:
+        logger.error(
+            '重灌被中断，标记留存，下次 --if-empty 将强制全量重灌：%s',
+            REINDEX_MARKER,
+        )
+        raise
+    os.remove(REINDEX_MARKER)
+    print('重灌正常完成，中断标记已清除。')
