@@ -25,11 +25,22 @@ jobs:
             exec 9>/tmp/campus_deploy.lock
             flock -w 900 9 || { echo "等待另一部署实例超时"; exit 1; }
 
+            # 清理残留的旧重灌进程（上次部署被掐断/挂起时的遗留，现场恢复第一步）：
+            # 只杀 python 重灌进程（^python 锚定命令行开头，不伤其 bash 宿主单元）；
+            # 其所属 bash 后台单元会顺序走到收尾行 systemctl start campus-backend，
+            # 随后自身退出、释放重灌锁与 pty，挂起的上一条部署 run 也随之结束。
+            # 被杀的重灌会留下中断标记，由本次部署的 --if-empty 强制全量重灌接续。
+            if pkill -f '^python .*reindex_all' 2>/dev/null; then
+              echo "已终止残留的旧重灌进程，等待其后台单元收尾..."
+              sleep 5
+            fi
+
             # 进入项目目录
             cd /www/wwwroot/campus_resource
 
-            # 拉取最新代码
-            git pull origin main
+            # 拉取最新代码（服务器直连 GitHub 间歇慢，5 分钟拉不下来就 fail fast，
+            # 避免无超时保护地挂死整个部署）
+            timeout 300 git pull origin main || { echo "git pull 超时/失败"; exit 1; }
 
             # 进入后端目录
             cd backend
@@ -57,6 +68,8 @@ jobs:
             # 排队（最多 2 小时），不会并发踩踏 Milvus Lite。
             # 注意：bash -c 内的 exec 9> 会替换继承自父 shell 的部署锁 fd，
             # 因此部署锁仍会在主脚本退出后正常释放，不会形成死锁。
+            # stdin 必须重定向 < /dev/null：否则后台进程继承 SSH 会话的 pty stdin，
+            # sshd 要等 pty 引用清零才关闭会话，导致部署 run 挂到重灌结束（超时假死）。
             systemctl stop campus-backend || true
             nohup bash -c '
               exec 9>/tmp/campus_reindex.lock
@@ -65,7 +78,7 @@ jobs:
               source venv/bin/activate
               python scripts/reindex_all.py --if-empty || echo "⚠️ Milvus 重索引异常退出（exit $?），日志：/tmp/campus_reindex_bg.log"
               systemctl start campus-backend
-            ' >> /tmp/campus_reindex_bg.log 2>&1 &
+            ' < /dev/null >> /tmp/campus_reindex_bg.log 2>&1 &
 
             # 健康检查（双条件，满足其一即部署成功）：
             #   a) 后台重灌正在进行（含排队等待，后端预期停机、灌完自动启动）
