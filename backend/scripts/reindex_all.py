@@ -79,6 +79,27 @@ def rebuild_collection() -> bool:
     return True
 
 
+def milvus_is_empty() -> bool:
+    """判断 Milvus 是否为空：collection 不存在，或向量数为 0。
+
+    CI/CD 用 --if-empty 调用时据此决定是否重建；判断过程异常时返回 True
+    （按空处理），交由后续 rebuild_collection 重连并给出最终结论（连不上会非零退出）。
+    """
+    from pymilvus import Collection, utility
+
+    try:
+        milvus_client.connect()
+        if not milvus_client.connected:
+            return True
+        name = milvus_client.COLLECTION_NAME
+        if not utility.has_collection(name):
+            return True
+        return Collection(name).num_entities == 0
+    except Exception as e:
+        logger.warning('判断 Milvus 是否为空失败，按空处理: %s', e)
+        return True
+
+
 def reindex_all():
     from apps.knowledge.models import KnowledgeDoc
 
@@ -136,5 +157,21 @@ def reindex_all():
 
 
 if __name__ == '__main__':
-    if rebuild_collection():
-        reindex_all()
+    import argparse
+
+    parser = argparse.ArgumentParser(description='全量重索引 Milvus 知识库')
+    parser.add_argument(
+        '--if-empty', action='store_true',
+        help='仅当 Milvus 为空时才重建（供 CI/CD 部署安全调用，已有数据时自动跳过，不重复灌库）',
+    )
+    args = parser.parse_args()
+
+    # CI/CD 守卫：Milvus 已有向量数据时直接跳过
+    if args.if_empty and not milvus_is_empty():
+        print('Milvus 已有向量数据，跳过重索引（--if-empty）。')
+        sys.exit(0)
+
+    # 重建失败（Milvus 连不上等）以非零码退出，供部署流水线感知
+    if not rebuild_collection():
+        sys.exit(1)
+    reindex_all()

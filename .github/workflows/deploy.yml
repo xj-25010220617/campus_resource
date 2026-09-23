@@ -33,9 +33,12 @@ jobs:
             # 执行数据库迁移（含 admin_panel 审计表）
             python manage.py migrate
 
-            # 后端由 systemd 托管（campus-backend.service），部署后重启即可，
-            # 进程死亡由 systemd 自动拉起，不再依赖 SSH 会话里的 nohup。
-            systemctl restart campus-backend
+            # Milvus 向量库为空时自动重灌：先停后端，避免 reindex 与运行中的后端
+            # 并发访问 Milvus Lite 文件（嵌入式单进程，不支持多进程并发），灌完再启动。
+            # --if-empty 保证已有数据时跳过；失败不阻断部署（后端仍会启动），但打印醒目告警。
+            systemctl stop campus-backend || true
+            python scripts/reindex_all.py --if-empty || echo "⚠️ Milvus 重索引失败，请登录服务器手动执行：python scripts/reindex_all.py"
+            systemctl start campus-backend
 
             # 健康检查：后端未起来则本次部署失败，避免"部署绿但服务挂"的静默失败
             sleep 3
