@@ -16,6 +16,8 @@ jobs:
           port: ${{ secrets.SSH_PORT }}
           username: ${{ secrets.SSH_USERNAME }}
           key: ${{ secrets.SSH_KEY }}
+          # torch/nvidia CUDA 依赖单个 wheel 达数百 MB，10 分钟默认超时不够
+          command_timeout: 30m
           script: |
             # 进入项目目录
             cd /www/wwwroot/campus_resource
@@ -27,8 +29,10 @@ jobs:
             cd backend
 
             # 激活虚拟环境并安装依赖
+            # 阿里云镜像：服务器为阿里云 ECS，走内网级带宽；教育网源对云主机限速，
+            # torch 的 nvidia CUDA 依赖（cudnn 单包 553MB）曾因此超时
             source venv/bin/activate
-            pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+            pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
 
             # 执行数据库迁移（含 admin_panel 审计表）
             python manage.py migrate
