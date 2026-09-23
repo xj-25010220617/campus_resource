@@ -269,10 +269,12 @@ ASR_DEBUG = True   # 开启后控制台打印 faster-whisper 识别信息，排�
 # ------------------------------------------------------------------
 # 扫描件 OCR（文字层抽取为空时的兜底）
 # ------------------------------------------------------------------
-# 单文档 OCR 页数上限（超过截断，避免扫描件页数过多导致索引超时/费用失控）
+# 单文档 OCR 页数上限（超过截断，避免扫描件页数过多导致索引超时/费用失控）。
+# 注意：超限不再静默成功——解析结果会带 truncated 标记并写入 doc.index_error。
 OCR_MAX_PAGES = config('OCR_MAX_PAGES', default=20, cast=int)
-# 触发 OCR 的文字层字数阈值：低于此字数视为扫描件走 OCR
-OCR_MIN_TEXT_CHARS = config('OCR_MIN_TEXT_CHARS', default=20, cast=int)
+# PDF 逐页判定阈值：单页文字层少于该字数即认为该页没有有效文字，转图片走 OCR。
+# 逐页判定（而非按全文判定）是混合型 PDF 扫描页不被跳过的前提。
+OCR_PAGE_MIN_TEXT_CHARS = config('OCR_PAGE_MIN_TEXT_CHARS', default=20, cast=int)
 
 # FAQ 自动生成配置
 # ------------------------------------------------------------------
