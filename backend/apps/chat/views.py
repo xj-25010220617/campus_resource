@@ -469,10 +469,18 @@ class AskView(APIView):
                     user_role, top_score, len(results), question[:50],
                 )
 
-        # 3.2b 知识库无结果 → 检查未索引文档 + 联网搜索兜底
+        # 3.2b 知识库无结果/低置信 → 检查未索引文档 + 联网搜索兜底
+        #     低置信（有召回但最高分低于阈值）说明命中大概率是泛化内容，直接改用联网结果，
+        #     避免模型据泛化内容对时效性/具体新闻类问题开脑洞编造（如把"与华为合作"脑补成具体获奖）。
         web_search_used = False
         pending_docs = []
-        if not should_refuse and not results and not rag._is_time_question(question):
+        top_score = max((r.get('score', 0) for r in results), default=0.0)
+        low_confidence = bool(results) and top_score < rag.WEB_SEARCH_MIN_SCORE
+        if (
+            not should_refuse
+            and not rag._is_time_question(question)
+            and (not results or low_confidence)
+        ):
             # 区分"文件存在但未索引"和"没有匹配文件"（未索引文档不传给 LLM）
             pending_docs = rag.find_pending_index_docs(question, user_context)
             if pending_docs:
@@ -480,11 +488,17 @@ class AskView(APIView):
                     '知识库存在未索引的匹配文档 %d 个: %s',
                     len(pending_docs), [d['doc_title'] for d in pending_docs],
                 )
-            logger.info('知识库无结果，启动联网搜索兜底: %s', question[:50])
+            logger.info(
+                '知识库无结果或低置信(top=%.3f)，启动联网搜索兜底: %s',
+                top_score, question[:50],
+            )
             from utils.web_search import search_school
             search_results = search_school(question, max_results=5)
             if search_results:
                 web_search_used = True
+                if low_confidence:
+                    # 低分召回是泛化内容，丢弃，避免干扰模型；联网结果作唯一事实来源
+                    results[:] = []
                 for sr in search_results:
                     results.append({
                         'doc_id': 0,
@@ -498,7 +512,7 @@ class AskView(APIView):
                         'page': 0,
                         'source_type': 'web_search',
                     })
-                logger.info('联网搜索兜底命中 %d 条', len(results))
+                logger.info('联网搜索兜底命中 %d 条', len(search_results))
             else:
                 logger.info('联网搜索也无结果')
 

@@ -256,6 +256,10 @@ CONTEXT_MAX_CHARS = 8000
 ADMIN_MIN_SCORE = 0.5  # 管理员最低可答分数阈值：知识库无命中或最高分低于此值拒答
 ADMIN_ROLES = {'super_admin', 'admin', 'college_admin', 'dept_admin'}
 
+# 普通用户联网兜底阈值：知识库最高分低于此值视为"低置信"（命中大概率是泛化内容），
+# 触发联网搜索兜底，用真实网页结果压住幻觉（时效性/具体新闻类问题受益最大）。
+WEB_SEARCH_MIN_SCORE = 0.5
+
 
 def is_strict_role(role: str) -> bool:
     """管理员等需精准引用的角色返回 True，学生（user）返回 False。"""
