@@ -266,10 +266,15 @@ def extract_text_from_html(html: str, url: str = "") -> dict:
     soup = BeautifulSoup(html, "lxml")
     result = {"title": "", "publish_date": "", "content": ""}
 
-    # 1. 标题
-    title_tag = soup.find("h1") or soup.find("h2") or soup.find("title")
+    # 1. 标题：h1/h2 → 官网文章标题容器 div.h-1（首个非空）→ <title>
+    title_tag = soup.find("h1") or soup.find("h2")
     if title_tag:
         result["title"] = title_tag.get_text(strip=True)
+    if not result["title"]:
+        for d in soup.find_all("div", class_="h-1"):
+            if d.get_text(strip=True):
+                result["title"] = d.get_text(strip=True)
+                break
     # 用 <title> 兜底
     if not result["title"] and soup.title:
         result["title"] = soup.title.get_text(strip=True)
@@ -285,6 +290,13 @@ def extract_text_from_html(html: str, url: str = "") -> dict:
         if tag:
             result["publish_date"] = tag.get_text(strip=True)
             break
+    # 官网文章日期条：div.h-2（如 "2026年9月4日编辑：…来源：…"）
+    if not result["publish_date"]:
+        for d in soup.find_all("div", class_="h-2"):
+            date_match = re.search(r"(\d{4}[-/年]\d{1,2}[-/月]\d{1,2}[日]?)", d.get_text())
+            if date_match:
+                result["publish_date"] = date_match.group(1)
+                break
     # 正则兜底（常见时间格式）
     if not result["publish_date"]:
         date_match = re.search(
@@ -294,19 +306,22 @@ def extract_text_from_html(html: str, url: str = "") -> dict:
         if date_match:
             result["publish_date"] = date_match.group(1)
 
-    # 3. 正文 - 尝试多种选择器
+    # 3. 正文 - 尝试多种选择器（text_ 为官网文章正文容器，优先级最高）
+    # 注意：不含 class="main"——nsu.edu.cn 的 div.main 是导航容器而非正文
     content_selectors = [
+        {"class_": "text_"},
         {"class_": "content"},
         {"class_": "article"},
         {"class_": "detail"},
-        {"class_": "main"},
         {"class_": re.compile(r"article|content|detail", re.I)},
         {"id": re.compile(r"article|content|detail", re.I)},
     ]
     content_div = None
     for sel in content_selectors:
-        content_div = soup.find("div", **sel)
-        if content_div:
+        div = soup.find("div", **sel)
+        # 容器须有实际文本才采用，避免空壳/导航容器截断兜底链路
+        if div and len(div.get_text(strip=True)) >= 30:
+            content_div = div
             break
 
     if content_div:
@@ -319,6 +334,13 @@ def extract_text_from_html(html: str, url: str = "") -> dict:
         body = soup.find("body")
         if body:
             for tag in body.find_all(["script", "style", "nav", "footer", "header"]):
+                tag.decompose()
+            # 官网导航用 div.nav 系列构建（非 <nav> 标签），一并剔除避免兜底抓到菜单文字；
+            # 按完整 class token 匹配，保留 main-content 等真实内容容器
+            for tag in body.find_all(
+                "div",
+                class_=re.compile(r"^(nav|menu|footer|header)(_|-|$)|^main$", re.I),
+            ):
                 tag.decompose()
             paragraphs = body.find_all("p")
             texts = [p.get_text(strip=True) for p in paragraphs if p.get_text(strip=True)]
@@ -518,17 +540,12 @@ class NeusoftSpider:
         logger.info(f"开始全站爬取: max_pages={max_pages}")
         all_results = []
 
-        # 1. 获取首页 HTML（一次性：用于内容提取 + 栏目链接提取）
+        # 1. 获取首页 HTML（一次性：用于栏目链接提取；首页为导航枢纽，
+        #    正文多为栏目标题而非知识内容，不作文档入库）
         html = self._fetch(self.base_url)
         if not html:
             logger.warning("无法获取首页 HTML，终止爬取")
             return []
-
-        # 解析首页内容
-        extracted = extract_text_from_html(html, self.base_url)
-        if extracted["content"] and len(extracted["content"]) >= 50:
-            extracted["url"] = self.base_url
-            all_results.append(extracted)
 
         # 2. 从首页 HTML 中提取重要栏目链接
         links = self._extract_links(html, self.base_url, keep_page_excluded=self.download_files)
@@ -869,7 +886,11 @@ def save_file_as_knowledge_doc(
             logger.debug(f"自动推断 discipline_id={discipline_id}（college_id={college_id}）")
 
     # 标题：优先锚文本，否则文件名主干（库已迁移 utf8mb4，无需 4 字节清洗）
+    # 官网附件锚文本常为"点击查看/下载"等无意义提示词，此时退回文件名主干
+    _generic_hints = {"点击查看", "点击下载", "查看", "下载", "更多", "详情", "download", "here"}
     title = (file_data.get("title_hint", "") or "").strip()
+    if title.lower() in _generic_hints:
+        title = ""
     if not title:
         title = file_name.rsplit(".", 1)[0]
     title = (title or "官网附件")[:512]
