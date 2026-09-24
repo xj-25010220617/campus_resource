@@ -12,7 +12,7 @@ import os
 import re
 import tempfile
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 # 2. Django
 from django.conf import settings
@@ -48,6 +48,42 @@ class FreshnessResult:
 # 文本抽取（抽自 config/celery.py 的实现，复用之）
 # ------------------------------------------------------------------
 # ------------------------------------------------------------------
+# 解析结果（结构化）
+# ------------------------------------------------------------------
+@dataclass
+class ParseResult:
+    """单文件解析结果。
+
+    文档类解析器只填 text；PDF / 图片解析器额外填页级统计，让索引层能区分
+    「完整解析」「部分解析（OCR 失败页 / 超页截断）」「完全没解析出正文」，
+    避免把不完整解析伪装成成功索引。
+    """
+    text: str = ''
+    error: str = ''                 # 非空 = 解析通道出错（依赖缺失 / 类型不支持 / OCR 不可用）
+    pages_total: int = 0
+    pages_native: int = 0           # 用原生文字层解析的页数
+    pages_ocr: int = 0              # OCR 成功产出文字的页数
+    pages_ocr_failed: int = 0       # OCR 报错或未识别出文字的页数
+    pages_ocr_skipped: int = 0      # 因超出 OCR_MAX_PAGES 未尝试 OCR 的页数
+    truncated: bool = False         # 是否发生截断（OCR 预算耗尽后仍有页面需要 OCR）
+
+    @property
+    def is_empty(self) -> bool:
+        return not (self.text or '').strip()
+
+    def issues(self) -> str:
+        """把「解析不完整/失败」的原因压成一行，供 KnowledgeDoc.index_error 记录。"""
+        parts = []
+        if self.error:
+            parts.append(self.error)
+        if self.pages_ocr_failed:
+            parts.append(f'{self.pages_ocr_failed} 页 OCR 失败/未识别出文字')
+        if self.truncated:
+            parts.append(f'超出 OCR_MAX_PAGES，{self.pages_ocr_skipped} 页未 OCR')
+        return '；'.join(parts)
+
+
+# ------------------------------------------------------------------
 # 扫描件 OCR（文字层抽取为空时的兜底）
 # ------------------------------------------------------------------
 _easyocr_reader = None
@@ -77,11 +113,16 @@ def _render_page_to_image(page) -> Optional[bytes]:
         return None
 
 
-def _ocr_image_local(image_bytes: bytes) -> str:
-    """本地 easyocr 识别（主通道）。"""
+def _ocr_image_detailed(image_bytes: bytes) -> Tuple[str, str]:
+    """本地 easyocr 识别，返回 (text, error)。
+
+    error 非空表示 OCR 通道本身不可用（未安装 / 初始化失败 / 解码异常），
+    与「图片里本来就没有文字」（返回空文本、error 为空）区分开，
+    避免后者被误记成依赖故障、前者被误记成正常空页。
+    """
     reader = _get_easyocr_reader()
     if reader is None:
-        return ''
+        return '', 'EasyOCR 不可用（未安装或初始化失败）'
 
     import io
     import numpy as np
@@ -91,87 +132,149 @@ def _ocr_image_local(image_bytes: bytes) -> str:
         img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
         arr = np.asarray(img)
         results = reader.readtext(arr, detail=0, paragraph=True)
-        return '\n'.join(str(t) for t in results).strip()
+        return '\n'.join(str(t) for t in results).strip(), ''
     except Exception as e:
         logger.warning(f'easyocr 识别失败: {e}')
-        return ''
+        return '', f'OCR 识别失败: {type(e).__name__}: {e}'
+
+
+def _ocr_image_local(image_bytes: bytes) -> str:
+    """本地 easyocr 识别（主通道，仅取文本，丢弃失败原因）。"""
+    return _ocr_image_detailed(image_bytes)[0]
 
 
 def _ocr_image(image_bytes: bytes) -> str:
-    """单页 OCR：easyocr 主通道。"""
+    """单页 OCR 的文本入口（保留旧签名）。
+
+    需要区分「OCR 不可用」与「图中无文字」的调用方请直接用
+    `_ocr_image_detailed`，它同时返回失败原因。
+    """
     return _ocr_image_local(image_bytes)
 
 
-def _ocr_pdf(file_path: str) -> str:
-    """扫描件 PDF：逐页渲染为图并 OCR，返回拼接文本。"""
-    import fitz
+def _parse_pdf(file_path: str) -> ParseResult:
+    """PDF 解析：逐页判定，文字层不足的页单独转图片走 OCR。
 
-    max_pages = int(getattr(settings, 'OCR_MAX_PAGES', 20))
-    try:
-        doc = fitz.open(file_path)
-    except Exception as e:
-        logger.error(f'OCR 打开 PDF 失败: {e}')
-        return ''
+    逐页判定是必须的。早期实现按「全文文字层长度」一次性判定：
+    混合型 PDF（文字页 + 扫描页）只要有 20 字文字层就整份跳过 OCR，扫描页内容
+    永久丢失；纯扫描件若每页只剩页码，页码累计也能超过阈值而被误判为文字 PDF，
+    正文一个字都不会 OCR。
+    """
+    result = ParseResult()
+    page_min_chars = int(getattr(settings, 'OCR_PAGE_MIN_TEXT_CHARS', 20))
+    max_ocr_pages = int(getattr(settings, 'OCR_MAX_PAGES', 20))
 
-    parts = []
-    try:
-        total_pages = doc.page_count
-        for i, page in enumerate(doc):
-            if i >= max_pages:
-                logger.warning(
-                    f'PDF 共 {total_pages} 页，超过 OCR 上限 {max_pages}，仅识别前 {max_pages} 页'
-                )
-                break
-            img_bytes = _render_page_to_image(page)
-            if not img_bytes:
-                continue
-            text = _ocr_image(img_bytes)
-            if text:
-                parts.append(text)
-    finally:
-        doc.close()
-    return '\n'.join(parts).strip()
-
-
-def _parse_pdf(file_path: str) -> str:
-    # 1. 先抽文字层（PyMuPDF，性能最好）
-    text = ''
     try:
         import fitz  # PyMuPDF
-        doc = fitz.open(file_path)
-        text = ''.join(page.get_text() + '\n' for page in doc)
-        doc.close()
-    except Exception:
-        pass
+    except ImportError as e:
+        # 依赖缺失必须显式失败：早前 _ocr_pdf 里的 import 在保护范围之外，
+        # ModuleNotFoundError 被上层宽 except 吞成空字符串，最终被当成
+        # 「扫描件无文字」静默降级，掩盖了环境问题。
+        result.error = f'PyMuPDF 未安装，PDF 无法解析: {e}'
+        logger.error(result.error)
+        return result
 
-    min_chars = int(getattr(settings, 'OCR_MIN_TEXT_CHARS', 20))
-    if text and len(text.strip()) >= min_chars:
-        return text
-
-    # 2. 文字层为空/过少 → 扫描件，走 OCR（渲染页面 → 云端/本地识别）
-    if text.strip():
-        logger.info(f'PDF 文字层仅 {len(text.strip())} 字，尝试 OCR 补全')
-    else:
-        logger.info('PDF 无文字层，尝试 OCR 识别扫描件')
-    ocr_text = _ocr_pdf(file_path)
-    if ocr_text:
-        return ocr_text
-
-    # 3. OCR 也失败，回退 pdfplumber 再抽一次文字层（兼容部分 fitz 抽不出但 pdfplumber 能抽出的 PDF）
     try:
-        import pdfplumber
-        out = ''
-        with pdfplumber.open(file_path) as pdf:
-            for page in pdf.pages:
-                t = page.extract_text()
-                if t:
-                    out += t + '\n'
-        if out.strip():
-            return out
+        doc = fitz.open(file_path)
     except Exception as e:
-        logger.warning(f'PDF 解析失败: {e}')
+        result.error = f'PDF 打开失败: {type(e).__name__}: {e}'
+        logger.warning(result.error)
+        return result
 
-    return text
+    parts = []
+    ocr_attempts = 0
+    try:
+        result.pages_total = doc.page_count
+        for page_no, page in enumerate(doc, start=1):
+            native = ''
+            try:
+                native = (page.get_text() or '').strip()
+            except Exception as e:
+                logger.warning(f'PDF 第 {page_no} 页文字层提取失败: {e}')
+
+            # 1) 该页文字层足够 → 直接用原生文字，不付 OCR 成本
+            if len(native) >= page_min_chars:
+                result.pages_native += 1
+                parts.append(native)
+                continue
+
+            # 2) 该页文字层不足 → 该页转图片 OCR
+            if ocr_attempts >= max_ocr_pages:
+                # 预算耗尽：不再尝试，但必须让上层知道这份文档没解析完整
+                result.truncated = True
+                result.pages_ocr_skipped += 1
+                continue
+            ocr_attempts += 1
+
+            image_bytes = _render_page_to_image(page)
+            if not image_bytes:
+                result.pages_ocr_failed += 1
+                continue
+
+            ocr_text, ocr_error = _ocr_image_detailed(image_bytes)
+            if ocr_error:
+                result.pages_ocr_failed += 1
+                if not result.error:
+                    result.error = ocr_error
+                continue
+
+            if ocr_text:
+                result.pages_ocr += 1
+                parts.append(ocr_text)
+            else:
+                # OCR 通道正常但该页没识别出文字
+                result.pages_ocr_failed += 1
+    finally:
+        doc.close()
+
+    result.text = '\n'.join(parts)
+    if result.truncated:
+        logger.warning(
+            f'PDF 共 {result.pages_total} 页，OCR 上限 {max_ocr_pages} 页已用尽，'
+            f'{result.pages_ocr_skipped} 页未 OCR'
+        )
+    logger.info(
+        'PDF 解析: 共 %d 页，原生文字 %d 页，OCR 成功 %d 页，OCR 失败 %d 页，未 OCR %d 页',
+        result.pages_total, result.pages_native, result.pages_ocr,
+        result.pages_ocr_failed, result.pages_ocr_skipped,
+    )
+    return result
+
+
+def _parse_image(file_path: str) -> ParseResult:
+    """图片解析：直接复用现有本地 OCR 识别图中文字。
+
+    图片没有任何文字层可退，所以只有两条路：OCR 出文字，或明确失败。
+    绝不允许把图片二进制按 UTF-8 读成乱码当正文（那会污染向量库）。
+    """
+    result = ParseResult(pages_total=1)
+
+    try:
+        with open(file_path, 'rb') as f:
+            image_bytes = f.read()
+    except OSError as e:
+        result.error = f'图片读取失败: {type(e).__name__}: {e}'
+        logger.warning(result.error)
+        return result
+
+    if not image_bytes:
+        result.error = '图片内容为空'
+        return result
+
+    text, ocr_error = _ocr_image_detailed(image_bytes)
+    if ocr_error:
+        result.error = ocr_error
+        result.pages_ocr_failed = 1
+        logger.warning(f'图片 OCR 不可用: {ocr_error}')
+        return result
+
+    result.text = text
+    if text:
+        result.pages_ocr = 1
+    else:
+        # 通道正常但图中没有可识别文字（纯色图/照片等）
+        result.pages_ocr_failed = 1
+    return result
 
 
 def _parse_docx(file_path: str) -> str:
@@ -322,8 +425,14 @@ def _parse_doc(file_path: str) -> str:
     return ''
 
 
-_EXTRACTORS = {
-    'pdf': _parse_pdf,
+def _read_text_file(file_path: str) -> str:
+    """纯文本读取（txt/md/html 等）。"""
+    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+        return f.read()
+
+
+# 文档类解析器：返回 str（本轮未改造，行为保持不变）
+_STR_EXTRACTORS = {
     'doc': _parse_doc,      # 旧格式 DOC
     'docx': _parse_docx,    # 新格式 DOCX
     'ppt': _parse_pptx,     # PPT 实际上也是 .pptx 格式
@@ -331,40 +440,123 @@ _EXTRACTORS = {
     'xls': _parse_xls,      # 旧格式 XLS
     'xlsx': _parse_xlsx,    # 新格式 XLSX
     'csv': _parse_csv,      # CSV 文本表格
-    'txt': lambda p: open(p, 'r', encoding='utf-8', errors='ignore').read(),
-    'md': lambda p: open(p, 'r', encoding='utf-8', errors='ignore').read(),
-    'html': lambda p: open(p, 'r', encoding='utf-8', errors='ignore').read(),
-    'htm': lambda p: open(p, 'r', encoding='utf-8', errors='ignore').read(),
+    'txt': _read_text_file,
+    'md': _read_text_file,
+    'html': _read_text_file,
+    'htm': _read_text_file,
+}
+
+# 结构化解析器：返回 ParseResult（PDF / 图片需要页级统计与 OCR 状态）
+_DETAILED_EXTRACTORS = {
+    'pdf': _parse_pdf,
+    'jpg': _parse_image,
+    'jpeg': _parse_image,
+    'png': _parse_image,
+    'gif': _parse_image,
+    'webp': _parse_image,
+    'bmp': _parse_image,
+    'tif': _parse_image,
+    'tiff': _parse_image,
+}
+
+# 允许按纯文本读取的扩展名（与 FileUploadView.TEXT_EXTRACTABLE_TYPES 对齐）。
+# 只有这些扩展名可以走 UTF-8 兜底读取；其余未知扩展名一律判「不支持」，
+# 杜绝 jpg/png/zip/psd 等二进制被 errors='ignore' 读成乱码后进入向量库。
+_TEXT_EXTENSIONS = {'txt', 'md', 'html', 'htm', 'csv', 'json', 'xml', 'yaml', 'yml'}
+
+
+def _as_text_parser(parser):
+    """把结构化解析器包成旧的「只返回文本」形式，兼容既有调用方。"""
+    def _run(file_path: str) -> str:
+        return parser(file_path).text
+    return _run
+
+
+# 扩展名 → 文本解析器（返回 str）。外部模块（如 FileUploadView 提取正文喂 AI 分类）
+# 按字符串使用该映射，保持既有契约不变。
+_EXTRACTORS = {
+    **{ext: _as_text_parser(p) for ext, p in _DETAILED_EXTRACTORS.items()},
+    **_STR_EXTRACTORS,
 }
 
 
 def resolve_file_extension(file_type: str, file_name: str = '') -> str:
-    """从原始文件名恢复真实扩展名，避免 xlsx/docx 被类别字段覆盖。"""
-    extension = os.path.splitext(file_name or '')[1].lower().lstrip('.')
-    if extension in _EXTRACTORS:
-        return extension
+    """从原始文件名恢复真实扩展名，避免 xlsx/docx 被类别字段覆盖。
+
+    形如扩展名的 ASCII 后缀一律原样返回（含当前没有解析器的 zip/psd 等），让上层
+    能报出「暂不支持解析 .zip」这种确切原因；文件名给不出可靠后缀时，回落到
+    file_type 类别对应的默认值。
+
+    后缀必须是 ASCII：中文文件名常把说明写在小数点后（「附件1.扫描件」「报告.最终版」），
+    `isalnum()` 对中文同样返回 True，若不限 ASCII 会把这些词当成扩展名，
+    从而让本该按 file_type=pdf 解析的文件被判「不支持 .扫描件」而失败。
+    """
+    name = (file_name or '').strip()
+    if '.' in name:
+        candidate = name.rsplit('.', 1)[-1].strip().lower()
+        # 形如扩展名：ASCII 字母数字、非纯数字、长度合理（与 serializers.get_file_ext 同规则）
+        if (candidate and candidate.isascii() and candidate.isalnum()
+                and not candidate.isdigit() and len(candidate) <= 16):
+            return candidate
     # file_type 是类别字段；仅在没有可靠文件名扩展名时使用安全默认值。
+    # image 无法从类别反推具体格式，统一给 jpg：OCR 按图片内容解码，与后缀无关。
     defaults = {'pdf': 'pdf', 'doc': 'doc', 'ppt': 'pptx', 'xls': 'xls',
-                'txt': 'txt', 'md': 'md', 'html': 'html'}
+                'txt': 'txt', 'md': 'md', 'html': 'html', 'image': 'jpg'}
     return defaults.get((file_type or '').lower(), '')
 
 
-def extract_text_from_oss(oss_key: str, file_type: str, file_name: str = '') -> str:
+def parse_file(file_path: str, extension: str) -> ParseResult:
+    """按扩展名选择解析器，返回结构化结果。
+
+    - PDF / 图片：逐页判定 + 必要时 OCR，带页级统计
+    - 文档类（docx/pptx/xlsx/csv…）：沿用原解析器，只取文本
+    - 纯文本类：UTF-8 读取
+    - 其余（含所有二进制类型）：判「不支持」，绝不按文本读取
     """
-    从 OSS 下载文件并抽取文本。
+    ext = (extension or '').lower().lstrip('.')
+
+    if ext in _DETAILED_EXTRACTORS:
+        return _DETAILED_EXTRACTORS[ext](file_path)
+
+    if ext in _STR_EXTRACTORS:
+        try:
+            return ParseResult(text=_STR_EXTRACTORS[ext](file_path) or '')
+        except Exception as e:
+            logger.warning(f'{ext} 解析失败: {e}')
+            return ParseResult(error=f'{ext} 解析失败: {type(e).__name__}: {e}')
+
+    if ext in _TEXT_EXTENSIONS:
+        try:
+            return ParseResult(text=_read_text_file(file_path))
+        except Exception as e:
+            logger.warning(f'文本读取失败: {e}')
+            return ParseResult(error=f'文本读取失败: {type(e).__name__}: {e}')
+
+    if not ext:
+        return ParseResult(error='无法识别文件类型：文件名无有效扩展名')
+
+    # 无解析器的类型不读文本：二进制按 UTF-8 + errors='ignore' 读出来的是乱码，
+    # 一旦进入分块/向量化就会污染向量库，必须显式判为不支持。
+    return ParseResult(error=f'暂不支持解析 .{ext} 类型（二进制文件不按文本读取）')
+
+
+def extract_text_from_oss_detailed(
+    oss_key: str, file_type: str, file_name: str = '',
+) -> ParseResult:
+    """从 OSS 下载文件并解析，返回结构化结果（含失败原因与页级统计）。
 
     file_type 保存的是归一化类别，解析时优先使用原始文件名扩展名。
     """
     from utils.http_client import ExternalClient
 
     if not oss_key:
-        return ''
+        return ParseResult(error='文档没有 OSS 对象 Key，无法下载源文件')
 
     # 1. 生成签名下载 URL
     download_url = oss_client.get_download_url(oss_key, expires=600)
     if not download_url:
         logger.error(f'无法生成下载 URL: {oss_key}')
-        return ''
+        return ParseResult(error='无法生成 OSS 下载 URL')
 
     # 2. 下载到临时文件
     extension = resolve_file_extension(file_type, file_name)
@@ -377,21 +569,21 @@ def extract_text_from_oss(oss_key: str, file_type: str, file_name: str = '') -> 
         with open(tmp_path, 'wb') as f:
             f.write(resp.content)
 
-        # 3. 抽取文本
-        extractor = _EXTRACTORS.get(extension)
-        if not extractor:
-            # 纯文本类型：移除截断限制，读取全部内容
-            with open(tmp_path, 'r', encoding='utf-8', errors='ignore') as f:
-                return f.read()
-        return extractor(tmp_path)
+        # 3. 解析
+        return parse_file(tmp_path, extension)
     except Exception as e:
         logger.error(f'下载/抽取失败 oss_key={oss_key}: {e}')
-        return ''
+        return ParseResult(error=f'下载/抽取失败: {type(e).__name__}: {str(e)[:200]}')
     finally:
         try:
             os.remove(tmp_path)
         except OSError:
             pass
+
+
+def extract_text_from_oss(oss_key: str, file_type: str, file_name: str = '') -> str:
+    """从 OSS 下载文件并抽取文本（只要文本，兼容既有调用方）。"""
+    return extract_text_from_oss_detailed(oss_key, file_type, file_name).text
 
 
 # ------------------------------------------------------------------

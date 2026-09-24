@@ -1,3 +1,4 @@
+```yaml
 name: Deploy Backend to Server
 
 on:
@@ -8,6 +9,7 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Deploy to server via SSH
         uses: appleboy/ssh-action@v1.0.3
@@ -16,84 +18,401 @@ jobs:
           port: ${{ secrets.SSH_PORT }}
           username: ${{ secrets.SSH_USERNAME }}
           key: ${{ secrets.SSH_KEY }}
-          # torch/nvidia CUDA 依赖单个 wheel 达数百 MB，10 分钟默认超时不够
-          command_timeout: 30m
-          script: |
-            # 串行化部署：GitHub 偶发会对同一 push 重复触发两条流水线，
-            # 两个部署进程并发访问 Milvus Lite 单文件（嵌入式、不支持多进程并发）
-            # 会导致重灌互相踩踏；这里用 flock 排队，最多等 15 分钟
-            exec 9>/tmp/campus_deploy.lock
-            flock -w 900 9 || { echo "等待另一部署实例超时"; exit 1; }
 
-            # 清理残留的旧重灌进程（上次部署被掐断/挂起时的遗留，现场恢复第一步）：
-            # 只杀 python 重灌进程（^python 锚定命令行开头，不伤其 bash 宿主单元）；
-            # 其所属 bash 后台单元会顺序走到收尾行 systemctl start campus-backend，
-            # 随后自身退出、释放重灌锁与 pty，挂起的上一条部署 run 也随之结束。
-            # 被杀的重灌会留下中断标记，由本次部署的 --if-empty 强制全量重灌接续。
+          # 依赖安装仅在 requirements.txt 发生变化时执行。
+          # 普通代码部署不会再触发 pip install。
+          command_timeout: 30m
+
+          script: |
+            set -e
+
+            # ============================================================
+            # 1. 部署串行锁
+            # ============================================================
+            # 防止 GitHub Actions 同时触发多个部署，
+            # 尤其避免 Milvus Lite 单文件被多个重灌进程同时访问。
+            exec 9>/tmp/campus_deploy.lock
+            flock -w 900 9 || {
+              echo "等待另一部署实例超时"
+              exit 1
+            }name: Deploy Backend to Server
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy to server via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          port: ${{ secrets.SSH_PORT }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          command_timeout: 30m
+          script_stop: true
+
+          script: |
+            set -e
+
+            cd /www/wwwroot/campus_resource
+
+            echo "========================================"
+            echo "开始部署"
+            echo "========================================"
+
+            echo "1. 获取当前提交"
+            OLD_COMMIT=$(git rev-parse HEAD)
+            echo "OLD_COMMIT=$OLD_COMMIT"
+
+            echo "2. 清理残留的 reindex 进程"
+            pkill -f '^python .*reindex_all' || true
+            sleep 2
+
+            echo "3. 拉取最新代码"
+            timeout 300 git pull origin main
+
+            NEW_COMMIT=$(git rev-parse HEAD)
+            echo "NEW_COMMIT=$NEW_COMMIT"
+
+            echo "4. 判断 requirements.txt 是否发生变化"
+
+            REQUIREMENTS_CHANGED=false
+
+            if [ "$OLD_COMMIT" != "$NEW_COMMIT" ]; then
+              if git diff --quiet "$OLD_COMMIT" "$NEW_COMMIT" -- backend/requirements.txt; then
+                echo "requirements.txt 没有变化"
+              else
+                echo "requirements.txt 已变化"
+                REQUIREMENTS_CHANGED=true
+              fi
+            else
+              echo "没有新的提交"
+            fi
+
+            echo "5. 激活 Python 虚拟环境"
+            cd /www/wwwroot/campus_resource/backend
+            source venv/bin/activate
+
+            echo "6. 检查 Python"
+            python --version
+            pip --version
+
+            if [ "$REQUIREMENTS_CHANGED" = true ]; then
+              echo "========================================"
+              echo "requirements.txt 已变化，开始安装依赖"
+              echo "========================================"
+
+              pip install \
+                -r requirements.txt \
+                -i https://mirrors.aliyun.com/pypi/simple/ \
+                --disable-pip-version-check \
+                --no-input \
+                --prefer-binary
+
+              echo "依赖安装完成"
+            else
+              echo "========================================"
+              echo "requirements.txt 没有变化"
+              echo "跳过 pip install"
+              echo "========================================"
+            fi
+
+            echo "7. 执行数据库迁移"
+            python manage.py migrate --noinput
+
+            echo "8. 标记 reindex 需要继续检查"
+            touch /tmp/campus_reindex_incomplete
+
+            echo "9. 停止后端服务"
+            systemctl stop campus-backend || true
+
+            echo "10. 后台启动 reindex"
+
+            nohup bash -c '
+              cd /www/wwwroot/campus_resource/backend
+              source venv/bin/activate
+
+              flock -w 7200 /tmp/campus_reindex.lock \
+                python scripts/reindex_all.py --if-empty
+
+              REINDEX_EXIT=$?
+
+              echo "reindex exit code: $REINDEX_EXIT"
+
+              if [ "$REINDEX_EXIT" -eq 0 ]; then
+                rm -f /tmp/campus_reindex_incomplete
+                echo "reindex 完成"
+              else
+                echo "reindex 失败，保留 incomplete 标记"
+              fi
+
+              systemctl start campus-backend
+
+              exit "$REINDEX_EXIT"
+            ' </dev/null >> /tmp/campus_reindex_bg.log 2>&1 &
+
+            echo "11. 等待服务启动"
+
+            for i in $(seq 1 36); do
+              if pgrep -f "scripts/reindex_all.py" > /dev/null; then
+                echo "reindex 正在后台运行，部署继续"
+                break
+              fi
+
+              if curl -fsS http://127.0.0.1:3000/api/docs/ > /dev/null; then
+                echo "后端服务已经启动"
+                break
+              fi
+
+              echo "等待后端启动... $i/36"
+              sleep 5
+            done
+
+            echo "12. 最终健康检查"
+
+            if curl -fsS http://127.0.0.1:3000/api/docs/ > /dev/null; then
+              echo "========================================"
+              echo "部署成功"
+              echo "========================================"
+            elif pgrep -f "scripts/reindex_all.py" > /dev/null; then
+              echo "========================================"
+              echo "reindex 正在后台运行，部署成功"
+              echo "========================================"
+            else
+              echo "========================================"
+              echo "后端启动失败"
+              echo "========================================"
+
+              echo "最近 reindex 日志："
+              tail -n 100 /tmp/campus_reindex_bg.log || true
+
+              exit 1
+            fi
+
+            echo "========================================"
+            echo "开始部署"
+            echo "========================================"
+
+            # ============================================================
+            # 2. 清理残留的旧重灌进程
+            # ============================================================
             if pkill -f '^python .*reindex_all' 2>/dev/null; then
-              echo "已终止残留的旧重灌进程，等待其后台单元收尾..."
+              echo "已终止残留的旧重灌进程，等待后台单元收尾..."
               sleep 5
             fi
 
-            # 进入项目目录
+            # ============================================================
+            # 3. 进入项目目录
+            # ============================================================
             cd /www/wwwroot/campus_resource
 
-            # 拉取最新代码（服务器直连 GitHub 间歇慢，5 分钟拉不下来就 fail fast，
-            # 避免无超时保护地挂死整个部署）
-            timeout 300 git pull origin main || { echo "git pull 超时/失败"; exit 1; }
+            # ============================================================
+            # 4. 记录 git pull 前的版本
+            # ============================================================
+            OLD_COMMIT=$(git rev-parse HEAD)
 
-            # 进入后端目录
-            cd backend
+            echo "部署前版本：$OLD_COMMIT"
 
-            # 激活虚拟环境并安装依赖
-            # 阿里云镜像：服务器为阿里云 ECS，走内网级带宽；教育网源对云主机限速，
-            # torch 的 nvidia CUDA 依赖（cudnn 单包 553MB）曾因此超时
+            # ============================================================
+            # 5. 拉取最新代码
+            # ============================================================
+            echo "正在拉取最新代码..."
+
+            timeout 300 git pull origin main || {
+              echo "git pull 超时/失败"
+              exit 1
+            }
+
+            NEW_COMMIT=$(git rev-parse HEAD)
+
+            echo "部署后版本：$NEW_COMMIT"
+
+            # ============================================================
+            # 6. 判断 requirements.txt 是否发生变化
+            # ============================================================
+            REQUIREMENTS_CHANGED="false"
+
+            if [ "$OLD_COMMIT" != "$NEW_COMMIT" ]; then
+
+              if git diff --quiet \
+                "$OLD_COMMIT" "$NEW_COMMIT" -- \
+                backend/requirements.txt
+              then
+                echo "requirements.txt 未发生变化"
+              else
+                REQUIREMENTS_CHANGED="true"
+                echo "⚠️ requirements.txt 发生变化，需要检查/安装依赖"
+              fi
+
+            else
+              echo "代码没有产生新的提交"
+            fi
+
+            # ============================================================
+            # 7. 进入后端目录并激活虚拟环境
+            # ============================================================
+            cd /www/wwwroot/campus_resource/backend
+
             source venv/bin/activate
-            pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
 
-            # 执行数据库迁移（含 admin_panel 审计表）
+            # ============================================================
+            # 8. 仅在 requirements.txt 变化时安装依赖
+            # ============================================================
+            if [ "$REQUIREMENTS_CHANGED" = "true" ]; then
+
+              echo "========================================"
+              echo "requirements.txt 已变化"
+              echo "开始安装 Python 依赖"
+              echo "========================================"
+
+              pip install \
+                -r requirements.txt \
+                -i https://mirrors.aliyun.com/pypi/simple/ \
+                --disable-pip-version-check \
+                --no-input \
+                --prefer-binary
+
+              echo "依赖安装完成"
+
+            else
+
+              echo "========================================"
+              echo "requirements.txt 未变化"
+              echo "跳过 pip install"
+              echo "========================================"
+
+            fi
+
+            # ============================================================
+            # 9. Django 数据库迁移
+            # ============================================================
+            echo "执行数据库迁移..."
+
             python manage.py migrate
 
-            # ⚠️ 一次性修复（重灌完成后请删除这两行）：上一次部署的重灌在 SSH 会话内
-            # 同步执行，被 30 分钟 command_timeout 掐死，留下部分向量数据但没有
-            # 中断标记（旧版脚本无标记逻辑）。手动创建标记让本次 --if-empty 强制
-            # 全量重灌；reindex_all.py 正常跑完后会自动删除标记。
+            # ============================================================
+            # 10. 标记 Milvus 需要重灌
+            # ============================================================
+            # 当前策略：每次代码部署都触发一次 --if-empty。
+            # 如果你的 reindex_all.py 本身会根据状态判断是否真正重灌，
+            # 则保留这里的标记。
+            #
+            # ⚠️ 这是之前一次性恢复旧数据留下的逻辑。
+            # 如果确认当前 Milvus 数据已经完整，可以后续单独删除。
             touch /tmp/campus_reindex_incomplete
 
-            # Milvus 向量库自动重灌：改在后台（nohup）执行，不再占用 SSH 会话——
-            # 扫描件 OCR 单篇可达数分钟，全库重灌会超 30 分钟 command_timeout，
-            # 同步执行必被掐死且后端停在停机状态。后台单元灌完自动拉起后端。
-            # 先停后端：reindex 不能与运行中的后端并发访问 Milvus Lite 单文件。
-            # 后台单元持独立 reindex 锁：部署锁早已释放，后续部署的重灌单元在此
-            # 排队（最多 2 小时），不会并发踩踏 Milvus Lite。
-            # 注意：bash -c 内的 exec 9> 会替换继承自父 shell 的部署锁 fd，
-            # 因此部署锁仍会在主脚本退出后正常释放，不会形成死锁。
-            # stdin 必须重定向 < /dev/null：否则后台进程继承 SSH 会话的 pty stdin，
-            # sshd 要等 pty 引用清零才关闭会话，导致部署 run 挂到重灌结束（超时假死）。
+            # ============================================================
+            # 11. 停止后端
+            # ============================================================
+            echo "停止 campus-backend..."
+
             systemctl stop campus-backend || true
+
+            # ============================================================
+            # 12. 后台执行 Milvus 重灌
+            # ============================================================
+            # reindex 不再占用 GitHub Actions SSH 会话。
+            #
+            # 独立锁：
+            # /tmp/campus_reindex.lock
+            #
+            # 最长等待 2 小时。
+            #
+            # stdin -> /dev/null
+            # stdout/stderr -> 日志文件
+            # 防止后台进程继承 SSH PTY 导致 GitHub Actions 一直等待。
             nohup bash -c '
               exec 9>/tmp/campus_reindex.lock
-              flock -w 7200 9 || { echo "等待重灌锁超时，放弃本次重灌（后端由正在跑的重灌完成后拉起）"; exit 0; }
+
+              flock -w 7200 9 || {
+                echo "等待重灌锁超时，放弃本次重灌"
+                exit 0
+              }
+
               cd /www/wwwroot/campus_resource/backend
+
               source venv/bin/activate
-              python scripts/reindex_all.py --if-empty || echo "⚠️ Milvus 重索引异常退出（exit $?），日志：/tmp/campus_reindex_bg.log"
+
+              echo "========================================"
+              echo "开始 Milvus 重灌：$(date)"
+              echo "========================================"
+
+              python scripts/reindex_all.py --if-empty
+
+              REINDEX_EXIT=$?
+
+              echo "Milvus 重灌结束，exit=$REINDEX_EXIT"
+
+              if [ "$REINDEX_EXIT" -eq 0 ]; then
+                echo "Milvus 重灌成功"
+              else
+                echo "⚠️ Milvus 重灌失败"
+              fi
+
+              echo "启动 campus-backend..."
+
               systemctl start campus-backend
+
+              echo "campus-backend 已启动"
+
+              exit "$REINDEX_EXIT"
+
             ' < /dev/null >> /tmp/campus_reindex_bg.log 2>&1 &
 
-            # 健康检查（双条件，满足其一即部署成功）：
-            #   a) 后台重灌正在进行（含排队等待，后端预期停机、灌完自动启动）
-            #   b) 后端已启动（重灌被跳过或已快速完成的场景）
-            # 循环最多 3 分钟，避免"部署绿但服务挂"的静默失败。
+            # ============================================================
+            # 13. 健康检查
+            # ============================================================
+            # 两种情况视为部署阶段成功：
+            #
+            # A. reindex_all.py 正在后台执行
+            #    → 后端暂时停机属于预期
+            #
+            # B. 后端已经正常启动
+            #
+            # 最多等待 3 分钟。
+            echo "等待部署状态..."
+
             for i in $(seq 1 36); do
+
               if pgrep -f "scripts/reindex_all.py" > /dev/null; then
-                echo "后台重灌进行中（完成后自动启动后端），部署成功"
+                echo "========================================"
+                echo "后台 Milvus 重灌正在进行"
+                echo "重灌完成后将自动启动后端"
+                echo "部署 SSH 阶段完成"
+                echo "========================================"
                 exit 0
               fi
-              if curl -sf http://127.0.0.1:3000/api/docs/ > /dev/null; then
+
+              if curl -sf \
+                http://127.0.0.1:3000/api/docs/ \
+                > /dev/null
+              then
+                echo "========================================"
                 echo "后端健康检查通过"
+                echo "部署成功"
+                echo "========================================"
                 exit 0
               fi
+
               sleep 5
             done
-            echo "后端未启动且无重灌进程运行，部署失败"
+
+            # ============================================================
+            # 14. 部署失败
+            # ============================================================
+            echo "========================================"
+            echo "部署失败"
+            echo "后端未启动且没有检测到重灌进程"
+            echo "========================================"
+
+            echo "最近的重灌日志："
+            tail -n 50 /tmp/campus_reindex_bg.log || true
+
             exit 1
+```
