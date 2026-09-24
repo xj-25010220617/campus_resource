@@ -1,0 +1,53 @@
+(venv) [root@iZ2vcc65pi40szswbxxe8uZ backend]# echo "=== .ssh 目录 ==="; ls -la /root/.ssh/; \
+echo "=== authorized_keys 内容 ==="; cat /root/.ssh/authorized_keys 2>/dev/null || echo "(文件不存在)"; \
+echo "=== 权限 ==="; stat -c '%a %U:%G %n' /root /root/.ssh /root/.ssh/authorized_keys 2>/dev/null; \
+echo "=== sshd 近期认证日志 ==="; journalctl -u sshd -n 15 --no-pager 2>/dev/null | tail -15; \
+echo "=== sshd 公钥相关配置 ==="; sshd -T 2>/dev/null | grep -E 'pubkeyauthentication|authorizedkeysfile|permitrootlogin|strictmodes'
+=== .ssh 目录 ===
+total 44
+drwx------.  2 root root 4096 Sep 23 23:59 .
+dr-xr-x---. 11 root root 4096 Sep 24 00:16 ..
+-rw-------   1 root root 3659 Sep 24 00:20 authorized_keys
+-rw-------   1 root root  399 Sep  1 09:30 id_ed25519
+-rw-r--r--   1 root root   95 Sep  1 09:30 id_ed25519.pub
+-rw-------   1 root root 3381 Aug 31 16:53 id_rsa
+-rw-r--r--   1 root root  740 Aug 31 16:53 id_rsa.pub
+-rw-r--r--   1 root root  919 Aug 31 14:33 known_hosts
+-rw-r--r--   1 root root  183 Aug 31 14:31 known_hosts.old
+-rw-------   1 root root  399 Sep 23 23:59 remote_guest_ed25519
+-rw-r--r--   1 root root   94 Sep 23 23:59 remote_guest_ed25519.pub
+=== authorized_keys 内容 ===
+ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDXYZIpaA4cqSI340xnhnYBd01CVP/uBjplQ7w/FEWXaA9aAAomn3NBUQr7d6tLMKmVfnzSJqXbzKhpxDkd9FAfASygK7xDhi3GMDqWJ0YhG4z0xNmU4JbrNsHpIC3MqhnOBf6bB6myBLflwMvMc+4G+YTsoM8/Yy+memnyfDM0JqEDomVazuORDO3fa647lCk+IKQhnUJzVi92ycsw7vFcuiTpt1Q+vtOYPbNVsUh6NXjgqUfKc/XtyYvPQUrtVxu2zv1S9UNGZdHRciyGWr1N5CyLXry3EbXzPT+0J2klomkvCH+BX6r9aURnwwFUZysa/fTxNJxMrllZvrx4/MLX skp-2vcbly8jls5qp5blv4s9
+ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQC9sDs1O7EhiVQciosiO+te49k3ei4YGiWykTt95dzkK9E+jD0XHwOUW/wJpf6pYDv4oX8c307l+m/4cKB9BPsJKK42OfHwGB15Cmua8GOMR1QwXA20DRFnPoFTBmRaFChV7zKhHn6eVqcdUqOr7+q+Aq7TiMnSADn2r6zJqSREnMFrVcwy2HioHNw5GCS8B6UMBiC9G+zpsS5noYOWu5HrLH/wIZzgxzYnPdMknWtVXtgiJ+txBVdW0xyqLoELdpdNgAfbrSa9xl0ZFofuEphtk9XgXj3E95BdvWhghQwxOYfHVWl2tX2NB+h/cafknhMSvi2YbPul5RTKX6BwYlgv37S5/qxRBp/l7ltFocdgEPpTP1Xc5Do6BCD51zAN5L2F/qid1f0S1wrM3hAKTCK55gN/IHgCNgAZ3IB5aX4WKWi9zHfHZHjWfa0vwJwzxT8t4ji8GuzV34e7TqLDQCdCx9HMqfqcAvW4DCy3wzcqVdKiLASwfa5rMHLgpivwrIteNyjPXaTPETzEIaw6AfTeaK5485K5sd+4aOUZbe5VYbtLEZVEvwfbmrtbELilOq7KAuPFWRtt8S9Uy2XlIlYKTPypDllTV2XUPxZdaPdxxLsxfYPVI4hpHhQx+k1asMl5Il15pSoK6imqJ2jkU3HVO1feKoGs/Avq9kX8eDBatQ== github-actions
+ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQCejty6lffnJBkXLn4q+a40ARvaJAlrQXdqMSEQTjQQJ2rSatRxHQoWIbK+xBN0ym7/8308fQ41jwuRI5Tx4eMTTpnE7jchHPqvjeoTxgpn3xqNU8eziACePGY+KLVTeMGpu/GMgiQkXMUMeWsWhyw6v5hTI6ontEEaivxHLrbdz+t0Si1em2qrpsPKA/hkfLoo/bKtrbKQX+GA06nPHqK9rxlHwukVe7f+FLsDqEx/lH7E7T4fEx4IRGWBCRm7RVDxCoxqmjAeP60GPswNs7uznO1d9kiE84I+ff7HmovFLo4b3slkx3SoIo1rGBLMPknqoi/YUPtYcj9jAxTTJcwxXiB6w74wfIVpkuDKzyQSLB282wVWEYUK+Tv4OehdS6at5df4acLiFu9Ln6pBIkGSR79kVMPGaRUL6mjgmRkrPd1CVOfKgqJU2qBlpWUeljya5t+gbWhfqG3bae9VpMKRXpwikiQS2/+3tuxdJphqT0+f2i/0KmIhtCucfLMPQ2cYq5h0/TKraB2B/nbWhBKzjR5gbMpma69bnmRq9kDNvaY0UbBLU2JsK2CnhTzUGm6dM2Dtyej5svOBqRZhxpsHjU9jM6rpBwdlnXcICTJRh3xJgF7YPoyOiYqELi2KrWevvAsCekgbyXIY+jSZkULZslWgOzukT3XaRLbmeJz1xw== github-actions
+ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQChOwTIaOnYJVFluxeRHzQ3TcLRY0zJLmJGK2e/N1qOYnryTsHu1Sccyqfmd/4cu8g77gii9sz6y4VW5y+zssso5tJg8NK2+c1T130jAkVwA+sFNB5S7EBekxWbZ5w5nCyL3KkFDm6XRw8LYOir0pb44XvTSLGz4Xp9bx6oHswK2X82Lj5iUmYCm1nWlCWGyBuhnahN1GgHWTSxPtx3vgxXBj0rnSWCVYaP7B/Wv9z9la50rDnwQbSrnCH82u8v5lwrMyNgWMw05bZbk0VgLO1j3YO7HjnwUZYbkQuAYafANg6tLYWPGOn2ISE8IF4ht/Jnlzt3xVi2O93tKZ6AEWuh+6nTDdmYSww1fieasq8gfxP9J2jizBqk0JzdUYjG3pGXVTBpA77YwdEf2ZDIzf83DdxUPWOGRLdJOFfVOylexoYnL2G7OgF3jE0m6vu9GW+zm9hijgjEXKsQNcv5n3KWcDRelwfxbAqvZ9ylD/0lWIiRJMXcsajTC/cYfkIlJJgG51gbCpPfuEq4/hVPx4gR18sZvJU0dZlsi9+VQC5MNHumH0Yjkc5QvP58W+b3+67g4iRJq3jZKCL6S2YHz76c+IygWgVacJVnF2FndvIQDMMH/8Hh9WmgL7527/vl+P+Hk0bf87ItbO4iQyamFVB27ptDag9lFd9QSIfveFUb4Q== github-actions
+ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQCrzYTKmYsgEfMLPKOeFXIBcvJf/2KIYKhoQ+ashwTopkDTXFY42W81TrJG94HjXmtiBDSBlN2wV/BeyikiI5/h3XLnRwS2J7z+DvYUCNAtkEduIEUGxyPb5ze9EbbEDqTjCAPMHd67usxybxe1uEz5EAFgrKJQ9wb3QipqtW1Mskc1dJv0iLutXUrh2xi8MVEpQiK6VK6PqJe3rh9hMv4Pn3q9DUl7GeQFUlzAJRs3Kxv7Pvm2dM9sLUXBPObekfYx7Ef/nxmhcYcXroF3iLZ6I7Jj0fvpk59Soq45vCDPGgxEfNu6E9ryMt0bsHODUWM1L0q+1wfnvph43cEqxGMN/Rv2CFp9YRtE6I9kkaUvc+wG5jSWMEANA4LRF283EDvRrOaTZ++NvxMWs/H41an4WWRO+QLYwtovfspPBvciPOy/o9+xpRFc/6vgKDaj6rNn2uMYlLvfm/MiLi8hgQPutkVxk5zdXSysWoso1IrI7BKIvhVnXyRb3AXJs0ia7P/TCne0kv/UPURRNz+D0NOYWNAp7B1fi0GK2/ITe3+sV2K/MSufKR4s/FkndmOUQYbc8mVOyc5QmYyC5fO5Llqf9fklEFGga+eITZeSxOeRmXX2TJDL7kqOgQGo7Q4w4ND8uOB8SBFcT+Rfn5rz2t0pTYF63b/NKoNVDZDU/a5Z3w== aurora@LAPTOP-SB3T51LN
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN8UkvvrN4ob2zsevg67Vf+mr0WlEa6of4ALV4jjEIwU campus-deploy
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN8UkvvrN4ob2zsevg67Vf+mr0WlEa6of4ALV4jjEIwU campus-deploy
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN8UkvvrN4ob2zsevg67Vf+mr0WlEa6of4ALV4jjEIwU campus-deploy
+=== 权限 ===
+550 root:root /root
+700 root:root /root/.ssh
+600 root:root /root/.ssh/authorized_keys
+=== sshd 近期认证日志 ===
+Sep 24 00:29:58 iZ2vcc65pi40szswbxxe8uZ sshd[2920]: Connection closed by invalid user user 203.189.196.168 port 45434 [preauth]
+Sep 24 00:30:17 iZ2vcc65pi40szswbxxe8uZ config_ecs_instance_connect[2929]: config_ecs_instance_connect core start with args: /usr/bin/ecs_config_instance_connect --uid 0
+Sep 24 00:30:17 iZ2vcc65pi40szswbxxe8uZ config_ecs_instance_connect[2929]: timeout is 5s
+Sep 24 00:30:17 iZ2vcc65pi40szswbxxe8uZ config_ecs_instance_connect[2929]: GET_HOST_OK cn-chengdu.axt.aliyun.com
+Sep 24 00:30:17 iZ2vcc65pi40szswbxxe8uZ config_ecs_instance_connect[2929]: Found user `root` with uid `0`
+Sep 24 00:30:17 iZ2vcc65pi40szswbxxe8uZ config_ecs_instance_connect[2929]: user name:root
+Sep 24 00:30:17 iZ2vcc65pi40szswbxxe8uZ sshd[2927]: error: Received disconnect from 100.104.65.220 port 50245:10:  [preauth]
+Sep 24 00:30:17 iZ2vcc65pi40szswbxxe8uZ sshd[2927]: Disconnected from authenticating user root 100.104.65.220 port 50245 [preauth]
+Sep 24 00:30:18 iZ2vcc65pi40szswbxxe8uZ config_ecs_instance_connect[2936]: config_ecs_instance_connect core start with args: /usr/bin/ecs_config_instance_connect --uid 0
+Sep 24 00:30:18 iZ2vcc65pi40szswbxxe8uZ config_ecs_instance_connect[2936]: timeout is 5s
+Sep 24 00:30:18 iZ2vcc65pi40szswbxxe8uZ config_ecs_instance_connect[2936]: GET_HOST_OK cn-chengdu.axt.aliyun.com
+Sep 24 00:30:18 iZ2vcc65pi40szswbxxe8uZ config_ecs_instance_connect[2936]: Found user `root` with uid `0`
+Sep 24 00:30:18 iZ2vcc65pi40szswbxxe8uZ config_ecs_instance_connect[2936]: user name:root
+Sep 24 00:30:18 iZ2vcc65pi40szswbxxe8uZ sshd[2934]: error: Received disconnect from 100.104.65.220 port 50259:10:  [preauth]
+Sep 24 00:30:18 iZ2vcc65pi40szswbxxe8uZ sshd[2934]: Disconnected from authenticating user root 100.104.65.220 port 50259 [preauth]
+=== sshd 公钥相关配置 ===
+permitrootlogin yes
+pubkeyauthentication yes
+strictmodes yes
+authorizedkeysfile .ssh/authorized_keys
+(venv) [root@iZ2vcc65pi40szswbxxe8uZ backend]# 
