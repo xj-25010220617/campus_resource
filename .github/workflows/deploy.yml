@@ -12,16 +12,31 @@ jobs:
     steps:
       - name: Deploy to server via SSH
         uses: appleboy/ssh-action@v1.0.3
+
+        # ⚠️ 严禁再加 script_stop: true —— 2026-09-24 生产事故根因。
+        #
+        # script_stop 并不是简单的 "set -e"，它会让 drone-ssh 把脚本按行拆开，
+        # 并在每一行之后插入一行退出码检查：
+        #   DRONE_SSH_PREV_COMMAND_EXIT_CODE=$? ; if [ $.. -ne 0 ]; then exit $..; fi;
+        # 而 shell 里 if 条件为假时，进入 else 分支那一刻 $? 仍然是 1（正是那个
+        # 失败的判断条件），于是插入的检查会在任何 else / elif 分支入口直接 exit 1：
+        # 脚本静默中止、日志没有任何报错，只留下 "Process exited with status 1"。
+        #
+        # "失败即停" 已经由脚本内的 set -e 承担，效果完全相同，且不会改写脚本。
+        # 另有一道 trap ERR 会把真正出错的行号打到日志里。
         with:
           host: ${{ secrets.SSH_HOST }}
           port: ${{ secrets.SSH_PORT }}
           username: ${{ secrets.SSH_USERNAME }}
           key: ${{ secrets.SSH_KEY }}
           command_timeout: 30m
-          script_stop: true
 
           script: |
             set -e
+
+            # 任何命令失败立即中止，并把出错行号打到日志，杜绝"静默 exit 1"。
+            # 被 || true 或 if/while 条件正常处理的失败不会触发（与 set -e 语义一致）。
+            trap 'echo "!!! 部署中止：脚本第 $LINENO 行命令失败" >&2' ERR 2>/dev/null || true
 
             cd /www/wwwroot/campus_resource
 
@@ -58,6 +73,8 @@ jobs:
               echo "没有新的提交"
             fi
 
+            echo "DEBUG: REQUIREMENTS_CHANGED=$REQUIREMENTS_CHANGED (OLD=$OLD_COMMIT NEW=$NEW_COMMIT)"
+
             echo "5. 激活 Python 虚拟环境"
             cd /www/wwwroot/campus_resource/backend
             source venv/bin/activate
@@ -86,12 +103,14 @@ jobs:
               echo "========================================"
             fi
 
+            echo "DEBUG: 即将执行数据库迁移"
             echo "7. 执行数据库迁移"
             python manage.py migrate --noinput
 
             echo "8. 标记 reindex 需要继续检查"
             touch /tmp/campus_reindex_incomplete
 
+            echo "DEBUG: 即将停止 campus-backend"
             echo "9. 停止后端服务"
             systemctl stop campus-backend || true
 
@@ -120,6 +139,7 @@ jobs:
               exit "$REINDEX_EXIT"
             ' </dev/null >> /tmp/campus_reindex_bg.log 2>&1 &
 
+            echo "DEBUG: 开始等待服务启动/健康检查"
             echo "11. 等待服务启动"
 
             for i in $(seq 1 36); do
