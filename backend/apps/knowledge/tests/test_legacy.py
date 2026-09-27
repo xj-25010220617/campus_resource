@@ -21,7 +21,7 @@ from utils.oss import (
     oss_client,
 )
 
-from .models import (
+from ..models import (
     ChunkedUploadSession,
     ContentModeration,
     DocChunk,
@@ -30,12 +30,12 @@ from .models import (
     ModerationAttempt,
     UploadIntent,
 )
-from .upload_intent import (
+from ..upload_intent import (
     cancel_upload_intent,
     create_upload_intent,
     is_quarantine_key,
 )
-from .moderation import (
+from ..moderation import (
     INDEXABLE_MODERATION_STATES,
     INDEXABLE_OSS_KEY_PREFIX,
     MAX_EXCERPT_LENGTH,
@@ -430,7 +430,7 @@ class UploadCallbackSecurityTests(TestCase):
 
     def assertModerationScheduled(self):
         """新建文档必须且只能派发一次统一审核编排任务。"""
-        from .tasks import index_document_task, moderate_and_promote_task
+        from ..tasks import index_document_task, moderate_and_promote_task
 
         orchestration = [
             call.args[1] for call in self.dispatch_async.call_args_list
@@ -814,7 +814,7 @@ class _QuarantineEntryPointBase(TestCase):
 
         `expected` 为期望派发次数（批量上传按文件数计）。
         """
-        from .tasks import index_document_task, moderate_and_promote_task
+        from ..tasks import index_document_task, moderate_and_promote_task
 
         orchestration = [
             call.args[1] for call in self.dispatch_async.call_args_list
@@ -1108,7 +1108,7 @@ class QuarantineAccessGateTests(TestCase):
     # /download/ 与 /preview/ 上的 is_official_oss_key() 门禁形同虚设。
     # ------------------------------------------------------------------
     def _serialize(self, doc):
-        from .serializers import KnowledgeDocSerializer
+        from ..serializers import KnowledgeDocSerializer
 
         return KnowledgeDocSerializer(doc).data
 
@@ -1481,7 +1481,7 @@ class ChunkedUploadSecurityTests(TestCase):
 
     def assertModerationScheduled(self):
         """合并出的文档必须且只能派发一次统一审核编排任务。"""
-        from .tasks import index_document_task, moderate_and_promote_task
+        from ..tasks import index_document_task, moderate_and_promote_task
 
         orchestration = [
             call.args[1] for call in self.dispatch_async.call_args_list
@@ -1758,7 +1758,7 @@ class IndexTaskSecurityTests(TestCase):
     @staticmethod
     def _run_task(doc_id):
         """兼容 Celery 已安装 / 未安装两种方式调用任务函数本体。"""
-        from .tasks import index_document_task
+        from ..tasks import index_document_task
 
         return getattr(index_document_task, 'run', index_document_task)(None, doc_id)
 
@@ -1809,7 +1809,7 @@ class IndexTaskSecurityTests(TestCase):
         STEP 4-B 起真正的审核门是 ContentModeration，而这两个字段是全仓库
         无任何写入点的死字段，把它们当成放行依据只会制造虚假的安全感。
         """
-        from .moderation import check_indexable
+        from ..moderation import check_indexable
 
         doc = self._doc(
             oss_key='knowledge/college/0/2026-09/a.pdf',
@@ -1830,7 +1830,7 @@ class IndexTaskSecurityTests(TestCase):
         """
         from utils.celery_dispatcher import safe_delay
 
-        from .tasks import index_document_task
+        from ..tasks import index_document_task
 
         doc = self._doc(oss_key='')
 
@@ -1848,7 +1848,7 @@ class IndexTaskSecurityTests(TestCase):
         """
         from utils.celery_dispatcher import safe_delay
 
-        from .tasks import index_document_task
+        from ..tasks import index_document_task
 
         class _BrokerDownTask:
             """只保留"异步分发失败"特征的替身，调用即等价于任务函数本体。"""

@@ -534,7 +534,19 @@ class TestBinaryNeverReadAsText(_ParserHarness, _OssStubMixin):
 # 索引任务：失败可见化
 # ------------------------------------------------------------------
 class TestIndexTaskFailureVisibility(TestCase):
-    """解析为空必须失败，且不进入 Embedding / Milvus / DocChunk。"""
+    """索引任务的失败可见化 + 审核门 fail-closed。
+
+    两组契约（P1-2D STEP 4-B 之后）：
+
+    1. **审核门**：`check_indexable()` 要求文档同时满足
+       "对象在 `knowledge/` 下" + "有 ContentModeration 记录" +
+       "`state ∈ INDEXABLE_MODERATION_STATES`" + "`storage_state=promoted`"。
+       不满足 → 任务判 `failed`，且**不解析、不 Embedding、不写 DocChunk、
+       不进 Milvus**。因此下文的夹具必须给出 `approved + promoted` 的审核
+       记录，否则测到的是审核门而不是解析失败可见化（门禁本身不做任何放宽）。
+    2. **解析结果可见化**：解析为空 → `failed` + `index_error`；截断/OCR
+       跳过 → 仍索引但必须留痕。
+    """
 
     def setUp(self):
         from apps.accounts.models import User
@@ -543,7 +555,40 @@ class TestIndexTaskFailureVisibility(TestCase):
             username='p0_index_admin', password='testpass123', role='super_admin',
         )
 
-    def _make_doc(self, **overrides):
+    def _approve(
+        self,
+        doc,
+        *,
+        state=None,
+        storage_state=None,
+    ):
+        """为文档补上审核记录（默认 approved + promoted = 应可通过索引门）。"""
+        from apps.knowledge.models import ContentModeration
+        from apps.knowledge.moderation import (
+            MODERATION_STATE_APPROVED,
+            STORAGE_STATE_PROMOTED,
+            VERDICT_CLEAN,
+        )
+
+        state = MODERATION_STATE_APPROVED if state is None else state
+        storage_state = STORAGE_STATE_PROMOTED if storage_state is None else storage_state
+        ContentModeration.objects.create(
+            doc=doc,
+            state=state,
+            verdict=VERDICT_CLEAN,
+            storage_state=storage_state,
+            # promoted_key 只对"已提升"才有意义，未提升时留空
+            promoted_key=doc.oss_key if storage_state == STORAGE_STATE_PROMOTED else '',
+        )
+        return doc
+
+    def _make_doc(self, *, with_moderation=True, **overrides):
+        """构造待索引文档。
+
+        with_moderation=True（默认）时同时写入 approved + promoted 的
+        ContentModeration：这些用例验证的是"过了审核门之后"的解析层行为，
+        不是审核门本身；审核门本身由 with_moderation=False 的用例验证。
+        """
         from apps.knowledge.models import KnowledgeDoc
 
         defaults = dict(
@@ -557,7 +602,10 @@ class TestIndexTaskFailureVisibility(TestCase):
             status='uploaded',
         )
         defaults.update(overrides)
-        return KnowledgeDoc.objects.create(**defaults)
+        doc = KnowledgeDoc.objects.create(**defaults)
+        if with_moderation:
+            self._approve(doc)
+        return doc
 
     def _run_index(self, doc_id: int):
         """同步执行索引任务：真实 Celery 用 .apply()，本地无 Celery 用 .delay()。"""
@@ -584,6 +632,69 @@ class TestIndexTaskFailureVisibility(TestCase):
         for p in patches:
             self.addCleanup(p.stop)
         return started   # [embed, insert_chunks, delete_by_doc, ensure_collection]
+
+    def test_no_moderation_record_is_not_indexed(self):
+        """无 ContentModeration 记录 → fail-closed。
+
+        P1-2D STEP 4-B 契约：审核记录缺失必须判为不可索引（历史文档语义），
+        且整条索引链一步都不能走：不解析、不 Embedding、不写 DocChunk、
+        不进 Milvus。这里**不能**放宽成"没有记录就默认放行"。
+        """
+        from apps.knowledge.extractor import ParseResult
+        from apps.knowledge.models import DocChunk
+
+        doc = self._make_doc(with_moderation=False)
+
+        m_embed, m_insert, m_delete, m_ensure = self._patch_downstream()
+        with mock.patch(
+            'apps.knowledge.extractor.extract_text_from_oss_detailed',
+            return_value=ParseResult(text='正常正文内容。' * 60, pages_total=1, pages_native=1),
+        ) as m_parse:
+            self._run_index(doc.id)
+
+        doc.refresh_from_db()
+        self.assertEqual(doc.status, 'failed')
+        self.assertIn('审核记录', doc.index_error)
+        self.assertIsNotNone(doc.failed_at)
+
+        m_parse.assert_not_called()          # 未过门 → 解析器不得被调用
+        m_embed.assert_not_called()          # 不得进入 Embedding
+        m_insert.assert_not_called()         # 不得写入 Milvus
+        m_delete.assert_not_called()
+        m_ensure.assert_not_called()
+        self.assertEqual(DocChunk.objects.filter(doc=doc).count(), 0)
+        self.assertEqual(doc.chunk_count, 0)
+
+    def test_promoted_is_required_even_when_approved(self):
+        """已审核但未提升（storage_state=quarantine）→ 同样不可索引。
+
+        对象即使已经躺在 knowledge/ 前缀下，没有完成 promotion 也不是
+        "可对外提供的内容"；门禁判据是 storage_state，不是路径本身。
+        """
+        from apps.knowledge.extractor import ParseResult
+        from apps.knowledge.models import DocChunk
+        from apps.knowledge.moderation import STORAGE_STATE_QUARANTINE
+
+        doc = self._make_doc(
+            with_moderation=False,
+            oss_key='knowledge/test/scan.pdf',
+        )
+        self._approve(doc, storage_state=STORAGE_STATE_QUARANTINE)
+
+        m_embed, m_insert, _, _ = self._patch_downstream()
+        with mock.patch(
+            'apps.knowledge.extractor.extract_text_from_oss_detailed',
+            return_value=ParseResult(text='正常正文内容。' * 60, pages_total=1, pages_native=1),
+        ) as m_parse:
+            self._run_index(doc.id)
+
+        doc.refresh_from_db()
+        self.assertEqual(doc.status, 'failed')
+        self.assertIn('提升', doc.index_error)
+        m_parse.assert_not_called()
+        m_embed.assert_not_called()
+        m_insert.assert_not_called()
+        self.assertEqual(DocChunk.objects.filter(doc=doc).count(), 0)
 
     def test_empty_parse_fails_without_embedding_or_milvus(self):
         """P0-3：解析为空 → failed + index_error，不 Embedding / 不 Milvus / 无 DocChunk。"""

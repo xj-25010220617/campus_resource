@@ -124,6 +124,16 @@ class _PromotionBucket:
             raise oss2.exceptions.OssError(404, {}, b'Not Found', {})
         return _FakeHeadResult(len(self.objects[key]))
 
+    def sign_url(self, method, key, expires, params=None):
+        """签名 URL：`utils.oss.oss_client.get_download_url()` 走的生产接口。
+
+        替身必须覆盖它，否则任何真的走到"下载对象"的用例都会因为缺少这个
+        方法而失败——那是替身不全，不是生产代码的缺陷。
+        """
+        if key not in self.objects:
+            raise oss2.exceptions.OssError(404, {}, b'Not Found', {})
+        return f'https://oss.example.invalid/{key}?Expires={expires}'
+
     def copy_object(self, source_bucket_name, source_key, target_key, headers=None):
         self.copy_calls.append((source_bucket_name, source_key, target_key, headers))
         if self.copy_side_effect is not None:
@@ -837,18 +847,34 @@ class IndexTaskModerationGateTests(_PromotionTestCase):
         self.assertEqual(self.doc.oss_key, QUARANTINE_KEY)
 
     def test_approved_and_promoted_document_passes_the_gate(self):
-        """门禁本身放行后，任务才会继续往下走（这里让它停在解析阶段即可）。"""
+        """门禁本身放行后，任务才会继续往下走（这里让它停在解析阶段即可）。
+
+        契约（P1-1）：`approved` + `storage_state=promoted` 是唯一放行组合。
+        任务体实际调用的是 `extract_text_from_oss_detailed`（返回 `ParseResult`），
+        所以 patch 必须打在**这个**符号上——打在旧的 `extract_text_from_oss`
+        上等于没 mock，用例会在真实下载路径上失败而不是在门禁上失败。
+        """
+        from apps.knowledge.extractor import ParseResult
+
         doc = self._make_doc(oss_key=EXPECTED_PROMOTED_KEY)
         self._moderation(doc=doc, storage_state=STORAGE_STATE_PROMOTED)
 
-        with patch('apps.knowledge.extractor.extract_text_from_oss', return_value='') as extract:
+        with patch(
+            'apps.knowledge.extractor.extract_text_from_oss_detailed',
+            return_value=ParseResult(text=''),
+        ) as extract:
             with patch('utils.celery_dispatcher.safe_delay'):
                 _call_task(index_document_task, doc.id)
 
+        # 门禁放行的证据：解析通道真的被调用了，且拿到的正是这份文档的参数
         extract.assert_called_once()
+        self.assertEqual(
+            extract.call_args.args, (doc.oss_key, doc.file_type, doc.file_name),
+        )
         doc.refresh_from_db()
         self.assertEqual(doc.status, 'failed')          # 空文本 → failed
         self.assertIn('解析结果为空', doc.index_error)   # 但**不是**被审核门拦下
+        self.assertNotIn('审核', doc.index_error)
 
 
 # ===========================================================================
