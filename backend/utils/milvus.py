@@ -174,12 +174,28 @@ class MilvusClient:
     # ------------------------------------------------------------------
     # 向量搜索
     # ------------------------------------------------------------------
+    def backend_name(self) -> str:
+        """当前可用的向量后端，供健康检查 / 监控探测。只读，不建连接。
+
+        Returns:
+            'milvus'      —— 已连上 Milvus
+            'chroma'      —— Milvus 不可用，但 ChromaDB 可导入（降级后端可用）
+            'unavailable' —— 两者都不可用：向量检索**无法执行**
+        """
+        if self._connected:
+            return 'milvus'
+        try:
+            import chromadb  # noqa: F401
+        except ImportError:
+            return 'unavailable'
+        return 'chroma'
+
     def search(
         self,
         query_embedding: List[float],
         top_k: int = 10,
         filter_ids: Optional[List[int]] = None,
-    ) -> List[dict]:
+    ) -> Optional[List[dict]]:
         """
         向量相似度搜索（支持按 doc_id 范围硬过滤）。
 
@@ -192,11 +208,29 @@ class MilvusClient:
             [{'vector_id': str, 'doc_id': int, 'chunk_index': int,
               'chunk_text': str, 'page_number': int, 'seq_order': int,
               'score': float}, ...]
+                —— 检索**执行成功**；空列表是合法的"确实没有匹配"
+            None
+                —— 向量后端**不可用**，检索根本没执行
+
+        Note（P1-2 Phase 1-2 / 审计报告 P-7）
+        -------------------------------------
+        这两种结果**必须区分**。此前两者都返回 `[]`，于是"向量库挂了"在
+        问答侧表现为"知识库里没有相关内容"——故障被伪装成正常的空结果，
+        运维与用户都无法察觉。调用方拿到 `None` 时必须按"服务不可用"处理，
+        绝不能 `or []` 吞掉。
         """
-        # 集合不可用（不存在且创建失败）时降级为空结果，交由上层关键词检索兜底，
-        # 避免 Milvus 为空/损坏时把 SchemaNotReadyException 等裸异常抛给调用方。
+        if self._connected:
+            # 已连接：直接检索。局部异常由 _search_milvus 内部降级为空结果
+            # （空结果是合法结果——"确实没有匹配"，不能被当成后端故障）。
+            return self._search_milvus(query_embedding, top_k, filter_ids)
+        # 未连接：懒连接并确保集合可用（连接失败 / 集合创建失败 / 维度与
+        # Embedding 配置不一致都在 ensure_collection 内被判定并记录）。
+        # 集合不可用说明向量检索**根本没执行**：按 P-7 返回 None（不是空列表），
+        # 交由上层区分"服务不可用"与"确实没有匹配"，并按关键词兜底继续。
+        # ensure_collection() 自身捕获异常，不会把 SchemaNotReadyException
+        # 等裸异常抛给调用方。
         if not self.ensure_collection():
-            return []
+            return None
         return self._search_milvus(query_embedding, top_k, filter_ids)
 
     def _search_milvus(

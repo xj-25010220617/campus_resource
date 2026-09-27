@@ -1,0 +1,61 @@
+{% extends "admin/base_site.html" %}
+{% comment %}
+人工确认放行的中间页（Phase 1-2 / 审计报告 P-2）。
+
+只收集"理由"并把选择集原样回传给 admin changelist 的 confirm_manually action。
+页面自身不做任何判断——权限、状态、对象存在性全部由
+apps.knowledge.confirmation.confirm_unchecked_document() 在服务端校验。
+{% endcomment %}
+
+{% block content %}
+  <h1>人工确认放行</h1>
+
+  <p>
+    人工确认把一次<strong>显式的人工判断</strong>记录为可追溯的审核事实。
+    它<strong>不会</strong>绕过后续流程：确认后对象仍要走
+    <code>promotion</code> 复制到 <code>knowledge/</code>，再进入索引。
+  </p>
+
+  <p>
+    只有当前状态为 <code>unavailable</code>、且对象真实存在于
+    <code>quarantine/</code> 的记录才会被放行；其余记录会逐条报告原因，
+    不会被修改。
+  </p>
+
+  <form method="post">
+    {% csrf_token %}
+    {% for obj in queryset %}
+      <input type="hidden" name="{{ action_checkbox_name }}" value="{{ obj.pk }}">
+    {% endfor %}
+    <input type="hidden" name="action" value="confirm_manually">
+    <input type="hidden" name="post" value="yes">
+
+    <fieldset class="module aligned">
+      <div class="form-row">
+        <label for="id_{{ reason_field }}">确认理由（必填）：</label>
+        <textarea id="id_{{ reason_field }}" name="{{ reason_field }}"
+                  rows="4" cols="80" required></textarea>
+        <p class="help">
+          例如：ClamAV 服务故障期间的人工复核，已人工下载并检查无毒。
+          本理由会原样写入 ContentModeration.confirmation_reason 并长期留存。
+        </p>
+      </div>
+    </fieldset>
+
+    <h2>将要处理的记录</h2>
+    <ul>
+      {% for obj in queryset %}
+        <li>
+          #{{ obj.pk }} — {{ obj.doc.title|default:"(无标题)" }}
+          [{{ obj.state }} / {{ obj.storage_state }}]
+          <code>{{ obj.quarantine_key|default:"(无隔离区 Key)" }}</code>
+        </li>
+      {% endfor %}
+    </ul>
+
+    <div class="submit-row">
+      <input type="submit" value="确认放行">
+      <a href="../" class="button cancel-link">取消</a>
+    </div>
+  </form>
+{% endblock %}

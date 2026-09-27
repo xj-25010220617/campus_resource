@@ -905,6 +905,50 @@ def authorized_knowledge_docs(user_context: Optional[dict] = None):
     return qs.filter(conditions)
 
 
+def _moderation_gated(qs):
+    """RAG 读取侧的审核门（纵深防御第二层，P1-2 Phase 1-2 / 审计报告 P-3）。
+
+    为什么读取侧还要再判一次
+    ------------------------
+    写入侧的 `check_indexable()` 只在**索引那一刻**生效。一旦某份文档的
+    `status` 因为任何原因变成 `indexed`（管理员手工改、运维脚本、将来的
+    错误回填、直接改库），它就永久绕过了那道门。而 `status='indexed'`
+    本身**不是**安全事实 —— 它只说明"索引流程跑完了"。
+
+    因此每个会**返回内容**的检索路径都必须自己再判一次审核 + 存储状态，
+    不能把安全性寄托在上一层过滤上（与 `utils/sse.py` 里"签发 URL 的每个
+    出口都要自己 fail-closed"是同一条原则）。
+
+    判据与写入侧**完全同源**：直接调用
+    `moderation.filter_indexable_docs()`，它复用
+    `INDEXABLE_MODERATION_STATES` / `STORAGE_STATE_PROMOTED`，不复制逻辑。
+
+    fail-closed：没有 ContentModeration 记录的历史文档一律被排除。
+    这是**预期行为**（审计报告 §十四），本阶段不回填、不删除、不改 status。
+    """
+    from apps.knowledge.moderation import filter_indexable_docs
+    return filter_indexable_docs(qs)
+
+
+def _vector_backend_state() -> str:
+    """当前向量后端：'milvus' / 'chroma' / 'unavailable'（只读探测）。"""
+    from utils.milvus import milvus_client
+    return milvus_client.backend_name()
+
+
+def vector_backend_available() -> bool:
+    """向量后端当前是否可用。
+
+    P1-2 Phase 1-2 / P-7：供健康检查与问答侧区分两种**完全不同**的空结果——
+
+        后端可用 + 空列表  → "知识库里确实没有相关内容"（正常）
+        后端不可用         → "检索服务故障"（必须告警，不能伪装成上一条）
+
+    调用方必须先查本函数再解释 `retrieve()` 的空返回。
+    """
+    return _vector_backend_state() != 'unavailable'
+
+
 # ------------------------------------------------------------------
 # 硬过滤（SQL WHERE 缩范围）
 # ------------------------------------------------------------------
@@ -917,7 +961,11 @@ def _apply_hard_filters(
     from apps.knowledge.models import KnowledgeDoc
 
     time_range = filters.get('time_range')
-    qs = authorized_knowledge_docs(user_context).filter(status='indexed')
+    # authorized（权限）+ status='indexed'（索引跑完）+ 审核/提升门（内容安全）。
+    # 第三项是 P1-2 Phase 1-2 新增的**读取侧**纵深防御，见 _moderation_gated()。
+    qs = _moderation_gated(
+        authorized_knowledge_docs(user_context).filter(status='indexed')
+    )
 
     # 不再默认只检索近一年；只有用户明确给出时间范围时才过滤。
     if time_range:
@@ -957,9 +1005,10 @@ def _filter_by_permission(
     if not doc_ids:
         return []
     allowed_ids = set(
-        authorized_knowledge_docs(user_context)
-        .filter(id__in=doc_ids, status='indexed')
-        .values_list('id', flat=True)
+        _moderation_gated(
+            authorized_knowledge_docs(user_context)
+            .filter(id__in=doc_ids, status='indexed')
+        ).values_list('id', flat=True)
     )
     return [h for h in hits if h.get('doc_id') in allowed_ids][:RAG_TOP_K]
 
@@ -1040,8 +1089,11 @@ def _fallback_title_search(
         kw_query |= Q(description__icontains=kw)
         kw_query |= Q(file_name__icontains=kw)
 
-    # Apply the same authorization scope as every other retrieval path.
-    docs = authorized_knowledge_docs(user_context).filter(kw_query, status='indexed')
+    # Apply the same authorization scope as every other retrieval path,
+    # plus the read-side moderation gate (P1-2 Phase 1-2 / P-3).
+    docs = _moderation_gated(
+        authorized_knowledge_docs(user_context).filter(kw_query, status='indexed')
+    )
     docs = docs.order_by('-created_at')[:top_k]
 
     # 取每篇文档的最相关 chunk 作为内容预览（首块兜底）
@@ -1110,8 +1162,10 @@ def retrieve_images(
     但图片入库时已由视觉模型生成 title/description，此处按标题/描述关键词匹配。
 
     注意：**不按 status='indexed' 过滤**——图片无文本可索引，index_document_task
-    会把图片置为 'failed'（或误把二进制当文本索引），因此仅按
-    file_type='image' + visibility='public' + 权限过滤，功能自洽。
+    会把图片置为 'failed'（或误把二进制当文本索引），按它过滤会让所有合法图片
+    都检索不到。图片的准入由读取侧审核门 `_moderation_gated()` 决定
+    （state ∈ {approved, confirmed_unchecked} 且 storage_state=promoted），
+    未审核 / 审核中 / 已拒绝 / 审核不可用 / 审核异常的图片一律不可检索。
 
     Returns:
         [{'doc_id','doc_title','description','oss_key','file_name','score'}, ...]
@@ -1140,11 +1194,17 @@ def retrieve_images(
     # 兼容存量数据：file_type 可能是类别 'image'，也可能是历史存的原始扩展名（jpg/png 等）
     image_types = ['image'] + sorted(IMAGE_FILE_TYPES)
 
-    # 图片没有文本分块、不参与向量索引，index_document_task 会将其置为 failed
-    # （见函数 docstring），故不按 status 过滤，仅按 file_type + 权限过滤，
-    # 靠 title/description 关键词匹配召回。
-    qs = authorized_knowledge_docs(user_context).filter(
-        file_type__in=image_types,
+    # 与文本检索路径一样叠加读取侧审核门（P1-2 Phase 1-2 / P-3）。
+    #
+    # 这里**不能**再叠加 `status='indexed'`：图片没有文本分块，索引任务对
+    # 图片不会把它推到 'indexed'，真正的准入事实是审核门（审核状态白名单 +
+    # storage_state=promoted），不是 status。曾经按 status='indexed' 过滤导致
+    # 合法且已审核通过的图片被整体过滤掉（图片检索恒为空），而 status 本身
+    # 又不是安全事实——审核门才是。
+    qs = _moderation_gated(
+        authorized_knowledge_docs(user_context).filter(
+            file_type__in=image_types,
+        )
     )
 
     # 权限过滤后的基准集合（不含关键词/学科/分类筛选），供图片意图兜底使用
@@ -1246,13 +1306,33 @@ def retrieve(
     logger.debug(f'硬过滤候选数: {len(candidate_ids)}, filters={parsed_filters}')
 
     # 2. 双路召回（仅在候选范围内检索，对每个改写版本都检索）
+    #
+    # P1-2 Phase 1-2 / P-7：`milvus_client.search()` 返回 None 表示向量后端
+    # **不可用**（Milvus 与 ChromaDB 都连不上），与"检索成功但没有匹配"
+    # （空列表）是两回事。以前两者都返回 []，于是向量库挂掉时问答表现为
+    # "知识库里没有相关内容"，故障被伪装成正常空结果。
+    #
+    # 这里仍然让请求继续走关键词/分块通道（不要因为向量不可用就整体 500），
+    # 但把降级事实**明确记录下来**，并通过 `vector_backend_available()` 暴露给
+    # 健康检查与后续的问答侧提示。
     vector_hits = []
+    vector_backend_unavailable = False
     for q in rewrite_questions:
         q_emb = _cached_embed(q)
         if q_emb:
-            vector_hits.extend(milvus_client.search(
+            hits = milvus_client.search(
                 q_emb, top_k=top_k, filter_ids=candidate_ids,
-            ))
+            )
+            if hits is None:
+                vector_backend_unavailable = True
+                continue  # 不要 `or []` 吞掉：None 是"服务不可用"，必须显式分支
+            vector_hits.extend(hits)
+    if vector_backend_unavailable:
+        logger.error(
+            '[RAG监控] 向量后端不可用（%s）：本次检索仅使用关键词/分块通道，'
+            '问答结果可能严重不完整 q=%s',
+            _vector_backend_state(), question[:50],
+        )
     # 去重：按 vector_id 或 (doc_id, chunk_index) 去重，保留同文档的多块
     # 原来按 (doc_id, page) 去重会导致每篇文档只保留 1 个块（知识文档 page 恒为 0）
     seen = {}

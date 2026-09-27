@@ -18,7 +18,7 @@ import logging
 import re
 import time
 from typing import List, Optional, Set, Tuple
-from urllib.parse import urljoin, urlparse, unquote
+from urllib.parse import unquote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -499,6 +499,10 @@ class NeusoftSpider:
             if self.download_files:
                 self.collect_file_links(html, url)
 
+            # 列表页也可能直接挂附件链接
+            if self.download_files:
+                self.collect_file_links(html, url)
+
             for link in links:
                 if self.download_files and _is_excluded(link):
                     # 文本抽取被排除的页面（如信息公开 xxgk）：仅做附件发现，不提取正文入库
@@ -755,59 +759,36 @@ def save_page_as_knowledge_doc(
             discipline_id = first.id
             logger.debug(f"自动推断 discipline_id={discipline_id}（college_id={college_id}）")
 
-    # 上传内容到 OSS（索引任务需要从 OSS 读取文本）
+    # 走内部可信写入入口：对象先落 quarantine/，审核通过后由 promotion 提升到
+    # knowledge/ 并索引。爬虫不再自己拼 oss_key，也不再直接投递索引任务。
     import uuid
-    from datetime import datetime
-    from utils.oss import oss_client
 
-    now = datetime.now()
-    safe_filename = f"crawl_{uuid.uuid4().hex[:12]}.txt"
-    oss_key = f"knowledge/website/0/{now:%Y-%m}/{safe_filename}"
+    from apps.knowledge import upload_service
 
-    upload_success = oss_client.upload_text(content, oss_key)
-    if not upload_success:
-        logger.error(f"OSS 上传失败，跳过保存: {title}")
+    try:
+        doc = upload_service.ingest_internal_document(
+            uploader,
+            payload=content.encode("utf-8"),
+            file_name=f"crawl_{uuid.uuid4().hex[:12]}.txt",
+            title=title[:512],
+            description=title[:200],
+            source_type="website",
+            source_url=url,
+            file_type="txt",
+            visibility="public",
+            scope="school",
+            college_id=college_id,
+            discipline_id=discipline_id,
+            md5_hash=content_hash,
+        )
+    except Exception as e:
+        logger.error(f"网页正文写入失败，跳过保存: {title} - {type(e).__name__}: {e}")
         return None
-
-    oss_url = (
-        f"https://{oss_client.bucket_name}.{oss_client.endpoint}/{oss_key}"
-        if oss_client.bucket_name and oss_client.endpoint
-        else ""
-    )
-
-    # 创建 KnowledgeDoc（使用系统的分类体系）
-    doc = KnowledgeDoc.objects.create(
-        title=title[:512],
-        description=title[:200],
-        source_type="website",
-        source_url=url,
-        file_type="txt",
-        file_size=len(content.encode("utf-8")),
-        md5_hash=content_hash,
-        oss_key=oss_key,
-        oss_url=oss_url,
-        visibility="public",
-        scope="school",
-        uploader=uploader,
-        college_id=college_id,
-        discipline_id=discipline_id,
-        # category_id 不传（category 表已移除）
-        status="uploaded",
-    )
 
     logger.info(
         f"已创建 KnowledgeDoc: id={doc.id}, title={title[:40]}, "
-        f"college_id={college_id}"
+        f"college_id={college_id}（待审核）"
     )
-
-    # 触发异步索引
-    try:
-        from utils.celery_dispatcher import safe_delay
-        from apps.knowledge.tasks import index_document_task
-        safe_delay(index_document_task, doc.id)
-    except Exception as e:
-        logger.warning(f"触发索引任务失败: {e}")
-
     return doc.id
 
 
@@ -821,6 +802,8 @@ def save_file_as_knowledge_doc(
 
     与手动上传契约一致：二进制经 OSS 直传，file_name 保留真实扩展名
     （索引任务按扩展名选择解析器），file_type 经 normalize_file_type 归一化。
+    写入路径同样走 upload_service.ingest_internal_document：附件先落
+    quarantine/，审核通过后才提升到 knowledge/ 并索引。
 
     Args:
         file_data: download_file() 返回的字典
@@ -840,7 +823,6 @@ def save_file_as_knowledge_doc(
         pass
 
     from apps.knowledge.models import KnowledgeDoc
-    from apps.knowledge.serializers import normalize_file_type
 
     url = file_data.get("url", "")
     content = file_data.get("content", b"")
@@ -895,63 +877,37 @@ def save_file_as_knowledge_doc(
         title = file_name.rsplit(".", 1)[0]
     title = (title or "官网附件")[:512]
 
-    # 上传二进制到 OSS（索引任务需要从 OSS 读取文件）
-    import uuid
-    from datetime import datetime
-    from utils.oss import guess_content_type, oss_client
-
-    now = datetime.now()
-    safe_filename = f"crawl_{uuid.uuid4().hex[:12]}.{ext}"
-    oss_key = f"knowledge/website/0/{now:%Y-%m}/{safe_filename}"
-
-    upload_success = oss_client.upload_bytes(
-        content, oss_key, content_type=guess_content_type(file_name)
-    )
-    if not upload_success:
-        logger.error(f"OSS 上传失败，跳过保存: {file_name}")
-        return None
-
-    oss_url = (
-        f"https://{oss_client.bucket_name}.{oss_client.endpoint}/{oss_key}"
-        if oss_client.bucket_name and oss_client.endpoint
-        else ""
-    )
-
     source_page = file_data.get("source_page", "")
     description = f"官网附件：{file_name}（来源页面: {source_page}）" if source_page else f"官网附件：{file_name}"
 
-    doc = KnowledgeDoc.objects.create(
-        title=title,
-        description=description[:200],
-        source_type="website",
-        source_url=url[:1024],
-        file_name=file_name[:256],
-        file_type=normalize_file_type(ext),
-        file_size=size,
-        md5_hash=md5,
-        oss_key=oss_key,
-        oss_url=oss_url,
-        visibility="public",
-        scope="school",
-        uploader=uploader,
-        college_id=college_id,
-        discipline_id=discipline_id,
-        status="uploaded",
-    )
+    # 走内部可信写入入口（与网页正文同一条链）：quarantine → 审核 → 提升 → 索引
+    from apps.knowledge import upload_service
+    from apps.knowledge.serializers import normalize_file_type
+
+    try:
+        doc = upload_service.ingest_internal_document(
+            uploader,
+            payload=content,
+            file_name=file_name,
+            title=title,
+            description=description[:200],
+            source_type="website",
+            source_url=url[:1024],
+            file_type=normalize_file_type(ext),
+            visibility="public",
+            scope="school",
+            college_id=college_id,
+            discipline_id=discipline_id,
+            md5_hash=md5,
+        )
+    except Exception as e:
+        logger.error(f"附件写入失败，跳过保存: {file_name} - {type(e).__name__}: {e}")
+        return None
 
     logger.info(
         f"已创建附件 KnowledgeDoc: id={doc.id}, file_name={file_name[:40]}, "
-        f"size={size}, college_id={college_id}"
+        f"size={size}, college_id={college_id}（待审核）"
     )
-
-    # 触发异步索引
-    try:
-        from utils.celery_dispatcher import safe_delay
-        from apps.knowledge.tasks import index_document_task
-        safe_delay(index_document_task, doc.id)
-    except Exception as e:
-        logger.warning(f"触发索引任务失败: {e}")
-
     return doc.id
 
 

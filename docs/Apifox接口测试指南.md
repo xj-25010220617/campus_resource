@@ -570,25 +570,41 @@ pm.test("返回文件名", () => pm.expect(json.file_name).to.be.a("string").and
 | **权限** | `IsAdminOrSuperAdmin` |
 
 > **调用时机**：前端用 STS 凭证直传 OSS 成功后，调此接口在数据库创建记录。
+>
+> ⚠️ **必须携带第 ① 步 `/upload/sts/` 返回的 `intent_id`**，且 `oss_key` 必须与
+> 第 ① 步返回的 `oss_key` **完全一致**（那个 key 由服务端生成，位于 `quarantine/`
+> 隔离区）。两个值只能从 STS 响应里取，不能自己拼。
 
 **Body → `form-data`**（全部选 `Text`）：
 
 | 参数 | 类型 | 必填 | 示例值 |
 |------|------|------|--------|
-| `oss_key` | Text | ✅ | `knowledge/1/2026-07/a1b2c3d4e5f6.pdf` |
-| `title` | Text | ✅ | `软件工程导论` |
-| `description` | Text | ✅ | `计算机学院软件工程专业入门教材` |
+| `intent_id` | Text | ✅ | `37`（第 ① 步 STS 响应里的 `intent_id`） |
+| `oss_key` | Text | ✅ | `quarantine/school/0/2026-09/9f8e7d6c5b4a.pdf`（**原样取第 ① 步的 `oss_key`**） |
+| `title` | Text | 否 | `软件工程导论`（不填由 AI 生成） |
+| `description` | Text | 否 | `计算机学院软件工程专业入门教材` |
 | `file_name` | Text | ✅ | `软件工程导论.pdf` |
-| `file_size` | Text | ✅ | `2048000` |
+| `file_size` | Text | ✅ | `2048000`（必须与 OSS 实际大小一致） |
 | `file_type` | Text | ✅ | `pdf` |
-| `md5` | Text | ✅ | `d41d8cd98f00b204e9800998ecf8427e` |
-| `college_id` | Text | ✅ | `1` |
-| `discipline_id` | Text | ✅ | `1` |
-| `category_id` | Text | ✅ | `5` |
+| `md5` | Text | ✅ | `d41d8cd98f00b204e9800998ecf8427e`（必须与 OSS 对象 ETag 一致） |
+| `college_id` | Text | 否 | `1`（非超管传了也无效，强制取本人归属） |
+| `department_id` | Text | 否 | `2`（同上） |
+| `discipline_id` | Text | 否 | `1` |
 | `keywords` | Text | 否 | `["软件工程","SDLC","期末考试"]` |
 | `visibility` | Text | 否 | `public` |
 
 > ⚠️ `keywords` 格式是 JSON 数组字符串：`["关键词1","关键词2"]`
+> ⚠️ `scope` / `category_id` 传了也不会生效（已废弃，字段会被忽略）。
+
+**服务端校验（5 项，逐项独立拒绝）**：
+
+| # | 校验 | 失败响应 |
+|---|------|----------|
+| 1 | `intent_id` 必填；必须是**当前登录用户**的、存在、未过期、状态为 issued | 400 缺字段 / 404 不存在或非本人 / 409 已过期或状态不允许 |
+| 2 | `oss_key` 必须与 `intent_id` 记录的 key **精确相等**（不做前缀或 scope 匹配） | 400 `OSS Key 与该上传凭证记录的对象不一致` |
+| 3 | 以 OSS `head_object` 实测为准：对象必须存在、大小与 `file_size` 一致、不超过分档上限、ETag 与 `md5` 一致、后缀与对象 Content-Type 匹配 | 400（字段级报错） |
+| 4 | 原子推进凭证状态（`issued` → `completed`），并发重复回调只有一个成功 | 重复回调返回既有文档 `duplicate: true` |
+| 5 | 同一 `oss_key` 已登记 / `md5` 命中已有文档 → 返回既有文档，不新建 | `{id, status, duplicate: true}`；他人不可见的对象返回 400 |
 
 **成功响应**（200）：
 ```json
@@ -596,6 +612,33 @@ pm.test("返回文件名", () => pm.expect(json.file_name).to.be.a("string").and
     "id": 16,
     "status": "uploaded"
 }
+```
+
+> 返回的 `status=uploaded` 表示"已入库，等待审核"。此时文件仍在 OSS 隔离区，
+> 审核通过并提升后才可被下载 / 预览 / 检索。
+
+**重复上传响应**（200）：
+```json
+{
+    "id": 16,
+    "status": "uploaded",
+    "duplicate": true
+}
+```
+
+**错误场景 — 漏传 intent_id**（400）：
+```json
+{ "intent_id": ["This field is required."] }
+```
+
+**错误场景 — intent_id 与 oss_key 不配套**（400）：
+```json
+{ "oss_key": ["OSS Key 与该上传凭证记录的对象不一致"] }
+```
+
+**错误场景 — 用了别人的 intent_id**（404）：
+```json
+{ "detail": "上传凭证不存在或不属于当前用户", "code": "NOT_FOUND" }
 ```
 
 **错误场景 — 文件类型不在白名单**（400）：
@@ -625,9 +668,12 @@ pm.test("状态 uploaded", () => pm.expect(json.status).to.equal("uploaded"));
 
 **流程**：
 ```
-① POST /api/knowledge/upload/sts/   → 拿 oss_key + upload_url
-② PUT {upload_url}（前端直传 OSS）   → 文件存入 OSS
-③ POST /api/knowledge/upload/callback/ → 通知后端"我传完了"，后端创建 DB 记录
+① POST /api/knowledge/upload/sts/   → 拿 intent_id + oss_key + upload_url
+   （若响应是 {"duplicate": true, "knowledge_doc_id": …}，说明文件已存在，
+     此时**没有签发 intent**，不要继续第 ②③ 步）
+② PUT {upload_url}（前端直传 OSS）   → 文件存入隔离区 quarantine/
+③ POST /api/knowledge/upload/callback/ → 带上 intent_id + 同一个 oss_key，
+                                        后端核验后创建 DB 记录（等待审核）
 ```
 
 **第②步 Apifox 模拟**（选做）：
@@ -652,6 +698,8 @@ const stsRes = pm.sendRequest({
 const stsData = stsRes.json();
 pm.environment.set("upload_url", stsData.upload_url);
 pm.environment.set("oss_key", stsData.oss_key);
+// 回调接口必填：intent_id 必须与 oss_key 成对使用（都来自本次 STS 响应）
+pm.environment.set("intent_id", stsData.intent_id);
 ```
 
 ---

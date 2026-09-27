@@ -7,19 +7,71 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 _DEV_SECRET_KEY = 'django-insecure-dev-key-change-in-production-2026'
 
+
+# ---------------------------------------------------------------------------
+# 环境变量读取助手（P1-2 Phase 1-2 / 审计报告 P-6）
+#
+# 生产安全配置此前依赖"部署的人记得去改 .env"：ALLOWED_HOSTS 缺省值是 `*`，
+# 一旦生产 .env 漏配或写空，Django 会**静默接受任意 Host 头**，没有任何报错。
+# 这里统一改成"缺省即安全 + 配错就拒绝启动"。
+#
+# 变量名同时接受 `DJANGO_*` 与仓库历史名（如 `ALLOWED_HOSTS` / `CORS_ORIGINS`），
+# 前者优先，避免已有 .env 直接失效。
+# ---------------------------------------------------------------------------
+
+from django.core.exceptions import ImproperlyConfigured  # noqa: E402
+
+
+def _cfg_bool(*names, default=False):
+    """按顺序取第一个非空环境变量并解析为布尔值。"""
+    for name in names:
+        raw = config(name, default=None)
+        if raw is None or str(raw).strip() == '':
+            continue
+        return str(raw).strip().lower() in ('1', 'true', 'yes', 'on')
+    return default
+
+
+def _cfg_list(*names, default=''):
+    """按顺序取第一个非空环境变量并按逗号切分为去空白的列表。"""
+    for name in names:
+        raw = config(name, default=None)
+        if raw is None or str(raw).strip() == '':
+            continue
+        return [item.strip() for item in str(raw).split(',') if item.strip()]
+    return [item.strip() for item in default.split(',') if item.strip()]
+
+
 SECRET_KEY = config('SECRET_KEY', default=_DEV_SECRET_KEY)
 
 # DEBUG 默认关闭（fail-closed）；本地开发在 .env 显式开启
-DEBUG = config('DEBUG', default=False, cast=bool)
+DEBUG = _cfg_bool('DJANGO_DEBUG', 'DEBUG', default=False)
 
 # 部署安全：生产环境（DEBUG=False）禁止使用已知的开发密钥
 if not DEBUG and SECRET_KEY == _DEV_SECRET_KEY:
-    from django.core.exceptions import ImproperlyConfigured
     raise ImproperlyConfigured(
         '生产环境必须显式设置 SECRET_KEY，禁止使用默认开发密钥'
     )
 
-ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='*').split(',')
+# ALLOWED_HOSTS：缺省不再是 `*`。本地开发（DEBUG=True）没有配置时兜底为 `*`
+# 以保持既有开发体验；生产环境必须显式配置，配错直接拒绝启动。
+ALLOWED_HOSTS = _cfg_list('DJANGO_ALLOWED_HOSTS', 'ALLOWED_HOSTS')
+if not ALLOWED_HOSTS:
+    if DEBUG:
+        ALLOWED_HOSTS = ['*']
+    else:
+        raise ImproperlyConfigured(
+            '生产环境（DEBUG=False）必须显式设置 ALLOWED_HOSTS，'
+            '例如 DJANGO_ALLOWED_HOSTS=example.edu.cn,www.example.edu.cn'
+        )
+
+if not DEBUG and '*' in ALLOWED_HOSTS:
+    raise ImproperlyConfigured(
+        '生产环境（DEBUG=False）禁止 ALLOWED_HOSTS 包含 "*"：'
+        '这会让任意 Host 头通过校验（审计报告 P-6）。'
+        '请改为显式列出真实域名，例如 '
+        'DJANGO_ALLOWED_HOSTS=example.edu.cn,www.example.edu.cn'
+    )
 
 # Application definition
 INSTALLED_APPS = [
@@ -128,8 +180,23 @@ STATIC_ROOT = BASE_DIR / 'staticfiles'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # CORS
-CORS_ALLOW_ALL_ORIGINS = DEBUG
-CORS_ALLOWED_ORIGINS = config('CORS_ORIGINS', default='http://localhost:5173').split(',')
+#
+# `CORS_ALLOW_ALL_ORIGINS` 只允许在开发环境为 True；生产环境即使显式设了
+# CORS_ALLOW_ALL_ORIGINS=true 也直接拒绝启动（审计报告 P-6）。跨域放行是
+# 浏览器侧的安全边界，不能靠"部署的人记得关"来保证。
+CORS_ALLOW_ALL_ORIGINS = _cfg_bool('CORS_ALLOW_ALL_ORIGINS', default=DEBUG)
+if not DEBUG and CORS_ALLOW_ALL_ORIGINS:
+    raise ImproperlyConfigured(
+        '生产环境（DEBUG=False）禁止 CORS_ALLOW_ALL_ORIGINS=True：'
+        '这会让任意站点携带用户凭证调用本服务（审计报告 P-6）。'
+        '请改用 CORS_ALLOWED_ORIGINS 列出真实前端源。'
+    )
+
+# 生产环境不再兜底到 localhost——那只会让人误以为已配置。
+CORS_ALLOWED_ORIGINS = _cfg_list(
+    'CORS_ALLOWED_ORIGINS', 'CORS_ORIGINS',
+    default='http://localhost:5173' if DEBUG else '',
+)
 
 # DRF configuration
 REST_FRAMEWORK = {
@@ -221,6 +288,96 @@ EMBED_VECTOR_DIM = int(config(
 _hf_endpoint = config('HF_ENDPOINT', default='')
 if _hf_endpoint:
     os.environ['HF_ENDPOINT'] = _hf_endpoint
+
+# ------------------------------------------------------------------
+# 上传意图（P1-2D）
+#
+# 服务端签发的隔离区上传凭证有效期。取得短是安全考虑：凭证过期后不能再
+# complete/consume，未完成的上传对象留在隔离区等待人工处理（§十四 不自动删除）。
+# 分片上传的会话有效期另见 chunked_views.SESSION_EXPIRE_HOURS（24 小时）。
+# ------------------------------------------------------------------
+UPLOAD_INTENT_TTL_SECONDS = config(
+    'UPLOAD_INTENT_TTL_SECONDS', default=3600, cast=int)
+
+# ------------------------------------------------------------------
+# 内容安全审核服务（P1-2C）
+#
+# 全部走配置，不在代码里散落字面量。安全相关默认值一律取**最严格**的一侧：
+# 检测器默认全部启用且必需——宁可让文档停在 unavailable，也不放行未审核内容。
+# ------------------------------------------------------------------
+# 策略版本：写入 ContentModeration.policy_version / ModerationAttempt.policy_version，
+# 规则或检测器变化后必须递增，才能区分"同一内容在不同策略下的结论"。
+CONTENT_MODERATION_POLICY_VERSION = config(
+    'CONTENT_MODERATION_POLICY_VERSION', default='content-moderation-v1',
+)
+
+# 必需检测器：其中任何一个没能给出结论，本次审核只能是 unavailable / error。
+# 要放宽必须显式修改这里（有记录的评审决定），而不是让代码静默跳过。
+CONTENT_MODERATION_REQUIRED_DETECTORS = ('clamav', 'rule', 'llm')
+# 可选检测器：缺席不阻断放行；但一旦给出非 clean 结论，依然计入判决。
+CONTENT_MODERATION_OPTIONAL_DETECTORS = ('vision',)
+# 图片没有任何可抽文本，视觉检测器缺席等于图片完全没被检查 → 默认必须。
+CONTENT_MODERATION_VISION_REQUIRED_FOR_IMAGES = True
+
+# 重试与租约
+CONTENT_MODERATION_MAX_ATTEMPTS = config('CONTENT_MODERATION_MAX_ATTEMPTS', default=3, cast=int)
+CONTENT_MODERATION_RETRY_BACKOFF_SECONDS = config(
+    'CONTENT_MODERATION_RETRY_BACKOFF_SECONDS', default=300, cast=int)
+CONTENT_MODERATION_LEASE_SECONDS = config(
+    'CONTENT_MODERATION_LEASE_SECONDS', default=600, cast=int)
+
+# 上传解耦后的补扫宽限期（P1-2 Phase 1-2 / 审计报告 P-4）。
+# `upload_service.schedule_moderation()` 只入队、绝不降级同步执行：队列不可用
+# 时文档会停在"已建 KnowledgeDoc、对象仍在 quarantine/、无审核记录"。
+# `retry_failed_moderations_task` 会重新派发这类文档，但只处理创建时间早于
+# 本宽限期的——避免和"刚提交、正在入队"的请求抢同一份文档。
+MODERATION_DISPATCH_RECOVERY_GRACE_SECONDS = config(
+    'MODERATION_DISPATCH_RECOVERY_GRACE_SECONDS', default=900, cast=int)
+
+# ------------------------------------------------------------------
+# Promotion（P1-2D STEP 4-B）
+#
+# 隔离区 → 正式区（quarantine/ → knowledge/）的抢占租约。promotion 期间记录
+# 被 CAS 置为 promoting；持有者崩溃后该状态不会自己恢复，超过本时长即视为
+# 租约过期，允许其他 worker 重新认领（OSS copy 幂等，重做安全）。
+# ------------------------------------------------------------------
+PROMOTION_CLAIM_TIMEOUT_SECONDS = config(
+    'PROMOTION_CLAIM_TIMEOUT_SECONDS', default=900, cast=int)
+
+# ClamAV（clamd INSTREAM）。默认启用且必需：未部署时应表现为
+# moderation_state=unavailable，而不是"跳过扫描后放行"。
+CLAMAV_ENABLED = config('CLAMAV_ENABLED', default=True, cast=bool)
+CLAMAV_HOST = config('CLAMAV_HOST', default='127.0.0.1')
+CLAMAV_PORT = config('CLAMAV_PORT', default=3310, cast=int)
+CLAMAV_TIMEOUT = config('CLAMAV_TIMEOUT', default=30, cast=int)
+
+# 模型审核
+LLM_MODERATION_ENABLED = config('LLM_MODERATION_ENABLED', default=True, cast=bool)
+LLM_MODERATION_TIMEOUT = config('LLM_MODERATION_TIMEOUT', default=60, cast=int)
+# 送模型的字符上限：绝不允许把文件全文直接发给模型
+MODERATION_MAX_LLM_INPUT_CHARS = config(
+    'MODERATION_MAX_LLM_INPUT_CHARS', default=12000, cast=int)
+
+# 视觉审核
+VISION_MODERATION_ENABLED = config('VISION_MODERATION_ENABLED', default=True, cast=bool)
+VISION_MODERATION_TIMEOUT = config('VISION_MODERATION_TIMEOUT', default=120, cast=int)
+
+# 读取 / 抽取上限
+MODERATION_MAX_DOWNLOAD_BYTES = config(
+    'MODERATION_MAX_DOWNLOAD_BYTES', default=50 * 1024 * 1024, cast=int)
+MODERATION_MAX_MEDIA_BYTES = config(
+    'MODERATION_MAX_MEDIA_BYTES', default=20 * 1024 * 1024, cast=int)
+MODERATION_MAX_EXTRACT_CHARS = config(
+    'MODERATION_MAX_EXTRACT_CHARS', default=2000000, cast=int)
+
+# 旧格式 DOC 解析（antiword）。不使用 soffice：它会以完整文档方式在本机
+# 打开上传文件，风险面显著更大，且当前部署未验证可用。
+MODERATION_DOC_ANTIWORD_ENABLED = config(
+    'MODERATION_DOC_ANTIWORD_ENABLED', default=True, cast=bool)
+MODERATION_SUBPROCESS_TIMEOUT_SECONDS = config(
+    'MODERATION_SUBPROCESS_TIMEOUT_SECONDS', default=20, cast=int)
+MODERATION_SUBPROCESS_MAX_OUTPUT_BYTES = config(
+    'MODERATION_SUBPROCESS_MAX_OUTPUT_BYTES', default=8 * 1024 * 1024, cast=int)
 
 # ------------------------------------------------------------------
 # Milvus / ChromaDB

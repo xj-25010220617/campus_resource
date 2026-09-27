@@ -1,7 +1,7 @@
 from rest_framework import serializers
 
 from .models import KnowledgeDoc, Keyword
-from utils.oss import oss_client
+from utils.oss import is_official_oss_key, oss_client
 
 
 class KnowledgeDocSerializer(serializers.ModelSerializer):
@@ -40,19 +40,40 @@ class KnowledgeDocSerializer(serializers.ModelSerializer):
             'file_size', 'md5_hash', 'page_count', 'uploader',
             'chunk_count', 'created_at', 'updated_at', 'indexed_at',
             'index_error', 'index_attempts', 'index_started_at', 'failed_at',
+            # 服务端内部状态：仅由上传视图 / 索引任务写入。
+            # 若允许客户端写入，可通过 {"status": "indexed"} 直接穿过
+            # RAG 检索的 status='indexed' 门，或伪造 is_sensitive /
+            # sensitive_checked 伪装成"已安全审核"。
+            'status', 'is_sensitive', 'sensitive_checked',
         ]
 
     def get_download_url(self, obj) -> str:
-        """带原始文件名的签名下载 URL（附件下载）"""
+        """带原始文件名的签名下载 URL（附件下载）
+
+        P1-2D STEP 4-A.2：只对**正式区**（`knowledge/`）对象签发。
+        新上传的文件在审核通过并 promotion 之前一直留在 `quarantine/`，
+        详情接口此前会直接对它签发 7 天有效的签名 URL，从而绕开
+        `/download/` 与 `/preview/` 已加的 fail-closed 门禁。
+        返回 `''`（而不是 `None`）与既有消费端约定一致，避免下游把空值
+        当成"需要重新签名"再拼一次 URL。
+        """
         if not obj.oss_key:
+            return ''
+        if not is_official_oss_key(obj.oss_key):
             return ''
         return oss_client.get_download_url(
             obj.oss_key, expires=604800, file_name=obj.file_name,
         )
 
     def get_oss_url(self, obj) -> str:
-        """签名预览 URL（无 attachment，浏览器内联显示）"""
+        """签名预览 URL（无 attachment，浏览器内联显示）
+
+        与 `get_download_url` 同一门禁：非正式区对象一律返回 `''`。
+        两个字段都可以单独构成内容访问入口，必须同时 fail-closed。
+        """
         if not obj.oss_key:
+            return ''
+        if not is_official_oss_key(obj.oss_key):
             return ''
         return oss_client.get_preview_url(obj.oss_key, expires=604800)
 
@@ -122,6 +143,14 @@ FILE_SIZE_LIMITS = {
     'other': 50 * 1024 * 1024,
 }
 
+# 分片上传安全上限（集中定义，避免在各 view 中复制 magic number）
+# - MAX_FILE_SIZE 取 FILE_SIZE_LIMITS 的最大档（视频 500MB），与 nginx
+#   `client_max_body_size 500m` 对齐，作为合并后的绝对上限兜底。
+# - MAX_CHUNK_SIZE 即单个分片请求的上限，取值与 MAX_FILE_SIZE 相同：
+#   单个分片不得超过允许上传的最大文件大小。
+MAX_FILE_SIZE = max(FILE_SIZE_LIMITS.values())
+MAX_CHUNK_SIZE = MAX_FILE_SIZE
+
 # 允许上传的文件类型白名单
 ALLOWED_FILE_TYPES = {
     # 文档类
@@ -144,16 +173,26 @@ ALLOWED_FILE_TYPES = {
 }
 
 
-def _validate_file_size(file_size: int, file_type: str) -> None:
-    """校验文件大小是否在允许范围内，超限抛出 ValidationError"""
+def check_file_size(file_size: int, file_type: str) -> str:
+    """按文件类型分档校验大小，返回超限提示文案（未超限返回空串）。
+
+    供视图层自行构造项目统一格式的错误响应（`{'字段': '文案'}` / `{'detail': '文案'}`），
+    与 `_validate_file_size` 共用同一份 `FILE_SIZE_LIMITS`，避免规则两处维护。
+    """
     ft = (file_type or 'other').lower()
     max_size = FILE_SIZE_LIMITS.get(ft, FILE_SIZE_LIMITS['other'])
     if file_size > max_size:
         max_mb = max_size // (1024 * 1024)
         cur_mb = file_size // (1024 * 1024)
-        raise serializers.ValidationError(
-            f'{ft} 文件大小不能超过 {max_mb}MB，当前大小 {cur_mb}MB'
-        )
+        return f'{ft} 文件大小不能超过 {max_mb}MB，当前大小 {cur_mb}MB'
+    return ''
+
+
+def _validate_file_size(file_size: int, file_type: str) -> None:
+    """校验文件大小是否在允许范围内，超限抛出 ValidationError"""
+    message = check_file_size(file_size, file_type)
+    if message:
+        raise serializers.ValidationError(message)
 
 
 def _validate_file_type(file_type: str) -> None:
@@ -254,7 +293,15 @@ class UploadSTSRequestSerializer(serializers.Serializer):
 class UploadCallbackSerializer(serializers.Serializer):
     """OSS上传完成回调请求参数"""
 
-    oss_key = serializers.CharField(max_length=512, help_text='OSS对象Key')
+    # P1-2D STEP 4-A：回调必须携带服务端在 /upload/sts/ 阶段签发的上传意图 ID。
+    # 这是"这个对象归谁"的唯一可信来源——服务端据此取出 intent.quarantine_key
+    # 并与客户端提交的 oss_key 做精确比对。缺了它就没有归属依据，因此必填。
+    intent_id = serializers.IntegerField(
+        help_text='上传意图ID（由 /api/knowledge/upload/sts/ 返回）',
+    )
+    oss_key = serializers.CharField(
+        max_length=512, help_text='OSS对象Key（必须与 intent 签发的 quarantine key 完全一致）',
+    )
     title = serializers.CharField(
         max_length=512, required=False, default='',
         help_text='文档标题（可选，未提供时由 AI 生成）',

@@ -119,6 +119,7 @@ def index_document_task(self, doc_id: int):
 
     from apps.knowledge.extractor import extract_text_from_oss_detailed
     from apps.knowledge.models import DocChunk, KnowledgeDoc
+    from apps.knowledge.moderation import check_indexable
     from apps.knowledge.utils import chunk_document
     from utils.llm import llm_client
     from utils.milvus import milvus_client
@@ -127,6 +128,18 @@ def index_document_task(self, doc_id: int):
         doc = KnowledgeDoc.objects.get(id=doc_id)
     except KnowledgeDoc.DoesNotExist:
         logger.warning(f'index_document_task: doc_id={doc_id} 不存在')
+        return None
+
+    # 索引前置安全校验（集中式唯一入口，见 apps.knowledge.moderation）。
+    # 必须放在任务体内：本任务还可能被 safe_delay 同步降级、脚本 task.run()、
+    # 爬虫 safe_delay、broker 残留消息等路径直接调用，只加在视图层会被绕过。
+    allowed, reason = check_indexable(doc)
+    if not allowed:
+        logger.warning(f'index_document_task doc_id={doc_id} 未通过索引前置校验: {reason}')
+        doc.status = 'failed'
+        doc.index_error = f'索引前置校验未通过：{reason}'
+        doc.failed_at = timezone.now()
+        doc.save(update_fields=['status', 'index_error', 'failed_at', 'updated_at'])
         return None
 
     # Celery 绑定任务提供 request.retries；本地同步降级时使用 0 次重试作为默认值。
@@ -265,6 +278,224 @@ def index_document_task(self, doc_id: int):
         if retries < max_retries and self is not None:
             raise self.retry(exc=e)
         raise
+
+
+def _bound_task_id(bound_task) -> str:
+    """取当前 Celery 任务 ID。
+
+    降级同步执行（未安装 Celery / broker 不可用）时 `self` 是 None，没有
+    `request`——此时返回 'sync'，而不是让 AttributeError 把整个任务体吞掉
+    （那会让审核链路在本地环境变成静默空操作）。与 `index_document_task`
+    里 `getattr(self, 'request', None)` 的写法保持一致。
+    """
+    request = getattr(bound_task, 'request', None)
+    return getattr(request, 'id', None) or 'sync'
+
+
+@shared_task(bind=True, ignore_result=True)
+def moderate_and_promote_task(self, doc_id: int):
+    """P1-2D STEP 4-B：上传完成后的统一编排 —— 审核 → 提升 → 索引。
+
+    职责边界（刻意保持分离，不要把 promotion 塞回 `moderate_document()`）：
+
+        moderate_document(doc_id)   只写审核结论，绝不改存储位置、绝不索引
+        promote_document(doc_id)    只在校验审核结论后做 quarantine → knowledge
+        index_document_task(doc_id) 由 promotion 的 on_commit 派发
+
+    本任务自身不做任何安全判定——"能不能提升"由 `promote_document()` 内部的
+    白名单判定决定，"能不能索引"由 `check_indexable()` 兜底。这里只是把三段
+    串起来，因此**不存在**"编排层漏了一个 if 就放行"的风险面。
+
+    幂等性：
+    - 已 `approved + promoted` 时 `promote_document()` 直接短路，不重复 copy；
+      此时本任务走"补派索引"路径（promotion 成功但派发丢失的恢复路径），
+      且只有 `doc.status != 'indexed'` 时才补派——重复调用不会重复索引。
+    - 本次刚 promoted 时不重复派发索引：promotion 的 on_commit 已经派过。
+    - 审核结论为 rejected / unavailable / error / pending / scanning 时，
+      `promote_document()` 一律 skip，不会产生任何 OSS 或存储状态变更。
+
+    Args:
+        doc_id: KnowledgeDoc 主键
+    """
+    from .models import ContentModeration, KnowledgeDoc
+    from .moderation import check_indexable, moderate_document
+    from .promotion import PromotionResult, promote_document
+
+    try:
+        doc = KnowledgeDoc.objects.get(id=doc_id)
+    except KnowledgeDoc.DoesNotExist:
+        logger.warning('moderate_and_promote_task: doc_id=%s 不存在', doc_id)
+        return None
+
+    # ---- 1. 审核（只写 ContentModeration / ModerationAttempt） ----
+    run = moderate_document(doc_id, worker_id=f'worker-{_bound_task_id(self)}')
+    logger.info(
+        'moderate_and_promote_task 审核阶段 doc_id=%s state=%s verdict=%s applied=%s',
+        doc_id, run.state, run.verdict, run.applied,
+    )
+
+    moderation = ContentModeration.objects.filter(doc_id=doc_id).first()
+    if moderation is None:
+        # 审核服务在写记录之前就失败了（doc 不存在 / 无 oss_key）——
+        # 没有任何可提升的事实，直接结束。绝不视为通过。
+        logger.warning('moderate_and_promote_task: doc_id=%s 无审核记录，中止', doc_id)
+        return None
+
+    # ---- 2. 提升（内部做白名单判定 + CAS + OSS 校验） ----
+    promotion = promote_document(doc_id, worker_id=f'task-{_bound_task_id(self)}')
+
+    # ---- 3. 索引派发 ----
+    # 两条互斥路径，刻意不重叠，避免同一次调用把同一份文档派发两次
+    # （索引会真的调用 Embedding API，重复派发是实打实的成本）：
+    #
+    #   STATUS_PROMOTED —— 本次刚完成提升：`promote_document()` 已经在事务
+    #                      提交后注册了索引派发，这里**不再**重复派发。
+    #   STATUS_ALREADY  —— 早已 promoted（幂等短路，没有产生任何 on_commit）：
+    #                      这是"提升成功但派发丢失"的恢复路径，在这里补齐。
+    #
+    # 两条路径都先用 `check_indexable()` 兜底：即使 storage_state 是 promoted，
+    # 审核结论为 rejected 时依然不得索引。
+    if promotion.status == PromotionResult.STATUS_ALREADY:
+        doc.refresh_from_db(fields=['oss_key', 'status'])
+        allowed, reason = check_indexable(doc)
+        if allowed and doc.status != 'indexed':
+            from utils.celery_dispatcher import safe_delay
+
+            safe_delay(index_document_task, doc.id)
+            logger.info('moderate_and_promote_task 补派索引 doc_id=%s', doc_id)
+        elif not allowed:
+            logger.warning(
+                'moderate_and_promote_task: doc_id=%s 已提升但仍不可索引: %s',
+                doc_id, reason,
+            )
+    return None
+
+
+def _recover_undispatched_uploads(limit: int, now, dispatch) -> int:
+    """补扫"已上传但从未进入审核队列"的文档（审计报告 P-4 的恢复路径）。
+
+    `upload_service.schedule_moderation()` 走 `dispatch_async`——**只入队，
+    绝不降级同步执行**。队列不可用时它只记 ERROR 日志就返回，于是留下这样一种
+    文档：KnowledgeDoc 已建、对象仍在 `quarantine/`、**没有任何
+    ContentModeration 记录**。这是刻意的 fail-closed（宁可不审，也不放行），
+    但必须有恢复路径，否则队列抖一次，那批上传就永久卡在未审核。
+
+    选取条件（全部必须满足）：
+        oss_key 以 `quarantine/` 开头   —— 只处理隔离区对象，正式区历史文档不碰
+        status == 'uploaded'            —— 从未开始索引
+        created_at 早于宽限期            —— 避免与刚提交、正在入队的请求抢同一份
+        无 ContentModeration 记录        —— 从未被审核过
+
+    **本函数不做任何放行判定**：它只把文档重新排进 `moderate_and_promote_task`，
+    能不能过审仍由 `moderate_document()` 决定、能不能提升仍由
+    `promote_document()` 决定。任何"补扫即放行"的改动都属于安全事故。
+
+    Returns:
+        本轮重新派发的文档数
+    """
+    from datetime import timedelta
+
+    from django.conf import settings
+
+    from utils.oss import QUARANTINE_KEY_PREFIX
+
+    from .models import ContentModeration, KnowledgeDoc
+
+    grace = int(getattr(
+        settings, 'MODERATION_DISPATCH_RECOVERY_GRACE_SECONDS', 900,
+    ))
+    cutoff = now - timedelta(seconds=grace)
+
+    candidates = list(
+        KnowledgeDoc.objects.filter(
+            oss_key__startswith=QUARANTINE_KEY_PREFIX,
+            status='uploaded',
+            created_at__lt=cutoff,
+        ).exclude(
+            id__in=ContentModeration.objects.values('doc_id'),
+        ).order_by('created_at').values_list('id', flat=True)[:limit]
+    )
+    if not candidates:
+        return 0
+
+    for doc_id in candidates:
+        dispatch(moderate_and_promote_task, doc_id)
+
+    logger.warning(
+        '补扫到 %d 份"已上传但从未入队审核"的文档，已重新派发'
+        '（对象仍在 quarantine/，未做任何放行）',
+        len(candidates),
+    )
+    return len(candidates)
+
+
+@shared_task(bind=True, ignore_result=True)
+def retry_failed_moderations_task(self, limit: int = 50):
+    """重试审核未完成的文档（`unavailable` / `error`）的最小 reaper。
+
+    `moderate_document()` 在检测链没能给出结论时会写 `next_retry_at`，
+    但不会自己重跑——重试需要一个调度者。本任务就是那个调度者。
+
+    选取条件（全部必须满足）：
+        state ∈ {unavailable, error}          —— 绝不重跑 approved / rejected 终态
+        next_retry_at 已到期                   —— 使用既有字段，不新增
+        attempt_count < CONTENT_MODERATION_MAX_ATTEMPTS —— 不超过上限
+
+    并发与幂等：
+    - 派发前用 CAS 把 `next_retry_at` 推到下一个退避点，重复/并发运行的 reaper
+      不会对同一文档重复派发。
+    - 即使派发出去的任务丢失，退避到期后仍会再次进入，不会静默卡死。
+    - **达到 max_attempts 的文档保持 unavailable / error，绝不自动 approved**：
+      本任务只重新派发 `moderate_document()`，没有任何"放行"分支。
+
+    Args:
+        limit: 单轮最多处理的文档数（避免一次扫描把队列打满）
+    """
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    from .models import ContentModeration
+    from .moderation import (
+        MODERATION_STATE_ERROR,
+        MODERATION_STATE_UNAVAILABLE,
+        max_attempts,
+        retry_backoff_seconds,
+    )
+
+    now = timezone.now()
+    due = list(
+        ContentModeration.objects.filter(
+            state__in=(MODERATION_STATE_UNAVAILABLE, MODERATION_STATE_ERROR),
+            next_retry_at__isnull=False,
+            next_retry_at__lte=now,
+            attempt_count__lt=max_attempts(),
+        ).order_by('next_retry_at').values_list('pk', 'doc_id')[:limit]
+    )
+
+    backoff = timedelta(seconds=retry_backoff_seconds())
+    from utils.celery_dispatcher import safe_delay
+
+    dispatched = 0
+    for pk, doc_id in due:
+        claimed = ContentModeration.objects.filter(
+            pk=pk, next_retry_at__lte=now,
+        ).update(next_retry_at=now + backoff)
+        if not claimed:
+            continue  # 被并发运行的另一个 reaper 抢先
+        safe_delay(moderate_and_promote_task, doc_id)
+        dispatched += 1
+
+    # P-4 恢复路径：队列不可用期间 `dispatch_async` 只记日志不执行，
+    # 会留下"有文档、无审核记录"的孤儿。这里把它们重新排队。
+    recovered = _recover_undispatched_uploads(limit, now, safe_delay)
+
+    if dispatched or recovered:
+        logger.info(
+            'retry_failed_moderations_task: 重新派发审核 %d 份，'
+            '补扫未入队上传 %d 份', dispatched, recovered,
+        )
+    return None
 
 
 @shared_task(bind=True, ignore_result=True)

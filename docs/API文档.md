@@ -390,32 +390,47 @@
 |------|------|
 | **接口路径** | `/api/knowledge/upload/callback/` |
 | **请求方式** | `POST` |
-| **请求参数** | `oss_key`, `title`, `description`, `file_name`, `file_size`, `file_type`, `md5`, `discipline_id`, `college_id`, `scope`, `visibility`, `keywords` |
+| **请求参数** | `intent_id`, `oss_key`, `title`, `description`, `file_name`, `file_size`, `file_type`, `md5`, `discipline_id`, `college_id`, `department_id`, `visibility`, `keywords` |
 | **请求参数类型** | 见下表 (JSON body) |
 | **是否必须传入** | 带 * 必填，其余选填 |
-| **返回参数** | `{id, status}` |
+| **返回参数** | `{id, status}`；重复上传返回 `{id, status, duplicate: true}` |
 | **返回参数类型** | `object` |
-| **备注** | OSS 上传成功后前端调用，创建 knowledge_doc 记录并自动触发 Celery 异步索引任务 |
+| **备注** | OSS 直传成功后前端调用。**必须携带 `/upload/sts/` 阶段签发的 `intent_id`**（服务端据此确认"这个对象归谁"）。创建 knowledge_doc 记录后进入统一审核编排：对象留在隔离区 `quarantine/` → 审核 → 提升到 `knowledge/` → 索引 |
 
 | 请求字段 | 类型 | 必填 | 说明 |
 |----------|------|:--:|------|
-| `oss_key` | string | * | OSS 对象 Key |
-| `title` | string | * | 文档标题 |
-| `description` | string | * | 文档描述（不可提取文本格式时尤为重要） |
+| `intent_id` | int | * | **上传凭证 ID，由 `/api/knowledge/upload/sts/` 返回** |
+| `oss_key` | string | * | OSS 对象 Key，**必须与 `intent_id` 签发的 key 完全一致** |
+| `title` | string | | 文档标题（未提供时由 AI 生成） |
+| `description` | string | | 文档描述（不可提取文本格式时尤为重要） |
 | `file_name` | string | * | 原始文件名 |
-| `file_size` | int | * | 文件大小（字节） |
+| `file_size` | int | * | 文件大小（字节）。仅用于校验，入库以服务端实测大小为准 |
 | `file_type` | string | * | pdf/doc/ppt/xls/image/video/audio/md/txt/html/other |
 | `md5` | string | * | MD5 哈希 |
 | `discipline_id` | int | | 学科方向 ID |
-| `college_id` | int | | 所属学院 ID（默认取上传者学院） |
-| `scope` | string | | 归属范围（school/college/department），默认 school |
+| `college_id` | int | | 所属学院 ID（默认取上传者学院；非超管不接受此参数） |
+| `department_id` | int | | 所属部门 ID（默认取上传者部门；非超管不接受此参数） |
 | `visibility` | string | | 可见性（public/private），默认 public |
 | `keywords` | array[string] | | 关键词列表 |
+| `scope` | string | | **已废弃、不生效**：归属范围由上传者角色自动决定，传了也会被忽略 |
+
+#### 4.2.1 服务端校验（每一项都会拒绝请求）
+
+| # | 校验 | 失败响应 |
+|---|------|----------|
+| 1 | `intent_id` 必填且格式合法；必须是**当前登录用户**的凭证，且存在、未过期、状态允许（issued） | 400（缺字段/格式错）<br>404 凭证不存在或不属于当前用户<br>409 已过期 / 状态不允许 |
+| 2 | `oss_key` 必须与 `intent_id` 记录的隔离区 key **精确相等**（不做前缀匹配、不做 scope 匹配） | 400 `OSS Key 与该上传凭证记录的对象不一致` |
+| 3 | 以 OSS `head_object` 为准校验对象：必须存在；实测大小必须与声明的 `file_size` 一致；不超过该类型的分档上限；对象 ETag（STS 直传时即 MD5）必须与 `md5` 一致；文件后缀与对象 Content-Type 必须匹配 | 400（`file_size` / `md5` / `file_name` / `oss_key` 字段错误）；OSS 校验不可用时同样拒绝 |
+| 4 | 原子推进凭证状态（`issued` → `completed`）：并发的重复回调只有一次能成功，其余按重复处理，不会创建第二条文档 | 重复回调返回 `{id, status, duplicate: true}` |
+| 5 | 同一 `oss_key` 已被登记、或 `md5` 命中已存在文档：返回既有文档，不新增记录 | `{id, status, duplicate: true}`（他人不可见的对象返回 400，不泄露存在性） |
+
+> ⚠️ 前端注意：`intent_id` **不是可选字段**。省略它、或用上一次上传的 `intent_id` 配新的 `oss_key`，都会被服务端拒绝（400/404/409）。
 
 | 返回字段 | 类型 | 说明 |
 |----------|------|------|
 | `id` | int | 新创建的文档 ID |
-| `status` | string | uploaded（等待处理） |
+| `status` | string | uploaded（已入库，**等待审核**；审核通过并提升后才会被索引/检索到） |
+| `duplicate` | bool | 仅重复上传时返回，`true` 表示未新建文档，`id` 为既有文档 |
 
 ---
 
