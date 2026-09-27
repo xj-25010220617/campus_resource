@@ -1140,9 +1140,11 @@ def retrieve_images(
     # 兼容存量数据：file_type 可能是类别 'image'，也可能是历史存的原始扩展名（jpg/png 等）
     image_types = ['image'] + sorted(IMAGE_FILE_TYPES)
 
-    # 图片也必须处于 indexed，避免失败文档进入问答引用。
+    # 图片没有文本分块、不参与向量索引，index_document_task 会将其置为 failed
+    # （见函数 docstring），故不按 status 过滤，仅按 file_type + 权限过滤，
+    # 靠 title/description 关键词匹配召回。
     qs = authorized_knowledge_docs(user_context).filter(
-        file_type__in=image_types, status='indexed',
+        file_type__in=image_types,
     )
 
     # 权限过滤后的基准集合（不含关键词/学科/分类筛选），供图片意图兜底使用
