@@ -17,7 +17,11 @@
 - 不做 promotion（`promote_object()`）：入口阶段对象**始终留在 quarantine/**，
   提升由 `promotion.promote_document()` 在审核通过后执行。
 - 不触发 `index_document_task` / `extract_freshness_task`
-- 不创建 `KnowledgeDoc`（那是各入口自己的业务，含各自的元数据与关键词）
+- 不创建 `KnowledgeDoc`（那是各入口自己的业务，含各自的元数据与关键词）。
+  唯一的例外是给**内部可信调用方**（爬虫）用的 `ingest_internal_document()`：
+  它不是 HTTP 入口，没有"自己的业务字段"可组装，因此由本模块把
+  "意图 → 隔离区对象 → 建文档 → 安排审核"四步一次做完，避免调用方
+  自己拼 oss_key 而再次写回 `knowledge/`。
 
 P1-2D STEP 4-B 的接入点只有一个：各入口在**建完 KnowledgeDoc 之后**调用
 `schedule_moderation(doc.id)`。它用 `transaction.on_commit()` 派发，因此在
@@ -266,3 +270,108 @@ def schedule_moderation(doc_id: int) -> bool:
 
     transaction.on_commit(_dispatch)
     return outcome[0] if outcome else True
+
+
+# ---------------------------------------------------------------------------
+# 5. 内部可信调用入口（爬虫等非 HTTP 调用方）
+# ---------------------------------------------------------------------------
+
+def ingest_internal_document(
+    uploader, *,
+    payload: bytes,
+    file_name: str,
+    title: str,
+    description: str = '',
+    source_type: str = 'internal',
+    source_url: str = '',
+    file_type: str = 'other',
+    visibility: str = 'public',
+    scope: str = 'school',
+    college_id=None,
+    department_id=None,
+    discipline_id=None,
+    md5_hash: str = '',
+):
+    """内部服务（官网爬虫等）写入内容的**唯一**入口：隔离区 → 建文档 → 安排审核。
+
+    与 5 个 HTTP 上传入口的唯一区别是"请求从哪来"：这里没有 DRF Request，
+    也没有客户端可以影响的 oss_key。链路本身与 HTTP 上传完全一致：
+
+        begin_upload            → quarantine key 由服务端生成（调用方无法指定）
+        put_quarantine_object   → 对象落在 quarantine/
+        KnowledgeDoc(status='uploaded', oss_key=隔离区 key)
+        schedule_moderation     → 审核 → 提升到 knowledge/ → 索引
+
+    **调用方不得**自己拼 oss_key、不得自己写 `knowledge/` 前缀、不得自己调
+    `moderate_document()` / 建 `ContentModeration` / 投递索引任务：审核判定由
+    `moderate_and_promote_task` 在执行侧完成，提升到正式区由 promotion 完成。
+
+    Args:
+        uploader: 归属用户（必填，用于归属校验与审核审计）
+        payload: 内容字节（文本调用方自行 `encode('utf-8')`）
+        file_name: 原始文件名（用于取扩展名 / Content-Type / 展示）
+        title: 文档标题
+        description / source_type / source_url / file_type / visibility /
+        scope / college_id / department_id / discipline_id / md5_hash:
+            KnowledgeDoc 的业务字段，原样透传（不做审核相关判断）
+
+    Returns:
+        KnowledgeDoc 实例（`status='uploaded'`，`oss_key` 位于隔离区）
+
+    Raises:
+        UploadIntentError: 参数非法 / 意图状态异常 / 大小不一致
+        OSSOperationError: 隔离区写入失败（此时不留 KnowledgeDoc 记录）
+    """
+    from .models import KnowledgeDoc
+
+    if uploader is None or getattr(uploader, 'pk', None) is None:
+        raise UploadIntentError(REASON_INVALID_ARGUMENT, '内部写入必须绑定归属用户')
+    if not payload:
+        raise UploadIntentError(REASON_INVALID_ARGUMENT, '内容为空，拒绝写入')
+    if not file_name:
+        raise UploadIntentError(REASON_INVALID_ARGUMENT, '缺少文件名，无法生成隔离区 Key')
+
+    content_type = guess_content_type(file_name)
+    intent = begin_upload(
+        uploader, file_name,
+        content_type=content_type,
+        expected_size=len(payload),
+    )
+
+    try:
+        stored = put_quarantine_object(intent, payload, content_type=content_type)
+    except Exception:
+        # 隔离区写入失败：意图停在 issued（由过期回收），此处不建文档记录，
+        # 避免出现"文档指向一个不存在的对象"的悬空行。
+        logger.exception(
+            '内部写入隔离区失败 intent=%s file_name=%s', intent.pk, file_name,
+        )
+        raise
+
+    doc = KnowledgeDoc.objects.create(
+        title=(title or file_name)[:512],
+        description=(description or '')[:200],
+        source_type=source_type,
+        source_url=source_url,
+        file_name=file_name[:256],
+        file_type=file_type,
+        file_size=stored['size'],
+        md5_hash=md5_hash,
+        oss_key=stored['oss_key'],
+        oss_url=stored['oss_url'],
+        visibility=visibility,
+        scope=scope,
+        uploader=uploader,
+        college_id=college_id,
+        department_id=department_id,
+        discipline_id=discipline_id,
+        # status 不接受调用方指定：内部写入的新内容一律从未审核开始（fail-closed）
+        status='uploaded',
+    )
+    logger.info(
+        '内部写入已进入隔离区 doc_id=%s source_type=%s key=%s（等待审核，未索引）',
+        doc.id, source_type, doc.oss_key,
+    )
+
+    schedule_moderation(doc.id)
+    return doc

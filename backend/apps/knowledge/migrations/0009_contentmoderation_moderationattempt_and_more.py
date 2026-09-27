@@ -9,7 +9,10 @@ class Migration(migrations.Migration):
 
     dependencies = [
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
-        ('knowledge', '0007_knowledgedoc_index_diagnostics'),
+        # 线性化：必须先跑 0008_utf8mb4_charset（把 database 默认字符集改为
+        # utf8mb4），本迁移新建的 ContentModeration / ModerationAttempt 才会
+        # 以 utf8mb4 建表。反过来会让新表落在 utf8 下，中文字段被截断。
+        ('knowledge', '0008_utf8mb4_charset'),
     ]
 
     operations = [

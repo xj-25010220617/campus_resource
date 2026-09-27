@@ -14,7 +14,7 @@ import logging
 import re
 import time
 from typing import List, Optional, Set, Tuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -63,6 +63,102 @@ HEADERS = {
 
 # 爬取控制
 REQUEST_TIMEOUT = 15
+
+# ------------------------------------------------------------------
+# 附件下载配置（仅下载可解析的文档类，图片/音视频/压缩包不下载）
+# ------------------------------------------------------------------
+DOWNLOAD_FILES = bool(_get_config("CRAWLER_DOWNLOAD_FILES", True))
+MAX_FILE_SIZE = int(_get_config("CRAWLER_MAX_FILE_SIZE_MB", 50)) * 1024 * 1024
+MAX_FILES_PER_RUN = int(_get_config("CRAWLER_MAX_FILES", 100))
+# (连接超时, 读取超时)：附件可能较大，读取超时单独放宽
+FILE_TIMEOUT = (REQUEST_TIMEOUT, int(_get_config("CRAWLER_FILE_TIMEOUT", 60)))
+
+_cfg_types = str(_get_config("CRAWLER_FILE_TYPES", "pdf,doc,docx,xls,xlsx,ppt,pptx,csv,txt,md"))
+FILE_TYPES = {t.strip().lower() for t in _cfg_types.split(",") if t.strip()}
+# 附件扩展名匹配（仅匹配 URL path，不匹配 query）
+_FILE_EXT_RE = re.compile(r"\.(%s)$" % "|".join(sorted(FILE_TYPES)), re.IGNORECASE)
+
+_cfg_hints = str(_get_config("CRAWLER_FILE_URL_HINTS", "download"))
+FILE_URL_HINTS = tuple(h.strip().lower() for h in _cfg_hints.split(",") if h.strip())
+
+# 明显是网页后缀的 URL 不作为候选附件（注意不含 .jsp：download.jsp 是常见下载入口）
+PAGE_EXT_RE = re.compile(r"\.(html?|shtml|aspx|php|do|action)$", re.IGNORECASE)
+
+# Content-Type → 扩展名（仅文档类；application/octet-stream 不映射，交给文件名扩展名判定）
+CONTENT_TYPE_EXT_MAP = {
+    "application/pdf": "pdf",
+    "application/msword": "doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/vnd.ms-powerpoint": "ppt",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+    "application/vnd.ms-excel": "xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+    "text/csv": "csv",
+    "text/plain": "txt",
+    "text/markdown": "md",
+}
+
+
+# ------------------------------------------------------------------
+# 附件 URL / 响应头解析
+# ------------------------------------------------------------------
+def is_file_url(url: str) -> bool:
+    """判断 URL 是否为文档类附件（按 unquote 后的 path 扩展名判定，query 不参与）。"""
+    path = unquote(urlparse(url).path)
+    return bool(_FILE_EXT_RE.search(path.lower()))
+
+
+def is_file_candidate_url(url: str) -> bool:
+    """判断无扩展名 URL 是否为候选附件（download.jsp 类下载入口）。
+
+    path 含 FILE_URL_HINTS 关键词（如 download）且不是明显网页后缀才视为候选，
+    是否真为附件由下载后的 Content-Type 二次确认。
+    """
+    path = unquote(urlparse(url).path).lower()
+    if PAGE_EXT_RE.search(path):
+        return False
+    return any(hint in path for hint in FILE_URL_HINTS)
+
+
+def guess_ext_from_content_type(content_type: str) -> str:
+    """从响应 Content-Type 推断文档扩展名，无法识别返回空串。"""
+    ct = (content_type or "").split(";", 1)[0].strip().lower()
+    return CONTENT_TYPE_EXT_MAP.get(ct, "")
+
+
+def parse_content_disposition(header: str) -> str:
+    """解析 Content-Disposition 头中的文件名，解析失败返回空串。
+
+    支持 RFC5987（filename*=UTF-8''...）与普通 filename="..." 两种形式；
+    服务端 latin-1 编码导致的中文乱码做一次 GBK 修复尝试。
+    """
+    if not header:
+        return ""
+    m = re.search(r"filename\*\s*=\s*(?:UTF-8|utf-8)''([^;]+)", header)
+    if m:
+        return unquote(m.group(1).strip().strip('"'))
+    m = re.search(r'filename\s*=\s*"([^"]+)"', header)
+    if not m:
+        m = re.search(r"filename\s*=\s*([^;]+)", header)
+        if not m:
+            return ""
+    name = m.group(1).strip().strip('"')
+    try:
+        # requests 按 latin-1 解码头，中文文件名需还原原始字节后按 GBK 解码
+        fixed = name.encode("latin-1").decode("gbk")
+        name = fixed
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        pass  # 非 GBK 乱码，保留原值
+    return name
+
+
+def sanitize_file_name(name: str, ext: str) -> str:
+    """清洗文件名：去除路径分隔符/控制字符与原扩展名，重新拼接白名单扩展名，适配 file_name 字段。"""
+    name = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", name or "").strip()
+    if "." in name:
+        name = name.rsplit(".", 1)[0]
+    stem = name[:200] or "crawl_file"
+    return f"{stem}.{ext}"
 
 
 # ------------------------------------------------------------------
@@ -214,12 +310,24 @@ def extract_text_from_html(html: str, url: str = "") -> dict:
 class NeusoftSpider:
     """成都东软官网爬虫 - BFS 广度优先"""
 
-    def __init__(self, base_url: str = NEUSOFT_BASE_URL):
+    def __init__(
+        self,
+        base_url: str = NEUSOFT_BASE_URL,
+        download_files: bool = DOWNLOAD_FILES,
+        allowed_exts: Optional[Set[str]] = None,
+        max_files: int = MAX_FILES_PER_RUN,
+    ):
         self.base_url = base_url.rstrip("/")
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
         self.seen_urls: Set[str] = set()
         self.seen_hashes: Set[str] = set()  # 内容去重
+        # 附件下载：总开关 / 扩展名白名单 / 单次运行附件上限
+        self.download_files = download_files
+        self.allowed_exts = set(allowed_exts) if allowed_exts else set(FILE_TYPES)
+        self.max_files = max_files
+        self.seen_file_urls: Set[str] = set()  # 附件 URL 去重（运行内）
+        self.file_links: List[dict] = []       # 发现的附件 {"url","text","source_page"}
 
     def _fetch(self, url: str) -> Optional[str]:
         """请求 URL 返回 HTML，失败返回 None。JS 页面自动尝试 Playwright 渲染。"""
@@ -256,6 +364,41 @@ class NeusoftSpider:
                 links.append(full)
         return links
 
+    def collect_file_links(self, html: str, page_url: str) -> List[dict]:
+        """从页面发现文档类附件链接（只登记不下载），锚文本作标题提示。
+
+        同一 URL 全局只登记一次；登记数达到 max_files 即停止发现。
+        """
+        if not self.download_files or len(self.file_links) >= self.max_files:
+            return []
+        found = []
+        soup = BeautifulSoup(html, "lxml")
+        for a in soup.find_all("a", href=True):
+            full = _normalize_url(a["href"], page_url)
+            if not full or full in self.seen_file_urls:
+                continue
+            if is_file_url(full):
+                # 扩展名白名单在发现阶段即过滤，避免窄白名单时白下载
+                path_ext = unquote(urlparse(full).path).rsplit(".", 1)[-1].lower()
+                if path_ext not in self.allowed_exts:
+                    continue
+            elif not is_file_candidate_url(full):
+                continue
+            self.seen_file_urls.add(full)
+            link = {
+                "url": full,
+                "text": a.get_text(strip=True)[:200],
+                "source_page": page_url,
+            }
+            self.file_links.append(link)
+            found.append(link)
+            if len(self.file_links) >= self.max_files:
+                logger.info(f"附件发现已达上限 {self.max_files}，停止收集")
+                break
+        if found:
+            logger.debug(f"页面 {page_url} 发现 {len(found)} 个附件候选")
+        return found
+
     def crawl_page(self, url: str) -> Optional[dict]:
         """抓取单个页面并提取内容。
 
@@ -266,6 +409,9 @@ class NeusoftSpider:
         if not html:
             return None
         extracted = extract_text_from_html(html, url)
+        # 附件发现：放在"内容过短"判断之前，避免正文极短的下载页丢失附件
+        if self.download_files:
+            self.collect_file_links(html, url)
         if not extracted["content"] or len(extracted["content"]) < 50:
             logger.debug(f"内容过短，跳过: {url}")
             return None
@@ -293,6 +439,10 @@ class NeusoftSpider:
 
             # 提取本页所有链接
             links = self._extract_links(html, url)
+
+            # 列表页也可能直接挂附件链接
+            if self.download_files:
+                self.collect_file_links(html, url)
 
             for link in links:
                 if _is_detail_page(link) and link not in self.seen_urls:
@@ -343,6 +493,10 @@ class NeusoftSpider:
 
         # 2. 从首页 HTML 中提取重要栏目链接
         links = self._extract_links(html, self.base_url)
+
+        # 首页也可能直接挂附件链接
+        if self.download_files:
+            self.collect_file_links(html, self.base_url)
         section_urls = set()
         for link in links:
             if _is_important_section(link):
@@ -364,6 +518,109 @@ class NeusoftSpider:
 
         logger.info(f"全站爬取完成: 共 {len(all_results)} 页")
         return all_results
+
+    # ------------------------------------------------------------------
+    # 附件下载（独立于页面抓取的二进制路径，不走 _fetch/Playwright）
+    # ------------------------------------------------------------------
+    def _resolve_ext_and_name(self, resp, url: str) -> Tuple[str, str]:
+        """从响应头/URL 判定附件扩展名与原始文件名。
+
+        优先级：Content-Disposition 文件名 > URL path basename > Content-Type 反查。
+        返回 (ext, raw_name)，无法判定白名单内扩展名时 ext 为空串。
+        """
+        cd_name = parse_content_disposition(resp.headers.get("Content-Disposition", ""))
+        path_name = unquote(urlparse(url).path).rsplit("/", 1)[-1]
+        raw_name = cd_name or path_name
+        ct_ext = guess_ext_from_content_type(resp.headers.get("Content-Type", ""))
+
+        ext = ""
+        # 1. 文件名自带的扩展名（Content-Disposition 或 URL）
+        for candidate in (cd_name, path_name):
+            if "." in candidate:
+                cand_ext = candidate.rsplit(".", 1)[-1].strip().lower()
+                if cand_ext in self.allowed_exts:
+                    ext = cand_ext
+                    break
+        # 2. Content-Type 反查
+        if not ext:
+            ext = ct_ext if ct_ext in self.allowed_exts else ""
+        return ext, raw_name
+
+    def download_file(self, file_link: dict) -> Optional[dict]:
+        """流式下载单个附件，超过大小上限即中止。
+
+        Args:
+            file_link: collect_file_links() 登记的 {"url","text","source_page"}
+
+        Returns:
+            {"url","file_name","ext","content","size","md5","title_hint","source_page"}，
+            失败/超限/非文档类型返回 None
+        """
+        url = file_link["url"]
+        try:
+            resp = self.session.get(
+                url, timeout=FILE_TIMEOUT, stream=True,
+                headers={"Accept": "*/*"},
+            )
+        except requests.RequestException as e:
+            logger.warning(f"附件请求失败: {url} - {e}")
+            return None
+
+        try:
+            resp.raise_for_status()
+            # Content-Type 为网页说明是误伤的页面（如 /download/ 列表页），放弃
+            content_type = resp.headers.get("Content-Type", "")
+            if content_type.split(";", 1)[0].strip().lower() in ("text/html", "application/xhtml+xml"):
+                logger.debug(f"候选 URL 实为网页，跳过: {url}")
+                return None
+
+            ext, raw_name = self._resolve_ext_and_name(resp, url)
+            if not ext:
+                logger.debug(f"附件扩展名不在白名单内，跳过: {url} (Content-Type={content_type})")
+                return None
+
+            # 大小上限：单扩展名限制（与手动上传一致）与爬虫全局上限取较小者
+            limit = MAX_FILE_SIZE
+            try:
+                from apps.knowledge.serializers import FILE_SIZE_LIMITS
+                limit = min(limit, FILE_SIZE_LIMITS.get(ext, MAX_FILE_SIZE))
+            except Exception as e:
+                # Django 未初始化等场景退化为全局上限
+                logger.debug(f"读取 FILE_SIZE_LIMITS 失败，使用全局上限: {e}")
+            content_length = resp.headers.get("Content-Length", "")
+            try:
+                if content_length and int(content_length) > limit:
+                    logger.warning(f"附件超过大小上限({limit // 1024 // 1024}MB)，中止: {url}")
+                    return None
+            except ValueError:
+                pass  # Content-Length 非法时依赖逐块累计判断
+
+            data = bytearray()
+            for chunk in resp.iter_content(chunk_size=65536):
+                data.extend(chunk)
+                if len(data) > limit:
+                    logger.warning(f"附件超过大小上限({limit // 1024 // 1024}MB)，中止: {url}")
+                    return None
+
+            if not data:
+                logger.warning(f"附件内容为空: {url}")
+                return None
+
+            return {
+                "url": url,
+                "file_name": sanitize_file_name(raw_name, ext),
+                "ext": ext,
+                "content": bytes(data),
+                "size": len(data),
+                "md5": hashlib.md5(bytes(data)).hexdigest(),
+                "title_hint": file_link.get("text", ""),
+                "source_page": file_link.get("source_page", ""),
+            }
+        except requests.RequestException as e:
+            logger.warning(f"附件下载失败: {url} - {e}")
+            return None
+        finally:
+            resp.close()
 
 
 # ------------------------------------------------------------------
@@ -439,60 +696,212 @@ def save_page_as_knowledge_doc(
             discipline_id = first.id
             logger.debug(f"自动推断 discipline_id={discipline_id}（college_id={college_id}）")
 
-    # 上传内容到 OSS（索引任务需要从 OSS 读取文本）
+    # 走内部可信写入入口：对象先落 quarantine/，审核通过后由 promotion 提升到
+    # knowledge/ 并索引。爬虫不再自己拼 oss_key，也不再直接投递索引任务。
     import uuid
-    from datetime import datetime
-    from utils.oss import oss_client
 
-    now = datetime.now()
-    safe_filename = f"crawl_{uuid.uuid4().hex[:12]}.txt"
-    oss_key = f"knowledge/website/0/{now:%Y-%m}/{safe_filename}"
+    from apps.knowledge import upload_service
 
-    upload_success = oss_client.upload_text(content, oss_key)
-    if not upload_success:
-        logger.error(f"OSS 上传失败，跳过保存: {title}")
+    try:
+        doc = upload_service.ingest_internal_document(
+            uploader,
+            payload=content.encode("utf-8"),
+            file_name=f"crawl_{uuid.uuid4().hex[:12]}.txt",
+            title=title[:512],
+            description=title[:200],
+            source_type="website",
+            source_url=url,
+            file_type="txt",
+            visibility="public",
+            scope="school",
+            college_id=college_id,
+            discipline_id=discipline_id,
+            md5_hash=content_hash,
+        )
+    except Exception as e:
+        logger.error(f"网页正文写入失败，跳过保存: {title} - {type(e).__name__}: {e}")
         return None
-
-    oss_url = (
-        f"https://{oss_client.bucket_name}.{oss_client.endpoint}/{oss_key}"
-        if oss_client.bucket_name and oss_client.endpoint
-        else ""
-    )
-
-    # 创建 KnowledgeDoc（使用系统的分类体系）
-    doc = KnowledgeDoc.objects.create(
-        title=title[:512],
-        description=title[:200],
-        source_type="website",
-        source_url=url,
-        file_type="txt",
-        file_size=len(content.encode("utf-8")),
-        md5_hash=content_hash,
-        oss_key=oss_key,
-        oss_url=oss_url,
-        visibility="public",
-        scope="school",
-        uploader=uploader,
-        college_id=college_id,
-        discipline_id=discipline_id,
-        # category_id 不传（category 表已移除）
-        status="uploaded",
-    )
 
     logger.info(
         f"已创建 KnowledgeDoc: id={doc.id}, title={title[:40]}, "
-        f"college_id={college_id}"
+        f"college_id={college_id}（待审核）"
     )
-
-    # 触发异步索引
-    try:
-        from utils.celery_dispatcher import safe_delay
-        from apps.knowledge.tasks import index_document_task
-        safe_delay(index_document_task, doc.id)
-    except Exception as e:
-        logger.warning(f"触发索引任务失败: {e}")
-
     return doc.id
+
+
+def save_file_as_knowledge_doc(
+    file_data: dict,
+    uploader_id: int = 1,
+    college_id: Optional[int] = None,
+    discipline_id: int = None,
+) -> Optional[int]:
+    """将下载的官网附件保存为 KnowledgeDoc 并触发异步索引。
+
+    与手动上传契约一致：二进制经 OSS 直传，file_name 保留真实扩展名
+    （索引任务按扩展名选择解析器），file_type 经 normalize_file_type 归一化。
+    写入路径同样走 upload_service.ingest_internal_document：附件先落
+    quarantine/，审核通过后才提升到 knowledge/ 并索引。
+
+    Args:
+        file_data: download_file() 返回的字典
+        uploader_id: 上传者用户 ID（默认 admin）
+        college_id: 所属学院 ID
+        discipline_id: 学科方向 ID（可选，默认从上传者所在学院推断）
+
+    Returns:
+        KnowledgeDoc.id，失败返回 None
+    """
+    try:
+        import django
+        import os
+        os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
+        django.setup()
+    except Exception:
+        pass
+
+    from apps.knowledge.models import KnowledgeDoc
+
+    url = file_data.get("url", "")
+    content = file_data.get("content", b"")
+    size = file_data.get("size", 0)
+    md5 = file_data.get("md5", "")
+    file_name = file_data.get("file_name", "")
+    ext = file_data.get("ext", "other")
+
+    if not content or not file_name:
+        logger.warning(f"附件数据不完整，跳过保存: {url}")
+        return None
+    if size > MAX_FILE_SIZE:
+        logger.warning(f"附件超过大小上限，跳过保存: {url}")
+        return None
+
+    # 去重：同 URL 已入库 / 同内容（MD5）已入库
+    if KnowledgeDoc.objects.filter(source_url=url[:1024]).exists():
+        logger.info(f"附件 URL 已存在，跳过: {url}")
+        return None
+    if KnowledgeDoc.objects.filter(md5_hash=md5).exists():
+        logger.info(f"附件内容已存在（MD5 重复），跳过: {file_name}")
+        return None
+
+    # 获取上传者
+    from django.contrib.auth import get_user_model
+    User = get_user_model()
+    try:
+        uploader = User.objects.get(id=uploader_id)
+    except User.DoesNotExist:
+        uploader = User.objects.filter(is_superuser=True).first()
+        if not uploader:
+            logger.error("无法找到上传者用户")
+            return None
+
+    # 如果未指定 discipline_id，尝试从上传者所在学院推断第一个学科方向
+    if discipline_id is None and college_id:
+        from apps.classify.models import Discipline
+        first = Discipline.objects.filter(
+            knowledge_docs__college_id=college_id
+        ).order_by("id").first()
+        if first:
+            discipline_id = first.id
+            logger.debug(f"自动推断 discipline_id={discipline_id}（college_id={college_id}）")
+
+    # 标题：优先锚文本，否则文件名主干（库已迁移 utf8mb4，无需 4 字节清洗）
+    # 官网附件锚文本常为"点击查看/下载"等无意义提示词，此时退回文件名主干
+    _generic_hints = {"点击查看", "点击下载", "查看", "下载", "更多", "详情", "download", "here"}
+    title = (file_data.get("title_hint", "") or "").strip()
+    if title.lower() in _generic_hints:
+        title = ""
+    if not title:
+        title = file_name.rsplit(".", 1)[0]
+    title = (title or "官网附件")[:512]
+
+    source_page = file_data.get("source_page", "")
+    description = f"官网附件：{file_name}（来源页面: {source_page}）" if source_page else f"官网附件：{file_name}"
+
+    # 走内部可信写入入口（与网页正文同一条链）：quarantine → 审核 → 提升 → 索引
+    from apps.knowledge import upload_service
+    from apps.knowledge.serializers import normalize_file_type
+
+    try:
+        doc = upload_service.ingest_internal_document(
+            uploader,
+            payload=content,
+            file_name=file_name,
+            title=title,
+            description=description[:200],
+            source_type="website",
+            source_url=url[:1024],
+            file_type=normalize_file_type(ext),
+            visibility="public",
+            scope="school",
+            college_id=college_id,
+            discipline_id=discipline_id,
+            md5_hash=md5,
+        )
+    except Exception as e:
+        logger.error(f"附件写入失败，跳过保存: {file_name} - {type(e).__name__}: {e}")
+        return None
+
+    logger.info(
+        f"已创建附件 KnowledgeDoc: id={doc.id}, file_name={file_name[:40]}, "
+        f"size={size}, college_id={college_id}（待审核）"
+    )
+    return doc.id
+
+
+def download_and_save_files(
+    spider: "NeusoftSpider",
+    uploader_id: int = 1,
+    college_id: Optional[int] = None,
+    discipline_id: int = None,
+) -> dict:
+    """顺序下载爬取阶段发现的所有附件并入库，单文件失败不中断整轮。
+
+    Returns:
+        统计 {"found","downloaded","saved","skipped_md5","skipped_dup","failed"}
+    """
+    stats = {
+        "found": len(spider.file_links), "downloaded": 0, "saved": 0,
+        "skipped_md5": 0, "skipped_dup": 0, "failed": 0,
+    }
+    seen_md5: Set[str] = set()
+
+    from apps.knowledge.models import KnowledgeDoc
+
+    for link in spider.file_links[: spider.max_files]:
+        if stats["saved"] >= spider.max_files:
+            break
+        try:
+            # 下载前先按 source_url 查库去重，避免重复下载大文件
+            if KnowledgeDoc.objects.filter(source_url=link["url"][:1024]).exists():
+                stats["skipped_dup"] += 1
+                continue
+
+            time.sleep(CRAWL_DELAY)  # 礼貌限速，逐个顺序下载
+            data = spider.download_file(link)
+            if not data:
+                stats["failed"] += 1
+                continue
+            stats["downloaded"] += 1
+
+            if data["md5"] in seen_md5:
+                stats["skipped_md5"] += 1
+                continue
+            if save_file_as_knowledge_doc(
+                data,
+                uploader_id=uploader_id,
+                college_id=college_id,
+                discipline_id=discipline_id,
+            ):
+                seen_md5.add(data["md5"])
+                stats["saved"] += 1
+            else:
+                stats["skipped_dup"] += 1  # save 内部已按 URL/MD5 去重记日志
+        except Exception as e:  # 单附件异常不中断整轮
+            logger.error(f"附件处理异常: {link.get('url')} - {e}")
+            stats["failed"] += 1
+
+    logger.info(f"附件下载统计: {stats}")
+    return stats
 
 
 def crawl_and_index(
@@ -500,6 +909,9 @@ def crawl_and_index(
     uploader_id: int = 1,
     college_id: Optional[int] = None,
     discipline_id: int = None,
+    download_files: Optional[bool] = None,
+    file_types: Optional[str] = None,
+    max_files: Optional[int] = None,
 ) -> int:
     """全站爬取并自动索引到知识库。
 
@@ -508,11 +920,25 @@ def crawl_and_index(
         uploader_id: 上传者用户 ID
         college_id: 所属学院 ID
         discipline_id: 学科方向 ID（可选，默认自动推断）
+        download_files: 是否下载文档类附件（None=取设置 CRAWLER_DOWNLOAD_FILES）
+        file_types: 附件扩展名白名单覆盖，逗号分隔（如 "pdf,docx"），None=取设置
+        max_files: 本次最多下载附件数，None=取设置 CRAWLER_MAX_FILES
 
     Returns:
-        成功保存的文档数
+        成功保存的文档数（页面 + 附件）
     """
-    spider = NeusoftSpider()
+    if download_files is None:
+        download_files = DOWNLOAD_FILES
+
+    allowed_exts = None
+    if file_types:
+        allowed_exts = {t.strip().lower() for t in file_types.split(",") if t.strip()}
+
+    spider = NeusoftSpider(
+        download_files=download_files,
+        allowed_exts=allowed_exts,
+        max_files=max_files or MAX_FILES_PER_RUN,
+    )
     pages = spider.start_crawl(max_pages=max_pages)
 
     saved = 0
@@ -526,5 +952,15 @@ def crawl_and_index(
         if doc_id:
             saved += 1
 
-    logger.info(f"爬取并索引完成: 共爬取 {len(pages)} 页，保存 {saved} 篇文档")
+    # 页面爬取完成后统一下载附件入库
+    if download_files:
+        stats = download_and_save_files(
+            spider,
+            uploader_id=uploader_id,
+            college_id=college_id,
+            discipline_id=discipline_id,
+        )
+        saved += stats["saved"]
+
+    logger.info(f"爬取并索引完成: 共爬取 {len(pages)} 页，保存 {saved} 篇文档（含附件）")
     return saved

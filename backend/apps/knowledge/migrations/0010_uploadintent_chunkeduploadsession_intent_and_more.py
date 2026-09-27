@@ -9,7 +9,7 @@ class Migration(migrations.Migration):
 
     dependencies = [
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
-        ('knowledge', '0008_contentmoderation_moderationattempt_and_more'),
+        ('knowledge', '0009_contentmoderation_moderationattempt_and_more'),
     ]
 
     operations = [

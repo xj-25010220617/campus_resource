@@ -44,8 +44,8 @@
 
 | 接口 | 用途 |
 |------|------|
-| `POST /api/knowledge/upload/sts/` | 获取 OSS 直传 STS 凭证（含 MD5 去重检查） |
-| `POST /api/knowledge/upload/callback/` | OSS 上传完成回调，创建文档记录并触发索引 |
+| `POST /api/knowledge/upload/sts/` | 获取 OSS 直传 STS 凭证（含 MD5 去重检查），返回 `intent_id` + 隔离区 `oss_key` |
+| `POST /api/knowledge/upload/callback/` | OSS 上传完成回调，**必须带 `intent_id`**；创建文档记录并进入审核编排（审核→提升→索引） |
 | `GET /api/knowledge/docs/` | 文档列表（分页+搜索+多条件筛选） |
 | `GET /api/knowledge/docs/{id}/` | 文档详情 |
 | `PUT /api/knowledge/docs/{id}/` | 编辑文档元数据 |

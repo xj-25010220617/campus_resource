@@ -979,25 +979,49 @@ if category.parent is None:
 
 ### 10.8 文件上传完整流程
 
-#### 流程概览
+> ⚠️ **本节为 2026-07 的设计快照，代码片段已过时，请勿照抄。**
+> 当前契约以 [docs/API文档.md](API文档.md) §4.2 为准。与本轮（安全隔离
+> P0/P1）相关的差异集中在这一条：**回调必须携带 `/upload/sts/` 签发的
+> `intent_id`**，`oss_key` 必须与 intent 记录的值精确相等，对象先落
+> `quarantine/` 隔离区，经审核 → 提升后才到 `knowledge/` 并可被索引。
+> 下方流程概览已按现状更新，代码片段保留原样（历史记录）。
+
+#### 流程概览（已按当前实现更新）
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │  前端                                                             │
 │  ① POST /upload/sts/  {file_name, file_size, md5}                │
 │     ├─ MD5 去重检查（oss_client.check_duplicate）                 │
-│     ├─ 命中 → {"duplicate": true, "resource_id": N}             │
-│     └─ 未命中 → oss_client.get_sts_credentials()                 │
-│                → {oss_key, upload_url, sts_credentials}          │
-│  ② 前端用 STS 凭证直传文件到 OSS（PutObject）                     │
-│  ③ POST /upload/callback/  {oss_key, title, ..., file_type, md5}│
-│     ├─ oss_key 路径穿越校验                                       │
-│     ├─ 分类关联校验（college/discipline 存在，category 二级）     │
-│     ├─ MD5 二次去重（防并发）                                    │
-│     └─ KnowledgeDoc.objects.create(...) + Keyword 批量创建        │
-│  ④ 异步：Celery index_document.delay(doc_id)（待集成）           │
+│     ├─ 命中 → {"duplicate": true, "knowledge_doc_id": N}         │
+│     │        （**未签发 intent**，不要继续第 ②③ 步）            │
+│     └─ 未命中 → 服务端建 UploadIntent（quarantine key 由服务端    │
+│                生成，客户端不可指定）                             │
+│                → {intent_id, oss_key(quarantine/…), upload_url,  │
+│                   sts_credentials, expires_at}                   │
+│  ② 前端用 STS 凭证直传文件到隔离区 OSS（PutObject）              │
+│  ③ POST /upload/callback/                                        │
+│     {intent_id, oss_key, title, ..., file_type, md5}             │
+│     ├─ intent_id 必填：必须是本人的、存在、未过期、issued         │
+│     ├─ oss_key 与 intent 记录的隔离区 key **精确相等**            │
+│     ├─ OSS head_object 实测：存在 / 大小 / ETag=md5 / 类型一致    │
+│     ├─ 原子推进 intent（issued→completed），并发重复回调只成功一次│
+│     ├─ 同 oss_key / 同 md5 已登记 → 返回既有文档 duplicate:true   │
+│     └─ KnowledgeDoc.objects.create(status='uploaded') + Keyword   │
+│  ④ 异步（on_commit 派发，队列不可用则保持未审核）：              │
+│     moderate_and_promote_task → 审核 → 提升到 knowledge/ → 索引  │
 └──────────────────────────────────────────────────────────────────┘
 ```
+
+#### 服务端校验（5 项）
+
+| # | 校验 | 失败 |
+|---|------|------|
+| 1 | `intent_id` 必填；属于当前用户、存在、未过期、状态 issued | 400 / 404 / 409 |
+| 2 | `oss_key` 与 intent 的 quarantine key 精确相等（无前缀/scope 匹配） | 400 |
+| 3 | OSS `head_object`：存在、大小=声明、分档上限、ETag=md5、后缀与 Content-Type 匹配 | 400 |
+| 4 | 原子推进 intent 状态（防重放），并发重复回调只成功一次 | 重复→duplicate:true |
+| 5 | 同 `oss_key` / 同 `md5` 已登记 → 返回既有文档，不新建 | duplicate:true（他人不可见→400） |
 
 #### 接口清单
 
@@ -1082,12 +1106,25 @@ def upload_text(self, content: str, oss_key: str) -> bool:
 #### OSS Key 格式
 
 ```
-knowledge/{college_id}/{YYYY-MM}/{uuid}.{ext}
+（当前实现）新上传（含 HTTP 上传、文本录入、分片上传、爬虫正文与附件）的入口
+一律落在隔离区；审核通过后由 promotion **只换顶层前缀**提升到正式区：
+
+quarantine/{scope}/{owner_id}/{YYYY-MM}/{uuid12}.{ext}   ← 新内容落在这里
+knowledge/{scope}/{owner_id}/{YYYY-MM}/{uuid12}.{ext}    ← 提升后（尾部路径不变）
 
 示例：
-  knowledge/3/2026-07/a1b2c3d4e5f6.pdf     # 文件上传
-  knowledge/3/2026-07/b2c3d4e5f6a7.txt     # 文本录入
+  quarantine/school/0/2026-09/9f8e7d6c5b4a.pdf   # 新上传（未审核，不可下载/检索）
+  knowledge/school/0/2026-09/9f8e7d6c5b4a.pdf    # 审核通过并提升后
+
+⚠️ 下面这条 2026-07 的旧格式（`knowledge/{college_id}/…`）已不再由上传入口
+生成，保留仅作历史说明：
+  knowledge/3/2026-07/a1b2c3d4e5f6.pdf
 ```
+
+> 读侧门禁与命名空间绑定：索引门 `check_indexable()` 要求 `knowledge/` 前缀 +
+> `storage_state=promoted`；下载/预览/引用 URL 出口由 `is_official_oss_key()`
+> 只对 `knowledge/` 前缀的 key 签名。因此隔离区对象在提升之前既不可被索引，
+> 也不可被取回。
 
 ### 10.9 上传安全加固
 

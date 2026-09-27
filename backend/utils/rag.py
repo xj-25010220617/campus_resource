@@ -1110,8 +1110,10 @@ def retrieve_images(
     但图片入库时已由视觉模型生成 title/description，此处按标题/描述关键词匹配。
 
     注意：**不按 status='indexed' 过滤**——图片无文本可索引，index_document_task
-    会把图片置为 'failed'（或误把二进制当文本索引），因此仅按
-    file_type='image' + visibility='public' + 权限过滤，功能自洽。
+    会把图片置为 'failed'（或误把二进制当文本索引），按它过滤会让所有合法图片
+    都检索不到。图片的准入由读取侧审核门 `_moderation_gated()` 决定
+    （state ∈ {approved, confirmed_unchecked} 且 storage_state=promoted），
+    未审核 / 审核中 / 已拒绝 / 审核不可用 / 审核异常的图片一律不可检索。
 
     Returns:
         [{'doc_id','doc_title','description','oss_key','file_name','score'}, ...]
@@ -1140,11 +1142,16 @@ def retrieve_images(
     # 兼容存量数据：file_type 可能是类别 'image'，也可能是历史存的原始扩展名（jpg/png 等）
     image_types = ['image'] + sorted(IMAGE_FILE_TYPES)
 
-    # 图片也必须处于 indexed，避免失败文档进入问答引用；
-    # 并与文本检索路径一样叠加读取侧审核门（P1-2 Phase 1-2 / P-3）。
+    # 与文本检索路径一样叠加读取侧审核门（P1-2 Phase 1-2 / P-3）。
+    #
+    # 这里**不能**再叠加 `status='indexed'`：图片没有文本分块，索引任务对
+    # 图片不会把它推到 'indexed'，真正的准入事实是审核门（审核状态白名单 +
+    # storage_state=promoted），不是 status。曾经按 status='indexed' 过滤导致
+    # 合法且已审核通过的图片被整体过滤掉（图片检索恒为空），而 status 本身
+    # 又不是安全事实——审核门才是。
     qs = _moderation_gated(
         authorized_knowledge_docs(user_context).filter(
-            file_type__in=image_types, status='indexed',
+            file_type__in=image_types,
         )
     )
 
