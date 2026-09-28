@@ -17,7 +17,7 @@
 1. **只处理通过审核门的文档**。旧版只按 `status='uploaded'` 过滤，等于把
    "未审核"当成了"待索引"。现在门禁判定唯一来源是 `check_indexable()`——
    它要求对象在 `knowledge/`、`storage_state=promoted`、`state ∈
-   {approved, confirmed_unchecked}`。
+   {approved, unavailable}`。
 
 2. **不再把不可索引的文档写成 `failed`**。`index_document_task` 内部在门禁
    不通过时会写 `status='failed'` + `index_error`；旧脚本正是靠这个把 95 份

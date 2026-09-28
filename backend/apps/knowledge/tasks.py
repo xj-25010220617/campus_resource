@@ -311,8 +311,11 @@ def moderate_and_promote_task(self, doc_id: int):
       此时本任务走"补派索引"路径（promotion 成功但派发丢失的恢复路径），
       且只有 `doc.status != 'indexed'` 时才补派——重复调用不会重复索引。
     - 本次刚 promoted 时不重复派发索引：promotion 的 on_commit 已经派过。
-    - 审核结论为 rejected / unavailable / error / pending / scanning 时，
+    - 审核结论为 rejected / pending / scanning / error 时，
       `promote_document()` 一律 skip，不会产生任何 OSS 或存储状态变更。
+    - `unavailable` **会**被提升（2026-09-28 业务规则）——它不是"还没审完"，
+      而是"审完了，结论是查不了"，按规则直接入库。它同时是审核终态，
+      本任务重入时 `moderate_document()` 会 skip，不会重跑检测链。
 
     Args:
         doc_id: KnowledgeDoc 主键
@@ -355,6 +358,9 @@ def moderate_and_promote_task(self, doc_id: int):
     #
     # 两条路径都先用 `check_indexable()` 兜底：即使 storage_state 是 promoted，
     # 审核结论为 rejected 时依然不得索引。
+    #
+    # 注意这里**不**判断"能不能解析"：能不能索引由 check_indexable() 决定，
+    # 索引能不能成功由 index_document_task 的解析链路决定，两者串联。
     if promotion.status == PromotionResult.STATUS_ALREADY:
         doc.refresh_from_db(fields=['oss_key', 'status'])
         allowed, reason = check_indexable(doc)
@@ -431,21 +437,31 @@ def _recover_undispatched_uploads(limit: int, now, dispatch) -> int:
 
 @shared_task(bind=True, ignore_result=True)
 def retry_failed_moderations_task(self, limit: int = 50):
-    """重试审核未完成的文档（`unavailable` / `error`）的最小 reaper。
+    """重试**审核过程异常**文档（仅 `error`）的最小 reaper。
 
-    `moderate_document()` 在检测链没能给出结论时会写 `next_retry_at`，
-    但不会自己重跑——重试需要一个调度者。本任务就是那个调度者。
+    `moderate_document()` 在审核过程抛错时会写 `next_retry_at`，但不会自己
+    重跑——重试需要一个调度者。本任务就是那个调度者。
 
     选取条件（全部必须满足）：
-        state ∈ {unavailable, error}          —— 绝不重跑 approved / rejected 终态
+        state == error                        —— 绝不重跑 approved / rejected /
+                                                 unavailable 三个终态
         next_retry_at 已到期                   —— 使用既有字段，不新增
         attempt_count < CONTENT_MODERATION_MAX_ATTEMPTS —— 不超过上限
+
+    为什么 `unavailable` **不**重试（2026-09-28 业务规则）
+    ---------------------------------------------------
+    - `unavailable` 现在自动入库（`is_storage_allowed()` 放行），已经发布；
+    - 它同时是审核终态，重跑检测链只会产生一个更差的结果：一次迟到的
+      `rejected` 会把已经发布、已经进 Milvus 的内容留在一个"已入库但结论为
+      拒绝"的矛盾状态里，而系统**没有**撤回（demotion）流程；
+    - `error` 则不同：它表示审核过程本身异常，文档**没有**入库，重试是纯粹
+      的恢复动作，且重试结果若为 rejected 也只会让它继续留在正式区之外。
 
     并发与幂等：
     - 派发前用 CAS 把 `next_retry_at` 推到下一个退避点，重复/并发运行的 reaper
       不会对同一文档重复派发。
     - 即使派发出去的任务丢失，退避到期后仍会再次进入，不会静默卡死。
-    - **达到 max_attempts 的文档保持 unavailable / error，绝不自动 approved**：
+    - **达到 max_attempts 的文档保持 error，绝不自动 approved**：
       本任务只重新派发 `moderate_document()`，没有任何"放行"分支。
 
     Args:
@@ -458,7 +474,6 @@ def retry_failed_moderations_task(self, limit: int = 50):
     from .models import ContentModeration
     from .moderation import (
         MODERATION_STATE_ERROR,
-        MODERATION_STATE_UNAVAILABLE,
         max_attempts,
         retry_backoff_seconds,
     )
@@ -466,7 +481,7 @@ def retry_failed_moderations_task(self, limit: int = 50):
     now = timezone.now()
     due = list(
         ContentModeration.objects.filter(
-            state__in=(MODERATION_STATE_UNAVAILABLE, MODERATION_STATE_ERROR),
+            state=MODERATION_STATE_ERROR,
             next_retry_at__isnull=False,
             next_retry_at__lte=now,
             attempt_count__lt=max_attempts(),

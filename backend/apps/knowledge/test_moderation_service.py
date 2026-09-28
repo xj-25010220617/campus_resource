@@ -1093,6 +1093,13 @@ class StateMachineTableTests(TestCase):
     def test_terminal_states_are_marked(self):
         self.assertIn(MODERATION_STATE_APPROVED, TERMINAL_MODERATION_STATES)
         self.assertIn(MODERATION_STATE_REJECTED, TERMINAL_MODERATION_STATES)
+        # 2026-09-28：unavailable 自动入库并成为终态——重审只可能把它变成
+        # rejected，留下一份"已发布但结论为拒绝"的文档且无降级路径。
+        self.assertIn(MODERATION_STATE_UNAVAILABLE, TERMINAL_MODERATION_STATES)
+
+    def test_error_is_not_terminal(self):
+        """`error` 表示审核过程异常，可重试，不得被当成终态。"""
+        self.assertNotIn(MODERATION_STATE_ERROR, TERMINAL_MODERATION_STATES)
 
     def test_policy_version_is_configured_not_empty(self):
         self.assertTrue(policy_version())
@@ -1407,10 +1414,21 @@ class ModerateDocumentServiceTests(_OSSPatchMixin, TestCase):
         self.assertEqual(moderation.storage_state, 'quarantine')
         self.assertEqual(moderation.promoted_key, '')
 
-    def test_unavailable_sets_next_retry_at(self):
+    def test_unavailable_does_not_schedule_a_retry(self):
+        """2026-09-28：`unavailable` 是终态，不再安排重试（见 moderation.py）。"""
         self._run(llm=_detector_unavailable('llm'))
 
         moderation = ContentModeration.objects.get(doc=self.doc)
+        self.assertEqual(moderation.state, MODERATION_STATE_UNAVAILABLE)
+        self.assertIsNone(moderation.next_retry_at)
+
+    def test_error_schedules_a_retry(self):
+        with patch('apps.knowledge.extraction.extract_from_oss',
+                   side_effect=RuntimeError('boom')):
+            moderate_document(self.doc.id, worker_id='test-worker')
+
+        moderation = ContentModeration.objects.get(doc=self.doc)
+        self.assertEqual(moderation.state, MODERATION_STATE_ERROR)
         self.assertIsNotNone(moderation.next_retry_at)
 
     def test_categories_and_findings_are_persisted(self):

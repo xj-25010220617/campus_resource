@@ -4,7 +4,10 @@
 
     P-1 / P-9  运维脚本安全化（reindex_tool：dry-run 只读、预检 fail-closed、
                --force 不绕审核门、不把不可索引文档写成 failed）
-    P-2        人工确认放行（唯一写入方 confirmation.py 的全部拒绝分支）
+    P-2        人工确认放行 —— **已随 2026-09-28 规则整体下线**。
+               `unavailable` 现在自动入库，不再需要管理员放行，因此
+               `confirmation.py` / Admin action / management command 与
+               原先覆盖它们的 `ManualConfirmationTests` 一并删除。
     P-3        RAG 读取侧审核门（白名单 × storage_state 矩阵）
     P-4        上传链与审核链解耦（dispatch_async 绝不降级同步执行 + 补扫恢复）
     P-5        部署编排（端口统一 / worker / beat 注册的任务名）
@@ -32,7 +35,6 @@ from utils.oss import QUARANTINE_KEY_PREFIX, oss_client
 from .models import ContentModeration, DocChunk, KnowledgeDoc
 from .moderation import (
     MODERATION_STATE_APPROVED,
-    MODERATION_STATE_CONFIRMED_UNCHECKED,
     MODERATION_STATE_ERROR,
     MODERATION_STATE_PENDING,
     MODERATION_STATE_REJECTED,
@@ -389,7 +391,7 @@ class ReindexDryRunTests(_Base):
         self.assertEqual(stats['not_promoted'], 0)
         self.assertEqual(stats['indexable'], 1)
         self.assertEqual(stats['not_indexable'], 2)
-        self.assertIn('approved', stats['indexable_states'])
+        self.assertIn('approved', stats['storage_allowed_states'])
 
     def test_dry_run_report_mentions_blocked_reasons(self):
         from .reindex_tool import collect_stats, format_stats
@@ -517,172 +519,6 @@ class ReindexPreflightTests(_Base):
 
 
 # ===========================================================================
-# P-2：人工确认放行
-# ===========================================================================
-
-class ManualConfirmationTests(_Base):
-
-    def setUp(self):
-        super().setUp()
-        self.doc = self._doc()
-        self.moderation = self._moderation(self.doc)
-
-    def _confirm(self, head_result=_DEFAULT_OSS, **kw):
-        from .confirmation import confirm_unchecked_document
-
-        stub = _OssStub(
-            {'exists': True} if head_result is _DEFAULT_OSS else head_result,
-        )
-        with patch.object(oss_client, 'head_object', stub), \
-                patch('utils.celery_dispatcher.safe_delay') as safe_delay:
-            with self.captureOnCommitCallbacks(execute=True):
-                result = confirm_unchecked_document(
-                    kw.pop('doc', self.doc),
-                    actor=kw.pop('actor', self.admin),
-                    reason=kw.pop('reason',
-                                  'ClamAV 故障期间人工复核，已下载检查无毒'),
-                    **kw,
-                )
-        return result, stub, safe_delay
-
-    # ---- 拒绝分支 ---------------------------------------------------
-
-    def test_anonymous_is_refused(self):
-        from .confirmation import ConfirmationError
-
-        with self.assertRaises(ConfirmationError) as ctx:
-            self._confirm(actor=None)
-        self.assertEqual(ctx.exception.reason, 'not_authenticated')
-
-    def test_non_admin_is_refused(self):
-        from .confirmation import ConfirmationError
-
-        with self.assertRaises(ConfirmationError) as ctx:
-            self._confirm(actor=self.plain)
-        self.assertEqual(ctx.exception.reason, 'not_admin')
-        self.moderation.refresh_from_db()
-        self.assertEqual(self.moderation.state, MODERATION_STATE_UNAVAILABLE)
-
-    def test_empty_reason_is_refused(self):
-        from .confirmation import ConfirmationError
-
-        with self.assertRaises(ConfirmationError) as ctx:
-            self._confirm(reason='   ')
-        self.assertEqual(ctx.exception.reason, 'reason_required')
-
-    def test_document_without_moderation_is_refused(self):
-        """历史文档（无审核记录）不属于本入口——P-8 是独立阶段。"""
-        from .confirmation import ConfirmationError
-
-        legacy = self._doc(oss_key='knowledge/college/1/2026-09/legacy.txt')
-        with self.assertRaises(ConfirmationError) as ctx:
-            self._confirm(doc=legacy)
-        self.assertEqual(ctx.exception.reason, 'no_moderation')
-
-    def test_rejected_document_can_never_be_confirmed(self):
-        from .confirmation import ConfirmationError
-
-        self.moderation.state = MODERATION_STATE_REJECTED
-        self.moderation.save(update_fields=['state'])
-
-        with self.assertRaises(ConfirmationError) as ctx:
-            self._confirm()
-        self.assertEqual(ctx.exception.reason, 'not_confirmable_state')
-
-        self.moderation.refresh_from_db()
-        self.assertEqual(self.moderation.state, MODERATION_STATE_REJECTED)
-
-    def test_error_state_is_not_confirmable(self):
-        """error 是"程序异常"，应先由重试器处理，人工不直接覆盖。"""
-        from .confirmation import ConfirmationError
-
-        self.moderation.state = MODERATION_STATE_ERROR
-        self.moderation.save(update_fields=['state'])
-
-        with self.assertRaises(ConfirmationError) as ctx:
-            self._confirm()
-        self.assertEqual(ctx.exception.reason, 'not_confirmable_state')
-
-    def test_non_quarantine_key_is_refused(self):
-        from .confirmation import ConfirmationError
-
-        self.moderation.quarantine_key = 'knowledge/college/1/2026-09/x.txt'
-        self.moderation.save(update_fields=['quarantine_key'])
-
-        with self.assertRaises(ConfirmationError) as ctx:
-            self._confirm()
-        self.assertEqual(ctx.exception.reason, 'not_quarantine_key')
-
-    def test_missing_object_is_refused(self):
-        from .confirmation import ConfirmationError
-
-        with self.assertRaises(ConfirmationError) as ctx:
-            self._confirm(head_result={'exists': False})
-        self.assertEqual(ctx.exception.reason, 'object_missing')
-
-        self.moderation.refresh_from_db()
-        self.assertEqual(self.moderation.state, MODERATION_STATE_UNAVAILABLE)
-
-    def test_unverifiable_object_is_refused(self):
-        """OSS 查不到 ≠ 对象存在（fail-closed）。"""
-        from .confirmation import ConfirmationError
-
-        with self.assertRaises(ConfirmationError) as ctx:
-            self._confirm(head_result=None)
-        self.assertEqual(ctx.exception.reason, 'object_unverifiable')
-
-    # ---- 成功路径 ---------------------------------------------------
-
-    def test_success_writes_audit_triple(self):
-        result, stub, safe_delay = self._confirm()
-
-        self.assertEqual(result.state, MODERATION_STATE_CONFIRMED_UNCHECKED)
-        self.assertEqual(result.confirmed_by, self.admin)
-        self.assertIsNotNone(result.confirmed_at)
-        self.assertIn('人工复核', result.confirmation_reason)
-        self.assertEqual(stub.calls, [self.doc.oss_key],
-                         '必须真的去 OSS 核实过对象存在')
-
-    def test_success_dispatches_orchestration_not_index(self):
-        """§9：确认后必须走 promotion，绝不能直接索引。"""
-        from .tasks import index_document_task, moderate_and_promote_task
-
-        _, _, safe_delay = self._confirm()
-
-        safe_delay.assert_called_once()
-        self.assertIs(safe_delay.call_args.args[0], moderate_and_promote_task)
-        self.assertEqual(safe_delay.call_args.args[1], self.doc.id)
-        self.assertIsNot(
-            safe_delay.call_args.args[0], index_document_task,
-            '人工确认不得绕过 promotion 直接派发索引',
-        )
-
-    def test_confirmed_state_is_terminal_for_orchestrator(self):
-        """前提固定：confirmed_unchecked 属于终态，编排任务不会重跑检测链。"""
-        from .moderation import TERMINAL_MODERATION_STATES
-
-        self.assertIn(
-            MODERATION_STATE_CONFIRMED_UNCHECKED, TERMINAL_MODERATION_STATES,
-            'confirmation.py 依赖该前提，一旦被改动必须同步重新设计确认流程',
-        )
-
-    def test_confirmed_state_is_indexable(self):
-        from .moderation import is_indexable_moderation_state
-
-        self.assertTrue(
-            is_indexable_moderation_state(MODERATION_STATE_CONFIRMED_UNCHECKED),
-        )
-
-    def test_second_confirmation_loses_cas(self):
-        from .confirmation import ConfirmationError
-
-        self._confirm()
-        with self.assertRaises(ConfirmationError) as ctx:
-            self._confirm()
-        self.assertEqual(ctx.exception.reason, 'not_confirmable_state')
-
-
-# ===========================================================================
 # P-3：RAG 读取侧审核门
 # ===========================================================================
 
@@ -714,9 +550,23 @@ class RagModerationGateTests(_Base):
                          storage_state=STORAGE_STATE_PROMOTED)
         self.assertEqual(self._gate_ids(), set())
 
-    def test_promoted_but_unavailable_is_excluded(self):
+    def test_unavailable_and_promoted_is_included(self):
+        """2026-09-28：`unavailable` = "检测链没能给出结论"，自动入库、可检索。"""
         doc = self._doc(status='indexed')
         self._moderation(doc, state=MODERATION_STATE_UNAVAILABLE,
+                         storage_state=STORAGE_STATE_PROMOTED)
+        self.assertEqual(self._gate_ids(), {doc.id})
+
+    def test_promoted_but_error_is_excluded(self):
+        """`error` = 审核过程发生异常，**不**自动放行（与 unavailable 的区别）。"""
+        doc = self._doc(status='indexed')
+        self._moderation(doc, state=MODERATION_STATE_ERROR,
+                         storage_state=STORAGE_STATE_PROMOTED)
+        self.assertEqual(self._gate_ids(), set())
+
+    def test_promoted_but_pending_is_excluded(self):
+        doc = self._doc(status='indexed')
+        self._moderation(doc, state=MODERATION_STATE_PENDING,
                          storage_state=STORAGE_STATE_PROMOTED)
         self.assertEqual(self._gate_ids(), set())
 
@@ -732,11 +582,12 @@ class RagModerationGateTests(_Base):
                          storage_state=STORAGE_STATE_PROMOTED)
         self.assertEqual(self._gate_ids(), {doc.id})
 
-    def test_confirmed_unchecked_and_promoted_is_included(self):
+    def test_scanning_and_promoted_is_excluded(self):
+        """`scanning` 是审核中的中间态，即便被非法提升也不得进 RAG。"""
         doc = self._doc(status='indexed')
-        self._moderation(doc, state=MODERATION_STATE_CONFIRMED_UNCHECKED,
+        self._moderation(doc, state='scanning',
                          storage_state=STORAGE_STATE_PROMOTED)
-        self.assertEqual(self._gate_ids(), {doc.id})
+        self.assertEqual(self._gate_ids(), set())
 
     def test_no_status_indexed_bypass(self):
         """`OR status='indexed'` 这类兜底不得存在：已索引但未审核 → 不可检索。"""

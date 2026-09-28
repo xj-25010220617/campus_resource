@@ -9,8 +9,8 @@
           `upload_service.ingest_internal_document()` 进入隔离区，
           不得自己拼 `knowledge/` key、不得自己投递索引任务；
           `download_files=True` 仍然可用。
-    P1-1  图片检索的准入由读取侧审核门决定（approved / confirmed_unchecked
-          可检索，pending / scanning / rejected / unavailable / error 不可），
+    P1-1  图片检索的准入由读取侧审核门决定（approved / unavailable
+          可检索，pending / scanning / rejected / error 不可），
           且不再因为 `status != 'indexed'` 把合法图片整体过滤掉。
     P1-4  UploadCallbackSerializer 的 `intent_id` 保持必填。
 
@@ -33,7 +33,6 @@ from apps.accounts.models import College, User
 from .models import ContentModeration, KnowledgeDoc
 from .moderation import (
     MODERATION_STATE_APPROVED,
-    MODERATION_STATE_CONFIRMED_UNCHECKED,
     MODERATION_STATE_ERROR,
     MODERATION_STATE_PENDING,
     MODERATION_STATE_REJECTED,
@@ -106,7 +105,8 @@ class MigrationGraphLinearizationTests(SimpleTestCase):
     def test_knowledge_keeps_a_single_leaf(self):
         self.assertEqual(
             self.loader.graph.leaf_nodes('knowledge'),
-            [('knowledge', '0010_uploadintent_chunkeduploadsession_intent_and_more')],
+            [('knowledge',
+              '0011_unavailable_storage_allowed_drop_manual_confirmation')],
         )
 
     def test_charset_migration_precedes_the_three_security_tables(self):
@@ -119,6 +119,7 @@ class MigrationGraphLinearizationTests(SimpleTestCase):
                 '0008_utf8mb4_charset',
                 '0009_contentmoderation_moderationattempt_and_more',
                 '0010_uploadintent_chunkeduploadsession_intent_and_more',
+                '0011_unavailable_storage_allowed_drop_manual_confirmation',
             ],
         )
 
@@ -430,8 +431,9 @@ class ImageRetrievalGateTests(TestCase):
         doc = self._image('篮球场全景', state=MODERATION_STATE_APPROVED)
         self.assertIn(doc.id, self._retrieved_ids())
 
-    def test_confirmed_unchecked_and_promoted_image_is_retrievable(self):
-        doc = self._image('篮球场俯视图', state=MODERATION_STATE_CONFIRMED_UNCHECKED)
+    def test_unavailable_and_promoted_image_is_retrievable(self):
+        """2026-09-28：`unavailable` 与 approved 同等放行，无需人工确认。"""
+        doc = self._image('篮球场俯视图', state=MODERATION_STATE_UNAVAILABLE)
         self.assertIn(doc.id, self._retrieved_ids())
 
     def test_pending_image_is_not_retrievable(self):
@@ -446,8 +448,10 @@ class ImageRetrievalGateTests(TestCase):
         doc = self._image('篮球场违规图', state=MODERATION_STATE_REJECTED)
         self.assertNotIn(doc.id, self._retrieved_ids())
 
-    def test_unavailable_image_is_not_retrievable(self):
-        doc = self._image('篮球场无法判定图', state=MODERATION_STATE_UNAVAILABLE)
+    def test_unavailable_but_not_promoted_image_is_not_retrievable(self):
+        """放行状态 + 未提升 = 仍在隔离区，不得检索。"""
+        doc = self._image('篮球场未提升无法判定图', state=MODERATION_STATE_UNAVAILABLE,
+                          storage_state=STORAGE_STATE_QUARANTINE)
         self.assertNotIn(doc.id, self._retrieved_ids())
 
     def test_error_image_is_not_retrievable(self):

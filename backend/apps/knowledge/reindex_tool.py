@@ -35,7 +35,7 @@
 1. **绝不批量删除**：本模块没有任何 `objects.all().delete()` / `.update()`。
 2. **绝不绕过审核门**：每个文档是否可索引，一律问 `check_indexable()`——
    它内部委托 `is_document_indexable_by_moderation()`，要求对象在
-   `knowledge/`、`storage_state=promoted`、`state ∈ {approved, confirmed_unchecked}`。
+   `knowledge/`、`storage_state=promoted`、`state ∈ {approved, unavailable}`。
    本模块**不**复制这套判定，也不提供任何"忽略门禁"的参数。
 3. **`--force` 不是"绕过"**：它只允许重新索引**已经 `indexed`** 的文档
    （默认模式下这些文档会被跳过）。门禁依旧逐条生效，未审核的历史文档
@@ -88,9 +88,9 @@ def collect_stats() -> dict:
     """
     from .models import ContentModeration
     from .moderation import (
-        INDEXABLE_MODERATION_STATES,
         MODERATION_STATE_APPROVED,
-        MODERATION_STATE_CONFIRMED_UNCHECKED,
+        MODERATION_STATE_UNAVAILABLE,
+        STORAGE_ALLOWED_MODERATION_STATES,
         STORAGE_STATE_PROMOTED,
         check_indexable,
     )
@@ -99,7 +99,7 @@ def collect_stats() -> dict:
     by_status = {}
     has_moderation = 0
     approved = 0
-    confirmed_unchecked = 0
+    unavailable = 0
     promoted = 0
     indexable = 0
     blocked_reasons = {}
@@ -118,8 +118,8 @@ def collect_stats() -> dict:
             has_moderation += 1
             if moderation.state == MODERATION_STATE_APPROVED:
                 approved += 1
-            elif moderation.state == MODERATION_STATE_CONFIRMED_UNCHECKED:
-                confirmed_unchecked += 1
+            elif moderation.state == MODERATION_STATE_UNAVAILABLE:
+                unavailable += 1
             if moderation.storage_state == STORAGE_STATE_PROMOTED:
                 promoted += 1
 
@@ -138,14 +138,14 @@ def collect_stats() -> dict:
         'has_moderation': has_moderation,
         'no_moderation': total - has_moderation,
         'approved': approved,
-        'confirmed_unchecked': confirmed_unchecked,
+        'unavailable': unavailable,
         'promoted': promoted,
         'not_promoted': has_moderation - promoted,
         'indexable': indexable,
         'not_indexable': total - indexable,
         'blocked_reasons': blocked_reasons,
-        # 白名单口径的自我描述：这两个常量是"可放行"的唯一定义
-        'indexable_states': sorted(INDEXABLE_MODERATION_STATES),
+        # 白名单口径的自我描述：这个常量是"可放行"的唯一定义
+        'storage_allowed_states': sorted(STORAGE_ALLOWED_MODERATION_STATES),
     }
 
 
@@ -163,7 +163,7 @@ def format_stats(stats: dict) -> str:
         f'有 ContentModeration 记录  : {stats["has_moderation"]}',
         f'无 ContentModeration 记录  : {stats["no_moderation"]}',
         f'  state=approved           : {stats["approved"]}',
-        f'  state=confirmed_unchecked: {stats["confirmed_unchecked"]}',
+        f'  state=unavailable        : {stats["unavailable"]}',
         f'storage_state=promoted     : {stats["promoted"]}',
         f'storage_state≠promoted     : {stats["not_promoted"]}',
         f'可索引（通过审核门）       : {stats["indexable"]}',
@@ -176,8 +176,8 @@ def format_stats(stats: dict) -> str:
         ):
             lines.append(f'  [{count:>4}] {reason}')
     lines.append(
-        '放行状态白名单              : '
-        + ', '.join(stats['indexable_states'])
+        '入库状态白名单              : '
+        + ', '.join(stats['storage_allowed_states'])
     )
     return '\n'.join(lines)
 
@@ -264,10 +264,13 @@ def run_reindex(
         # fail-closed：库里还有没过门的文档时，默认模式一概不动。
         # 这是故意的——免得"重索引"被当成"顺便把历史数据也处理了"的借口。
         raise ReindexBlocked(
-            f'预检未通过：{len(blocked)} 份文档不可索引（最常见原因：'
-            f'没有 ContentModeration 记录或 storage_state≠promoted）。'
-            f'默认模式拒绝执行任何写入。请先完成人工审核/确认'
-            f'（manage.py confirm_moderation），或使用 --dry-run 查看统计。'
+            f'预检未通过：{len(blocked)} 份文档不可索引（见上方"不可索引原因'
+            f'分布"：没有审核记录 / state 不属于 approved·unavailable / '
+            f'storage_state≠promoted）。默认模式拒绝执行任何写入。'
+            f'注意：unavailable 与 approved 都会自动放行，因此这里的文档要么是'
+            f'尚未审完（pending / scanning），要么是审核异常（error，等待重试），'
+            f'要么是被拒绝或被挡在审核门外的存量数据——这些都没有人工放行入口。'
+            f'请用 --dry-run 查看统计后再决定处置方式。'
         )
 
     if limit is not None:

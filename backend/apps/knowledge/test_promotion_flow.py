@@ -10,7 +10,7 @@
     F. 并发（抢占 CAS 与收尾 CAS 都只有一个赢家）
     G. `check_indexable()` 的完整门禁矩阵（命名空间 × 审核状态 × 存储状态）
     H. `moderate_and_promote_task()` 编排（通过才提升，拒绝即止步）
-    I. `retry_failed_moderations_task()`（只重派 unavailable / error，绝不自动放行）
+    I. `retry_failed_moderations_task()`（只重派 error，绝不自动放行）
     J. SSE 出口纵深防御（隔离区对象一律不签名）
 
 测试原则（§二十七）：**不连接任何真实外部依赖**。OSS 用内存替身、检测器全部
@@ -39,7 +39,6 @@ from .detectors import DetectorResult
 from .models import ContentModeration, KnowledgeDoc, ModerationAttempt
 from .moderation import (
     MODERATION_STATE_APPROVED,
-    MODERATION_STATE_CONFIRMED_UNCHECKED,
     MODERATION_STATE_ERROR,
     MODERATION_STATE_PENDING,
     MODERATION_STATE_REJECTED,
@@ -54,7 +53,7 @@ from .moderation import (
     VERDICT_VIRUS,
     check_indexable,
     is_document_indexable_by_moderation,
-    is_indexable_moderation_state,
+    is_storage_allowed,
 )
 from .promotion import (
     PromotionResult,
@@ -345,13 +344,15 @@ class PromotionGateTests(_PromotionTestCase):
         self.assertEqual(result.status, PromotionResult.STATUS_SKIPPED)
         self.assertEqual(result.reason, 'doc_not_found')
 
-    def test_every_non_indexable_state_blocks_promotion(self):
-        """白名单之外的状态一个都不能提升（含 pending / scanning 中间态）。"""
+    def test_every_non_storage_allowed_state_blocks_promotion(self):
+        """白名单之外的状态一个都不能提升（含 pending / scanning 中间态）。
+
+        `unavailable` **不在**本表内：它与 approved 同属放行白名单（2026-09-28）。
+        """
         for state in (
             MODERATION_STATE_PENDING,
             MODERATION_STATE_SCANNING,
             MODERATION_STATE_REJECTED,
-            MODERATION_STATE_UNAVAILABLE,
             MODERATION_STATE_ERROR,
         ):
             with self.subTest(state=state):
@@ -366,7 +367,7 @@ class PromotionGateTests(_PromotionTestCase):
                 result = promote_document(doc.id, schedule_index=False)
 
                 self.assertEqual(result.status, PromotionResult.STATUS_SKIPPED)
-                self.assertEqual(result.reason, f'not_approved:{state}')
+                self.assertEqual(result.reason, f'not_storage_allowed:{state}')
                 self.assertEqual(self.bucket.copy_calls, [])
                 doc.refresh_from_db()
                 self.assertTrue(is_quarantine_key(doc.oss_key))
@@ -381,11 +382,10 @@ class PromotionGateTests(_PromotionTestCase):
         self.assertEqual(self.bucket.copy_calls, [])
 
     def test_gate_matches_the_shared_whitelist(self):
-        """promotion 的判定必须复用 `is_indexable_moderation_state()`，
+        """promotion 的判定必须复用 `is_storage_allowed()`，
         不得另写一套 approved 比较。"""
         for state in (
             MODERATION_STATE_APPROVED,
-            MODERATION_STATE_CONFIRMED_UNCHECKED,
             MODERATION_STATE_REJECTED,
             MODERATION_STATE_UNAVAILABLE,
             MODERATION_STATE_ERROR,
@@ -395,9 +395,17 @@ class PromotionGateTests(_PromotionTestCase):
             None,
         ):
             with self.subTest(state=state):
-                self.assertEqual(is_indexable_moderation_state(state), state in (
-                    MODERATION_STATE_APPROVED, MODERATION_STATE_CONFIRMED_UNCHECKED,
+                self.assertEqual(is_storage_allowed(state), state in (
+                    MODERATION_STATE_APPROVED, MODERATION_STATE_UNAVAILABLE,
                 ))
+
+    def test_unavailable_moderation_state_is_a_storage_allowed_state(self):
+        """核心放行项：`unavailable` 不得被任何一处判定挡住。"""
+        self.assertTrue(is_storage_allowed(MODERATION_STATE_UNAVAILABLE))
+        self._moderation(state=MODERATION_STATE_UNAVAILABLE,
+                         storage_state=STORAGE_STATE_PROMOTED)
+        allowed, reason = is_document_indexable_by_moderation(self.doc)
+        self.assertTrue(allowed, f'unavailable 应通过审核门，实际被拒：{reason}')
 
     def test_rejected_document_already_in_official_namespace_is_not_re_promoted(self):
         """storage_state 已是 promoted 但审核结论是 rejected：不得短路放行。"""
@@ -438,9 +446,9 @@ class PromotionSuccessTests(_PromotionTestCase):
         self.assertEqual(len(self.bucket.copy_calls), 1)
         self.assertIn(EXPECTED_PROMOTED_KEY, self.bucket.objects)
 
-    def test_confirmed_unchecked_is_also_eligible(self):
-        """人工确认放行的文档与 approved 同等对待（同属白名单）。"""
-        self._moderation(state=MODERATION_STATE_CONFIRMED_UNCHECKED)
+    def test_unavailable_is_also_eligible(self):
+        """`unavailable` 与 approved 同等对待（同属存储白名单），无需人工放行。"""
+        self._moderation(state=MODERATION_STATE_UNAVAILABLE)
 
         result = promote_document(self.doc.id, schedule_index=False)
 
@@ -933,7 +941,12 @@ class ModerateAndPromoteTaskTests(_PromotionTestCase):
         self.assertNotEqual(self.doc.status, 'indexed')
         safe_delay.assert_not_called()
 
-    def test_unavailable_detector_never_promotes(self):
+    def test_unavailable_detector_still_promotes(self):
+        """2026-09-28 核心规则：`unavailable` 自动入库，无需人工放行。
+
+        检测链给不出结论 ≠ 内容有害；按业务规则它与 approved 同等放行。
+        放行的只是**存储**——能不能被检索仍取决于后面的解析链路。
+        """
         self._patch_detectors(
             llm=DetectorResult.unavailable('llm', reason='测试', error='不可用'),
         )
@@ -942,6 +955,23 @@ class ModerateAndPromoteTaskTests(_PromotionTestCase):
 
         moderation = ContentModeration.objects.get(doc=self.doc)
         self.assertEqual(moderation.state, MODERATION_STATE_UNAVAILABLE)
+        self.assertEqual(moderation.storage_state, STORAGE_STATE_PROMOTED)
+        self.assertEqual(len(self.bucket.copy_calls), 1)
+        self.doc.refresh_from_db()
+        self.assertTrue(is_official_oss_key(self.doc.oss_key))
+        # 派发的是索引任务，不是"直接写 indexed"
+        self.assertIs(safe_delay.call_args.args[0], index_document_task)
+
+    def test_error_detector_never_promotes(self):
+        """`error` = 审核过程异常，**不**自动放行（与 unavailable 的分界线）。"""
+        self._patch_detectors(
+            llm=DetectorResult.error('llm', reason='测试', error='boom'),
+        )
+
+        safe_delay = self._run_task()
+
+        moderation = ContentModeration.objects.get(doc=self.doc)
+        self.assertEqual(moderation.state, MODERATION_STATE_ERROR)
         self.assertEqual(self.bucket.copy_calls, [])
         safe_delay.assert_not_called()
 
@@ -1013,7 +1043,7 @@ class ModerateAndPromoteTaskTests(_PromotionTestCase):
 
 class RetryFailedModerationsTaskTests(_PromotionTestCase):
 
-    def _due(self, state=MODERATION_STATE_UNAVAILABLE, **overrides):
+    def _due(self, state=MODERATION_STATE_ERROR, **overrides):
         defaults = dict(
             doc=self.doc, state=state, storage_state=STORAGE_STATE_QUARANTINE,
             attempt_count=1,
@@ -1022,7 +1052,7 @@ class RetryFailedModerationsTaskTests(_PromotionTestCase):
         defaults.update(overrides)
         return ContentModeration.objects.create(**defaults)
 
-    def test_due_unavailable_document_is_re_dispatched(self):
+    def test_due_error_document_is_re_dispatched(self):
         self._due()
 
         with patch('utils.celery_dispatcher.safe_delay') as safe_delay:
@@ -1032,17 +1062,24 @@ class RetryFailedModerationsTaskTests(_PromotionTestCase):
         self.assertIs(safe_delay.call_args.args[0], moderate_and_promote_task)
         self.assertEqual(safe_delay.call_args.args[1], self.doc.id)
 
-    def test_due_error_document_is_re_dispatched(self):
-        self._due(state=MODERATION_STATE_ERROR)
+    def test_due_unavailable_document_is_never_re_dispatched(self):
+        """`unavailable` 是终态（2026-09-28）：已经入库，重跑只可能把它变成 rejected，
+        留下一份"已发布但结论为拒绝"的文档，而没有降级/撤回路径。"""
+        moderation = self._due(state=MODERATION_STATE_UNAVAILABLE)
 
         with patch('utils.celery_dispatcher.safe_delay') as safe_delay:
             _call_task(retry_failed_moderations_task)
 
-        safe_delay.assert_called_once()
+        safe_delay.assert_not_called()
+        moderation.refresh_from_db()
+        self.assertEqual(moderation.state, MODERATION_STATE_UNAVAILABLE)
+        self.assertEqual(moderation.attempt_count, 1)
 
     def test_terminal_states_are_never_re_run(self):
-        """approved / rejected 是终态，重试器不得触碰（更不得"重审后放行"）。"""
+        """approved / rejected / unavailable 是终态，重试器不得触碰
+        （更不得"重审后放行"）。"""
         for state in (MODERATION_STATE_APPROVED, MODERATION_STATE_REJECTED,
+                      MODERATION_STATE_UNAVAILABLE,
                       MODERATION_STATE_PENDING, MODERATION_STATE_SCANNING):
             with self.subTest(state=state):
                 ContentModeration.objects.all().delete()
@@ -1062,7 +1099,7 @@ class RetryFailedModerationsTaskTests(_PromotionTestCase):
         safe_delay.assert_not_called()
 
     def test_attempts_at_the_cap_are_left_alone(self):
-        """达到上限的文档保持 unavailable / error，绝不自动 approved。"""
+        """达到上限的文档保持 error，绝不自动 approved。"""
         from .moderation import max_attempts
 
         self._due(attempt_count=max_attempts())
@@ -1073,7 +1110,7 @@ class RetryFailedModerationsTaskTests(_PromotionTestCase):
         safe_delay.assert_not_called()
         self.assertEqual(
             ContentModeration.objects.get(doc=self.doc).state,
-            MODERATION_STATE_UNAVAILABLE,
+            MODERATION_STATE_ERROR,
         )
 
     def test_claim_pushes_next_retry_at_to_avoid_double_dispatch(self):

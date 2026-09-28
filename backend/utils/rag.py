@@ -921,7 +921,7 @@ def _moderation_gated(qs):
 
     判据与写入侧**完全同源**：直接调用
     `moderation.filter_indexable_docs()`，它复用
-    `INDEXABLE_MODERATION_STATES` / `STORAGE_STATE_PROMOTED`，不复制逻辑。
+    `STORAGE_ALLOWED_MODERATION_STATES` / `STORAGE_STATE_PROMOTED`，不复制逻辑。
 
     fail-closed：没有 ContentModeration 记录的历史文档一律被排除。
     这是**预期行为**（审计报告 §十四），本阶段不回填、不删除、不改 status。
@@ -1164,8 +1164,8 @@ def retrieve_images(
     注意：**不按 status='indexed' 过滤**——图片无文本可索引，index_document_task
     会把图片置为 'failed'（或误把二进制当文本索引），按它过滤会让所有合法图片
     都检索不到。图片的准入由读取侧审核门 `_moderation_gated()` 决定
-    （state ∈ {approved, confirmed_unchecked} 且 storage_state=promoted），
-    未审核 / 审核中 / 已拒绝 / 审核不可用 / 审核异常的图片一律不可检索。
+    （state ∈ {approved, unavailable} 且 storage_state=promoted），
+    未审核 / 审核中 / 已拒绝 / 审核异常的图片一律不可检索。
 
     Returns:
         [{'doc_id','doc_title','description','oss_key','file_name','score'}, ...]

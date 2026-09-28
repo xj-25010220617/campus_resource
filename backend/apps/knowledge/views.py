@@ -864,7 +864,7 @@ class UploadCallbackView(APIView):
                 )
 
         # P1-2D STEP 4-B：把该文档交给统一审核编排（审核 → 提升 → 索引）。
-        # 对象此刻仍在 quarantine/，只有审核给出 approved/confirmed_unchecked
+        # 对象此刻仍在 quarantine/，只有审核给出 approved/unavailable
         # 且 promotion 成功之后才可能被索引。入口不做任何审核判定。
         upload_service.schedule_moderation(new_doc.id)
 

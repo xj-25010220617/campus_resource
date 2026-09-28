@@ -45,8 +45,10 @@ echo.
 set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" (
     echo.
-    echo [reindex] 未执行写入（退出码 %RC%）。请先看上面的统计与不可索引原因分布，
-    echo [reindex] 再用 manage.py confirm_moderation 处理需要人工确认的文档。
+    echo [reindex] 未执行写入（退出码 %RC%）。请先看上面的统计与不可索引原因分布。
+    echo [reindex] 注意：approved 与 unavailable 都会自动放行，没有人工放行入口；
+    echo [reindex] 停在门外的文档要么尚未审完（pending / scanning），要么审核异常
+    echo [reindex] （error，等重试），要么是被拒绝的文档，均不可索引。
 )
 
 endlocal & exit /b %RC%

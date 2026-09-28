@@ -36,7 +36,6 @@ from ..upload_intent import (
     is_quarantine_key,
 )
 from ..moderation import (
-    INDEXABLE_MODERATION_STATES,
     INDEXABLE_OSS_KEY_PREFIX,
     MAX_EXCERPT_LENGTH,
     MAX_FINDINGS,
@@ -47,8 +46,9 @@ from ..moderation import (
     STORAGE_STATE_PROMOTED,
     VERDICT_CHOICES,
     VERDICT_CLEAN,
-    is_indexable_moderation_state,
     normalize_findings,
+    is_storage_allowed,
+    STORAGE_ALLOWED_MODERATION_STATES,
 )
 
 
@@ -134,7 +134,7 @@ class RagRetrievalTests(TestCase):
         doc = KnowledgeDoc.objects.create(**defaults)
         # P1-2 Phase 1-2 / 审计报告 P-3：RAG 读取侧已加审核门，
         # `status='indexed'` 不再是"可被检索"的充分条件——还必须
-        # `state ∈ {approved, confirmed_unchecked}` 且 `storage_state=promoted`。
+        # `state ∈ {approved, unavailable}` 且 `storage_state=promoted`。
         # 因此"已索引文档"的夹具必须同时给出审核记录，否则它代表的是一个
         # STEP 4-B 之后**不可能存在**的状态（未审核却已索引）。
         # 这是夹具修正，不是放宽安全判定：审核门本身未做任何改动。
@@ -2014,21 +2014,22 @@ class ContentModerationModelTests(TestCase):
         # 文档"看起来正常"，但根本不存在审核记录，绝不能推导出放行
         self.assertFalse(ContentModeration.objects.filter(doc=self.doc).exists())
 
-    def test_confirmed_fields_default_to_unconfirmed(self):
-        moderation = ContentModeration.objects.create(doc=self.doc)
+    def test_manual_confirmation_fields_are_gone(self):
+        """2026-09-28：人工确认放行整体下线，三个审计字段不再存在于模型上。"""
+        field_names = {f.name for f in ContentModeration._meta.get_fields()}
 
-        self.assertIsNone(moderation.confirmed_by)
-        self.assertIsNone(moderation.confirmed_at)
-        self.assertEqual(moderation.confirmation_reason, '')
+        for gone in ('confirmed_by', 'confirmed_at', 'confirmation_reason'):
+            self.assertNotIn(gone, field_names, f'{gone} 应已随人工确认机制删除')
 
     def test_is_approved_follows_the_whitelist_only(self):
         moderation = ContentModeration.objects.create(doc=self.doc)
 
-        for state in ('pending', 'scanning', 'rejected', 'unavailable', 'error', ''):
+        for state in ('pending', 'scanning', 'rejected', 'error', ''):
             moderation.state = state
             self.assertFalse(moderation.is_approved, f'state={state!r} 不应放行')
 
-        for state in ('approved', 'confirmed_unchecked'):
+        # unavailable = "检测链没能给出结论"，按 2026-09-28 规则与 approved 同等放行。
+        for state in ('approved', 'unavailable'):
             moderation.state = state
             self.assertTrue(moderation.is_approved, f'state={state!r} 应放行')
 
@@ -2137,7 +2138,7 @@ class ModerationSchemaMigrationTests(TestCase):
 
         self.assertFalse(
             ContentModeration.objects.filter(
-                state__in=('approved', 'confirmed_unchecked'),
+                state__in=('approved', 'unavailable'),
             ).exists()
         )
         self.assertFalse(ContentModeration.objects.filter(verdict='clean').exists())
@@ -2162,21 +2163,22 @@ class ModerationSchemaMigrationTests(TestCase):
 class ModerationStateInvariantTests(TestCase):
     """状态常量与白名单不变量。"""
 
-    def test_indexable_states_is_an_exact_whitelist(self):
+    def test_storage_allowed_states_is_an_exact_whitelist(self):
         self.assertEqual(
-            INDEXABLE_MODERATION_STATES, frozenset({'approved', 'confirmed_unchecked'}),
+            STORAGE_ALLOWED_MODERATION_STATES,
+            frozenset({'approved', 'unavailable'}),
         )
 
-    def test_unknown_and_empty_states_are_not_indexable(self):
+    def test_unknown_and_empty_states_are_not_storage_allowed(self):
         for state in (None, '', 'PENDING', 'Approved', 'pending', 'scanning',
-                      'rejected', 'unavailable', 'error'):
-            self.assertFalse(is_indexable_moderation_state(state), f'state={state!r}')
+                      'rejected', 'error', 'confirmed_unchecked'):
+            self.assertFalse(is_storage_allowed(state), f'state={state!r}')
 
     def test_state_choices_are_exactly_the_agreed_set(self):
         self.assertEqual(
             [choice[0] for choice in MODERATION_STATE_CHOICES],
             ['pending', 'scanning', 'approved', 'rejected',
-             'unavailable', 'confirmed_unchecked', 'error'],
+             'unavailable', 'error'],
         )
 
     def test_verdict_choices_are_exactly_the_agreed_set(self):

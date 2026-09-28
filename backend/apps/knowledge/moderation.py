@@ -54,7 +54,6 @@ MODERATION_STATE_SCANNING = 'scanning'
 MODERATION_STATE_APPROVED = 'approved'
 MODERATION_STATE_REJECTED = 'rejected'
 MODERATION_STATE_UNAVAILABLE = 'unavailable'
-MODERATION_STATE_CONFIRMED_UNCHECKED = 'confirmed_unchecked'
 MODERATION_STATE_ERROR = 'error'
 
 MODERATION_STATE_CHOICES = [
@@ -63,7 +62,6 @@ MODERATION_STATE_CHOICES = [
     (MODERATION_STATE_APPROVED, '已通过'),
     (MODERATION_STATE_REJECTED, '已拒绝'),
     (MODERATION_STATE_UNAVAILABLE, '审核不可用'),
-    (MODERATION_STATE_CONFIRMED_UNCHECKED, '人工确认放行'),
     (MODERATION_STATE_ERROR, '审核异常'),
 ]
 
@@ -103,15 +101,41 @@ STORAGE_STATE_CHOICES = [
     (STORAGE_STATE_DELETED, '已删除'),
 ]
 
-# **唯一**允许放行的审核状态白名单。
+# **唯一**允许进入正式知识库存储的审核状态白名单。
 #
-# 必须使用白名单（`state in INDEXABLE_MODERATION_STATES`）判断，禁止写成
+# 业务规则（2026-09-28 定稿）：
+#
+#     approved     审核判定内容干净                        → 允许入库
+#     unavailable  检测链没能给出结论（能力不足 / 服务不可用） → 允许入库
+#                                                       （不再人工复核）
+#
+#     rejected     已判定有害                              → 禁止入库
+#     pending      尚未审核                                → 禁止入库
+#     scanning     正在审核                                → 禁止入库
+#     error        审核过程异常                            → 禁止入库
+#
+# `unavailable` 与 `error` 的语义差别是这条规则的分界线：前者是"当前能力不足 /
+# 查不了"，后者是"审核过程本身出错了"。把两者混同会让审核异常变成一条放行路径。
+#
+# ⚠️ 必须使用白名单（`state in STORAGE_ALLOWED_MODERATION_STATES`）判断，禁止写成
 # `state != 'rejected'` 这类黑名单：黑名单在将来新增状态时会**静默放行**，
 # 而白名单只会**静默拒绝**。同一个遗漏，后果完全相反。
-INDEXABLE_MODERATION_STATES = frozenset({
+STORAGE_ALLOWED_MODERATION_STATES = frozenset({
     MODERATION_STATE_APPROVED,
-    MODERATION_STATE_CONFIRMED_UNCHECKED,
+    MODERATION_STATE_UNAVAILABLE,
 })
+
+# 读取侧（`filter_indexable_docs()`）与索引侧用的是**同一个集合**：
+#
+#     "允许入库" ≠ "允许进入 RAG 索引"
+#
+# 二者的区别不在审核状态，而在**解析链路**——能否被检索取决于
+# `index_document_task` 是否真的解析出文本、分块、Embedding、写入 Milvus。
+# 因此索引侧**不额外收紧**审核状态（否则所有扫描件 PDF 都会被误挡），
+# 也**不额外放宽**（那等于给 rejected 开后门）。
+#
+# 这里只有一个常量名是刻意的：两个概念若各留一个名字，将来必然有人只改其中
+# 一处。要改放行范围，就改 `STORAGE_ALLOWED_MODERATION_STATES`，别处无从改起。
 
 # ---------------------------------------------------------------------------
 # findings 结构约束（P1-2A 只定义约束，不实现检测器）
@@ -156,7 +180,7 @@ def check_indexable(doc) -> tuple:
     #
     #     1. 对象位于正式区（knowledge/）        —— 上面的前缀检查
     #     2. ContentModeration.storage_state == promoted  —— 已完成 promotion
-    #     3. ContentModeration.state ∈ INDEXABLE_MODERATION_STATES（白名单）
+    #     3. ContentModeration.state ∈ STORAGE_ALLOWED_MODERATION_STATES（白名单）
     #
     # 复用 is_document_indexable_by_moderation()，不在此处复制判断逻辑，
     # 避免同一个安全语义出现第二份实现后各自漂移。
@@ -164,6 +188,9 @@ def check_indexable(doc) -> tuple:
     # ⚠️ 兼容性后果（STEP 4-B 报告 §9 已记录）：尚无 ContentModeration 记录的
     # 历史文档与爬虫文档会被判为不可索引。这是**故意**的 fail-closed ——
     # 绝不能为了兼容存量数据而让 `knowledge/` 前缀本身变成放行依据。
+    #
+    # 注意本函数**只**判断"能不能索引"，不负责"能不能解析"：一份 approved 的
+    # MP4 会通过这里，然后在任务体的解析阶段失败。两道关是串联的，不是同一道。
     return is_document_indexable_by_moderation(doc)
 
 
@@ -171,21 +198,31 @@ def check_indexable(doc) -> tuple:
 # P1-2A helpers（纯函数，不触碰数据库、不触碰 OSS）
 # ---------------------------------------------------------------------------
 
-def is_indexable_moderation_state(state) -> bool:
-    """审核状态是否允许放行（白名单判断）。
+def is_storage_allowed(state) -> bool:
+    """审核状态是否允许进入正式知识库存储（**唯一**的放行策略函数）。
+
+    这是"moderation 状态 → 能否入库"的**唯一**判定入口。promotion、索引门、
+    读取门都必须调它，不得各自写一份 `state == 'approved'` 比较：
+
+        promote_document()                    → 能不能 quarantine → knowledge/
+        is_document_indexable_by_moderation() → 能不能被索引
+        filter_indexable_docs()               → 能不能被 RAG 检索到
+        ContentModeration.is_approved         → 模型层的自省属性
 
     Args:
         state: 审核状态字符串
 
     Returns:
-        True  仅当 state 属于 INDEXABLE_MODERATION_STATES
-              （即 approved / confirmed_unchecked）
+        True  仅当 state 属于 STORAGE_ALLOWED_MODERATION_STATES
+              （即 approved / unavailable）
 
     Note:
         未知状态、空值、None 一律返回 False。判定必须走白名单，
         不要在外层改写成 `state != 'rejected'`。
+        本函数**不**判断"能不能解析"——见模块内 STORAGE_ALLOWED_MODERATION_STATES
+        的注释：入库与进索引是两件事，区别在解析链路，不在审核状态。
     """
-    return state in INDEXABLE_MODERATION_STATES
+    return state in STORAGE_ALLOWED_MODERATION_STATES
 
 
 def normalize_findings(findings) -> list:
@@ -299,10 +336,16 @@ def default_lease_seconds() -> int:
 # ---------------------------------------------------------------------------
 
 #: 终态：到达后不再自动重跑（`force=True` 除外）
+#:
+#: `unavailable` 也是终态。它**不是**"还没审完"，而是"审完了，结论是查不了"：
+#: 按 2026-09-28 的业务规则，这种文档不再人工复核、直接入库，所以重跑检测链
+#: 只会带来下行风险 —— 一次迟到的 `rejected` 会把已经发布的内容留在一个
+#: "已入库但结论为拒绝"的矛盾状态里，而系统没有撤回（demotion）流程。
+#: 因此 `unavailable` 一旦写入即为最终结论，不再自动重审。
 TERMINAL_MODERATION_STATES = frozenset({
     MODERATION_STATE_APPROVED,
     MODERATION_STATE_REJECTED,
-    MODERATION_STATE_CONFIRMED_UNCHECKED,
+    MODERATION_STATE_UNAVAILABLE,
 })
 
 #: **强拒绝**结论：出现即判定 rejected，且优先级最高
@@ -330,7 +373,7 @@ ALLOWED_TRANSITIONS = {
     MODERATION_STATE_PENDING: frozenset({
         MODERATION_STATE_SCANNING, MODERATION_STATE_UNAVAILABLE,
         MODERATION_STATE_ERROR, MODERATION_STATE_APPROVED,
-        MODERATION_STATE_REJECTED, MODERATION_STATE_CONFIRMED_UNCHECKED,
+        MODERATION_STATE_REJECTED,
     }),
     MODERATION_STATE_SCANNING: frozenset({
         MODERATION_STATE_APPROVED, MODERATION_STATE_REJECTED,
@@ -340,7 +383,7 @@ ALLOWED_TRANSITIONS = {
     MODERATION_STATE_UNAVAILABLE: frozenset({
         MODERATION_STATE_SCANNING, MODERATION_STATE_APPROVED,
         MODERATION_STATE_REJECTED, MODERATION_STATE_ERROR,
-        MODERATION_STATE_CONFIRMED_UNCHECKED, MODERATION_STATE_PENDING,
+        MODERATION_STATE_PENDING,
     }),
     MODERATION_STATE_ERROR: frozenset({
         MODERATION_STATE_SCANNING, MODERATION_STATE_APPROVED,
@@ -354,10 +397,6 @@ ALLOWED_TRANSITIONS = {
     MODERATION_STATE_REJECTED: frozenset({
         MODERATION_STATE_SCANNING, MODERATION_STATE_UNAVAILABLE,
         MODERATION_STATE_ERROR,
-    }),
-    MODERATION_STATE_CONFIRMED_UNCHECKED: frozenset({
-        MODERATION_STATE_SCANNING, MODERATION_STATE_REJECTED,
-        MODERATION_STATE_UNAVAILABLE, MODERATION_STATE_ERROR,
     }),
 }
 
@@ -785,7 +824,10 @@ def moderate_document(doc_id, oss_key=None, file_type=None, file_name=None,
             # CAS：只有比当前已生效序号更"新"的尝试才允许写入。
             # 旧任务即使后完成，也绝不可能覆盖新结果（§三十）。
             next_retry = None
-            if (aggregation.state in (MODERATION_STATE_UNAVAILABLE, MODERATION_STATE_ERROR)
+            # 只有 `error` 安排重试。`unavailable` 不重试：它已是终态（见
+            # TERMINAL_MODERATION_STATES 的注释），重跑只会带来"迟到的 rejected"
+            # 这一下行风险，而系统没有撤回流程。
+            if (aggregation.state == MODERATION_STATE_ERROR
                     and attempt_seq < max_attempts()):
                 next_retry = now + datetime.timedelta(seconds=retry_backoff_seconds())
 
@@ -821,6 +863,13 @@ def moderate_document(doc_id, oss_key=None, file_type=None, file_name=None,
         logger.exception(f'审核服务异常 doc_id={doc_id}: {e}')
         try:
             now = timezone.now()
+            # 与正常路径保持一致：`error` 必须安排重试，否则本函数抛出的异常会让
+            # 文档永久停在 error —— `retry_failed_moderations_task` 挑的是
+            # "state=error 且 next_retry_at 已到期"，next_retry_at 为 NULL 就永远
+            # 轮不到它。这是**异常路径与正常路径的唯一差异**，别在这里省字段。
+            next_retry = None
+            if attempt_seq < max_attempts():
+                next_retry = now + datetime.timedelta(seconds=retry_backoff_seconds())
             with transaction.atomic():
                 if attempt is not None:
                     attempt.finished_at = now
@@ -837,6 +886,7 @@ def moderate_document(doc_id, oss_key=None, file_type=None, file_name=None,
                     service='moderation_service',
                     policy_version=policy_version(),
                     applied_seq=attempt_seq,
+                    next_retry_at=next_retry,
                 )
         except Exception:
             logger.exception(f'审核服务：异常状态写入失败 doc_id={doc_id}')
@@ -851,13 +901,18 @@ def moderate_document(doc_id, oss_key=None, file_type=None, file_name=None,
 
 
 def is_document_indexable_by_moderation(doc) -> tuple:
-    """内容安全审核门：对象是否已完成审核 + promotion。
+    """内容安全审核门：对象是否已允许入库 + 完成 promotion。
 
-    返回 `(allowed, reason)`。STEP 4-B 起由 `check_indexable()` 调用，
-    是索引准入的**唯一**审核判据（与命名空间检查合起来构成完整索引门）：
+    返回 `(allowed, reason)`。由 `check_indexable()` 调用，是索引准入的
+    **唯一**审核判据（与命名空间检查合起来构成完整索引门）：
 
         storage_state == promoted
-        AND moderation_state in INDEXABLE_MODERATION_STATES
+        AND moderation_state in STORAGE_ALLOWED_MODERATION_STATES
+
+    注意本门**只回答"这份内容允不允许被检索"**，不回答"能不能解析出文本"。
+    一份 `unavailable` 的 MP4 会通过本门（允许入库、允许进入索引流程），
+    随后在 `index_document_task` 的解析阶段失败，保持 `status != 'indexed'`。
+    这正是"入库"与"进 RAG 索引"分离的落点。
 
     Note:
         记录不存在必须判为**拒绝**（`legacy_unchecked` 语义），绝不能因为
@@ -869,7 +924,7 @@ def is_document_indexable_by_moderation(doc) -> tuple:
     record = ContentModeration.objects.filter(doc=doc).first()
     if record is None:
         return False, '文档没有审核记录（历史文档需重新审核）'
-    if not is_indexable_moderation_state(record.state):
+    if not is_storage_allowed(record.state):
         return False, f'文档未通过安全审核（当前状态：{record.state}）'
     if record.storage_state != STORAGE_STATE_PROMOTED:
         return False, f'文档尚未提升到正式区（当前存储状态：{record.storage_state}）'
@@ -885,7 +940,7 @@ def filter_indexable_docs(qs):
         写入侧 —— index_document_task 调 check_indexable()，逐文档判定
         读取侧 —— utils.rag 的三条检索路径调本函数，批量 SQL 过滤
 
-    两侧共用 `INDEXABLE_MODERATION_STATES` 与 `STORAGE_STATE_PROMOTED`
+    两侧共用 `STORAGE_ALLOWED_MODERATION_STATES` 与 `STORAGE_STATE_PROMOTED`
     两个常量，**不存在第二份白名单**。`tests` 中有断言固定"queryset 版与
     单文档版对同一份数据给出相同结论"，防止两者将来各自漂移。
 
@@ -893,6 +948,10 @@ def filter_indexable_docs(qs):
         - 没有 ContentModeration 记录        → 不通过（历史文档 fail-closed）
         - state 不在白名单                    → 不通过
         - storage_state != promoted           → 不通过
+
+    读取侧**只读审核门，不读 `KnowledgeDoc.status`**：能否检索由"内容是否
+    允许 + 是否已提升"决定，而"这份内容有没有真的解析出来"由写入侧的
+    `status='indexed'` 决定，两处条件在各自的调用点叠加（见 utils/rag.py）。
 
     Args:
         qs: KnowledgeDoc 的 QuerySet
@@ -905,7 +964,7 @@ def filter_indexable_docs(qs):
     ContentModeration = _ContentModerationModel()
     gated = ContentModeration.objects.filter(
         doc_id=OuterRef('pk'),
-        state__in=sorted(INDEXABLE_MODERATION_STATES),
+        state__in=sorted(STORAGE_ALLOWED_MODERATION_STATES),
         storage_state=STORAGE_STATE_PROMOTED,
     )
     return qs.filter(Exists(gated))

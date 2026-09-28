@@ -8,7 +8,7 @@ from .moderation import (
     STORAGE_STATE_PROMOTED,
     STORAGE_STATE_QUARANTINE,
     VERDICT_CHOICES,
-    is_indexable_moderation_state,
+    is_storage_allowed,
 )
 from .upload_intent import (
     UPLOAD_INTENT_ISSUED,
@@ -351,7 +351,7 @@ class ChunkedUploadSession(models.Model):
     # intent 就是该会话的归属凭证，而上面的 oss_key **就是** intent 上的
     # quarantine key（服务端经 upload_service.begin_upload() 生成，客户端无法
     # 指定），两步 merge 出来的 KnowledgeDoc 也指向这个隔离区对象。之后只有
-    # 审核给出 approved / confirmed_unchecked 且 promotion 成功，对象才会被复制到
+    # 审核给出 approved / unavailable 且 promotion 成功，对象才会被复制到
     # knowledge/ 并允许索引。
     # 可空：历史上已存在的会话没有 intent；STEP 4-A 之前创建的会话也不会带 intent。
     # OneToOne + null=True 允许存在多个 NULL，因此对存量数据无影响；
@@ -413,14 +413,19 @@ class ContentModeration(models.Model):
 
     安全不变量
     ----------
-    1. 只有 `INDEXABLE_MODERATION_STATES`（`approved` / `confirmed_unchecked`）
-       允许放行。判断必须走白名单，见 `is_indexable_moderation_state()`。
-    2. `unavailable` ≠ `approved`。检测链没能完成时必须停在 `unavailable`，
-       绝不能因为"扫描失败"就当作干净放行。
-    3. `confirmed_unchecked` 不能自动产生，只允许由
-       `unavailable` + 显式人工动作产生，且必须同时具备 `confirmed_by`、
-       `confirmed_at`、非空 `confirmation_reason` 三者。确认接口见
-       `apps/knowledge/confirmation.py`（仅 `ADMIN_ROLES` 可调用）。
+    1. 只有 `STORAGE_ALLOWED_MODERATION_STATES`（`approved` / `unavailable`）
+       允许进入正式知识库。判断必须走白名单，见 `is_storage_allowed()`。
+    2. `unavailable` ≠ `approved`。两者在**存储**上同等放行（2026-09-28 业务
+       规则：检测链查不了的内容不再人工复核，直接入库），但在**语义**上必须
+       始终可区分：`unavailable` 表示"没查过"，`approved` 表示"查过且干净"。
+       任何把 `unavailable` 直接写成 `approved` 的"归一化"都会抹掉这个事实，
+       属于禁止的改动。
+    3. `unavailable` 是**终态**：写入后不再自动重审（见 moderation.py
+       TERMINAL_MODERATION_STATES）。系统没有撤回（demotion）流程，一次迟到的
+       `rejected` 只会留下"已入库但结论为拒绝"的矛盾状态。
+    4. 人工确认放行（旧的 `confirmed_unchecked`）已随 2026-09-28 规则下线：
+       `unavailable` 现在自动入库，不需要管理员操作。状态、模型字段、命令、
+       Admin action 均已移除，对应的 migration 见 0011。
 
     接入现状（P1-2D STEP 4-B 已完成）
     --------------------------------
@@ -500,19 +505,6 @@ class ContentModeration(models.Model):
     next_retry_at = models.DateTimeField(
         null=True, blank=True, db_index=True, verbose_name='下次可重试时间',
     )
-    confirmed_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.SET_NULL,
-        null=True, blank=True,
-        related_name='confirmed_moderations',
-        verbose_name='确认人',
-    )
-    confirmed_at = models.DateTimeField(
-        null=True, blank=True, verbose_name='确认时间',
-    )
-    confirmation_reason = models.TextField(
-        blank=True, default='', verbose_name='确认理由（人工确认放行时非空）',
-    )
     created_at = models.DateTimeField(
         auto_now_add=True, db_index=True, verbose_name='创建时间',
     )
@@ -525,7 +517,7 @@ class ContentModeration(models.Model):
         ordering = ['-created_at']
         db_table_comment = (
             '内容安全审核当前状态表(1:1 knowledge_doc;'
-            'state 白名单 approved/confirmed_unchecked 才可放行;'
+            'state 白名单 approved/unavailable 才可放行;'
             'storage_state=promoted 表示对象已在 knowledge/ 正式命名空间)'
         )
         indexes = [
@@ -538,12 +530,13 @@ class ContentModeration(models.Model):
 
     @property
     def is_approved(self) -> bool:
-        """审核状态是否属于放行白名单。
+        """审核状态是否允许进入正式知识库（存储门，见 `is_storage_allowed()`）。
 
-        注意：**只**判断审核状态，不判断存储状态。完整的访问门（P1-2E）
-        需要 `is_approved and is_promoted` 同时成立；本阶段不启用该门。
+        注意：**只**判断审核状态，不判断存储状态。完整的访问门需要
+        `is_approved and is_promoted` 同时成立。
+        也**不**判断"能不能被检索"——那还要看解析是否成功。
         """
-        return is_indexable_moderation_state(self.state)
+        return is_storage_allowed(self.state)
 
     @property
     def is_promoted(self) -> bool:

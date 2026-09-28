@@ -5,7 +5,8 @@ rem Celery Beat 调度器（P1-2 Phase 1-2 / 审计报告 P-5、P-26）
 rem
 rem 背景：改造前没有 beat 启动脚本，而 `retry-failed-moderations` 恰恰是
 rem 兜住"审核链断了"的那个人：
-rem   - 检测器不可用导致 unavailable / error 的文档，靠它按退避重派；
+rem   - 审核异常（error）的文档，靠它按退避重派（2026-09-28 起
+rem     unavailable 不再重试，它已是终态且自动入库）；
 rem   - 因 broker 不可用而从未入队的上传（P-4 的 fail-closed 路径），
 rem     同样靠它补扫重派（见 apps/knowledge/tasks.py 的
 rem     `_recover_undispatched_uploads`）。

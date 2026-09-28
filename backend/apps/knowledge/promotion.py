@@ -4,7 +4,7 @@
 ------------------------------------------------
     OSS primitive : promote_object()   —— 一次 copy + HEAD 校验，纯 OSS 操作，
                                           不碰数据库、不改任何业务状态
-    业务 workflow : promote_document() —— 本模块。审核判定 → 生成正式区 Key →
+    业务 workflow : promote_document() —— 本模块。存储门判定 → 生成正式区 Key →
                                           OSS 提升 → CAS 推进 storage_state →
                                           更新 KnowledgeDoc.oss_key → 安排索引
 
@@ -16,7 +16,7 @@
 OSS 操作**不可回滚**，因此绝不能把它包进 `transaction.atomic()` 假装成一个原子
 事务。执行顺序被刻意固定为：
 
-    1. 审核白名单判定            （DB 读，fail-closed）
+    1. 存储门白名单判定           （DB 读，fail-closed）
     2. CAS 抢占 promoting        （DB 写，排他，崩溃后可超时重认领）
     3. OSS copy + verify         （**事务之外**，幂等，可安全重试）
     4. CAS promoting → promoted  （DB 写，排他）
@@ -49,7 +49,7 @@ from .moderation import (
     STORAGE_STATE_PROMOTING,
     STORAGE_STATE_PROMOTION_FAILED,
     STORAGE_STATE_QUARANTINE,
-    is_indexable_moderation_state,
+    is_storage_allowed,
 )
 
 logger = logging.getLogger(__name__)
@@ -127,7 +127,11 @@ def _schedule_index(doc_id: int) -> None:
 
 def promote_document(doc_id: int, *, worker_id: str = '',
                      schedule_index: bool = True) -> PromotionResult:
-    """把已通过审核的隔离区对象提升到正式区，并在成功后安排索引。
+    """把允许入库的隔离区对象提升到正式区，并在成功后安排索引。
+
+    "允许入库"由 `is_storage_allowed(state)` 判定 —— 目前是 `approved` 与
+    `unavailable`（后者表示检测链无法给出结论，按业务规则不再人工复核）。
+    `rejected` / `pending` / `scanning` / `error` 一律不提升。
 
     Args:
         doc_id: KnowledgeDoc 主键
@@ -143,6 +147,11 @@ def promote_document(doc_id: int, *, worker_id: str = '',
         调用方**必须**先跑 `moderate_document()`；本函数只读审核结论，从不修改
         `ContentModeration.state`（审核结论与存储状态是两件事，见 models.py
         ContentModeration 的类 docstring）。
+
+        提升成功**不等于**索引成功：本函数只把对象复制到 `knowledge/`，随后
+        派发的 `index_document_task` 还要独立经过解析 → 分块 → Embedding →
+        Milvus。MP4 / ZIP 这类没有解析能力的文件会停在"已入库、未索引"，
+        这是合法状态，不是失败。
     """
     started = time.time()
     ContentModeration = _ContentModerationModel()
@@ -164,11 +173,14 @@ def promote_document(doc_id: int, *, worker_id: str = '',
     if moderation is None:
         return _result(PromotionResult.STATUS_SKIPPED, reason='no_moderation')
 
-    # ---- 1. 审核白名单（fail-closed：未知状态一律拒绝） ----
-    if not is_indexable_moderation_state(moderation.state):
+    # ---- 1. 存储门白名单（fail-closed：未知状态一律拒绝） ----
+    # 2026-09-28 业务规则：approved 与 unavailable 都允许入库；rejected / pending /
+    # scanning / error 一律不放行。判定委托 is_storage_allowed()，本模块不复制
+    # 这份策略，也不提供任何"强制提升"参数。
+    if not is_storage_allowed(moderation.state):
         return _result(
             PromotionResult.STATUS_SKIPPED,
-            reason=f'not_approved:{moderation.state}',
+            reason=f'not_storage_allowed:{moderation.state}',
         )
 
     # ---- 2. 已是 promoted：幂等短路，绝不重复 copy ----

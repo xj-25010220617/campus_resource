@@ -540,7 +540,7 @@ class TestIndexTaskFailureVisibility(TestCase):
 
     1. **审核门**：`check_indexable()` 要求文档同时满足
        "对象在 `knowledge/` 下" + "有 ContentModeration 记录" +
-       "`state ∈ INDEXABLE_MODERATION_STATES`" + "`storage_state=promoted`"。
+       "`state ∈ STORAGE_ALLOWED_MODERATION_STATES`" + "`storage_state=promoted`"。
        不满足 → 任务判 `failed`，且**不解析、不 Embedding、不写 DocChunk、
        不进 Milvus**。因此下文的夹具必须给出 `approved + promoted` 的审核
        记录，否则测到的是审核门而不是解析失败可见化（门禁本身不做任何放宽）。
