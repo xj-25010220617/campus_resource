@@ -6,6 +6,7 @@
 权限外文档→拒绝拉。
 """
 from django.test import TestCase
+from django.utils import timezone
 
 from apps.knowledge.models import DocChunk, KnowledgeDoc
 from utils import rag
@@ -143,3 +144,37 @@ class TestExpandEnumeration(TestCase):
             '2020届优秀毕业生有谁', [_hit(doc, 0.8)], self.ctx,
         )
         assert title is None  # 单块文档不会跨块截断，无需扩展
+
+
+class TestHardFilterTimeZero(TestCase):
+    """记录 time_range 维度错位陷阱：届别年份 ≠ 文档上传年份。
+
+    "15级优秀毕业生" 被意图解析成 time_range=2015 时，按
+    created_at__year 过滤会清零全部候选（历史届别文档都是近期
+    上传的），retrieve() 须降级去掉时间条件重试。
+    """
+
+    def setUp(self):
+        self.ctx = {'role': 'super_admin'}
+        self.doc = _make_doc('2015届优秀毕业生')
+
+    def test_content_year_kills_candidates(self):
+        # 文档 created_at 是当前年份（测试运行年），按 2015 过滤必为零
+        ids = rag._apply_hard_filters(
+            {'time_range': '2015'}, self.ctx,
+        )
+        assert self.doc.id not in ids
+        assert ids == []
+
+    def test_upload_year_matches(self):
+        ids = rag._apply_hard_filters(
+            {'time_range': str(timezone.now().year)}, self.ctx,
+        )
+        assert self.doc.id in ids
+
+    def test_non_year_time_range_ignored(self):
+        # "15级"这类非 yyyy 格式不构成时间过滤
+        ids = rag._apply_hard_filters(
+            {'time_range': '15级'}, self.ctx,
+        )
+        assert self.doc.id in ids

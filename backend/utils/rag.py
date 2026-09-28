@@ -1363,6 +1363,19 @@ def retrieve(
     # 1. SQL 硬过滤 → 候选 ID 列表
     candidate_ids = _apply_hard_filters(parsed_filters, user_context, top_k=500)
 
+    # 1b. 时间条件清零时降级去掉时间重试：
+    #     "15级/2015届"指内容的届别年份，而 time_range 过滤的是文档上传
+    #     时间（created_at）。意图解析把届别映射成 time_range 会误杀全部
+    #     候选（历史届别文档都是近期上传的），宁可放宽时间也不能零召回。
+    if not candidate_ids and parsed_filters.get('time_range'):
+        stripped = {k: v for k, v in parsed_filters.items() if k != 'time_range'}
+        candidate_ids = _apply_hard_filters(stripped, user_context, top_k=500)
+        if candidate_ids:
+            logger.info(
+                f'time_range={parsed_filters["time_range"]!r} 清零候选，'
+                f'已降级去掉时间条件重试: 候选 {len(candidate_ids)} 个'
+            )
+
     if not candidate_ids:
         logger.info(f'硬过滤后无候选，尝试标题降级搜索: question={question[:50]}')
         title_matches = _fallback_title_search(question, user_context, top_k=5)
