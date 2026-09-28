@@ -6,7 +6,7 @@ RAG 检索管道
 import logging
 import threading
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from django.conf import settings
 
@@ -321,6 +321,7 @@ def build_rag_prompt(
     question: str,
     chunks: List[dict],
     history: Optional[List[dict]] = None,
+    max_chars: int = CONTEXT_MAX_CHARS,
 ) -> List[dict]:
     """
     构造 RAG Prompt（支持多轮对话历史）。
@@ -329,6 +330,7 @@ def build_rag_prompt(
         question: 用户问题
         chunks: 检索结果 [{'content': str, 'doc_title': str, 'page': int, 'score': float}, ...]
         history: 历史对话 [{'role': 'user'|'assistant', 'content': str}, ...]（可选）
+        max_chars: 参考资料总字符上限（穷举类问题由调用方放宽，避免名单被截断）
 
     Returns:
         messages 列表，可直接传给 LLM chat
@@ -344,7 +346,7 @@ def build_rag_prompt(
             ref_block += f' 第{page}页'
         ref_block += f'）\n{content}'
         total_chars += len(ref_block)
-        if total_chars > CONTEXT_MAX_CHARS:
+        if total_chars > max_chars:
             break
         ref_lines.append(ref_block)
 
@@ -903,6 +905,132 @@ def authorized_knowledge_docs(user_context: Optional[dict] = None):
     if user_id:
         conditions |= Q(uploader_id=user_id)
     return qs.filter(conditions)
+
+
+# ------------------------------------------------------------------
+# 穷举类问题扩展（"列出名单/都有谁"类查询拉取目标文档全部分块）
+# ------------------------------------------------------------------
+# 背景：名单类查询（如"15级优秀毕业生有谁"）的名单往往跨十几个分块，
+# 常规检索按语义相似度取 top-5，5 个槽位还会被同标题的多个年份文档平摊
+# （2010-2015 届《优秀毕业生》各占 1 块），LLM 只看到目标文档 1/13 的
+# 分块，回答必然残缺。解法：识别穷举意图后，把目标文档的全部 DocChunk
+# 按 chunk_index 顺序整体注入上下文，并放宽 build_rag_prompt 的字符上限。
+ENUM_CONTEXT_MAX_CHARS = 24000  # 穷举类问题的参考资料字符上限（13 块 × 500 字 ≈ 6.5K，留足余量）
+
+_ENUM_INTENT_KEYWORDS = (
+    '列出', '列举', '名单', '所有', '全部', '有谁', '都有谁',
+    '哪些人', '哪些同学', '人员', '分别是',
+)
+
+
+def is_enumeration_question(question: str) -> bool:
+    """检测穷举类意图：要求完整罗列条目（名单/所有/有谁…）。"""
+    q = (question or '').strip()
+    return any(k in q for k in _ENUM_INTENT_KEYWORDS)
+
+
+def _extract_query_years(question: str) -> List[str]:
+    """提取问题中的年份（"15级/2015届/2015年"→2015），用于精确定位目标文档。"""
+    import re as _re
+
+    years: List[str] = []
+    for m in _re.finditer(r'(\d{2,4})\s*[届级]', question or ''):
+        y = m.group(1)
+        y = y if len(y) == 4 else f'20{y}'
+        if y not in years:
+            years.append(y)
+    for m in _re.finditer(r'(?:19|20)\d{2}', question or ''):
+        if m.group(0) not in years:
+            years.append(m.group(0))
+    return years
+
+
+def _pick_enum_target_doc(
+    results: List[dict],
+    question: str,
+    score_gap: float,
+) -> Optional[dict]:
+    """从检索结果中定位穷举目标文档。
+
+    - 问题含年份：标题/文件名含该年份的命中中取分数最高者；年份找不到
+      对应文档时返回 None——宁可不扩展，也不能拉错年份给"完整的错误名单"。
+    - 无年份：仅当结果明显集中于单一文档（top1 领先 top2 ≥ score_gap）才扩展，
+      避免在多个候选文档间武断拉满一个。
+    """
+    years = _extract_query_years(question)
+    if years:
+        matched = [
+            r for r in results
+            if any(
+                y in f"{r.get('doc_title', '')}{r.get('file_name', '')}"
+                for y in years
+            )
+        ]
+        return max(matched, key=lambda r: r.get('score', 0)) if matched else None
+
+    if len(results) == 1:
+        return results[0]
+    if (
+        len(results) >= 2
+        and results[0].get('score', 0) - results[1].get('score', 0) >= score_gap
+    ):
+        return results[0]
+    return None
+
+
+def try_expand_enumeration(
+    question: str,
+    results: List[dict],
+    user_context: Optional[dict] = None,
+    score_gap: float = 0.05,
+) -> Tuple[List[dict], Optional[str]]:
+    """穷举类问题：把目标文档的全部分块按序注入检索结果。
+
+    必须复用 authorized_knowledge_docs() 权限过滤 + status='indexed'
+    限制，扩展逻辑不得成为越权读取通道。
+
+    Returns:
+        (新结果列表, 目标文档标题或 None)。目标文档分块按 chunk_index
+        升序排最前，其余原始命中（剔除目标文档重复块）按原顺序跟在后面。
+        未触发扩展时原样返回 (results, None)。
+    """
+    if not results or not is_enumeration_question(question):
+        return results, None
+
+    target = _pick_enum_target_doc(results, question, score_gap)
+    if not target or not target.get('doc_id'):
+        return results, None
+
+    doc_id = target['doc_id']
+    if not authorized_knowledge_docs(user_context).filter(
+        id=doc_id, status='indexed',
+    ).exists():
+        return results, None
+
+    from apps.knowledge.models import DocChunk
+    chunks = list(DocChunk.objects.filter(doc_id=doc_id).order_by('chunk_index'))
+    # 单块文档不存在"名单跨块截断"问题，无需扩展
+    if len(chunks) <= 1:
+        return results, None
+
+    expanded = [
+        {
+            'doc_id': doc_id,
+            'doc_title': target.get('doc_title', ''),
+            'content': c.content,
+            'score': target.get('score', 0.0),
+            'page': c.page_start or 0,
+            'chunk_index': c.chunk_index,
+            'vector_id': c.vector_id,
+            'source_type': target.get('source_type', ''),
+            'source_url': target.get('source_url', ''),
+            'file_name': target.get('file_name', ''),
+            'oss_key': target.get('oss_key', ''),
+        }
+        for c in chunks
+    ]
+    others = [r for r in results if r.get('doc_id') != doc_id]
+    return expanded + others, target.get('doc_title', '')
 
 
 # ------------------------------------------------------------------
