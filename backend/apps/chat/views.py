@@ -457,6 +457,14 @@ class AskView(APIView):
             parsed_filters=parsed,
         )
 
+        # 3.2d 穷举类问题扩展：名单类查询把目标文档全部分块拉进上下文，
+        #     避免"15级优秀毕业生"这类跨 13 块的名单被 top-5 槽位截断
+        enum_doc_title = None
+        if results:
+            results, enum_doc_title = rag.try_expand_enumeration(
+                question, results, user_context,
+            )
+
         # 3.2a 分角色严谨度：管理员（需精准引用）知识库无可靠命中时直接拒答，
         #      不调用 LLM、不联网兜底（联网摘要非知识库权威来源，不能作为管理员依据）。
         should_refuse = False
@@ -539,13 +547,24 @@ class AskView(APIView):
 
         # 5. 构造 Prompt（含历史上下文）
         llm_question = question
+        suffix_parts = []
+        if enum_doc_title:
+            suffix_parts.append(
+                f'（系统已检索到《{enum_doc_title}》的完整内容分块。'
+                f'请基于参考资料完整作答；如需列举人员名单，必须穷尽参考资料中的全部条目，'
+                f'不得省略，不得用"等"字概括。）'
+            )
         if image_intent and images:
             titles = '、'.join(img['doc_title'] for img in images[:6])
-            llm_question = (
-                f'{question}\n\n'
+            suffix_parts.append(
                 f'（系统已为你检索到相关图片：{titles}。请在回答末尾说明"已为你找到相关图片，详见下方"。）'
             )
-        messages = rag.build_rag_prompt(llm_question, results, history=history)
+        if suffix_parts:
+            llm_question = f'{question}\n\n' + '\n'.join(suffix_parts)
+        messages = rag.build_rag_prompt(
+            llm_question, results, history=history,
+            max_chars=rag.ENUM_CONTEXT_MAX_CHARS if enum_doc_title else rag.CONTEXT_MAX_CHARS,
+        )
 
         # 6. 创建 AI 消息占位（流结束后写入完整内容）
         is_authorized = user_role in ('admin', 'super_admin')
@@ -587,7 +606,11 @@ class AskView(APIView):
                     collected_tokens.append(refuse_text)
                     yield _format_sse('token', {'content': refuse_text})
                 else:
-                    stream = llm_client.chat_stream(messages)
+                    # 穷举类问题名单可能很长，放宽输出上限防止答案尾部被 max_tokens 截断
+                    stream = llm_client.chat_stream(
+                        messages,
+                        max_tokens=4096 if enum_doc_title else 2048,
+                    )
                     for token in stream:
                         if token:
                             if first_token_ts is None:
@@ -1104,7 +1127,14 @@ class VoiceAskView(APIView):
                     parsed_filters=parsed, top_k=rag.RAG_TOP_K,
                     min_score=rag.RAG_SCORE_THRESHOLD,
                 )
-                messages = rag.build_rag_prompt(question, hits)
+                # 穷举类问题扩展：名单类查询拉取目标文档全部分块，避免名单被截断
+                hits, enum_doc_title = rag.try_expand_enumeration(
+                    question, hits, user_context,
+                )
+                messages = rag.build_rag_prompt(
+                    question, hits,
+                    max_chars=rag.ENUM_CONTEXT_MAX_CHARS if enum_doc_title else rag.CONTEXT_MAX_CHARS,
+                )
 
                 # 更新查询日志的 hits 信息
                 log.hit_count = len(hits)
@@ -1115,8 +1145,11 @@ class VoiceAskView(APIView):
                 if not hits and not rag._is_time_question(question):
                     pending_docs = rag.find_pending_index_docs(question, user_context)
 
-                # 3. LLM 流式输出
-                for chunk in llm_client.chat_stream(messages):
+                # 3. LLM 流式输出（穷举类问题放宽输出上限防止名单尾部截断）
+                for chunk in llm_client.chat_stream(
+                    messages,
+                    max_tokens=4096 if enum_doc_title else 2048,
+                ):
                     if chunk and first_ts is None:
                         first_ts = time.time()  # 思考时长终点：首字到达
                     full_answer += chunk
