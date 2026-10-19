@@ -36,7 +36,15 @@ class ChatConfig(AppConfig):
                     )
             except Exception as e:
                 logger.warning(
-                    'Embedding API 健康检查异常: %s。RAG 检索可能降级为关键词搜索。', e
-                )
+                        'Embedding API 健康检查异常: %s。RAG 检索可能降级为关键词搜索。', e
+                    )
+
+                # 顺带预热 Cross-Encoder 重排模型（懒加载冷启动实测 ~170s，
+                # 不预热会拖慢后端重启后的第一个 RAG 查询）
+                try:
+                    from utils.reranker import _get_cross_encoder
+                    _get_cross_encoder()
+                except Exception as e:
+                    logger.warning('Cross-Encoder 预热异常: %s', e)
 
         threading.Thread(target=_check_embed_api, daemon=True).start()
