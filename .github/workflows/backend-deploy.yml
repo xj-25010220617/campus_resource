@@ -29,6 +29,8 @@ jobs:
           port: ${{ secrets.SSH_PORT }}
           username: ${{ secrets.SSH_USERNAME }}
           key: ${{ secrets.SSH_KEY }}
+          # 服务器 host key 指纹（2026-10-19 腾讯云 124.221.94.207，ed25519）
+          fingerprint: SHA256:wh0eA4TXFxwcUgY/hkz8gks/msWX3N9Z3HW80ed8rmc
           command_timeout: 30m
 
           script: |
@@ -38,10 +40,11 @@ jobs:
             # 被 || true 或 if/while 条件正常处理的失败不会触发（与 set -e 语义一致）。
             trap 'echo "!!! 部署中止：脚本第 $LINENO 行命令失败" >&2' ERR 2>/dev/null || true
 
-            cd /www/wwwroot/campus_resource
+            APP_DIR=/www/wwwroot/campus_resource
+            cd "$APP_DIR"
 
             echo "========================================"
-            echo "开始部署"
+            echo "开始部署（服务器 $(hostname) / $APP_DIR）"
             echo "========================================"
 
             echo "1. 获取当前提交"
@@ -53,7 +56,11 @@ jobs:
             sleep 2
 
             echo "3. 拉取最新代码"
-            timeout 300 git pull origin main
+            timeout 300 git fetch origin main
+            git reset --hard origin/main
+
+            echo "3.5 重放本地补丁（OSS 预签名 / embedding 单例 / milvus 索引）"
+            bash /home/ubuntu/apps/patches/apply_fixes.sh || echo "警告：补丁脚本返回非 0，继续"
 
             NEW_COMMIT=$(git rev-parse HEAD)
             echo "NEW_COMMIT=$NEW_COMMIT"
@@ -76,7 +83,7 @@ jobs:
             echo "DEBUG: REQUIREMENTS_CHANGED=$REQUIREMENTS_CHANGED (OLD=$OLD_COMMIT NEW=$NEW_COMMIT)"
 
             echo "5. 激活 Python 虚拟环境"
-            cd /www/wwwroot/campus_resource/backend
+            cd "$APP_DIR/backend"
             source venv/bin/activate
 
             echo "6. 检查 Python"
@@ -112,7 +119,7 @@ jobs:
 
             echo "DEBUG: 即将停止 campus-backend"
             echo "9. 停止后端服务"
-            systemctl stop campus-backend || true
+            sudo -n systemctl stop campus-backend || true
 
             echo "10. 后台启动 reindex"
 
@@ -134,7 +141,7 @@ jobs:
                 echo "reindex 失败，保留 incomplete 标记"
               fi
 
-              systemctl start campus-backend
+              sudo -n systemctl start campus-backend
 
               exit "$REINDEX_EXIT"
             ' </dev/null >> /tmp/campus_reindex_bg.log 2>&1 &
