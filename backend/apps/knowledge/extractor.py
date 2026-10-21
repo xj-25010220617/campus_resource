@@ -66,6 +66,8 @@ class ParseResult:
     pages_ocr_failed: int = 0       # OCR 报错或未识别出文字的页数
     pages_ocr_skipped: int = 0      # 因超出 OCR_MAX_PAGES 未尝试 OCR 的页数
     truncated: bool = False         # 是否发生截断（OCR 预算耗尽后仍有页面需要 OCR）
+    structured: bool = False        # 表格/名单类文档已按『字段名：值』结构化
+    record_count: int = 0           # 结构化记录条数（供计数类问题精确作答）
 
     @property
     def is_empty(self) -> bool:
@@ -192,6 +194,16 @@ def _parse_pdf(file_path: str) -> ParseResult:
             except Exception as e:
                 logger.warning(f'PDF 第 {page_no} 页文字层提取失败: {e}')
 
+            # 0) 表格优先：该页检测到表格时，直接输出结构化记录（字段名标注），
+            #    避免正文文字层的列错位；无表格才走原生文字 / OCR 兜底。
+            table_text, table_count = _pdf_page_tables(page_no, page)
+            if table_text:
+                result.structured = True
+                result.record_count += table_count
+                result.pages_native += 1
+                parts.append(table_text)
+                continue
+
             # 1) 该页文字层足够 → 直接用原生文字，不付 OCR 成本
             if len(native) >= page_min_chars:
                 result.pages_native += 1
@@ -277,26 +289,122 @@ def _parse_image(file_path: str) -> ParseResult:
     return result
 
 
-def _parse_docx(file_path: str) -> str:
-    """DOCX 解析：段落 + 表格 + 文本框"""
+def _records_from_grid(rows) -> Tuple[str, int, bool]:
+    """把二维表格网格转成『字段名标注记录』文本，供向量化与计数。
+
+    表头取第一个"看起来像表头"的行（满足：该行有 ≥2 个非空单元格）。
+    若首行是跨列合并的标题（只有 1 个非空格），则跳过它、用第二行当表头。
+    每条记录保留『字段名：值』的显式标注，避免裸数据（`3\\t李四\\t5000`）
+    在向量化后字段语义丢失。
+
+    Returns:
+        (text, record_count, structured)
+        - text 首行是『本表格共 N 条记录；字段：…』概要 + 逐条记录
+        - structured=False 表示该网格不适合按表格解析（单列/无数据），退化为普通文本
+    """
+    if not rows:
+        return '', 0, False
+
+    clean = [[str(c or '').strip() for c in r] for r in rows]
+    clean = [r for r in clean if any(r)]
+    if not clean:
+        return '', 0, False
+
+    ncols = max(len(r) for r in clean)
+
+    def _fill(row):
+        return sum(1 for c in row if c)
+
+    header_idx = 0
+    if len(clean) >= 2 and _fill(clean[0]) <= 1 and _fill(clean[1]) >= 2:
+        header_idx = 1  # 跳过跨列合并的标题行
+
+    # 单列、或表头之后没有数据行 → 无法形成「字段→值」对应，退化为普通文本
+    if ncols <= 1 or len(clean) - header_idx < 2:
+        text = '\n'.join('\t'.join(r).rstrip() for r in clean)
+        return text, 0, False
+
+    header = [clean[header_idx][i] if i < len(clean[header_idx]) else '' for i in range(ncols)]
+    for i, h in enumerate(header):
+        if not h:
+            header[i] = f'列{i + 1}'
+
+    records = []
+    for cells in clean[header_idx + 1:]:
+        row = [cells[i] if i < len(cells) else '' for i in range(ncols)]
+        parts = [f'{header[i]}：{row[i]}' for i in range(ncols) if row[i]]
+        if parts:
+            records.append('；'.join(parts))
+
+    if not records:
+        text = '\n'.join('\t'.join(r).rstrip() for r in clean)
+        return text, 0, False
+
+    summary = f'本表格共 {len(records)} 条记录；字段：{"、".join(header)}'
+    return summary + '\n' + '\n'.join(records), len(records), True
+
+
+def _pdf_page_tables(page_no: int, page) -> Tuple[str, int]:
+    """用 PyMuPDF find_tables 提取页面表格并转成结构化记录。
+
+    仅当 find_tables 可用且确实检测到表格时才返回结构化文本；
+    老版本 PyMuPDF、无表格页、提取异常一律返回 ('', 0)，退回原生文字/OCR。
+    """
+    try:
+        finder = page.find_tables()
+        tables = finder.tables if finder else []
+    except Exception:
+        return '', 0
+
+    if not tables:
+        return '', 0
+
+    texts, total = [], 0
+    for t in tables:
+        try:
+            rows = t.extract()
+        except Exception:
+            continue
+        grid = [[('' if c is None else str(c)) for c in row] for row in rows]
+        text, n, structured = _records_from_grid(grid)
+        if structured and text:
+            texts.append(f'第{page_no}页表格\n' + text)
+            total += n
+    return '\n\n'.join(texts), total
+
+
+def _parse_docx(file_path: str) -> ParseResult:
+    """DOCX 解析：段落 + 表格 + 文本框。
+
+    表格按结构化记录输出（字段名标注），段落作普通文本附加。
+    """
+    result = ParseResult()
     try:
         from docx import Document
         doc = Document(file_path)
 
-        # 1. 提取段落
-        text_parts = [p.text for p in doc.paragraphs if p.text.strip()]
+        paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+        para_text = '\n'.join(paragraphs)
 
-        # 2. 提取表格（行政文档核心内容常在表格里）
+        table_texts = []
         for table in doc.tables:
-            for row in table.rows:
-                row_text = '\t'.join(cell.text.strip() for cell in row.cells)
-                if row_text.strip():
-                    text_parts.append(row_text)
+            grid = [[cell.text.strip() for cell in row.cells] for row in table.rows]
+            text, n, structured = _records_from_grid(grid)
+            if text:
+                table_texts.append(text)
+                result.record_count += n
+                result.structured = result.structured or structured
 
-        return '\n'.join(text_parts)
+        if table_texts:
+            result.text = '\n\n'.join(table_texts)
+            if para_text:
+                result.text += '\n\n' + para_text
+        else:
+            result.text = para_text
     except Exception as e:
         logger.warning(f'DOCX 解析失败: {e}')
-        return ''
+        result.error = f'DOCX 解析失败: {type(e).__name__}: {e}'
+    return result
 
 
 def _parse_pptx(file_path: str) -> str:
@@ -315,67 +423,86 @@ def _parse_pptx(file_path: str) -> str:
         return ''
 
 
-def _parse_xlsx(file_path: str) -> str:
-    """XLSX 解析：全部 sheet，全部行"""
+def _parse_xlsx(file_path: str) -> ParseResult:
+    """XLSX 解析：全部 sheet；表格 sheet 按『字段名标注记录』结构化。"""
+    result = ParseResult()
     try:
         import openpyxl
         wb = openpyxl.load_workbook(file_path, data_only=True)
-        text = ''
+        parts = []
         for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
-            # 添加 sheet 标题便于上下文
-            text += f'=== 工作表: {sheet_name} ===\n'
-            for row in ws.iter_rows(values_only=True):
-                row_text = '\t'.join(str(c) if c is not None else '' for c in row)
-                if row_text.strip():
-                    text += row_text + '\n'
-        return text
+            grid = [
+                [('' if c is None else str(c)) for c in row]
+                for row in ws.iter_rows(values_only=True)
+            ]
+            text, n, structured = _records_from_grid(grid)
+            if not text:
+                continue
+            result.record_count += n
+            result.structured = result.structured or structured
+            prefix = f'工作表「{sheet_name}」\n' if structured else f'=== 工作表: {sheet_name} ===\n'
+            parts.append(prefix + text)
+        result.text = '\n\n'.join(parts)
     except Exception as e:
         logger.warning(f'XLSX 解析失败: {e}')
-        return ''
+        result.error = f'XLSX 解析失败: {type(e).__name__}: {e}'
+    return result
 
 
-def _parse_csv(file_path: str) -> str:
-    """CSV 解析：兼容 UTF-8/GBK，按行转换为可检索文本。"""
+def _parse_csv(file_path: str) -> ParseResult:
+    """CSV 解析：兼容 UTF-8/GBK；按表头结构化。"""
+    result = ParseResult()
     import csv
 
     for encoding in ('utf-8-sig', 'utf-8', 'gb18030'):
         try:
             with open(file_path, 'r', encoding=encoding, newline='') as f:
-                rows = csv.reader(f)
-                return '\n'.join('\t'.join(row) for row in rows)
+                rows = list(csv.reader(f))
+            text, n, structured = _records_from_grid(rows)
+            result.text = text
+            result.record_count = n
+            result.structured = structured
+            return result
         except UnicodeDecodeError:
             continue
         except Exception as e:
             logger.warning(f'CSV 解析失败: {e}')
-            return ''
-    logger.warning('CSV 解析失败：不支持的字符编码')
-    return ''
+            result.error = f'CSV 解析失败: {type(e).__name__}: {e}'
+            return result
+    result.error = 'CSV 解析失败：不支持的字符编码'
+    return result
 
 
-def _parse_xls(file_path: str) -> str:
-    """XLS 旧格式解析（xlrd 回退方案）"""
+def _parse_xls(file_path: str) -> ParseResult:
+    """XLS 旧格式解析（xlrd 回退方案）。"""
+    result = ParseResult()
     try:
         import xlrd
         # xlrd 2.0+ 不支持 .xlsx，这里只处理 .xls
         workbook = xlrd.open_workbook(file_path, formatting_info=False, on_demand=True)
-        text = ''
+        parts = []
         for sheet_idx in range(workbook.nsheets):
             sheet = workbook.sheet_by_index(sheet_idx)
-            text += f'=== 工作表: {sheet.name} ===\n'
+            grid = []
             for row_idx in range(sheet.nrows):
-                row = sheet.row_values(row_idx)
-                row_text = '\t'.join(str(cell) if cell not in ('', None) else '' for cell in row)
-                if row_text.strip():
-                    text += row_text + '\n'
+                grid.append([str(c) if c not in ('', None) else '' for c in sheet.row_values(row_idx)])
+            text, n, structured = _records_from_grid(grid)
+            if not text:
+                continue
+            result.record_count += n
+            result.structured = result.structured or structured
+            prefix = f'工作表「{sheet.name}」\n' if structured else f'=== 工作表: {sheet.name} ===\n'
+            parts.append(prefix + text)
         workbook.release_resources()
-        return text
+        result.text = '\n\n'.join(parts)
     except ImportError:
         logger.warning('xlrd 未安装，XLS 解析不可用（pip install xlrd==1.2.0）')
-        return ''
+        result.error = 'xlrd 未安装，XLS 解析不可用（pip install xlrd==1.2.0）'
     except Exception as e:
         logger.warning(f'XLS 解析失败: {e}')
-        return ''
+        result.error = f'XLS 解析失败: {type(e).__name__}: {e}'
+    return result
 
 
 def _parse_doc(file_path: str) -> str:
@@ -431,22 +558,18 @@ def _read_text_file(file_path: str) -> str:
         return f.read()
 
 
-# 文档类解析器：返回 str（本轮未改造，行为保持不变）
+# 文档类解析器：返回 str（非表格文档，行为保持不变）
 _STR_EXTRACTORS = {
     'doc': _parse_doc,      # 旧格式 DOC
-    'docx': _parse_docx,    # 新格式 DOCX
     'ppt': _parse_pptx,     # PPT 实际上也是 .pptx 格式
     'pptx': _parse_pptx,    # PPTX
-    'xls': _parse_xls,      # 旧格式 XLS
-    'xlsx': _parse_xlsx,    # 新格式 XLSX
-    'csv': _parse_csv,      # CSV 文本表格
     'txt': _read_text_file,
     'md': _read_text_file,
     'html': _read_text_file,
     'htm': _read_text_file,
 }
 
-# 结构化解析器：返回 ParseResult（PDF / 图片需要页级统计与 OCR 状态）
+# 结构化解析器：返回 ParseResult（PDF / 图片带页级统计；表格类带 structured / record_count）
 _DETAILED_EXTRACTORS = {
     'pdf': _parse_pdf,
     'jpg': _parse_image,
@@ -457,6 +580,10 @@ _DETAILED_EXTRACTORS = {
     'bmp': _parse_image,
     'tif': _parse_image,
     'tiff': _parse_image,
+    'docx': _parse_docx,    # 含表格，需结构化
+    'xls': _parse_xls,
+    'xlsx': _parse_xlsx,
+    'csv': _parse_csv,
 }
 
 # 允许按纯文本读取的扩展名（与 FileUploadView.TEXT_EXTRACTABLE_TYPES 对齐）。

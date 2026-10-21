@@ -119,7 +119,7 @@ def index_document_task(self, doc_id: int):
 
     from apps.knowledge.extractor import extract_text_from_oss_detailed
     from apps.knowledge.models import DocChunk, KnowledgeDoc
-    from apps.knowledge.utils import chunk_document
+    from apps.knowledge.utils import chunk_document, chunk_records
     from utils.llm import llm_client
     from utils.milvus import milvus_client
 
@@ -171,7 +171,8 @@ def index_document_task(self, doc_id: int):
         doc.status = 'chunking'
         doc.save(update_fields=['status', 'updated_at'])
 
-        raw_chunks = chunk_document(text, chunk_size=500, overlap=100)
+        raw_chunks = chunk_records(text, chunk_size=500) if parsed.structured \
+            else chunk_document(text, chunk_size=500, overlap=100)
         if not raw_chunks:
             logger.warning(f'doc_id={doc_id} 分块结果为空，跳过索引')
             doc.status = 'failed'

@@ -229,12 +229,13 @@ SYSTEM_PROMPT = """你是成都东软学院的AI智能助手，负责回答学�
 指令：
 1. 学院概况、院系专业、校园服务等问题，优先用内建知识库回答
 2. 外部资料有更具体信息时可补充
-3. 只有当你确实引用了"外部检索资料"中的具体内容时，才在回答末尾列出参考文件名称，如"（参考文件：xxx、xxx）"；
+3. 涉及数量统计（多少个/总数/共计/几条/几项）的问题，必须以检索到的表格资料顶部的「本表格共 N 条记录」或逐条计数为准，禁止凭记忆估算或编造数字
+4. 只有当你确实引用了"外部检索资料"中的具体内容时，才在回答末尾列出参考文件名称，如"（参考文件：xxx、xxx）"；
    时间/日期/星期等问题请直接依据"当前时间"回答，不要列出参考文件；
    严禁把"当前时间""每日简报""学校内建知识库""系统实时注入时间"等内部来源当作参考文件列出
-4. 都不足以回答时，请如实告知
-5. 常识性问题可直接用自己的知识回答
-6. 回答使用中文，结构清晰"""
+5. 都不足以回答时，请如实告知
+6. 常识性问题可直接用自己的知识回答
+7. 回答使用中文，结构清晰"""
 
 
 # ------------------------------------------------------------------
@@ -929,6 +930,24 @@ def is_enumeration_question(question: str) -> bool:
     return any(k in q for k in _ENUM_INTENT_KEYWORDS)
 
 
+_AGGREGATION_INTENT_KEYWORDS = (
+    '多少个', '多少项', '多少条', '多少名', '多少位', '多少篇',
+    '一共', '共计', '总数', '总数量', '数量',
+    '有几项', '有几条', '有几个', '有几名',
+    '不重复', '去重', '统计', '汇总', '合计',
+)
+
+
+def is_aggregation_question(question: str) -> bool:
+    """检测聚合/计数类意图：需要统计记录条数或汇总字段。
+
+    计数类问题与穷举类问题一样，答案依赖全量记录而非语义 top-K 碎片；
+    因此命中后走 try_expand_enumeration 的全量注入通道。
+    """
+    q = (question or '').strip()
+    return any(k in q for k in _AGGREGATION_INTENT_KEYWORDS)
+
+
 def _extract_query_years(question: str) -> List[str]:
     """提取问题中的年份（"15级/2015届/2015年"→2015），用于精确定位目标文档。"""
     import re as _re
@@ -994,7 +1013,9 @@ def try_expand_enumeration(
         升序排最前，其余原始命中（剔除目标文档重复块）按原顺序跟在后面。
         未触发扩展时原样返回 (results, None)。
     """
-    if not results or not is_enumeration_question(question):
+    if not results or not (
+        is_enumeration_question(question) or is_aggregation_question(question)
+    ):
         return results, None
 
     target = _pick_enum_target_doc(results, question, score_gap)
