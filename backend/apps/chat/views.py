@@ -34,6 +34,158 @@ from .serializers import (
 logger = logging.getLogger(__name__)
 
 
+# ------------------------------------------------------------------
+# 文字提问专用：同一会话内的文件上下文继承
+# ------------------------------------------------------------------
+# 语音入口（_stream_answer）不调用以下任何函数，行为保持不变。
+
+_DOC_CONTEXT_MAX_TURNS = 2
+_DOC_TIME_QUERY_TYPES = ('doc_upload_time', 'doc_index_time')
+_DOC_CONTEXT_REPLAY_TYPES = (
+    'doc_upload_time', 'doc_index_time', 'list_docs_by_range',
+)
+
+
+def _user_context_for(user):
+    return {
+        'user_id': getattr(user, 'id', None),
+        'role': getattr(user, 'role', 'user'),
+        'college_id': getattr(user, 'college_id', None),
+        'department_id': getattr(user, 'department_id', None),
+    }
+
+
+def _extract_doc_ids_from_result(result):
+    """从 execute_query 结果提取本轮命中的 doc_id，并判断是否可能被截断。"""
+    if not isinstance(result, dict) or not result.get('success'):
+        return [], False
+
+    data = result.get('data')
+    total = None
+    if isinstance(data, dict):
+        items = data.get('matches')
+        if items is None:
+            items = data.get('items') or []
+        total = data.get('total')
+        truncated = bool(data.get('truncated'))
+    elif isinstance(data, list):
+        items = data
+        truncated = False
+    else:
+        return [], False
+
+    ids = sorted({
+        int(item.get('id'))
+        for item in items
+        if isinstance(item, dict)
+        and isinstance(item.get('id'), int)
+        and item['id'] > 0
+    })
+    if isinstance(total, int) and total > len(ids):
+        truncated = True
+    return ids, truncated
+
+
+def _authorized_rag_doc_ids(raw_ids, user):
+    """把上一轮 RAG 命中的 doc_id 重新按当前权限过滤。"""
+    ids = sorted({
+        int(item) for item in (raw_ids or [])
+        if isinstance(item, int) and item > 0
+    })
+    if not ids:
+        return []
+
+    from utils.rag import authorized_knowledge_docs
+
+    allowed = set(
+        authorized_knowledge_docs(_user_context_for(user))
+        .filter(id__in=ids, status='indexed')
+        .values_list('id', flat=True)
+    )
+    return [item for item in ids if item in allowed]
+
+
+def _turn_doc_context(conversation, turn_msg, upper_msg, user):
+    """解析某一轮指向的 doc_id，返回 (ids, ambiguous, source) 或 None。
+
+    优先使用服务端持久化的 RAG 检索日志（仅当前会话、当前轮次窗口）；
+    没有可用日志时，重放该轮的结构化查询（只读，且重新过当前权限）。
+    """
+    from utils.data_query import execute_query
+    from utils.query_router import route_text_question
+
+    log = (
+        QueryLog.objects.filter(
+            conversation=conversation,
+            question=turn_msg.content,
+            created_at__gte=turn_msg.created_at,
+            created_at__lt=upper_msg.created_at,
+        )
+        .order_by('-created_at', '-id')
+        .first()
+    )
+    if log is not None:
+        ids = _authorized_rag_doc_ids(log.top_doc_ids, user)
+        if ids:
+            return ids, len(ids) > 1, 'rag_log'
+        # 该轮日志没有可用 doc_id（如语音数据查询轮），继续按重放解析
+
+    route = route_text_question(turn_msg.content, user, context=None)
+    if route.get('query_type') not in _DOC_CONTEXT_REPLAY_TYPES:
+        return None
+
+    result = execute_query(route, user)
+    ids, truncated = _extract_doc_ids_from_result(result)
+    if not ids:
+        return None
+    return ids, (truncated or len(ids) > 1), 'data_query_replay'
+
+
+def _is_text_time_followup(text, user):
+    """该轮本身是否只是“这个文件/什么时候上传的”这类无具体文件名的追问。"""
+    from utils.query_router import route_text_question
+
+    route = route_text_question(text, user, context=None)
+    if route.get('query_type') not in _DOC_TIME_QUERY_TYPES:
+        return False
+    params = route.get('params') or {}
+    return not params.get('keywords') and not params.get('doc_id')
+
+
+def _resolve_doc_context(conversation, current_user_msg, user):
+    """只在当前会话内回溯最近的用户轮次，返回唯一的文件线索或澄清标记。
+
+    - 最近一轮能唯一确定文件时立即采用；
+    - 多候选时立即返回 ambiguous，不猜测、不再向更早回溯；
+    - 只有上一轮本身也是“文件时间追问”时才继续向前回溯；
+    - 不跨会话、不跨用户，不读取客户端传入的 doc_id。
+    """
+    if not user or not getattr(user, 'is_authenticated', False):
+        return {}
+
+    turns = list(
+        conversation.messages
+        .filter(role='user', id__lt=current_user_msg.id)
+        .order_by('-id')[:_DOC_CONTEXT_MAX_TURNS + 1]
+    )
+
+    for index, turn_msg in enumerate(turns[:_DOC_CONTEXT_MAX_TURNS]):
+        upper_msg = turns[index - 1] if index > 0 else current_user_msg
+        try:
+            turn_ctx = _turn_doc_context(conversation, turn_msg, upper_msg, user)
+        except Exception:
+            logger.warning('解析上一轮文件上下文失败 message=%s', turn_msg.id)
+            turn_ctx = None
+
+        if turn_ctx is not None:
+            ids, ambiguous, source = turn_ctx
+            return {'doc_ids': ids, 'ambiguous': ambiguous, 'source': source}
+
+        if not _is_text_time_followup(turn_msg.content, user):
+            break
+    return {}
+
+
 @extend_schema(
     summary='会话管理',
     description='会话管理接口，支持列表、创建、详情、编辑、删除',
@@ -413,14 +565,19 @@ class AskView(APIView):
             logger.info('新建会话 id=%d user=%s', conversation.id, user.username if user else 'anonymous')
 
         # 2. 保存用户消息
-        ChatMessage.objects.create(
+        user_msg = ChatMessage.objects.create(
             conversation=conversation, role='user', content=question,
         )
 
-        # 文件管理查询路由
+        # 文件管理查询路由（文字入口：允许继承同一会话上一轮的唯一文件）
         if is_data_query:
+            from utils.query_router import route_text_question
+            doc_context = _resolve_doc_context(conversation, user_msg, user)
+            text_route = route_text_question(question, user, context=doc_context)
+            if text_route.get('type') == 'data_query':
+                route = text_route
             return self._handle_data_query(
-                question, user, conversation, route,
+                question, user, conversation, route, doc_context,
             )
 
         # 3. 获取历史消息（用于多轮对话上下文）
@@ -712,16 +869,28 @@ class AskView(APIView):
         response['Access-Control-Allow-Origin'] = '*'
         return response
 
-    def _handle_data_query(self, question, user, conversation, route):
+    def _handle_data_query(self, question, user, conversation, route, doc_context=None):
         """处理文件管理类查询：查询数据库 → LLM 格式化 → SSE 流式输出。"""
-        from utils.data_query import execute_query, build_data_query_prompt
+        from utils.data_query import (
+            annotate_doc_time_status, build_text_data_query_prompt, execute_query,
+        )
         from utils.sse import _format_sse
 
         # 执行查询
         query_result = execute_query(route, user)
 
-        # 构造 Prompt
-        messages = build_data_query_prompt(question, query_result)
+        # 上一轮多候选：不猜测文件，标记为需要澄清（仅文字入口）
+        if doc_context and doc_context.get('ambiguous') and query_result.get('success'):
+            data = query_result.get('data')
+            if isinstance(data, dict) and data.get('need_filename'):
+                data = dict(data)
+                data['context_ambiguous'] = True
+                query_result = dict(query_result)
+                query_result['data'] = data
+
+        # 状态标注与提示词包装只服务于文字入口；语音入口仍调用原函数
+        query_result = annotate_doc_time_status(query_result, route)
+        messages = build_text_data_query_prompt(question, query_result)
 
         # 创建 AI 消息占位
         assistant_msg = ChatMessage.objects.create(

@@ -19,7 +19,9 @@ from apps.knowledge.serializers import (
     KnowledgeDocListSerializer,
 )
 from utils.data_query import (
+    annotate_doc_time_status,
     build_data_query_prompt,
+    build_text_data_query_prompt,
     count_user_docs,
     execute_query,
     get_doc_times,
@@ -30,6 +32,7 @@ from utils.query_router import (
     _extract_file_keywords,
     _extract_scope,
     route_question,
+    route_text_question,
 )
 from utils.sse import build_references_events
 from utils.timefmt import (
@@ -816,3 +819,191 @@ class DataAnswerPromptTests(TestCase):
             '完全不存在的东西.pdf是几点上传的', result,
         )[0]['content']
         self.assertIn('不能据此断言文件在整个数据库中不存在', system)
+
+
+class TextRouteContextTests(TestCase):
+    """文字入口专用路由：上下文继承与当前问题优先。"""
+
+    def test_unique_context_injects_doc_id(self):
+        route = route_text_question(
+            '这个文件什么时候上传的',
+            context={'doc_ids': [42], 'ambiguous': False},
+        )
+        self.assertEqual(route['type'], 'data_query')
+        self.assertEqual(route['query_type'], 'doc_upload_time')
+        self.assertEqual(route['params']['doc_id'], 42)
+        self.assertNotIn('keywords', route['params'])
+
+    def test_current_filename_overrides_context(self):
+        route = route_text_question(
+            '《审计报告》是什么时候上传的',
+            context={'doc_ids': [42], 'ambiguous': False},
+        )
+        self.assertNotIn('doc_id', route['params'])
+        self.assertIn('审计报告', route['params']['keywords'])
+
+    def test_ambiguous_context_never_injects_doc_id(self):
+        route = route_text_question(
+            '这个文件什么时候上传的',
+            context={'doc_ids': [1, 2], 'ambiguous': True},
+        )
+        self.assertNotIn('doc_id', route['params'])
+        self.assertNotIn('keywords', route['params'])
+
+    def test_single_id_marked_ambiguous_is_not_used(self):
+        # 列表被截断：只看到 1 个但仍有更多候选
+        route = route_text_question(
+            '这个文件什么时候上传的',
+            context={'doc_ids': [7], 'ambiguous': True},
+        )
+        self.assertNotIn('doc_id', route['params'])
+
+    def test_pronoun_noise_is_removed(self):
+        route = route_text_question('刚才那个文件什么时候上传的')
+        self.assertEqual(route['query_type'], 'doc_upload_time')
+        self.assertNotIn('keywords', route['params'])
+        self.assertNotIn('doc_id', route['params'])
+
+    def test_attachment_number_token_is_removed(self):
+        route = route_text_question('附件6.关于国家奖学金的公示是什么时候上传的')
+        keywords = route['params'].get('keywords') or []
+        self.assertTrue(keywords)
+        for keyword in keywords:
+            self.assertNotEqual(
+                keyword.strip('.-_、,，.。:：;；()（）[]【】'), '6',
+            )
+
+    def test_current_keywords_not_replaced_by_context(self):
+        route = route_text_question(
+            '审计报告是什么时候上传的',
+            context={'doc_ids': [42], 'ambiguous': False},
+        )
+        self.assertNotIn('doc_id', route['params'])
+        self.assertIn('审计报告', route['params']['keywords'])
+
+    def test_non_time_query_ignores_context(self):
+        route = route_text_question(
+            '昨天上传了哪些文件', context={'doc_ids': [42]},
+        )
+        self.assertEqual(route['query_type'], 'list_docs_by_range')
+        self.assertNotIn('doc_id', route['params'])
+
+    def test_index_time_question_also_inherits(self):
+        route = route_text_question(
+            '那它的索引完成时间呢',
+            context={'doc_ids': [9], 'ambiguous': False},
+        )
+        self.assertEqual(route['query_type'], 'doc_index_time')
+        self.assertEqual(route['params']['doc_id'], 9)
+
+    def test_shared_route_question_stays_legacy(self):
+        route = route_question('刚才那个文件什么时候上传的')
+        self.assertEqual(route['params'].get('keywords'), ['刚才'])
+        self.assertNotIn('doc_id', route['params'])
+
+
+class DocTimeStatusTests(TestCase):
+    """文字入口状态标注与提示词包装（语音不调用这些函数）。"""
+
+    def _route(self, doc_id=None):
+        params = {'doc_id': doc_id} if doc_id else {}
+        return {
+            'type': 'data_query',
+            'query_type': 'doc_upload_time',
+            'params': params,
+        }
+
+    def _data(self, **overrides):
+        base = {
+            'need_filename': False,
+            'not_found': True,
+            'ambiguous': False,
+            'total': 0,
+            'shown': 0,
+            'truncated': False,
+            'matches': [],
+            'scope_label': '当前账号可访问范围',
+        }
+        base.update(overrides)
+        return base
+
+    def test_ok_status_is_not_written_into_data(self):
+        data = self._data(not_found=False, total=1, shown=1, matches=[{'id': 1}])
+        annotated = annotate_doc_time_status({'success': True, 'data': data}, self._route())
+        self.assertEqual(annotated['status'], 'ok')
+        self.assertNotIn('status', annotated['data'])
+
+    def test_need_filename_status(self):
+        data = self._data(need_filename=True, not_found=False)
+        annotated = annotate_doc_time_status({'success': True, 'data': data}, self._route())
+        self.assertEqual(annotated['status'], 'need_filename')
+
+    def test_context_ambiguous_wins_over_need_filename(self):
+        data = self._data(need_filename=True, not_found=False, context_ambiguous=True)
+        annotated = annotate_doc_time_status({'success': True, 'data': data}, self._route())
+        self.assertEqual(annotated['status'], 'ambiguous')
+
+    def test_ambiguous_status(self):
+        data = self._data(not_found=False, total=2, shown=2, ambiguous=True)
+        annotated = annotate_doc_time_status({'success': True, 'data': data}, self._route())
+        self.assertEqual(annotated['status'], 'ambiguous')
+
+    def test_doc_id_miss_is_not_visible(self):
+        annotated = annotate_doc_time_status(
+            {'success': True, 'data': self._data()}, self._route(doc_id=5),
+        )
+        self.assertEqual(annotated['status'], 'not_visible')
+        self.assertNotIn('status', annotated['data'])
+
+    def test_keyword_miss_is_not_found(self):
+        annotated = annotate_doc_time_status(
+            {'success': True, 'data': self._data()}, self._route(),
+        )
+        self.assertEqual(annotated['status'], 'not_found')
+
+    def test_query_error_status(self):
+        annotated = annotate_doc_time_status(
+            {'success': False, 'data': None, 'error': 'boom'}, self._route(),
+        )
+        self.assertEqual(annotated['status'], 'query_error')
+
+    def test_non_time_route_is_unchanged(self):
+        result = {'success': True, 'data': {'total': 1}}
+        route = {'query_type': 'list_docs_by_range', 'params': {}}
+        self.assertEqual(annotate_doc_time_status(result, route), result)
+        self.assertNotIn('status', annotate_doc_time_status(result, route))
+
+    def test_ok_prompt_is_identical_to_legacy(self):
+        data = self._data(not_found=False, total=1, shown=1, matches=[{'id': 1}])
+        result = {'success': True, 'data': data}
+        annotated = dict(result, status='ok')
+        self.assertEqual(
+            build_text_data_query_prompt('这个文件什么时候上传的', annotated),
+            build_data_query_prompt('这个文件什么时候上传的', result),
+        )
+
+    def test_not_visible_prompt_matches_not_found(self):
+        result = {'success': True, 'data': self._data()}
+        not_found = annotate_doc_time_status(result, self._route())
+        not_visible = annotate_doc_time_status(result, self._route(doc_id=5))
+        question = '这个文件什么时候上传的'
+        content_not_found = build_text_data_query_prompt(question, not_found)[0]['content']
+        content_not_visible = build_text_data_query_prompt(question, not_visible)[0]['content']
+        self.assertEqual(content_not_found, content_not_visible)
+        self.assertNotIn('not_visible', content_not_visible)
+
+    def test_need_filename_prompt_asks_for_clarification(self):
+        result = {'success': True, 'data': self._data(need_filename=True, not_found=False)}
+        annotated = annotate_doc_time_status(result, self._route())
+        content = build_text_data_query_prompt('这个文件什么时候上传的', annotated)[0]['content']
+        self.assertIn('当前状态为 need_filename', content)
+        self.assertIn('请用户补充完整文件名', content)
+        self.assertIn('不得声称', content)
+
+    def test_query_error_prompt_never_claims_not_found(self):
+        result = {'success': False, 'data': None, 'error': 'boom'}
+        annotated = annotate_doc_time_status(result, self._route())
+        content = build_text_data_query_prompt('这个文件什么时候上传的', annotated)[0]['content']
+        self.assertIn('暂时无法查询', content)
+        self.assertIn('当前状态为 query_error', content)
+        self.assertNotIn('没有匹配', content)

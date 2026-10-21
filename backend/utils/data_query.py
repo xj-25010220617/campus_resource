@@ -877,3 +877,88 @@ def _format_size(size_bytes: int) -> str:
         return f"{size_bytes / (1024 * 1024):.1f} MB"
     else:
         return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+
+
+# ------------------------------------------------------------------
+# 文字提问专用：结果状态标注与提示词包装
+# ------------------------------------------------------------------
+# 语音入口继续使用 execute_query / get_doc_times / build_data_query_prompt，
+# 以下函数只由文字入口（AskView._handle_data_query）调用。
+
+_DOC_TIME_QUERY_TYPES = ("doc_upload_time", "doc_index_time")
+
+# not_visible 与 not_found 必须使用完全相同的措辞，避免泄露文件是否存在。
+_NOT_FOUND_RULE = (
+    "当前状态为 not_found：只能说明“在当前查询条件下没有匹配到”，"
+    "不得断言文件在系统中不存在，不得提及权限、可见性或是否存在。"
+)
+
+_TEXT_STATUS_RULES = {
+    "need_filename": (
+        "当前状态为 need_filename：尚未确定用户指的是哪份文件。"
+        "请用户补充完整文件名或说明具体是哪一份；"
+        "不得声称“没有找到相关文件”，不得列出文件清单，也不得猜测文件。"
+    ),
+    "ambiguous": (
+        "当前状态为 ambiguous：存在多份候选文件（可能来自上一轮检索结果）。"
+        "请用户指明是哪一份（可提供文件名）；"
+        "普通用户场景不要罗列候选文件名，不得替用户选择其中一份。"
+    ),
+    "not_found": _NOT_FOUND_RULE,
+    # 与 not_found 完全一致：对外不得暴露“文件存在但不可见”的信息
+    "not_visible": _NOT_FOUND_RULE,
+    "query_error": (
+        "当前状态为 query_error：查询过程出现异常。"
+        "只能告知用户“查询暂时不可用，请稍后重试”，"
+        "禁止说“没有找到”，也不得给出任何文件或时间信息。"
+    ),
+}
+
+
+def annotate_doc_time_status(result: dict, route: dict) -> dict:
+    """文字入口专用：在 execute_query 结果顶层附加 status。
+
+    只读、无副作用；status 放在 result 顶层，不进入 result["data"]，
+    因此不会随 json.dumps 进入提示词。非文件时间查询原样返回。
+    """
+    if not isinstance(result, dict):
+        return result
+    if (route or {}).get("query_type") not in _DOC_TIME_QUERY_TYPES:
+        return result
+
+    if not result.get("success"):
+        status = "query_error"
+    else:
+        data = result.get("data")
+        if not isinstance(data, dict):
+            status = "query_error"
+        elif data.get("context_ambiguous"):
+            status = "ambiguous"
+        elif data.get("need_filename"):
+            status = "need_filename"
+        elif data.get("ambiguous"):
+            status = "ambiguous"
+        elif data.get("not_found"):
+            status = "not_visible" if (route.get("params") or {}).get("doc_id") else "not_found"
+        else:
+            status = "ok"
+
+    annotated = dict(result)
+    annotated["status"] = status
+    return annotated
+
+
+def build_text_data_query_prompt(question: str, result: dict) -> list:
+    """文字入口专用提示词。
+
+    status 为 ok 时与既有提示词逐字节一致；只有异常/不完整状态才追加规则，
+    避免影响正常的查询回答。
+    """
+    status = (result or {}).get("status")
+    messages = build_data_query_prompt(question, result)
+    if status in (None, "ok"):
+        return messages
+
+    rule = _TEXT_STATUS_RULES.get(status, _NOT_FOUND_RULE)
+    messages[0]["content"] = messages[0]["content"] + "\n\n" + rule
+    return messages

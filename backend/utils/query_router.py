@@ -618,3 +618,81 @@ def route_question(question: str, user=None) -> dict:
 def is_data_query(question: str) -> bool:
     """快速判断是否为文件管理查询（简化接口）。"""
     return route_question(question)["type"] == "data_query"
+
+
+# ------------------------------------------------------------------
+# 文字提问专用：上下文继承与关键词收敛
+# ------------------------------------------------------------------
+# 语音入口（AskView._stream_answer）继续调用 route_question，
+# 不经过下面任何代码；新增逻辑只服务于文字提问入口。
+
+_TEXT_TIME_QUERY_TYPES = ("doc_upload_time", "doc_index_time")
+
+# 只在文字入口剔除的指代/时间副词；“刚才”等词不在共享噪声正则里，
+# 以免改变语音入口的关键词提取结果。
+_TEXT_ONLY_NOISE_RE = re.compile(
+    r"刚才|刚刚|刚才那个|刚刚那个|上面|上述|前面|之前|此前|说的|刚刚说的"
+    r"|(?:那)?(?:它|他|她)们?(?:的)?"
+)
+
+_TEXT_TOKEN_STRIP_CHARS = ".-_、,，.。:：;；()（）[]【】<>《》"
+
+
+def _is_noise_text_token(token: str) -> bool:
+    """文字入口用的关键词噪声判断（不影响共享的 _extract_file_keywords）。"""
+    core = (token or "").strip(_TEXT_TOKEN_STRIP_CHARS)
+    if not core:
+        return True
+    if _TEXT_ONLY_NOISE_RE.fullmatch(core):
+        return True
+    # “附件6.关于……” 里被切出来的纯序号不是文件名主体
+    if re.fullmatch(r"\d{1,2}", core):
+        return True
+    if core.lower() in _EXTENSION_TOKENS:
+        return True
+    return False
+
+
+def _cleanup_text_keywords(keywords) -> list:
+    return [kw for kw in (keywords or []) if not _is_noise_text_token(kw)]
+
+
+def route_text_question(
+    question: str, user=None, context: Optional[dict] = None,
+) -> dict:
+    """文字提问入口专用路由：在 route_question 结果上做最小收敛。
+
+    规则（只对 doc_upload_time / doc_index_time 生效）：
+    - 当前问题带具体文件名关键词：以当前问题为准，历史上下文不生效；
+    - 当前问题只剩指代词（“这个文件”“刚才那个文件”）：允许继承唯一 doc_id；
+    - 历史多候选：不注入 doc_id（由回答层要求澄清）；
+    - doc_id 只作为候选，授权由 get_doc_times 按当前权限重新判定。
+
+    不改变 route_question / _extract_file_keywords 的行为，语音入口不受影响。
+    """
+    route = route_question(question, user)
+    if route.get("type") != "data_query":
+        return route
+    if route.get("query_type") not in _TEXT_TIME_QUERY_TYPES:
+        return route
+
+    params = route.setdefault("params", {})
+    raw_keywords = params.get("keywords") or []
+    keywords = _cleanup_text_keywords(raw_keywords)
+
+    if keywords:
+        # 当前问题已经给出可识别的名称/标识，历史一律不覆盖
+        params["keywords"] = keywords
+        return route
+    if raw_keywords:
+        # 原关键词全部是“刚才/序号”之类噪声，按纯指代处理
+        params.pop("keywords", None)
+
+    ctx = context or {}
+    doc_ids = [
+        item for item in (ctx.get("doc_ids") or [])
+        if isinstance(item, int) and item > 0
+    ]
+    if not ctx.get("ambiguous") and len(doc_ids) == 1:
+        params["doc_id"] = doc_ids[0]
+    return route
