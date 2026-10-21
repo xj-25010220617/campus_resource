@@ -4,6 +4,15 @@ on:
   push:
     branches:
       - main
+  # 手动触发：仅在换 embedding 模型、改分块逻辑、或向量库损坏时使用。
+  # 正常 push 部署不会重建向量库。
+  workflow_dispatch:
+    inputs:
+      reindex:
+        description: "强制全量重建向量库（会停服 20~40 分钟）"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   deploy:
@@ -24,13 +33,24 @@ jobs:
         #
         # "失败即停" 已经由脚本内的 set -e 承担，效果完全相同，且不会改写脚本。
         # 另有一道 trap ERR 会把真正出错的行号打到日志里。
+        #
+        # ⚠️ 2026-10-21 调整（502 事故后）：
+        #   1. 不再每次部署都 touch /tmp/campus_reindex_incomplete。
+        #      该标记是 reindex_all.py 的「上次重灌被中断」信号，只能由脚本自己
+        #      在真正开始重灌时创建、正常完成时删除。部署脚本预先 touch 会让
+        #      --if-empty 永远走进「强制全量」，每次都重灌 197 篇、停服 20~30 分钟。
+        #   2. 不再 pkill 正在跑的 reindex（杀掉 → 标记留存 → 下次又全量，死循环）。
+        #   3. 正常部署改为 HUP 平滑重载 gunicorn，停服窗口从 20~30 分钟降到 0~3 秒。
+        #   4. 需要重灌时先停 celery（省下 2.9GB embedding 模型内存并释放 Milvus
+        #      单文件锁，这是 17:06 reindex 被 OOM 杀掉的直接原因），且无论重灌成功
+        #      还是失败都会把后端重新拉起来，绝不再出现「重灌被杀、服务一直不启动」。
         with:
           host: ${{ secrets.SSH_HOST }}
           port: ${{ secrets.SSH_PORT }}
           username: ${{ secrets.SSH_USERNAME }}
           key: ${{ secrets.SSH_KEY }}
-          # 服务器 host key 指纹（2026-10-19 腾讯云 124.221.94.207，ed25519）
-          command_timeout: 30m
+          # 重灌路径需要 20~40 分钟，留足余量
+          command_timeout: 60m
 
           script: |
             set -e
@@ -40,6 +60,8 @@ jobs:
             trap 'echo "!!! 部署中止：脚本第 $LINENO 行命令失败" >&2' ERR 2>/dev/null || true
 
             APP_DIR=/www/wwwroot/campus_resource
+            MARKER=/tmp/campus_reindex_incomplete
+            REINDEX_LOG=/tmp/campus_reindex_bg.log
             cd "$APP_DIR"
 
             echo "========================================"
@@ -50,9 +72,21 @@ jobs:
             OLD_COMMIT=$(git rev-parse HEAD)
             echo "OLD_COMMIT=$OLD_COMMIT"
 
-            echo "2. 清理残留的 reindex 进程"
-            pkill -f '^python .*reindex_all' || true
-            sleep 2
+            echo "2. 检查是否有正在运行的重灌（不杀掉它）"
+            if pgrep -f "scripts/reindex_all.py" > /dev/null; then
+              echo "检测到正在运行的重灌，等待其结束（最多 30 分钟）"
+              for i in $(seq 1 180); do
+                pgrep -f "scripts/reindex_all.py" > /dev/null || break
+                sleep 10
+              done
+              if pgrep -f "scripts/reindex_all.py" > /dev/null; then
+                echo "警告：重灌仍在运行，本次部署继续（知识库检索可能暂时降级）"
+              else
+                echo "重灌已结束，继续部署"
+              fi
+            else
+              echo "没有正在运行的重灌"
+            fi
 
             echo "3. 拉取最新代码"
             timeout 300 git fetch origin main
@@ -65,9 +99,7 @@ jobs:
             echo "NEW_COMMIT=$NEW_COMMIT"
 
             echo "4. 判断 requirements.txt 是否发生变化"
-
             REQUIREMENTS_CHANGED=false
-
             if [ "$OLD_COMMIT" != "$NEW_COMMIT" ]; then
               if git diff --quiet "$OLD_COMMIT" "$NEW_COMMIT" -- backend/requirements.txt; then
                 echo "requirements.txt 没有变化"
@@ -78,7 +110,6 @@ jobs:
             else
               echo "没有新的提交"
             fi
-
             echo "DEBUG: REQUIREMENTS_CHANGED=$REQUIREMENTS_CHANGED (OLD=$OLD_COMMIT NEW=$NEW_COMMIT)"
 
             echo "5. 激活 Python 虚拟环境"
@@ -93,93 +124,134 @@ jobs:
               echo "========================================"
               echo "requirements.txt 已变化，开始安装依赖"
               echo "========================================"
-
               pip install \
                 -r requirements.txt \
                 -i https://mirrors.aliyun.com/pypi/simple/ \
                 --disable-pip-version-check \
                 --no-input \
                 --prefer-binary
-
               echo "依赖安装完成"
             else
               echo "========================================"
-              echo "requirements.txt 没有变化"
-              echo "跳过 pip install"
+              echo "requirements.txt 没有变化，跳过 pip install"
               echo "========================================"
             fi
 
-            echo "DEBUG: 即将执行数据库迁移"
             echo "7. 执行数据库迁移"
             python manage.py migrate --noinput
 
-            echo "8. 标记 reindex 需要继续检查"
-            touch /tmp/campus_reindex_incomplete
+            echo "8. 判断是否需要重建向量库"
+            NEED_REINDEX=0
+            REINDEX_REASON=""
 
-            echo "DEBUG: 即将停止 campus-backend"
-            echo "9. 停止后端服务"
-            sudo -n systemctl stop campus-backend || true
+            FORCE_REINDEX="${{ inputs.reindex }}"
+            if [ "$FORCE_REINDEX" = "true" ]; then
+              NEED_REINDEX=1
+              REINDEX_REASON="手动触发（workflow_dispatch reindex=true）"
+            fi
 
-            echo "10. 后台启动 reindex"
+            if [ -e "$MARKER" ]; then
+              NEED_REINDEX=1
+              REINDEX_REASON="${REINDEX_REASON}上次重灌被中断（$MARKER 存在）"
+            fi
 
-            nohup bash -c '
-              cd /www/wwwroot/campus_resource/backend
-              source venv/bin/activate
+            if [ "$NEED_REINDEX" = "1" ]; then
+              echo "需要重建：$REINDEX_REASON"
+            else
+              echo "向量库无需重建，跳过 reindex（正常部署路径）"
+            fi
 
-              flock -w 7200 /tmp/campus_reindex.lock \
-                python scripts/reindex_all.py --if-empty
+            echo "9. 应用新代码"
+            if [ "$NEED_REINDEX" = "1" ]; then
+              # ── 重灌路径：必须独占 Milvus（单文件锁），停服期间完成 ──
+              echo "========================================"
+              echo "开始重建向量库，期间后端不可用（预计 20~40 分钟）"
+              echo "原因：$REINDEX_REASON"
+              echo "========================================"
 
+              echo "9.1 停止 celery（释放 Milvus 锁 + 约 2.9GB embedding 模型内存）"
+              sudo -n systemctl stop campus-celery || true
+              sleep 3
+
+              echo "9.2 停止后端"
+              sudo -n systemctl stop campus-backend || true
+
+              echo "9.3 前台执行全量重灌（日志同时落盘 $REINDEX_LOG）"
+              set +e
+              flock -w 60 /tmp/campus_reindex.lock \
+                python scripts/reindex_all.py >> "$REINDEX_LOG" 2>&1
               REINDEX_EXIT=$?
+              set -e
 
               echo "reindex exit code: $REINDEX_EXIT"
+              tail -n 40 "$REINDEX_LOG" || true
 
               if [ "$REINDEX_EXIT" -eq 0 ]; then
-                rm -f /tmp/campus_reindex_incomplete
-                echo "reindex 完成"
+                rm -f "$MARKER"
+                echo "重灌成功，中断标记已清除"
               else
-                echo "reindex 失败，保留 incomplete 标记"
+                echo "!!! 重灌失败（exit=$REINDEX_EXIT），保留中断标记，下次部署会重试"
               fi
 
-              sudo -n systemctl start campus-backend
+              echo "9.4 无论重灌成败，都把服务拉起来（避免一直 502）"
+              sudo -n systemctl start campus-celery || true
+              sleep 2
+              sudo -n systemctl start campus-backend || true
 
-              exit "$REINDEX_EXIT"
-            ' </dev/null >> /tmp/campus_reindex_bg.log 2>&1 &
+              if [ "$REINDEX_EXIT" -ne 0 ]; then
+                echo "本次部署判定为失败：代码已更新、服务已恢复，但向量库不完整"
+                exit 1
+              fi
+            else
+              # ── 正常路径：不停服，HUP 平滑重载 gunicorn ──
+              echo "平滑重载 gunicorn（master 不退出，端口不断）"
+              if sudo -n systemctl is-active --quiet campus-backend; then
+                if sudo -n systemctl kill -s HUP --kill-who=main campus-backend; then
+                  echo "已发送 HUP，等待 worker 重启"
+                else
+                  echo "HUP 失败，回退为 restart"
+                  sudo -n systemctl restart campus-backend
+                fi
+              else
+                echo "后端当前未运行，直接启动"
+                sudo -n systemctl start campus-backend
+              fi
 
-            echo "DEBUG: 开始等待服务启动/健康检查"
-            echo "11. 等待服务启动"
+              # celery 代码可能也变了，但 restart 会重新加载模型（约 2.9GB）。
+              # 只在新提交确实改了任务代码时才重启，避免无谓的内存抖动。
+              if [ "$OLD_COMMIT" != "$NEW_COMMIT" ] && \
+                 ! git diff --quiet "$OLD_COMMIT" "$NEW_COMMIT" -- backend/apps/knowledge/tasks.py backend/config/celery.py 2>/dev/null; then
+                echo "任务代码有变化，重启 celery"
+                sudo -n systemctl restart campus-celery || true
+              else
+                echo "任务代码无变化，保持 celery 运行"
+              fi
+            fi
 
-            for i in $(seq 1 36); do
-              if pgrep -f "scripts/reindex_all.py" > /dev/null; then
-                echo "reindex 正在后台运行，部署继续"
+            echo "10. 健康检查（最多 120 秒）"
+            HEALTHY=0
+            for i in $(seq 1 24); do
+              if curl -fsS http://127.0.0.1:3000/api/docs/ > /dev/null 2>&1; then
+                HEALTHY=1
+                echo "后端在线（第 $i 次探测）"
                 break
               fi
-
-              if curl -fsS http://127.0.0.1:3000/api/docs/ > /dev/null; then
-                echo "后端服务已经启动"
-                break
-              fi
-
-              echo "等待后端启动... $i/36"
+              echo "等待后端启动... $i/24"
               sleep 5
             done
 
-            echo "12. 最终健康检查"
-
-            if curl -fsS http://127.0.0.1:3000/api/docs/ > /dev/null; then
+            echo "11. 结果"
+            if [ "$HEALTHY" = "1" ]; then
               echo "========================================"
-              echo "部署成功"
-              echo "========================================"
-            elif pgrep -f "scripts/reindex_all.py" > /dev/null; then
-              echo "========================================"
-              echo "reindex 正在后台运行，部署成功"
+              echo "部署成功：$NEW_COMMIT"
+              echo "后端 http://127.0.0.1:3000/api/docs/ -> 200"
               echo "========================================"
             else
               echo "========================================"
-              echo "后端启动失败"
+              echo "部署失败：后端未在 120 秒内就绪"
               echo "========================================"
-
-              echo "最近 reindex 日志："
-              tail -n 100 /tmp/campus_reindex_bg.log || true
-
+              sudo -n systemctl status campus-backend --no-pager -l | tail -n 30 || true
+              echo "后端错误日志："
+              tail -n 50 /home/ubuntu/apps/logs/backend-error.log || true
               exit 1
             fi
