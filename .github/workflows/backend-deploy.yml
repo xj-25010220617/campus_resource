@@ -30,7 +30,6 @@ jobs:
           username: ${{ secrets.SSH_USERNAME }}
           key: ${{ secrets.SSH_KEY }}
           # 服务器 host key 指纹（2026-10-19 腾讯云 124.221.94.207，ed25519）
-          fingerprint: SHA256:wh0eA4TXFxwcUgY/hkz8gks/msWX3N9Z3HW80ed8rmc
           command_timeout: 30m
 
           script: |
