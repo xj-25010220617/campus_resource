@@ -1,0 +1,186 @@
+name: Deploy Backend to Server
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy to server via SSH
+        uses: appleboy/ssh-action@v1.0.3
+
+        # ⚠️ 严禁再加 script_stop: true —— 2026-09-24 生产事故根因。
+        #
+        # script_stop 并不是简单的 "set -e"，它会让 drone-ssh 把脚本按行拆开，
+        # 并在每一行之后插入一行退出码检查：
+        #   DRONE_SSH_PREV_COMMAND_EXIT_CODE=$? ; if [ $.. -ne 0 ]; then exit $..; fi;
+        # 而 shell 里 if 条件为假时，进入 else 分支那一刻 $? 仍然是 1（正是那个
+        # 失败的判断条件），于是插入的检查会在任何 else / elif 分支入口直接 exit 1：
+        # 脚本静默中止、日志没有任何报错，只留下 "Process exited with status 1"。
+        #
+        # "失败即停" 已经由脚本内的 set -e 承担，效果完全相同，且不会改写脚本。
+        # 另有一道 trap ERR 会把真正出错的行号打到日志里。
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          port: ${{ secrets.SSH_PORT }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          # 服务器 host key 指纹（2026-10-19 腾讯云 124.221.94.207，ed25519）
+          fingerprint: SHA256:wh0eA4TXFxwcUgY/hkz8gks/msWX3N9Z3HW80ed8rmc
+          command_timeout: 30m
+
+          script: |
+            set -e
+
+            # 任何命令失败立即中止，并把出错行号打到日志，杜绝"静默 exit 1"。
+            # 被 || true 或 if/while 条件正常处理的失败不会触发（与 set -e 语义一致）。
+            trap 'echo "!!! 部署中止：脚本第 $LINENO 行命令失败" >&2' ERR 2>/dev/null || true
+
+            APP_DIR=/www/wwwroot/campus_resource
+            cd "$APP_DIR"
+
+            echo "========================================"
+            echo "开始部署（服务器 $(hostname) / $APP_DIR）"
+            echo "========================================"
+
+            echo "1. 获取当前提交"
+            OLD_COMMIT=$(git rev-parse HEAD)
+            echo "OLD_COMMIT=$OLD_COMMIT"
+
+            echo "2. 清理残留的 reindex 进程"
+            pkill -f '^python .*reindex_all' || true
+            sleep 2
+
+            echo "3. 拉取最新代码"
+            timeout 300 git fetch origin main
+            git reset --hard origin/main
+
+            echo "3.5 重放本地补丁（OSS 预签名 / embedding 单例 / milvus 索引）"
+            bash /home/ubuntu/apps/patches/apply_fixes.sh || echo "警告：补丁脚本返回非 0，继续"
+
+            NEW_COMMIT=$(git rev-parse HEAD)
+            echo "NEW_COMMIT=$NEW_COMMIT"
+
+            echo "4. 判断 requirements.txt 是否发生变化"
+
+            REQUIREMENTS_CHANGED=false
+
+            if [ "$OLD_COMMIT" != "$NEW_COMMIT" ]; then
+              if git diff --quiet "$OLD_COMMIT" "$NEW_COMMIT" -- backend/requirements.txt; then
+                echo "requirements.txt 没有变化"
+              else
+                echo "requirements.txt 已变化"
+                REQUIREMENTS_CHANGED=true
+              fi
+            else
+              echo "没有新的提交"
+            fi
+
+            echo "DEBUG: REQUIREMENTS_CHANGED=$REQUIREMENTS_CHANGED (OLD=$OLD_COMMIT NEW=$NEW_COMMIT)"
+
+            echo "5. 激活 Python 虚拟环境"
+            cd "$APP_DIR/backend"
+            source venv/bin/activate
+
+            echo "6. 检查 Python"
+            python --version
+            pip --version
+
+            if [ "$REQUIREMENTS_CHANGED" = true ]; then
+              echo "========================================"
+              echo "requirements.txt 已变化，开始安装依赖"
+              echo "========================================"
+
+              pip install \
+                -r requirements.txt \
+                -i https://mirrors.aliyun.com/pypi/simple/ \
+                --disable-pip-version-check \
+                --no-input \
+                --prefer-binary
+
+              echo "依赖安装完成"
+            else
+              echo "========================================"
+              echo "requirements.txt 没有变化"
+              echo "跳过 pip install"
+              echo "========================================"
+            fi
+
+            echo "DEBUG: 即将执行数据库迁移"
+            echo "7. 执行数据库迁移"
+            python manage.py migrate --noinput
+
+            echo "8. 标记 reindex 需要继续检查"
+            touch /tmp/campus_reindex_incomplete
+
+            echo "DEBUG: 即将停止 campus-backend"
+            echo "9. 停止后端服务"
+            sudo -n systemctl stop campus-backend || true
+
+            echo "10. 后台启动 reindex"
+
+            nohup bash -c '
+              cd /www/wwwroot/campus_resource/backend
+              source venv/bin/activate
+
+              flock -w 7200 /tmp/campus_reindex.lock \
+                python scripts/reindex_all.py --if-empty
+
+              REINDEX_EXIT=$?
+
+              echo "reindex exit code: $REINDEX_EXIT"
+
+              if [ "$REINDEX_EXIT" -eq 0 ]; then
+                rm -f /tmp/campus_reindex_incomplete
+                echo "reindex 完成"
+              else
+                echo "reindex 失败，保留 incomplete 标记"
+              fi
+
+              sudo -n systemctl start campus-backend
+
+              exit "$REINDEX_EXIT"
+            ' </dev/null >> /tmp/campus_reindex_bg.log 2>&1 &
+
+            echo "DEBUG: 开始等待服务启动/健康检查"
+            echo "11. 等待服务启动"
+
+            for i in $(seq 1 36); do
+              if pgrep -f "scripts/reindex_all.py" > /dev/null; then
+                echo "reindex 正在后台运行，部署继续"
+                break
+              fi
+
+              if curl -fsS http://127.0.0.1:3000/api/docs/ > /dev/null; then
+                echo "后端服务已经启动"
+                break
+              fi
+
+              echo "等待后端启动... $i/36"
+              sleep 5
+            done
+
+            echo "12. 最终健康检查"
+
+            if curl -fsS http://127.0.0.1:3000/api/docs/ > /dev/null; then
+              echo "========================================"
+              echo "部署成功"
+              echo "========================================"
+            elif pgrep -f "scripts/reindex_all.py" > /dev/null; then
+              echo "========================================"
+              echo "reindex 正在后台运行，部署成功"
+              echo "========================================"
+            else
+              echo "========================================"
+              echo "后端启动失败"
+              echo "========================================"
+
+              echo "最近 reindex 日志："
+              tail -n 100 /tmp/campus_reindex_bg.log || true
+
+              exit 1
+            fi
