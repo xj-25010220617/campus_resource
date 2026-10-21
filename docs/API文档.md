@@ -16,9 +16,24 @@
 | **请求参数** | 无 |
 | **请求参数类型** | — |
 | **是否必须传入** | — |
-| **返回参数** | HTTP 302 重定向至学校统一认证页面 |
-| **返回参数类型** | — |
-| **备注** | 用户被重定向到学校 SSO 登录页，登录成功后回调 `/api/auth/sso/callback/` |
+| **返回参数** | 由后端配置决定，三种模式均返回 JSON（不使用 302）：Mock 模式 `mode`, `mock_codes`, `usage`（HTTP 200）；正式模式 `mode`, `sso_url`, `detail`（HTTP 200）；未配置 `mode`, `detail`（HTTP 501） |
+| **返回参数类型** | `object` |
+| **备注** | Mock 模式：`ENVIRONMENT=development/test` 且 `SSO_MOCK_ENABLED=True` 时返回测试账号列表，前端展示选择弹窗后调 `POST /api/auth/sso/callback/`；`SSO_MOCK_ALLOW_PRIVILEGED=False`（默认）时列表不含高权限账号（mock_super_admin / mock_admin）。正式模式：配置 `SSO_LOGIN_URL` 后返回 `{"mode":"redirect","sso_url":"..."}`，前端跳转学校统一认证页，登录成功后回调 `/api/auth/sso/callback/`。均未配置：返回 501 `{"mode":"unconfigured","detail":"SSO 登录暂未配置，请联系管理员"}` |
+
+| Mock 模式返回字段 | 类型 | 说明 |
+|----------|------|------|
+| `mode` | string | 固定 `mock` |
+| `mock_codes[].code` | string | 测试码，用于调用回调接口 |
+| `mock_codes[].username` | string | 对应用户名 |
+| `mock_codes[].role` | string | 角色（college_admin / dept_admin / user） |
+| `mock_codes[].description` | string | 展示用描述 |
+| `usage` | string | 调用说明 |
+
+| 正式模式返回字段 | 类型 | 说明 |
+|----------|------|------|
+| `mode` | string | 固定 `redirect` |
+| `sso_url` | string | 学校统一认证页面地址 |
+| `detail` | string | 提示文案 |
 
 ---
 
@@ -28,12 +43,12 @@
 |------|------|
 | **接口路径** | `/api/auth/sso/callback/` |
 | **请求方式** | `POST` |
-| **请求参数** | `saml_response` / `code` |
-| **请求参数类型** | `string` (form-data) |
+| **请求参数** | `code`（Mock 模式）/ `saml_response` / `code`（正式模式） |
+| **请求参数类型** | `string` (JSON body) |
 | **是否必须传入** | 是 |
-| **返回参数** | `access`, `refresh`, `user` |
-| **返回参数类型** | `access`: string, `refresh`: string, `user`: object |
-| **备注** | SSO 回调后签发 JWT，`user` 对象包含 id/username/role/college_id。MVP 阶段如未对接 SSO，可用 JWT 登录兜底 |
+| **返回参数** | `access`, `refresh`, `user`, `created` |
+| **返回参数类型** | `access`: string, `refresh`: string, `user`: object, `created`: bool |
+| **备注** | Mock 模式：校验 `code` 后按 `sso_uid` 查找/自动创建用户并签发 JWT，`SSO_MOCK_ALLOW_PRIVILEGED=False`（默认）时高权限 code 视同无效拒绝。正式模式：SSO 票据校验对接后签发 JWT（暂未对接，未启用 Mock 时返回 501）。失败返回 400/401 `{"detail": "...", "code": "..."}` |
 
 | 返回字段 | 类型 | 说明 |
 |----------|------|------|
@@ -41,12 +56,13 @@
 | `refresh` | string | refresh token，有效期 7 天 |
 | `user.id` | int | 用户 ID |
 | `user.username` | string | 用户名（工号/学号） |
-| `user.role` | string | super_admin / admin / user |
+| `user.role` | string | super_admin / college_admin / dept_admin / admin / user |
 | `user.role_display` | string | 角色中文名 |
 | `user.college_id` | int/null | 所属学院 ID |
 | `user.college_name` | string/null | 所属学院名称 |
 | `user.phone` | string | 手机号 |
 | `user.avatar` | string | 头像 URL |
+| `created` | bool | 本次登录是否新建了用户 |
 
 ---
 

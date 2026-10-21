@@ -12,6 +12,11 @@ SECRET_KEY = config('SECRET_KEY', default=_DEV_SECRET_KEY)
 # DEBUG 默认关闭（fail-closed）；本地开发在 .env 显式开启
 DEBUG = config('DEBUG', default=False, cast=bool)
 
+# 环境标识：production / test / development。
+# 默认跟随 DEBUG（True→development，False→production），测试服在 .env 显式设置 ENVIRONMENT=test。
+# SSO Mock 等仅限非生产环境的功能以此为准（见 apps/accounts/views.py 的 _sso_mock_enabled）。
+ENVIRONMENT = config('ENVIRONMENT', default='development' if DEBUG else 'production')
+
 # 部署安全：生产环境（DEBUG=False）禁止使用已知的开发密钥
 if not DEBUG and SECRET_KEY == _DEV_SECRET_KEY:
     from django.core.exceptions import ImproperlyConfigured
@@ -248,9 +253,12 @@ CELERY_TASK_TRACK_STARTED = True
 # ------------------------------------------------------------------
 # SSO 单点登录
 # ------------------------------------------------------------------
-# Mock SSO 仅用于本地开发调试。生产环境必须保持默认 False；
-# 且即便误置为 True，仅当 DEBUG=True 时才会生效（见 accounts.views._sso_mock_enabled）。
+# Mock SSO 仅用于开发/测试环境（ENVIRONMENT=development/test）。生产环境必须保持默认 False；
+# 且即便误置为 True，ENVIRONMENT=production 时也不会生效（见 accounts.views._sso_mock_enabled）。
+# SSO_MOCK_ALLOW_PRIVILEGED 控制 Mock 是否暴露高权限账号（mock_super_admin/mock_admin）：
+# 公网测试服保持默认 False（登录列表隐藏、callback 拒绝），需要测试超管时临时打开。
 SSO_MOCK_ENABLED = config('SSO_MOCK_ENABLED', default=False, cast=bool)
+SSO_MOCK_ALLOW_PRIVILEGED = config('SSO_MOCK_ALLOW_PRIVILEGED', default=False, cast=bool)
 SSO_LOGIN_URL = config('SSO_LOGIN_URL', default='')
 
 # ------------------------------------------------------------------

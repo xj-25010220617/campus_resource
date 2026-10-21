@@ -155,6 +155,7 @@ MOCK_SSO_USERS = {
         'first_name': 'SSO',
         'last_name': '教师',
         'email': 'sso_teacher@nsu.edu.cn',
+        'college_code': 'CS',
     },
     'mock_student': {
         'sso_uid': 'sso_10003',
@@ -163,6 +164,7 @@ MOCK_SSO_USERS = {
         'first_name': 'SSO',
         'last_name': '学生',
         'email': 'sso_student@nsu.edu.cn',
+        'college_code': 'CS',
     },
 }
 
@@ -224,12 +226,30 @@ class ChangePasswordView(APIView):
 
 
 def _sso_mock_enabled() -> bool:
-    """Mock SSO 安全门槛：仅在显式开启且处于 DEBUG 环境时可用。
+    """Mock SSO 安全门槛：仅在显式开启且环境为 development/test 时可用。
 
-    生产环境（DEBUG=False）无论 SSO_MOCK_ENABLED 如何配置都不放行，
+    生产环境（ENVIRONMENT=production）无论 SSO_MOCK_ENABLED 如何配置都不放行，
     避免任何人用固定 code 换取高权限 JWT。
     """
-    return bool(settings.DEBUG) and getattr(settings, 'SSO_MOCK_ENABLED', False)
+    return (
+        getattr(settings, 'ENVIRONMENT', 'production') in ('development', 'test')
+        and bool(getattr(settings, 'SSO_MOCK_ENABLED', False))
+    )
+
+
+# 高权限 Mock 账号：SSO_MOCK_ALLOW_PRIVILEGED=False（默认）时不对外暴露——
+# 登录列表不返回、callback 视同无效 code 拒绝，防止公网环境用固定 code 换 super_admin JWT
+PRIVILEGED_MOCK_CODES = {'mock_super_admin', 'mock_admin'}
+
+
+def _visible_mock_sso_users() -> dict:
+    """按 SSO_MOCK_ALLOW_PRIVILEGED 过滤后的可见 Mock 账号，登录列表与 callback 共用同一份"""
+    if getattr(settings, 'SSO_MOCK_ALLOW_PRIVILEGED', False):
+        return MOCK_SSO_USERS
+    return {
+        code: info for code, info in MOCK_SSO_USERS.items()
+        if code not in PRIVILEGED_MOCK_CODES
+    }
 
 
 class SsoLoginView(APIView):
@@ -238,11 +258,15 @@ class SsoLoginView(APIView):
 
     GET /api/auth/sso/login/
     功能：
-        - Mock 模式（仅本地 DEBUG）：返回可用测试码列表，前端可跳转到回调接口完成 SSO 模拟
-        - 正式模式：HTTP 302 重定向至学校统一认证页面
+        - Mock 模式（ENVIRONMENT=development/test 且 SSO_MOCK_ENABLED=True）：
+          返回可用测试码列表，前端选择后调用 POST /api/auth/sso/callback/ 完成模拟登录；
+          SSO_MOCK_ALLOW_PRIVILEGED=False（默认）时列表不含高权限账号
+        - 正式模式（配置了 SSO_LOGIN_URL）：返回 200 JSON，前端取 sso_url 跳转学校统一认证
+        - 未配置：返回 501
     返回：
-        - Mock: {"mock_codes": [...], "redirect_url_template": "..."}
-        - 正式: HTTP 302
+        - Mock: 200 {"mode": "mock", "mock_codes": [...], "usage": "..."}
+        - 正式: 200 {"mode": "redirect", "sso_url": "...", "detail": "..."}
+        - 未配置: 501 {"mode": "unconfigured", "detail": "..."}
     """
     permission_classes = [permissions.AllowAny]
 
@@ -252,7 +276,7 @@ class SsoLoginView(APIView):
         if is_mock:
             # Mock 模式：返回可用测试码，前端选择后构造回调请求
             mock_codes = []
-            for code, info in MOCK_SSO_USERS.items():
+            for code, info in _visible_mock_sso_users().items():
                 mock_codes.append({
                     'code': code,
                     'username': info['username'],
@@ -265,15 +289,19 @@ class SsoLoginView(APIView):
                 'usage': '使用任一 code 调用 POST /api/auth/sso/callback/ 即可登录',
             })
 
-        # 正式模式：重定向到学校 SSO
+        # 正式模式：返回学校统一认证地址，前端跳转
         sso_url = getattr(settings, 'SSO_LOGIN_URL', '')
         if sso_url:
             return Response(
-                {'detail': f'请访问学校统一认证: {sso_url}', 'sso_url': sso_url},
+                {
+                    'mode': 'redirect',
+                    'detail': f'请访问学校统一认证: {sso_url}',
+                    'sso_url': sso_url,
+                },
                 status=status.HTTP_200_OK,
             )
         return Response(
-            {'detail': 'SSO 登录暂未配置，请联系管理员'},
+            {'mode': 'unconfigured', 'detail': 'SSO 登录暂未配置，请联系管理员'},
             status=status.HTTP_501_NOT_IMPLEMENTED,
         )
 
@@ -284,12 +312,15 @@ class SsoCallbackView(APIView):
 
     POST /api/auth/sso/callback/
     功能：
-        - Mock 模式：接受 code 参数，自动创建/查找用户，签发 JWT
+        - Mock 模式（ENVIRONMENT=development/test 且 SSO_MOCK_ENABLED=True）：
+          接受 code 参数，自动创建/查找用户，签发 JWT；
+          SSO_MOCK_ALLOW_PRIVILEGED=False（默认）时高权限 code 视同无效拒绝
         - 正式模式：验证 SAML/OAuth 票据，签发 JWT
     参数：
         - code (string, required, Mock 模式): 测试用户码（见 GET /api/auth/sso/login/）
         - saml_response / code (string, required, 正式模式): SSO 认证票据
     返回：{"access": "...", "refresh": "...", "user": {...}}
+    错误：401 {"detail": "...", "code": "INVALID_SSO_CODE"}（code 无效或已被隐藏）
     """
     permission_classes = [permissions.AllowAny]
 
@@ -308,6 +339,7 @@ class SsoCallbackView(APIView):
     def _handle_mock_callback(self, request):
         """Mock 模式回调：根据 code 查找/创建用户并签发 JWT"""
         code = request.data.get('code') or request.query_params.get('code')
+        visible_users = _visible_mock_sso_users()
 
         if not code:
             write_login_log(
@@ -321,8 +353,10 @@ class SsoCallbackView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        user_info = MOCK_SSO_USERS.get(code)
+        user_info = visible_users.get(code)
         if not user_info:
+            # 特权 code 在 SSO_MOCK_ALLOW_PRIVILEGED=False 时同样走到这里，
+            # 与无效 code 一视同仁，不暴露其存在
             write_login_log(
                 request,
                 login_type='sso_mock',
@@ -333,7 +367,7 @@ class SsoCallbackView(APIView):
             return Response(
                 {
                     'detail': f'无效的 SSO 测试码: {code}',
-                    'available_codes': list(MOCK_SSO_USERS.keys()),
+                    'available_codes': list(visible_users.keys()),
                     'code': ErrorCode.INVALID_SSO_CODE.value,
                 },
                 status=status.HTTP_401_UNAUTHORIZED,
@@ -403,9 +437,10 @@ class SsoCallbackView(APIView):
 
             role = user_info.get('role', 'user')
 
-            # 创建新用户（SSO 用户无本地密码）
+            # 创建新用户（SSO 用户无本地密码，create_user 未传 password 即 unusable）。
+            # username 撞库时追加 _2/_3 后缀兜底，避免 IntegrityError 500
             user = User.objects.create_user(
-                username=user_info['username'],
+                username=_unique_username(user_info['username']),
                 email=user_info.get('email', ''),
                 first_name=user_info.get('first_name', ''),
                 last_name=user_info.get('last_name', ''),
@@ -414,8 +449,6 @@ class SsoCallbackView(APIView):
                 college=college,
                 department=department,
             )
-            user.set_unusable_password()
-            user.save(update_fields=['password'])
             return user, True
 
 
@@ -644,8 +677,6 @@ class DingtalkCallbackView(APIView):
                 role='user',
                 sso_uid=union_id,
             )
-            user.set_unusable_password()
-            user.save(update_fields=['password'])
             return user, True
 
 
@@ -768,8 +799,6 @@ class DingtalkRedirectView(APIView):
                 email=email, first_name=nick, last_name='',
                 nickname=nick, phone=mobile, role='user', sso_uid=union_id,
             )
-            user.set_unusable_password()
-            user.save(update_fields=['password'])
             return user, True
 
     @staticmethod
