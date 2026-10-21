@@ -140,3 +140,53 @@ def chunk_text_by_paragraphs(
         len(text), len(chunks), chunk_size, overlap,
     )
     return chunks
+
+
+def chunk_records(text: str, chunk_size: int = CHUNK_SIZE) -> List[dict]:
+    """记录级分块：按行对齐打包，绝不把一行（一条记录）裁断。
+
+    用于表格/名单类文档。每个分块由若干完整行拼成、总长不超过
+    chunk_size；单行超长时单独成块（宁肯块偏大也不切断一条记录），
+    字段语义不因分块而丢失。首行（表格概要，如「本表格共 N 条记录」）
+    保留为块 0，供计数类问题直接取精确总数。
+
+    Returns:
+        同 chunk_document() 格式的 [{chunk_index, content, char_count}, ...]
+    """
+    if not text or not text.strip():
+        return []
+
+    chunks = []
+    buf: List[str] = []
+    buf_len = 0
+    index = 0
+
+    for line in text.split('\n'):
+        line = line.rstrip()
+        if not line:
+            continue
+        line_len = len(line) + 1  # +1 换行符
+        if buf and buf_len + line_len > chunk_size:
+            chunks.append({
+                'chunk_index': index,
+                'content': '\n'.join(buf),
+                'char_count': buf_len - 1,  # 去掉最后多余的换行
+            })
+            index += 1
+            buf = []
+            buf_len = 0
+        buf.append(line)
+        buf_len += line_len
+
+    if buf:
+        chunks.append({
+            'chunk_index': index,
+            'content': '\n'.join(buf),
+            'char_count': buf_len - 1,
+        })
+
+    logger.info(
+        '记录级分块完成: 原文 %d 字符 → %d 块 (chunk_size=%d)',
+        len(text), len(chunks), chunk_size,
+    )
+    return chunks

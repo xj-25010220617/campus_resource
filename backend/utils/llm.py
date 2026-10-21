@@ -40,6 +40,17 @@ ALIYUN_EMBED_BASE_URL = getattr(
 # 本地模型（仅 EMBED_BACKEND=local 时生效）
 LOCAL_EMBED_MODEL = getattr(settings, 'LOCAL_EMBED_MODEL', 'BAAI/bge-base-zh-v1.5')
 
+# 本地 Embedding 模型单例：避免每次调用重新加载数百 MB 权重（实测每次 ~10s）
+_local_embed_model = None
+
+
+def _get_local_embed_model():
+    global _local_embed_model
+    if _local_embed_model is None:
+        from sentence_transformers import SentenceTransformer
+        _local_embed_model = SentenceTransformer(LOCAL_EMBED_MODEL)
+    return _local_embed_model
+
 # bge-v1.5 系列要求 query 侧加检索前缀，passage 侧不加
 BGE_QUERY_PREFIX = '为这个句子生成表示以用于检索相关文章：'
 
@@ -154,8 +165,7 @@ class LLMClient:
     def _embed_via_local(self, texts: List[str], is_query: bool = False) -> Optional[List[List[float]]]:
         """通过本地 sentence-transformers 模型获取向量。"""
         try:
-            from sentence_transformers import SentenceTransformer
-            model = SentenceTransformer(LOCAL_EMBED_MODEL)
+            model = _get_local_embed_model()
             if is_query:
                 texts = [BGE_QUERY_PREFIX + t for t in texts]
             embeddings = model.encode(texts, show_progress_bar=False)
