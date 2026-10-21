@@ -123,6 +123,48 @@ def _keyword_q(keywords, fields=('title', 'file_name')):
     return query
 
 
+# 路由从问句里抽到的类型词 → 模型 file_type 取值（见 KnowledgeDoc.FILE_TYPE_CHOICES）
+_FILE_TYPE_ALIASES = {
+    "pdf": "pdf",
+    "word": "doc", "doc": "doc", "docx": "doc",
+    "ppt": "ppt", "pptx": "ppt", "演示": "ppt", "演示文稿": "ppt",
+    "excel": "xls", "xls": "xls", "xlsx": "xls", "表格": "xls",
+    "图片": "image", "image": "image", "jpg": "image", "jpeg": "image",
+    "png": "image",
+    "视频": "video", "video": "video",
+    "音频": "audio", "audio": "audio",
+    "txt": "txt", "md": "md", "html": "html",
+}
+
+
+def _normalize_file_type(value) -> Optional[str]:
+    """把路由参数里的类型词归一成模型可过滤的取值；无法识别时返回 None。"""
+    if not value:
+        return None
+    return _FILE_TYPE_ALIASES.get(str(value).strip().lower())
+
+
+def _apply_type_filters(qs, file_type=None, category=None):
+    """应用已归一化的文件类型/分类过滤；无法识别的取值不参与过滤。"""
+    normalized = _normalize_file_type(file_type)
+    if normalized:
+        qs = qs.filter(file_type=normalized)
+    if category:
+        qs = qs.filter(category__name__icontains=category)
+    return qs
+
+
+def _filter_meta(file_type=None, category=None) -> dict:
+    """记录真正生效的过滤条件，便于回答层与测试核对。"""
+    applied = {}
+    normalized = _normalize_file_type(file_type)
+    if normalized:
+        applied["file_type"] = normalized
+    if category:
+        applied["category"] = category
+    return {"applied_filters": applied} if applied else {}
+
+
 def _range_meta(range_label: Optional[str], start_at=None, end_at=None) -> dict:
     return {
         "range_label": range_label or "全部时间",
@@ -139,6 +181,8 @@ def count_user_docs(
     end_at=None,
     range_label: Optional[str] = None,
     scope_label: Optional[str] = None,
+    file_type=None,
+    category=None,
 ) -> dict:
     """统计文档数（超管看全部，管理员看自己的+本学院，普通用户仅看自己的）。
 
@@ -147,6 +191,7 @@ def count_user_docs(
     """
     qs = _visible_docs_qs(user, mine_only=mine_only)
     qs = _apply_range(qs, start_at, end_at)
+    qs = _apply_type_filters(qs, file_type, category)
 
     total = qs.count()
     by_status = dict(qs.values_list("status").annotate(count=Count("id")))
@@ -156,6 +201,7 @@ def count_user_docs(
         "by_status": by_status,
         "scope_label": scope_label or ("本人上传" if mine_only else "当前账号可访问范围"),
         **_range_meta(range_label, start_at, end_at),
+        **_filter_meta(file_type, category),
     }
 
 
@@ -399,13 +445,17 @@ def list_docs_by_range(
     scope_label: Optional[str] = None,
     limit: int = 20,
     offset: int = 0,
+    file_type=None,
+    category=None,
 ) -> dict:
     """按上传时间区间列出文档（左闭右开），并返回截断信息。"""
     limit = max(1, min(int(limit or 20), 100))
     offset = max(0, int(offset or 0))
 
     qs = _visible_docs_qs(user, mine_only=mine_only)
-    qs = _apply_range(qs, start_at, end_at).select_related("uploader", "category")
+    qs = _apply_range(qs, start_at, end_at)
+    qs = _apply_type_filters(qs, file_type, category)
+    qs = qs.select_related("uploader", "category")
     total = qs.count()
     docs = list(qs.order_by("-created_at")[offset:offset + limit])
 
@@ -422,6 +472,7 @@ def list_docs_by_range(
         "items": items,
         "scope_label": scope_label or ("本人上传" if mine_only else "当前账号可访问范围"),
         **_range_meta(range_label, start_at, end_at),
+        **_filter_meta(file_type, category),
     }
     if has_more:
         result["notice"] = (
@@ -440,15 +491,19 @@ def count_docs_by_range(
     range_label: Optional[str] = None,
     mine_only: bool = False,
     scope_label: Optional[str] = None,
+    file_type=None,
+    category=None,
 ) -> dict:
     """按上传时间区间统计文档数量（左闭右开）。"""
     qs = _visible_docs_qs(user, mine_only=mine_only)
     qs = _apply_range(qs, start_at, end_at)
+    qs = _apply_type_filters(qs, file_type, category)
     return {
         "total": qs.count(),
         "by_status": dict(qs.values_list("status").annotate(count=Count("id"))),
         "scope_label": scope_label or ("本人上传" if mine_only else "当前账号可访问范围"),
         **_range_meta(range_label, start_at, end_at),
+        **_filter_meta(file_type, category),
     }
 
 
@@ -619,12 +674,23 @@ def execute_query(route: dict, user) -> dict:
             "scope_label": params.get("scope_label"),
         }
 
+    def _filter_kwargs():
+        # 只有真正支持类型/分类过滤的查询才传，避免上游参数被静默丢弃
+        return {
+            "file_type": params.get("file_type"),
+            "category": params.get("category"),
+        }
+
     try:
         if query_type == "count_docs":
-            return {"success": True, "data": count_user_docs(user, **_common_kwargs())}
+            return {"success": True, "data": count_user_docs(
+                user, **_common_kwargs(), **_filter_kwargs(),
+            )}
 
         elif query_type == "count_docs_by_range":
-            return {"success": True, "data": count_docs_by_range(user, **_common_kwargs())}
+            return {"success": True, "data": count_docs_by_range(
+                user, **_common_kwargs(), **_filter_kwargs(),
+            )}
 
         elif query_type == "list_docs_by_range":
             return {"success": True, "data": list_docs_by_range(
@@ -632,6 +698,7 @@ def execute_query(route: dict, user) -> dict:
                 limit=params.get("limit", 20),
                 offset=params.get("offset", 0),
                 **_common_kwargs(),
+                **_filter_kwargs(),
             )}
 
         elif query_type == "recent_docs":
@@ -652,6 +719,8 @@ def execute_query(route: dict, user) -> dict:
             return {"success": True, "data": get_doc_categories(user)}
 
         elif query_type in ("doc_upload_time", "doc_index_time"):
+            # 无法确定目标文件时返回 need_filename，由回答层要求补充文件名；
+            # 不能静默换成“按区间列出文件”的无关查询。
             data = get_doc_times(
                 user,
                 keywords=params.get("keywords"),
@@ -659,13 +728,6 @@ def execute_query(route: dict, user) -> dict:
                 limit=params.get("limit", 10),
                 **_common_kwargs(),
             )
-            if data.get("need_filename") and (params.get("start_at") or params.get("end_at")):
-                # 用户给了时间范围但没给文件名：按区间列出文件时间
-                data = list_docs_by_range(
-                    user,
-                    limit=params.get("limit", 20),
-                    **_common_kwargs(),
-                )
             return {"success": True, "data": data}
 
         elif query_type == "find_docs":
@@ -757,15 +819,20 @@ _SYSTEM_PROMPT_TEMPLATE = """你是成都东软学院的 AI 智能助手，负�
 - 所有 *_display 字段已经是北京时间，直接原样使用，禁止再加减时区或换算成 UTC。
 - range_start / range_end 是左闭右开区间（含开始，不含结束）；range_label 可直接引用。
 - scope_label 说明查询范围（如“本人上传”“当前账号可访问范围”）；不要扩大或缩小这个范围。
-- total/shown/truncated/notice 表示结果是否被截断；若 truncated=true，必须告知用户总数、
-  已展示数量以及“可能还有更多”，不要假装已列出全部。
-- need_filename=true：请让用户补充具体文件名；not_found=true：如实说明未找到或无权限访问。
-- ambiguous=true：存在多个同名/相近文件时，逐一列出文件名、上传人、上传时间让用户确认。
+- shown 是本次实际返回的条数，total 是符合条件的总条数；total 可能远大于 shown，
+  绝不能把 shown 当成总数（例如 shown=20、total=170 时必须说明“共 170 个，这里列出 20 个”）。
+- truncated=true 时要告知用户“可能还有更多”，不要假装已列出全部。
+- need_filename=true：说明还没确定是哪个文件，请用户补充具体文件名；不要猜测文件，也不要改列文件清单。
+- not_found=true：只代表“在当前查询条件（range_label、applied_filters、scope_label）下没有匹配”，
+  不能据此断言文件在整个数据库中不存在。
+- ambiguous=true：存在多个同名/相近文件时，逐一列出文件名、上传人、上传时间让用户确认，不要替用户选一个。
+- applied_filters：本次真正生效的类型/分类过滤；没有该字段表示未按类型或分类过滤。
 
-请根据以上数据直接回答用户的问题。如果数据为空或没有找到，如实告知用户。
+请根据以上数据直接回答用户的问题。数据为空时如实说明“在本次查询条件下没有找到”，不要编造文件或时间。
 回答要简洁、友好，使用中文。
 
-注意：每条数据包含 download_url 字段，是文件的下载链接。如果查询到文件，请将文件名用 download_url 链接包装展示给用户。"""
+下载链接规则：只有当某条数据的 download_url 是非空字符串时，才可以用它给文件名加链接；
+数据中没有 download_url 或为空时，只写文件名，禁止自行拼接、猜测或引用示例链接。"""
 
 
 def build_data_query_prompt(question: str, result: dict) -> list:

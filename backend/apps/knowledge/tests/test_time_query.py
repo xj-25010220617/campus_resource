@@ -13,7 +13,7 @@ from django.utils.dateparse import parse_datetime
 from apps.accounts.models import College, User
 from apps.chat.models import ChatMessage, Conversation
 from apps.chat.serializers import ChatMessageSerializer
-from apps.classify.models import Department
+from apps.classify.models import Category, Department
 from apps.knowledge.models import KnowledgeDoc
 from apps.knowledge.serializers import (
     KnowledgeDocListSerializer,
@@ -25,7 +25,12 @@ from utils.data_query import (
     get_doc_times,
     list_docs_by_range,
 )
-from utils.query_router import _extract_date_range, _extract_scope, route_question
+from utils.query_router import (
+    _extract_date_range,
+    _extract_file_keywords,
+    _extract_scope,
+    route_question,
+)
 from utils.sse import build_references_events
 from utils.timefmt import (
     day_bounds,
@@ -493,3 +498,321 @@ class DataQueryTests(TestCase):
         data = ChatMessageSerializer(msg).data
         self.assertEqual(data['references'][0]['created_at_display'], '2026-10-21 00:30:00')
         self.assertEqual(data['references'][0]['doc_title'], '旧文件')
+
+
+# ------------------------------------------------------------------
+# 文件名内部的日期不得被当作查询日期条件
+# ------------------------------------------------------------------
+
+FILENAME = '成都东软学院2025年学生培养成本专项审计报告'
+
+
+class FileNameDateParsingTests(TestCase):
+    def test_filename_with_extension_year_is_ignored(self):
+        self.assertIsNone(_extract_date_range(f'{FILENAME}.pdf是几点上传的'))
+
+    def test_quoted_filename_year_is_ignored(self):
+        self.assertIsNone(_extract_date_range(f'《{FILENAME}.pdf》是几点上传的'))
+
+    def test_filename_without_extension_year_is_ignored(self):
+        self.assertIsNone(_extract_date_range(f'{FILENAME}是几点上传的'))
+
+    def test_filename_with_full_date_is_ignored(self):
+        name = '成都东软学院2026年10月20日培训方案.pdf'
+        self.assertIsNone(_extract_date_range(f'{name}是几点上传的'))
+
+    def test_real_year_condition_still_works(self):
+        result = _extract_date_range('2025年有哪些文件上传了')
+        self.assertEqual(result['start_at'], '2025-01-01T00:00:00+08:00')
+        self.assertEqual(result['end_at'], '2026-01-01T00:00:00+08:00')
+
+    def test_real_month_condition_still_works(self):
+        result = _extract_date_range('2025年10月有哪些文件上传了')
+        self.assertEqual(result['start_at'], '2025-10-01T00:00:00+08:00')
+        self.assertEqual(result['end_at'], '2025-11-01T00:00:00+08:00')
+
+    def test_real_full_date_condition_still_works(self):
+        result = _extract_date_range('2026年10月20日上传了哪些文件')
+        self.assertEqual(result['start_at'], '2026-10-20T00:00:00+08:00')
+        self.assertEqual(result['end_at'], '2026-10-21T00:00:00+08:00')
+
+    def test_year_outside_filename_is_kept(self):
+        # 只屏蔽文件名片段，不删除用户真正的年份条件
+        result = _extract_date_range('2025年上传的《审计报告.pdf》都有哪些')
+        self.assertEqual(result['start_at'], '2025-01-01T00:00:00+08:00')
+
+    def test_leading_instruction_does_not_break_year(self):
+        result = _extract_date_range('请问2025年上传了多少文件')
+        self.assertEqual(result['start_at'], '2025-01-01T00:00:00+08:00')
+
+    def test_yesterday_with_filename_still_keeps_range(self):
+        # 用户明确表达的相对日期必须保留
+        with patch('django.utils.timezone.now', return_value=FIXED_NOW):
+            result = _extract_date_range('昨天上传的文件中，审计报告.pdf 是几点上传的')
+        self.assertEqual(result['start_at'], '2026-10-20T00:00:00+08:00')
+        self.assertEqual(result['end_at'], '2026-10-21T00:00:00+08:00')
+
+    def test_extension_token_is_not_a_file_keyword(self):
+        keywords = _extract_file_keywords(f'{FILENAME}.pdf是几点上传的')
+        self.assertIn('学生培养成本专项审计报告', keywords)
+        self.assertNotIn('pdf', [item.lower() for item in keywords])
+
+
+class FileNameRouteTests(TestCase):
+    def test_full_filename_routes_to_upload_time_without_date_filter(self):
+        route = route_question(f'{FILENAME}.pdf是几点上传的')
+        self.assertEqual(route['query_type'], 'doc_upload_time')
+        self.assertNotIn('start_at', route['params'])
+        self.assertNotIn('end_at', route['params'])
+        self.assertIn('学生培养成本专项审计报告', route['params']['keywords'])
+        self.assertNotIn('pdf', [k.lower() for k in route['params']['keywords']])
+        # 精确文件时间查询不应生成下游不支持的假过滤
+        self.assertNotIn('file_type', route['params'])
+
+    def test_quoted_full_filename_routes_the_same_way(self):
+        route = route_question(f'《{FILENAME}.pdf》是几点上传的')
+        self.assertEqual(route['query_type'], 'doc_upload_time')
+        self.assertNotIn('start_at', route['params'])
+        self.assertEqual(route['params']['keywords'], [f'{FILENAME}.pdf'])
+
+    def test_filename_without_extension_routes_to_upload_time(self):
+        route = route_question(f'{FILENAME}是几点上传的')
+        self.assertEqual(route['query_type'], 'doc_upload_time')
+        self.assertNotIn('start_at', route['params'])
+
+    def test_index_time_question_routes_to_index_query(self):
+        route = route_question(f'{FILENAME}.pdf是什么时候完成索引的')
+        self.assertEqual(route['query_type'], 'doc_index_time')
+        self.assertNotIn('start_at', route['params'])
+
+    def test_year_list_question_is_still_a_range_list(self):
+        route = route_question('2025年有哪些文件上传了')
+        self.assertEqual(route['query_type'], 'list_docs_by_range')
+        self.assertEqual(route['params']['start_at'], '2025-01-01T00:00:00+08:00')
+
+    def test_month_list_question_is_still_a_range_list(self):
+        route = route_question('2025年10月有哪些文件上传了')
+        self.assertEqual(route['query_type'], 'list_docs_by_range')
+        self.assertEqual(route['params']['start_at'], '2025-10-01T00:00:00+08:00')
+
+    def test_explicit_range_with_filename_is_kept(self):
+        with patch('django.utils.timezone.now', return_value=FIXED_NOW):
+            route = route_question('昨天上传的文件中，审计报告.pdf 是几点上传的')
+        self.assertEqual(route['query_type'], 'doc_upload_time')
+        self.assertEqual(route['params']['start_at'], '2026-10-20T00:00:00+08:00')
+        self.assertIn('审计报告', route['params']['keywords'])
+
+    def test_bare_file_reference_keeps_need_filename_path(self):
+        route = route_question('这个文件是几点上传的')
+        self.assertEqual(route['query_type'], 'doc_upload_time')
+        self.assertNotIn('keywords', route['params'])
+
+
+class FileNameQueryTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.college = College.objects.create(name='计算机学院', code='CS')
+        cls.category = Category.objects.create(name='培养方案')
+        cls.admin = User.objects.create_user(
+            username='admin_fn', password='x', role='admin', college=cls.college,
+        )
+
+    def _doc(
+        self, title, created_at, file_type='pdf', category=None,
+        file_name=None, uploader=None,
+    ):
+        doc = KnowledgeDoc.objects.create(
+            title=title,
+            description='',
+            source_type='upload',
+            file_name=file_name or f'{title}.pdf',
+            file_type=file_type,
+            visibility='public',
+            college=self.college,
+            category=category,
+            uploader=uploader or self.admin,
+            status='indexed',
+        )
+        KnowledgeDoc.objects.filter(pk=doc.pk).update(created_at=created_at)
+        doc.refresh_from_db()
+        return doc
+
+    def test_file_with_year_in_name_is_found(self):
+        target = self._doc(
+            FILENAME, beijing_to_utc(2026, 10, 20, 11, 35, 20),
+            file_name=f'{FILENAME}.pdf',
+        )
+        result = execute_query(
+            route_question(f'{FILENAME}.pdf是几点上传的'), self.admin,
+        )
+        data = result['data']
+        self.assertTrue(result['success'])
+        self.assertFalse(data['not_found'])
+        self.assertEqual(data['total'], 1)
+        self.assertEqual(data['matches'][0]['id'], target.id)
+        self.assertEqual(data['matches'][0]['created_at_display'], '2026-10-20 11:35:20')
+
+    def test_quoted_filename_also_finds_the_file(self):
+        target = self._doc(
+            FILENAME, beijing_to_utc(2026, 10, 20, 11, 35, 20),
+            file_name=f'{FILENAME}.pdf',
+        )
+        data = execute_query(
+            route_question(f'《{FILENAME}.pdf》是几点上传的'), self.admin,
+        )['data']
+        self.assertEqual(data['total'], 1)
+        self.assertEqual(data['matches'][0]['id'], target.id)
+
+    def test_extension_token_does_not_widen_candidates(self):
+        target = self._doc(
+            FILENAME, beijing_to_utc(2026, 10, 20, 11, 0),
+            file_name=f'{FILENAME}.pdf',
+        )
+        # 只有扩展名相同、文件名主体无关的文件不能被当作候选
+        self._doc('无关文档', beijing_to_utc(2026, 10, 20, 12, 0),
+                  file_name='无关文档.pdf')
+        data = execute_query(
+            route_question(f'{FILENAME}.pdf是几点上传的'), self.admin,
+        )['data']
+        self.assertEqual(data['total'], 1)
+        self.assertEqual(data['matches'][0]['id'], target.id)
+
+    def test_missing_filename_returns_need_filename_not_a_list(self):
+        self._doc('昨天报告', beijing_to_utc(2026, 10, 20, 9, 0))
+        result = execute_query(
+            route_question('这个文件是几点上传的'), self.admin,
+        )
+        data = result['data']
+        self.assertTrue(result['success'])
+        self.assertTrue(data['need_filename'])
+        self.assertNotIn('items', data)  # 不得静默退化成文件列表
+        self.assertNotIn('not_found', data)
+
+    def test_not_found_is_distinct_from_query_error(self):
+        missing = execute_query(
+            route_question('完全不存在的东西.pdf是几点上传的'), self.admin,
+        )
+        self.assertTrue(missing['success'])
+        self.assertTrue(missing['data']['not_found'])
+
+        broken = execute_query({
+            'query_type': 'doc_upload_time',
+            'params': {'keywords': ['x'], 'start_at': 'not-a-date'},
+        }, self.admin)
+        self.assertFalse(broken['success'])
+        self.assertIn('start_at', broken['error'])
+
+    def test_explicit_date_still_constrains_the_file_query(self):
+        # 若用户明确说“昨天上传的”，今天上传的文件不应被当成答案
+        self._doc(
+            '审计报告', beijing_to_utc(2026, 10, 21, 8, 0),
+            file_name='审计报告.pdf',
+        )
+        with patch('django.utils.timezone.now', return_value=FIXED_NOW):
+            data = execute_query(
+                route_question('昨天上传的文件中，审计报告.pdf 是几点上传的'),
+                self.admin,
+            )['data']
+        self.assertTrue(data['not_found'])
+        self.assertEqual(data['range_label'], '昨天（2026-10-20）')
+
+    def test_file_type_filter_is_applied_in_range_list(self):
+        pdf_doc = self._doc('昨天课件', beijing_to_utc(2026, 10, 20, 9, 0))
+        word_doc = self._doc(
+            '昨天教案', beijing_to_utc(2026, 10, 20, 10, 0),
+            file_type='doc', file_name='昨天教案.docx',
+        )
+        with patch('django.utils.timezone.now', return_value=FIXED_NOW):
+            route = route_question('昨天上传了哪些Word文件')
+            self.assertEqual(route['query_type'], 'list_docs_by_range')
+            self.assertEqual(route['params']['file_type'], 'word')
+            data = execute_query(route, self.admin)['data']
+        self.assertEqual([item['id'] for item in data['items']], [word_doc.id])
+        self.assertEqual(data['applied_filters'], {'file_type': 'doc'})
+        self.assertNotIn(pdf_doc.id, [item['id'] for item in data['items']])
+
+    def test_category_filter_is_applied_in_range_count(self):
+        self._doc(
+            '昨天的培养方案', beijing_to_utc(2026, 10, 20, 9, 0),
+            category=self.category,
+        )
+        self._doc('昨天的其他文件', beijing_to_utc(2026, 10, 20, 10, 0))
+        with patch('django.utils.timezone.now', return_value=FIXED_NOW):
+            route = route_question('昨天上传了多少个培养方案文件')
+            self.assertEqual(route['query_type'], 'count_docs_by_range')
+            data = execute_query(route, self.admin)['data']
+        self.assertEqual(data['total'], 1)
+        self.assertEqual(data['applied_filters'], {'category': '培养方案'})
+
+    def test_unknown_file_type_does_not_filter_everything_out(self):
+        # 无法归一的类型词不能被当成“过滤到 0 条”
+        self._doc('昨天的报告', beijing_to_utc(2026, 10, 20, 9, 0))
+        data = list_docs_by_range(
+            self.admin,
+            start_at='2026-10-20T00:00:00+08:00',
+            end_at='2026-10-21T00:00:00+08:00',
+            mine_only=True,
+            file_type='不存在的类型',
+        )
+        self.assertEqual(data['total'], 1)
+        self.assertNotIn('applied_filters', data)
+
+
+class DataAnswerPromptTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.college = College.objects.create(name='计算机学院', code='CS')
+        cls.admin = User.objects.create_user(
+            username='admin_prompt', password='x', role='admin', college=cls.college,
+        )
+
+    def _doc(self, title, created_at):
+        doc = KnowledgeDoc.objects.create(
+            title=title, description='', source_type='upload',
+            file_name=f'{title}.pdf', file_type='pdf', visibility='public',
+            college=self.college, uploader=self.admin, status='indexed',
+        )
+        KnowledgeDoc.objects.filter(pk=doc.pk).update(created_at=created_at)
+        return doc
+
+    def test_list_result_has_no_download_url_field(self):
+        self._doc('昨天报告', beijing_to_utc(2026, 10, 20, 9, 0))
+        with patch('django.utils.timezone.now', return_value=FIXED_NOW):
+            data = execute_query(
+                route_question('昨天上传了哪些文件'), self.admin,
+            )['data']
+        self.assertTrue(data['items'])
+        for item in data['items']:
+            self.assertNotIn('download_url', item)
+
+    def test_prompt_does_not_claim_download_url_always_exists(self):
+        self._doc('昨天报告', beijing_to_utc(2026, 10, 20, 9, 0))
+        with patch('django.utils.timezone.now', return_value=FIXED_NOW):
+            result = execute_query(route_question('昨天上传了哪些文件'), self.admin)
+        system = build_data_query_prompt('昨天上传了哪些文件', result)[0]['content']
+        self.assertIn('download_url', system)
+        self.assertIn('禁止自行拼接', system)
+        self.assertNotIn('每条数据包含 download_url 字段', system)
+
+    def test_prompt_explains_shown_vs_total(self):
+        for i in range(25):
+            self._doc(
+                f'批量文件{i}',
+                beijing_to_utc(2026, 10, 20, 8, 0) + timedelta(minutes=i),
+            )
+        with patch('django.utils.timezone.now', return_value=FIXED_NOW):
+            result = execute_query(route_question('昨天上传了哪些文件'), self.admin)
+        self.assertEqual(result['data']['total'], 25)
+        self.assertEqual(result['data']['shown'], 20)
+        system = build_data_query_prompt('昨天上传了哪些文件', result)[0]['content']
+        self.assertIn('绝不能把 shown 当成总数', system)
+
+    def test_prompt_forbids_claiming_db_wide_absence(self):
+        result = execute_query(
+            route_question('完全不存在的东西.pdf是几点上传的'), self.admin,
+        )
+        self.assertTrue(result['data']['not_found'])
+        system = build_data_query_prompt(
+            '完全不存在的东西.pdf是几点上传的', result,
+        )[0]['content']
+        self.assertIn('不能据此断言文件在整个数据库中不存在', system)

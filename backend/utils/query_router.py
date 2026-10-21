@@ -111,6 +111,26 @@ _MONTH_RE = re.compile(r"((?:19|20)\d{2})\s*[年\-/.]\s*(\d{1,2})\s*月")
 _MONTH_NUM_RE = re.compile(r"((?:19|20)\d{2})\s*[-/.]\s*(\d{1,2})(?!\d)")
 _YEAR_RE = re.compile(r"((?:19|20)\d{2})\s*年")
 
+# 文件名片段：书名号/引号包裹的内容，以及带常见扩展名的连续片段。
+# 仅在解析日期前使用，避免“XX学院2025年审计报告.pdf”里的年份被当成查询区间；
+# 原问题与文件名关键词提取不受影响。
+_FILE_EXTENSIONS = (
+    r"pdf|docx?|xlsx?|pptx?|txt|md|csv|zip|rar|7z|"
+    r"jpe?g|png|gif|bmp|webp|mp4|mp3|wav"
+)
+_QUOTED_FRAGMENT_RE = re.compile(r"《[^》]{1,80}》|“[^”]{1,80}”|\"[^\"]{1,80}\"")
+_FILE_FRAGMENT_RE = re.compile(
+    r"[^\s，。！？、；：,.!?;:（）()\[\]【】《》“”\"']{1,80}"
+    # 不能用 \b：中文也属于 Unicode 单词字符，“.pdf是”之间没有词边界
+    r"\.(?:" + _FILE_EXTENSIONS + r")(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+# 问句开头的指令词：去掉后句首的“2025年”才能继续被识别为日期条件
+_LEADING_INSTRUCTION_RE = re.compile(
+    r"^(?:\s*(?:请问|麻烦|帮我|帮忙|请|查一下|查查|查询|查看|查|告诉我|"
+    r"我想知道|我想查|看看|显示|列出|统计|搜索|搜一下|找一下|找))+"
+)
+
 _RELATIVE_RANGE_RE = re.compile(
     r"(今年|本年度|本年|去年|上一年度|上一年|"
     r"本月|这个月|当月|上月|上个月|"
@@ -156,15 +176,31 @@ def _range_payload(start, end, label: str) -> dict:
     }
 
 
+def _date_condition_text(question: str) -> str:
+    """把明确引用/带扩展名的文件名片段替换为空格，只用于日期解析。
+
+    不修改原始问题，也不影响文件名关键词提取；目的是区分
+    “文件名里的日期”和“用户真正表达的日期条件”。
+    """
+    text = _QUOTED_FRAGMENT_RE.sub(" ", question)
+    text = _FILE_FRAGMENT_RE.sub(" ", text)
+    return _LEADING_INSTRUCTION_RE.sub(" ", text)
+
+
 def _extract_date_range(question: str, now: Optional[datetime] = None) -> Optional[dict]:
     """从自然语言问题中解析业务时区日期区间。
 
     支持：明确日期、明确年月、今天/昨天/前天、本周/上周、
     本月/上月、今年/去年、近 N 天/周/月，以及默认 30 天的“最近”。
     无法识别的日期返回 None，不猜测。
+
+    文件名内部的日期不算日期条件：解析前先屏蔽书名号/引号和带扩展名的文件片段；
+    在“某文件是几点上传的”这类精确时间问题里，孤立的一个“YYYY年”同样按文件名
+    的一部分处理（真正的日期条件请用相对时间或完整年月日表达）。
     """
     # naive datetime 按项目约定解释为业务时区，避免 localdate 直接抛 ValueError
     today = timezone.localdate(to_business_time(now) if now is not None else None)
+    question = _date_condition_text(question)
 
     match = _FULL_DATE_RE.search(question)
     if match:
@@ -244,6 +280,11 @@ def _extract_date_range(question: str, now: Optional[datetime] = None) -> Option
         label = f"最近{days}天（{start.date().isoformat()} 至 {today.isoformat()}）"
         return _range_payload(start, end, label)
 
+    if _is_doc_time_question(question):
+        # 精确文件时间问题里，孤立的“YYYY年”通常来自文件名（如“2025年审计报告”），
+        # 不应据此过滤；列表/统计问题仍然按年份解析。
+        return None
+
     match = _YEAR_RE.search(question)
     if match:
         year = int(match.group(1))
@@ -317,6 +358,13 @@ _FILE_KEYWORD_NOISE_RE = re.compile(
 )
 
 
+_EXTENSION_TOKENS = {
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "md",
+    "csv", "zip", "rar", "7z", "jpg", "jpeg", "png", "gif", "bmp",
+    "webp", "mp4", "mp3", "wav",
+}
+
+
 def _extract_file_keywords(question: str) -> list:
     """提取指定文件名/标题关键词，用于精确回答某个文件的时间。"""
     quoted = re.findall(r"[《“\"]([^》”\"]{1,80})[》”\"]", question)
@@ -334,6 +382,9 @@ def _extract_file_keywords(question: str) -> list:
     for token in re.split(r"\s+", text):
         token = token.strip("-_")
         if not token:
+            continue
+        # 纯扩展名（如 ".pdf" 被切出来的 "pdf"）不是文件名主体，参与 OR 匹配会扩大候选集
+        if token.lower() in _EXTENSION_TOKENS:
             continue
         if len(token) >= 2 or re.fullmatch(r"[A-Za-z0-9]+", token):
             tokens.append(token)
@@ -384,13 +435,26 @@ def _has_doc_reference(question: str) -> bool:
     ))
 
 
-def _build_params(question: str, date_range: Optional[dict], scope: tuple) -> dict:
+def _build_params(
+    question: str,
+    date_range: Optional[dict],
+    scope: tuple,
+    allow_type_filters: bool = True,
+) -> dict:
+    """组装查询参数。
+
+    allow_type_filters=False 用于精确文件时间查询：该分支按文件名匹配，
+    下游不接受 category/file_type，生成它们只会造成“看起来生效”的假过滤。
+    """
     mine_only, scope_label = scope
     params = {}
     if date_range:
         params.update(date_range)
     params["mine_only"] = mine_only
     params["scope_label"] = scope_label
+
+    if not allow_type_filters:
+        return params
 
     category_match = re.search(
         r"(教学课件|试题库|实验指导|规章制度|培养方案|"
@@ -426,9 +490,16 @@ def route_question(question: str, user=None) -> dict:
     is_time_question = _is_doc_time_question(question)
 
     # 1. 明确指向某个文件的时间问题：上传时间 / 索引完成时间
-    if is_time_question and (_has_doc_reference(question) or not date_range):
-        params = _build_params(question, date_range, scope)
-        keywords = _extract_file_keywords(question)
+    #    只要问题里能提取到文件名关键词（或书名号/“这个文件”等指代），就优先走精确查询；
+    #    不能仅因为出现了年份就降级成年度文件列表。
+    file_keywords = _extract_file_keywords(question)
+    if is_time_question and (
+        file_keywords or _has_doc_reference(question) or not date_range
+    ):
+        params = _build_params(
+            question, date_range, scope, allow_type_filters=False,
+        )
+        keywords = file_keywords
         if keywords:
             params["keywords"] = keywords
         if _INDEX_VERB_RE.search(question):
