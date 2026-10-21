@@ -317,6 +317,24 @@ def _summarize_history(history: List[dict]) -> Optional[str]:
     return None
 
 
+def _format_upload_time(value) -> str:
+    """把文档 created_at（UTC aware）格式化为北京时间字符串；空值/异常返回空串。
+
+    背景：USE_TZ=True 时 MySQL 存 UTC，LLM 若拿不到准确时间会编造回答（如问"文件几点上传的"），
+    因此参考资料块中注入按 TIME_ZONE（Asia/Shanghai）转换后的本地时间。
+    """
+    if not value:
+        return ''
+    try:
+        from django.utils import timezone as dj_tz
+        if dj_tz.is_aware(value):
+            value = dj_tz.localtime(value)
+        return value.strftime('%Y-%m-%d %H:%M')
+    except Exception as e:
+        logger.debug('上传时间格式化失败 value=%s: %s', value, e)
+        return ''
+
+
 def build_rag_prompt(
     question: str,
     chunks: List[dict],
@@ -337,6 +355,15 @@ def build_rag_prompt(
     """
     ref_lines = []
     total_chars = 0
+    # 按 doc_id 批量取上传时间（一次 IN 查询），注入参考资料块，
+    # 让 LLM 对"文件什么时候上传的"类问题有据可答，避免编造时间。
+    doc_ids = [c.get('doc_id') for c in chunks if c.get('doc_id')]
+    upload_times = {}
+    if doc_ids:
+        from apps.knowledge.models import KnowledgeDoc
+        upload_times = dict(
+            KnowledgeDoc.objects.filter(id__in=doc_ids).values_list('id', 'created_at'),
+        )
     for i, chunk in enumerate(chunks, 1):
         title = chunk.get('doc_title', '未知文档')
         page = chunk.get('page', 0)
@@ -344,6 +371,9 @@ def build_rag_prompt(
         ref_block = f'### 参考资料{i}（来源：{title}'
         if page:
             ref_block += f' 第{page}页'
+        upload_time = _format_upload_time(upload_times.get(chunk.get('doc_id')))
+        if upload_time:
+            ref_block += f'，上传时间：{upload_time}'
         ref_block += f'）\n{content}'
         total_chars += len(ref_block)
         if total_chars > max_chars:
