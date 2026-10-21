@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 _DOC_CONTEXT_MAX_TURNS = 2
 _DOC_TIME_QUERY_TYPES = ('doc_upload_time', 'doc_index_time')
 _DOC_CONTEXT_REPLAY_TYPES = (
-    'doc_upload_time', 'doc_index_time', 'list_docs_by_range',
+    'doc_upload_time', 'doc_index_time', 'list_docs_by_range', 'find_docs',
 )
 
 

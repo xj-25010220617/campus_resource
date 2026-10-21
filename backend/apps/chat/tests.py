@@ -421,6 +421,173 @@ class QueryLogWindowTests(ChatContextTestBase):
         self.assertIn('当前状态为 need_filename', system)
 
 
+class FindDocsContextTests(ChatContextTestBase):
+    """第一轮结构化 find_docs 后追问上传时间。
+
+    这些用例真实经过 route_question / AskView.post / _resolve_doc_context，
+    不手工伪造 QueryLog，以覆盖“第一轮不是 RAG”的真实路由。
+    """
+
+    def _find_docs_question(self, name):
+        return f'帮我查一下《{name}》'
+
+    def test_first_turn_is_find_docs_and_writes_no_query_log(self):
+        self._doc(
+            FILE_A, self.admin_a, beijing(2026, 10, 6, 9, 0),
+            college=self.college_a,
+        )
+        conv = self._conv(self.admin_a)
+        question = self._find_docs_question(FILE_A)
+        # 先确认这条话术在真实路由里就是结构化 find_docs，而非 RAG
+        self.assertEqual(
+            route_question(question, self.admin_a)['query_type'], 'find_docs',
+        )
+
+        response, captured = self._ask(self.admin_a, conv, question)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(FILE_A, self._system(captured))
+        # find_docs 走结构化分支，不会写 RAG 使用的 QueryLog
+        self.assertFalse(QueryLog.objects.filter(conversation=conv).exists())
+
+    def test_followup_after_unique_find_docs_hit_inherits_doc(self):
+        doc = self._doc(
+            FILE_A, self.admin_a, beijing(2026, 10, 6, 9, 0),
+            college=self.college_a,
+        )
+        conv = self._conv(self.admin_a)
+        first, _ = self._ask(
+            self.admin_a, conv, self._find_docs_question(FILE_A),
+        )
+        self.assertEqual(first.status_code, 200)
+
+        response, captured = self._ask(
+            self.admin_a, conv, '这个文件是什么时候上传的',
+        )
+        self.assertEqual(response.status_code, 200)
+        system = self._system(captured)
+        self.assertIn('2026-10-06 09:00:00', system)
+        self.assertIn(FILE_A, system)
+        self.assertNotIn('当前状态为 need_filename', system)
+        self.assertTrue(KnowledgeDoc.objects.filter(pk=doc.pk).exists())
+
+    def test_followup_after_multiple_find_docs_hits_requires_clarification(self):
+        self._doc(
+            FILE_A, self.admin_a, beijing(2026, 10, 7, 9, 0),
+            college=self.college_a,
+        )
+        self._doc(
+            FILE_B, self.admin_a, beijing(2026, 10, 8, 9, 0),
+            college=self.college_a,
+        )
+        conv = self._conv(self.admin_a)
+        first, _ = self._ask(
+            self.admin_a, conv, '帮我查一下《成都东软学院》相关文件',
+        )
+        self.assertEqual(first.status_code, 200)
+
+        response, captured = self._ask(
+            self.admin_a, conv, '这个文件是什么时候上传的',
+        )
+        self.assertEqual(response.status_code, 200)
+        system = self._system(captured)
+        self.assertIn('当前状态为 ambiguous', system)
+        # 不擅自选择其中一份，也不向用户罗列候选文件名
+        self.assertNotIn(FILE_A, system)
+        self.assertNotIn(FILE_B, system)
+        self.assertNotIn('2026-10-07 09:00:00', system)
+        self.assertNotIn('2026-10-08 09:00:00', system)
+
+    def test_followup_after_zero_find_docs_hit_asks_filename(self):
+        conv = self._conv(self.admin_a)
+        first, _ = self._ask(
+            self.admin_a, conv, self._find_docs_question('不存在的文档名称'),
+        )
+        self.assertEqual(first.status_code, 200)
+
+        response, captured = self._ask(
+            self.admin_a, conv, '这个文件是什么时候上传的',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('当前状态为 need_filename', self._system(captured))
+
+    def test_find_docs_context_respects_permission_change(self):
+        doc = self._doc(
+            FILE_A, self.admin_a, beijing(2026, 10, 9, 9, 0),
+            college=self.college_a,
+        )
+        conv = self._conv(self.admin_a)
+        self._ask(self.admin_a, conv, self._find_docs_question(FILE_A))
+
+        # 改属外院并更换上传人：admin_a 当前不再可见
+        KnowledgeDoc.objects.filter(pk=doc.pk).update(
+            college=self.college_b, uploader=self.admin_b,
+        )
+
+        response, captured = self._ask(
+            self.admin_a, conv, '这个文件是什么时候上传的',
+        )
+        self.assertEqual(response.status_code, 200)
+        system = self._system(captured)
+        self.assertIn('当前状态为 need_filename', system)
+        self.assertNotIn(FILE_A, system)
+        self.assertNotIn('2026-10-09 09:00:00', system)
+
+    def test_find_docs_context_respects_doc_deletion(self):
+        doc = self._doc(
+            FILE_A, self.admin_a, beijing(2026, 10, 10, 9, 0),
+            college=self.college_a,
+        )
+        conv = self._conv(self.admin_a)
+        self._ask(self.admin_a, conv, self._find_docs_question(FILE_A))
+        doc.delete()
+
+        response, captured = self._ask(
+            self.admin_a, conv, '这个文件是什么时候上传的',
+        )
+        self.assertEqual(response.status_code, 200)
+        system = self._system(captured)
+        self.assertIn('当前状态为 need_filename', system)
+        self.assertNotIn(FILE_A, system)
+
+    def test_find_docs_context_is_conversation_scoped(self):
+        self._doc(
+            FILE_A, self.admin_a, beijing(2026, 10, 11, 9, 0),
+            college=self.college_a,
+        )
+        old_conv = self._conv(self.admin_a, '旧会话')
+        self._ask(self.admin_a, old_conv, self._find_docs_question(FILE_A))
+
+        new_conv = self._conv(self.admin_a, '新会话')
+        response, captured = self._ask(
+            self.admin_a, new_conv, '这个文件是什么时候上传的',
+        )
+        self.assertEqual(response.status_code, 200)
+        system = self._system(captured)
+        self.assertIn('当前状态为 need_filename', system)
+        self.assertNotIn(FILE_A, system)
+
+    def test_ordinary_user_find_docs_scope_not_expanded(self):
+        # 文档属于管理员；普通用户的结构化可见范围只有本人上传
+        self._doc(
+            FILE_A, self.admin_a, beijing(2026, 10, 12, 9, 0),
+            college=self.college_a,
+        )
+        conv = self._conv(self.normal)
+        first, _ = self._ask(
+            self.normal, conv, self._find_docs_question(FILE_A),
+        )
+        self.assertEqual(first.status_code, 200)
+
+        response, captured = self._ask(
+            self.normal, conv, '这个文件是什么时候上传的',
+        )
+        self.assertEqual(response.status_code, 200)
+        system = self._system(captured)
+        self.assertIn('当前状态为 need_filename', system)
+        self.assertNotIn(FILE_A, system)
+        self.assertNotIn('2026-10-12 09:00:00', system)
+
+
 class VoiceIsolationTests(ChatContextTestBase):
     """语音入口仍调用共享旧函数，行为必须保持原样。"""
 
@@ -471,6 +638,16 @@ class VoiceIsolationTests(ChatContextTestBase):
         for helper in (
             'route_text_question', 'build_text_data_query_prompt',
             'annotate_doc_time_status', '_resolve_doc_context',
+        ):
+            self.assertNotIn(helper, source)
+
+    def test_voice_view_class_has_no_text_context_calls(self):
+        # post 与 _stream_answer 都不能接入文字入口的上下文解析/状态标注
+        source = inspect.getsource(chat_views.VoiceAskView)
+        for helper in (
+            'route_text_question', 'build_text_data_query_prompt',
+            'annotate_doc_time_status', '_resolve_doc_context',
+            '_turn_doc_context', '_is_text_time_followup',
         ):
             self.assertNotIn(helper, source)
 
