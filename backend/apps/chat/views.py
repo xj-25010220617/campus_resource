@@ -19,6 +19,7 @@ from utils import rag
 from utils.llm import llm_client, LLMTimeoutError
 from utils.sensitive_filter import check_sensitive
 from utils.sse import _format_sse, build_images_events, build_references_events
+from utils.timefmt import format_business_time, to_iso
 from utils.error_codes import ErrorCode
 from apps.classify.utils.query_parser import parse as parse_query
 
@@ -229,6 +230,11 @@ class MessageViewSet(ModelViewSet):
                 continue
             doc = queryset.get(id=doc_id)
             item['content_snippet'] = snippet_map.get(doc_id, '')
+            # 上传时间与索引完成时间分开返回（均为北京时间展示值 + ISO 原值）
+            item['created_at'] = to_iso(doc.created_at)
+            item['created_at_display'] = format_business_time(doc.created_at)
+            item['indexed_at'] = to_iso(doc.indexed_at)
+            item['indexed_at_display'] = format_business_time(doc.indexed_at)
             item['freshness_date'] = (
                 doc.freshness_date.isoformat() if doc.freshness_date else None
             )
@@ -1091,11 +1097,18 @@ class VoiceAskView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # 语音通道与文本通道复用同一套意图路由：时间/文件管理问题走确定性数据库查询，
+        # 不交给 RAG 或模型猜时间。
+        from utils.query_router import route_question
+        from utils.data_query import execute_query, build_data_query_prompt
+        route = route_question(question, user)
+        is_data_query = route['type'] == 'data_query'
+
         user_context = {
             'user_id': user.id, 'role': user.role,
             'college_id': user.college_id, 'department_id': user.department_id,
         }
-        parsed = parse_query(question, user_context)
+        parsed = {} if is_data_query else parse_query(question, user_context)
 
         # 处理或创建会话
         if conversation_id:
@@ -1120,6 +1133,30 @@ class VoiceAskView(APIView):
             try:
                 # 1. 推送 ASR 识别结果（语音转文字）
                 yield _format_sse('asr_text', {'text': question})
+
+                # 1.1 文件管理/时间类问题：确定性数据库查询，不走向量检索
+                if is_data_query:
+                    query_result = execute_query(route, user)
+                    messages = build_data_query_prompt(question, query_result)
+                    collected = []
+                    for token in llm_client.chat_stream(
+                        messages, temperature=0.3, max_tokens=1024,
+                    ):
+                        if token and first_ts is None:
+                            first_ts = time.time()
+                        if token:
+                            collected.append(token)
+                            yield _format_sse('token', {'content': token})
+                    full_answer = ''.join(collected)
+                    ai_msg = ChatMessage.objects.create(
+                        conversation=conv, role='assistant', content=full_answer,
+                    )
+                    ai_msg_ref[0] = ai_msg
+                    log.hit_count = 0
+                    log.response_ms = int((first_ts - t0) * 1000) if first_ts else 0
+                    log.save()
+                    yield _format_sse('done', {'message_id': ai_msg.id})
+                    return
 
                 # 2. RAG 检索（在 asr_text 推送之后执行）
                 hits = rag.retrieve(

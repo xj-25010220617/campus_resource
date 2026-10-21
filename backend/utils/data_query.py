@@ -2,45 +2,151 @@
 文件管理数据查询 (Data Query)
 
 执行文件管理相关的数据库查询，供意图路由分发后使用。
-支持：文档数统计、最近上传、存储统计、分类统计、带条件查找。
+支持：文档数统计、按日期区间统计/列表、指定文件上传/索引时间、
+最近上传、存储统计、分类统计、带条件查找。
+
+时间字段约定：
+- created_at：文件首次入库/上传到系统的时间；
+- indexed_at：索引完成时间（可能为空，表示尚未完成）；
+- freshness_date：内容截止日期，不是上传时间。
+所有 *_display 字段均已转换为业务时区（Asia/Shanghai）。
 """
 import logging
-from datetime import datetime, timedelta
 from typing import List, Optional
 
 from django.db.models import Count, Sum, Q
-from django.utils import timezone
+
+from utils.timefmt import (
+    format_business_time,
+    parse_bound,
+    recent_days_bounds,
+    to_iso,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def count_user_docs(user) -> dict:
-    """统计文档数（超管看全部，管理员看自己的+本学院，普通用户仅看自己的）。
+def _visible_docs_qs(user, mine_only: bool = False):
+    """构造当前用户可访问的文档查询集（复用既有角色/学院/部门隔离）。
 
-    Returns:
-        {"total": int, "by_status": {"indexed": int, "uploaded": int, ...}}
+    - mine_only=True：只看当前登录用户自己上传的文件；
+    - super_admin：全部；
+    - admin/college_admin：校级文档 + 本学院文档 + 自己上传的文档；
+    - dept_admin：校级文档 + 本部门文档 + 自己上传的文档；
+    - 普通用户：自己上传的文档；
+    - 未登录：空集。
     """
     from apps.knowledge.models import KnowledgeDoc
 
     user_role = getattr(user, 'role', None) if user else None
+    if not user or not user_role:
+        return KnowledgeDoc.objects.none()
+    if mine_only:
+        return KnowledgeDoc.objects.filter(uploader=user)
     if user_role == 'super_admin':
-        qs = KnowledgeDoc.objects.all()
-    elif user_role in ('admin', 'college_admin'):
-        qs = KnowledgeDoc.objects.filter(
+        return KnowledgeDoc.objects.all()
+    if user_role in ('admin', 'college_admin'):
+        return KnowledgeDoc.objects.filter(
             Q(college_id__isnull=True, department_id__isnull=True)
             | Q(college_id=user.college_id)
             | Q(uploader=user)
         )
-    elif user_role == 'dept_admin':
-        qs = KnowledgeDoc.objects.filter(
+    if user_role == 'dept_admin':
+        return KnowledgeDoc.objects.filter(
             Q(college_id__isnull=True, department_id__isnull=True)
             | Q(department_id=user.department_id)
             | Q(uploader=user)
         )
-    elif user_role:
-        qs = KnowledgeDoc.objects.filter(uploader=user)
-    else:
-        qs = KnowledgeDoc.objects.none()
+    return KnowledgeDoc.objects.filter(uploader=user)
+
+
+def _parse_bound_or_raise(value, name: str):
+    """解析路由传入的区间端点；传了非法值就报错，不静默忽略。"""
+    if not value:
+        return None
+    parsed = parse_bound(value)
+    if parsed is None:
+        raise ValueError(f"{name} 不是合法日期时间: {value!r}")
+    return parsed
+
+
+def _apply_range(qs, start_at=None, end_at=None, field: str = 'created_at'):
+    """按左闭右开区间过滤；只处理真正传入的端点。"""
+    start = _parse_bound_or_raise(start_at, 'start_at')
+    end = _parse_bound_or_raise(end_at, 'end_at')
+    if start is not None:
+        qs = qs.filter(**{f'{field}__gte': start})
+    if end is not None:
+        qs = qs.filter(**{f'{field}__lt': end})
+    return qs
+
+
+def _time_fields(doc) -> dict:
+    """统一的文件时间字段（ISO 8601 带 +08:00 + 业务时区展示值）。"""
+    return {
+        "created_at": to_iso(doc.created_at) or '',
+        "created_at_display": format_business_time(doc.created_at),
+        "indexed_at": to_iso(doc.indexed_at),
+        "indexed_at_display": format_business_time(doc.indexed_at),
+        "freshness_date": doc.freshness_date.isoformat() if doc.freshness_date else None,
+    }
+
+
+def _doc_summary(doc) -> dict:
+    data = {
+        "id": doc.id,
+        "title": doc.title,
+        "file_name": doc.file_name,
+        "file_type": doc.file_type,
+        "file_size": doc.file_size,
+        "file_size_str": _format_size(doc.file_size or 0),
+        "status": doc.get_status_display(),
+        "status_code": doc.status,
+        "uploader_name": doc.uploader.username if doc.uploader else "未知",
+        "category_name": doc.category.name if doc.category else "未分类",
+        "source_type": doc.get_source_type_display(),
+    }
+    data.update(_time_fields(doc))
+    return data
+
+
+def _keyword_q(keywords, fields=('title', 'file_name')):
+    query = Q()
+    for keyword in keywords or []:
+        keyword = (keyword or '').strip()
+        if not keyword:
+            continue
+        if len(keyword) < 2 and not keyword.isascii():
+            continue
+        for field in fields:
+            query |= Q(**{f'{field}__icontains': keyword})
+    return query
+
+
+def _range_meta(range_label: Optional[str], start_at=None, end_at=None) -> dict:
+    return {
+        "range_label": range_label or "全部时间",
+        "range_start": start_at,
+        "range_end": end_at,
+        "range_end_exclusive": True,
+    }
+
+
+def count_user_docs(
+    user,
+    mine_only: bool = False,
+    start_at=None,
+    end_at=None,
+    range_label: Optional[str] = None,
+    scope_label: Optional[str] = None,
+) -> dict:
+    """统计文档数（超管看全部，管理员看自己的+本学院，普通用户仅看自己的）。
+
+    Returns:
+        {"total": int, "by_status": {...}, "scope_label": str, "range_label": str}
+    """
+    qs = _visible_docs_qs(user, mine_only=mine_only)
+    qs = _apply_range(qs, start_at, end_at)
 
     total = qs.count()
     by_status = dict(qs.values_list("status").annotate(count=Count("id")))
@@ -48,6 +154,8 @@ def count_user_docs(user) -> dict:
     return {
         "total": total,
         "by_status": by_status,
+        "scope_label": scope_label or ("本人上传" if mine_only else "当前账号可访问范围"),
+        **_range_meta(range_label, start_at, end_at),
     }
 
 
@@ -57,86 +165,44 @@ def list_user_recent_docs(
     limit: int = 10,
     file_type: Optional[str] = None,
     category_name: Optional[str] = None,
+    mine_only: bool = False,
+    start_at=None,
+    end_at=None,
+    range_label: Optional[str] = None,
+    scope_label: Optional[str] = None,
 ) -> List[dict]:
-    """列出当前用户最近上传的文档。
+    """列出当前用户最近上传/指定区间内的文档。"""
+    qs = _visible_docs_qs(user, mine_only=mine_only)
 
-    Args:
-        user: 用户对象
-        days: 最近 N 天（None 表示不限时间）
-        limit: 最多返回条数
-        file_type: 按文件类型过滤（可选）
-        category_name: 按分类名称过滤（可选）
-
-    Returns:
-        [{"id": int, "title": str, "file_type": str, "file_size": int,
-          "status": str, "created_at": str, "category_name": str}, ...]
-    """
-    from apps.knowledge.models import KnowledgeDoc
-
-    # 权限范围：超管看全部，管理员看自己的+本学院，普通用户仅看自己的
-    user_role = getattr(user, 'role', None) if user else None
-    if user_role == 'super_admin':
-        qs = KnowledgeDoc.objects.all()
-    elif user_role in ('admin', 'college_admin'):
-        qs = KnowledgeDoc.objects.filter(
-            Q(college_id__isnull=True, department_id__isnull=True)
-            | Q(college_id=user.college_id)
-            | Q(uploader=user)
-        )
-    elif user_role == 'dept_admin':
-        qs = KnowledgeDoc.objects.filter(
-            Q(college_id__isnull=True, department_id__isnull=True)
-            | Q(department_id=user.department_id)
-            | Q(uploader=user)
-        )
-    elif user_role:
-        qs = KnowledgeDoc.objects.filter(uploader=user)
-    else:
-        qs = KnowledgeDoc.objects.none()
-
-    if days:
-        since = timezone.now() - timedelta(days=days)
-        qs = qs.filter(created_at__gte=since)
+    if start_at or end_at:
+        qs = _apply_range(qs, start_at, end_at)
+    elif days:
+        since, until = recent_days_bounds(days)
+        qs = qs.filter(created_at__gte=since, created_at__lt=until)
 
     if file_type:
         qs = qs.filter(file_type=file_type)
 
     if category_name:
-        from apps.classify.models import Category
         qs = qs.filter(
             Q(category__name__icontains=category_name)
             | Q(title__icontains=category_name)
             | Q(description__icontains=category_name)
         )
 
-    qs = qs.select_related("category").order_by("-created_at")[:limit]
+    qs = qs.select_related("category", "uploader").order_by("-created_at")[:limit]
 
     results = []
     for doc in qs:
-        results.append({
-            "id": doc.id,
-            "title": doc.title,
-            "file_type": doc.file_type,
-            "file_size": doc.file_size,
-            "status": doc.get_status_display(),
-            "created_at": doc.created_at.strftime("%Y-%m-%d %H:%M"),
-            "category_name": doc.category.name if doc.category else "未分类",
-            "source_type": doc.get_source_type_display(),
-        })
+        item = _doc_summary(doc)
+        item["scope_label"] = scope_label or ("本人上传" if mine_only else "当前账号可访问范围")
+        item["range_label"] = range_label or (f"最近{days}天" if days else "全部时间")
+        results.append(item)
     return results
 
 
 def get_user_storage_stats(user) -> dict:
-    """统计用户存储使用情况。
-
-    Returns:
-        {
-            "total_size": int,          # 总字节数
-            "total_size_str": str,      # 格式化大小
-            "total_files": int,
-            "by_file_type": [{"file_type": str, "count": int, "size": int}, ...]
-        }
-    """
+    """统计用户存储使用情况。"""
     from apps.knowledge.models import KnowledgeDoc
 
     qs = KnowledgeDoc.objects.filter(uploader=user)
@@ -144,7 +210,6 @@ def get_user_storage_stats(user) -> dict:
     total_files = qs.count()
     total_size = qs.aggregate(total=Sum("file_size"))["total"] or 0
 
-    # 按文件类型分组
     by_type = (
         qs.values("file_type")
         .annotate(count=Count("id"), size=Sum("file_size"))
@@ -160,11 +225,7 @@ def get_user_storage_stats(user) -> dict:
 
 
 def get_doc_categories(user) -> List[dict]:
-    """按分类统计用户上传的文档分布。
-
-    Returns:
-        [{"category_name": str, "count": int, "total_size": int}, ...]
-    """
+    """按分类统计用户上传的文档分布。"""
     from apps.knowledge.models import KnowledgeDoc
 
     qs = (
@@ -192,55 +253,25 @@ def find_user_docs(
     category: Optional[str] = None,
     file_type: Optional[str] = None,
     limit: int = 10,
+    mine_only: bool = False,
+    start_at=None,
+    end_at=None,
+    range_label: Optional[str] = None,
+    scope_label: Optional[str] = None,
 ) -> List[dict]:
-    """按条件查找用户上传的文档（组合过滤）。
-
-    Args:
-        user: 用户对象
-        keywords: 搜索关键词列表
-        days: 最近 N 天
-        category: 分类名称关键词
-        file_type: 文件类型
-        limit: 最多返回条数
-
-    Returns:
-        [{"id": int, "title": str, "description": str, ...}, ...]
-    """
-    from apps.knowledge.models import KnowledgeDoc
-
-    # 权限范围：超管看全部，管理员看自己的+本学院的，普通用户仅看自己的
-    user_role = getattr(user, 'role', None) if user else None
-    if user_role == 'super_admin':
-        qs = KnowledgeDoc.objects.all()
-    elif user_role in ('admin', 'college_admin'):
-        qs = KnowledgeDoc.objects.filter(
-            Q(college_id__isnull=True, department_id__isnull=True)
-            | Q(college_id=user.college_id)
-            | Q(uploader=user)
-        )
-    elif user_role == 'dept_admin':
-        qs = KnowledgeDoc.objects.filter(
-            Q(college_id__isnull=True, department_id__isnull=True)
-            | Q(department_id=user.department_id)
-            | Q(uploader=user)
-        )
-    elif user_role:
-        qs = KnowledgeDoc.objects.filter(uploader=user)
-    else:
-        qs = KnowledgeDoc.objects.none()
+    """按条件查找用户可访问的文档（组合过滤）。"""
+    qs = _visible_docs_qs(user, mine_only=mine_only)
 
     if keywords:
-        kw_query = Q()
-        for kw in keywords:
-            if len(kw) >= 2:
-                kw_query |= Q(title__icontains=kw)
-                kw_query |= Q(description__icontains=kw)
+        kw_query = _keyword_q(keywords, fields=('title', 'description', 'file_name'))
         if kw_query:
             qs = qs.filter(kw_query)
 
-    if days:
-        since = timezone.now() - timedelta(days=days)
-        qs = qs.filter(created_at__gte=since)
+    if start_at or end_at:
+        qs = _apply_range(qs, start_at, end_at)
+    elif days:
+        since, until = recent_days_bounds(days)
+        qs = qs.filter(created_at__gte=since, created_at__lt=until)
 
     if category:
         qs = qs.filter(
@@ -250,7 +281,7 @@ def find_user_docs(
     if file_type:
         qs = qs.filter(file_type=file_type)
 
-    qs = qs.select_related("category").order_by("-created_at")[:limit]
+    qs = qs.select_related("category", "uploader").order_by("-created_at")[:limit]
 
     from utils.oss import oss_client
 
@@ -263,21 +294,162 @@ def find_user_docs(
                 return url
         return ''
 
-    return [
-        {
+    results = []
+    for doc in qs:
+        item = _doc_summary(doc)
+        item["description"] = doc.description[:100] if doc.description else ""
+        item["download_url"] = _get_dl_url(doc)
+        item["scope_label"] = scope_label or ("本人上传" if mine_only else "当前账号可访问范围")
+        item["range_label"] = range_label or (f"最近{days}天" if days else "全部时间")
+        results.append(item)
+    return results
+
+
+# ------------------------------------------------------------------
+# 精确时间查询：指定文件的上传时间 / 索引完成时间
+# ------------------------------------------------------------------
+
+def get_doc_times(
+    user,
+    keywords: Optional[List[str]] = None,
+    doc_id: Optional[int] = None,
+    mine_only: bool = False,
+    start_at=None,
+    end_at=None,
+    range_label: Optional[str] = None,
+    scope_label: Optional[str] = None,
+    limit: int = 10,
+) -> dict:
+    """确定性查询指定文件的上传时间与索引完成时间。
+
+    不依赖 RAG 或模型推断；未找到时明确返回 not_found。
+    """
+    qs = _visible_docs_qs(user, mine_only=mine_only)
+    qs = _apply_range(qs, start_at, end_at)
+
+    if doc_id:
+        qs = qs.filter(pk=doc_id)
+    elif keywords:
+        kw_query = _keyword_q(keywords)
+        if not kw_query:
+            return {
+                "need_filename": True,
+                "matches": [],
+                "total": 0,
+                "scope_label": scope_label or ("本人上传" if mine_only else "当前账号可访问范围"),
+                **_range_meta(range_label, start_at, end_at),
+            }
+        qs = qs.filter(kw_query)
+    else:
+        return {
+            "need_filename": True,
+            "matches": [],
+            "total": 0,
+            "scope_label": scope_label or ("本人上传" if mine_only else "当前账号可访问范围"),
+            **_range_meta(range_label, start_at, end_at),
+        }
+
+    total = qs.count()
+    docs = list(
+        qs.select_related("uploader", "category").order_by("-created_at")[:limit]
+    )
+    matches = []
+    for doc in docs:
+        item = {
             "id": doc.id,
             "title": doc.title,
-            "description": doc.description[:100] if doc.description else "",
+            "file_name": doc.file_name,
             "file_type": doc.file_type,
-            "file_size": doc.file_size,
-            "file_size_str": _format_size(doc.file_size),
             "status": doc.get_status_display(),
-            "created_at": doc.created_at.strftime("%Y-%m-%d %H:%M"),
-            "category_name": doc.category.name if doc.category else "未分类",
-            "download_url": _get_dl_url(doc),
+            "status_code": doc.status,
+            "uploader_name": doc.uploader.username if doc.uploader else "未知",
+            **_time_fields(doc),
         }
-        for doc in qs
-    ]
+        matches.append(item)
+
+    result = {
+        "need_filename": False,
+        "not_found": total == 0,
+        "ambiguous": total > 1,
+        "total": total,
+        "shown": len(matches),
+        "truncated": total > len(matches),
+        "matches": matches,
+        "scope_label": scope_label or ("本人上传" if mine_only else "当前账号可访问范围"),
+        **_range_meta(range_label, start_at, end_at),
+    }
+    if total > len(matches):
+        result["notice"] = (
+            f"共匹配到 {total} 个文件，仅展示前 {len(matches)} 个；"
+            "请提供更精确的文件名或补充日期范围。"
+        )
+    return result
+
+
+# ------------------------------------------------------------------
+# 按日期区间统计 / 列表
+# ------------------------------------------------------------------
+
+def list_docs_by_range(
+    user,
+    start_at=None,
+    end_at=None,
+    range_label: Optional[str] = None,
+    mine_only: bool = False,
+    scope_label: Optional[str] = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> dict:
+    """按上传时间区间列出文档（左闭右开），并返回截断信息。"""
+    limit = max(1, min(int(limit or 20), 100))
+    offset = max(0, int(offset or 0))
+
+    qs = _visible_docs_qs(user, mine_only=mine_only)
+    qs = _apply_range(qs, start_at, end_at).select_related("uploader", "category")
+    total = qs.count()
+    docs = list(qs.order_by("-created_at")[offset:offset + limit])
+
+    items = [_doc_summary(doc) for doc in docs]
+    shown = len(items)
+    has_more = offset + shown < total
+    result = {
+        "total": total,
+        "shown": shown,
+        "offset": offset,
+        "limit": limit,
+        "truncated": has_more,
+        "has_more": has_more,
+        "items": items,
+        "scope_label": scope_label or ("本人上传" if mine_only else "当前账号可访问范围"),
+        **_range_meta(range_label, start_at, end_at),
+    }
+    if has_more:
+        result["notice"] = (
+            f"共 {total} 个文件，当前展示第 {offset + 1}-{offset + shown} 个，"
+            "还有更多结果；可缩小日期范围或要求继续列出。"
+        )
+    elif total == 0:
+        result["notice"] = "该时间区间内没有查询到文件。"
+    return result
+
+
+def count_docs_by_range(
+    user,
+    start_at=None,
+    end_at=None,
+    range_label: Optional[str] = None,
+    mine_only: bool = False,
+    scope_label: Optional[str] = None,
+) -> dict:
+    """按上传时间区间统计文档数量（左闭右开）。"""
+    qs = _visible_docs_qs(user, mine_only=mine_only)
+    qs = _apply_range(qs, start_at, end_at)
+    return {
+        "total": qs.count(),
+        "by_status": dict(qs.values_list("status").annotate(count=Count("id"))),
+        "scope_label": scope_label or ("本人上传" if mine_only else "当前账号可访问范围"),
+        **_range_meta(range_label, start_at, end_at),
+    }
 
 
 # ------------------------------------------------------------------
@@ -295,18 +467,32 @@ def _published_docs_queryset():
     return KnowledgeDoc.objects.filter(status='indexed')
 
 
+def _published_range_filter(qs, since=None, until=None):
+    """按索引时间过滤，未索引完成的文档回退到创建时间。"""
+    if since is not None:
+        qs = qs.filter(Q(indexed_at__gte=since) | Q(indexed_at__isnull=True, created_at__gte=since))
+    if until is not None:
+        qs = qs.filter(Q(indexed_at__lt=until) | Q(indexed_at__isnull=True, created_at__lt=until))
+    return qs
+
+
 def get_popular_knowledge_docs(
     limit: int = 10,
     days: Optional[int] = None,
     college_id: Optional[int] = None,
     discipline_id: Optional[int] = None,
+    start_at=None,
+    end_at=None,
 ) -> List[dict]:
     """查询热门知识文档（按最近索引时间排序，保留旧 API 字段）。"""
     qs = _published_docs_queryset()
 
-    if days:
-        since = timezone.now() - timedelta(days=days)
-        qs = qs.filter(Q(indexed_at__gte=since) | Q(indexed_at__isnull=True, created_at__gte=since))
+    start = _parse_bound_or_raise(start_at, 'start_at')
+    end = _parse_bound_or_raise(end_at, 'end_at')
+    if start is None and end is None and days:
+        start, end = recent_days_bounds(days)
+    qs = _published_range_filter(qs, start, end)
+
     if college_id:
         qs = qs.filter(college_id=college_id)
     if discipline_id:
@@ -323,7 +509,7 @@ def get_popular_knowledge_docs(
             'view_count': 0,
             'college_name': doc.college.name if doc.college else '未知',
             'uploader_name': doc.uploader.username if doc.uploader else '未知',
-            'published_at': (doc.indexed_at or doc.created_at).strftime('%Y-%m-%d'),
+            'published_at': format_business_time(doc.indexed_at or doc.created_at, '%Y-%m-%d'),
         }
         for doc in qs
     ]
@@ -334,12 +520,16 @@ def get_recent_knowledge_docs(
     days: int = 7,
     college_id: Optional[int] = None,
     discipline_id: Optional[int] = None,
+    start_at=None,
+    end_at=None,
 ) -> List[dict]:
     """查询最近索引的知识文档（保留旧 API 字段）。"""
-    since = timezone.now() - timedelta(days=days)
-    qs = _published_docs_queryset().filter(
-        Q(indexed_at__gte=since) | Q(indexed_at__isnull=True, created_at__gte=since)
-    )
+    start = _parse_bound_or_raise(start_at, 'start_at')
+    end = _parse_bound_or_raise(end_at, 'end_at')
+    if start is None and end is None:
+        start, end = recent_days_bounds(days)
+    qs = _published_range_filter(_published_docs_queryset(), start, end)
+
     if college_id:
         qs = qs.filter(college_id=college_id)
     if discipline_id:
@@ -357,7 +547,7 @@ def get_recent_knowledge_docs(
             'college_name': doc.college.name if doc.college else '未知',
             'category_name': doc.category.name if doc.category else '未分类',
             'uploader_name': doc.uploader.username if doc.uploader else '未知',
-            'published_at': (doc.indexed_at or doc.created_at).strftime('%Y-%m-%d'),
+            'published_at': format_business_time(doc.indexed_at or doc.created_at, '%Y-%m-%d'),
         }
         for doc in qs
     ]
@@ -420,9 +610,29 @@ def execute_query(route: dict, user) -> dict:
     query_type = route.get("query_type", "")
     params = route.get("params", {})
 
+    def _common_kwargs():
+        return {
+            "mine_only": bool(params.get("mine_only")),
+            "start_at": params.get("start_at"),
+            "end_at": params.get("end_at"),
+            "range_label": params.get("range_label"),
+            "scope_label": params.get("scope_label"),
+        }
+
     try:
         if query_type == "count_docs":
-            return {"success": True, "data": count_user_docs(user)}
+            return {"success": True, "data": count_user_docs(user, **_common_kwargs())}
+
+        elif query_type == "count_docs_by_range":
+            return {"success": True, "data": count_docs_by_range(user, **_common_kwargs())}
+
+        elif query_type == "list_docs_by_range":
+            return {"success": True, "data": list_docs_by_range(
+                user,
+                limit=params.get("limit", 20),
+                offset=params.get("offset", 0),
+                **_common_kwargs(),
+            )}
 
         elif query_type == "recent_docs":
             data = list_user_recent_docs(
@@ -431,6 +641,7 @@ def execute_query(route: dict, user) -> dict:
                 limit=params.get("limit", 10),
                 file_type=params.get("file_type"),
                 category_name=params.get("category"),
+                **_common_kwargs(),
             )
             return {"success": True, "data": data}
 
@@ -440,6 +651,23 @@ def execute_query(route: dict, user) -> dict:
         elif query_type == "doc_categories":
             return {"success": True, "data": get_doc_categories(user)}
 
+        elif query_type in ("doc_upload_time", "doc_index_time"):
+            data = get_doc_times(
+                user,
+                keywords=params.get("keywords"),
+                doc_id=params.get("doc_id"),
+                limit=params.get("limit", 10),
+                **_common_kwargs(),
+            )
+            if data.get("need_filename") and (params.get("start_at") or params.get("end_at")):
+                # 用户给了时间范围但没给文件名：按区间列出文件时间
+                data = list_docs_by_range(
+                    user,
+                    limit=params.get("limit", 20),
+                    **_common_kwargs(),
+                )
+            return {"success": True, "data": data}
+
         elif query_type == "find_docs":
             data = find_user_docs(
                 user,
@@ -448,6 +676,7 @@ def execute_query(route: dict, user) -> dict:
                 category=params.get("category"),
                 file_type=params.get("file_type"),
                 limit=params.get("limit", 10),
+                **_common_kwargs(),
             )
             return {"success": True, "data": data}
 
@@ -457,6 +686,8 @@ def execute_query(route: dict, user) -> dict:
                 days=params.get("days"),
                 college_id=params.get("college_id"),
                 discipline_id=params.get("discipline_id"),
+                start_at=params.get("start_at"),
+                end_at=params.get("end_at"),
             )
             return {"success": True, "data": data}
 
@@ -466,6 +697,8 @@ def execute_query(route: dict, user) -> dict:
                 days=params.get("days", 7),
                 college_id=params.get("college_id"),
                 discipline_id=params.get("discipline_id"),
+                start_at=params.get("start_at"),
+                end_at=params.get("end_at"),
             )
             return {"success": True, "data": data}
 
@@ -483,11 +716,13 @@ def execute_query(route: dict, user) -> dict:
             return {"success": True, "data": get_popular_knowledge_docs(
                 limit=params.get("limit", 10), days=params.get("days"),
                 college_id=params.get("college_id"), discipline_id=params.get("discipline_id"),
+                start_at=params.get("start_at"), end_at=params.get("end_at"),
             )}
         elif query_type == "resource_recent":
             return {"success": True, "data": get_recent_knowledge_docs(
                 limit=params.get("limit", 10), days=params.get("days", 7),
                 college_id=params.get("college_id"), discipline_id=params.get("discipline_id"),
+                start_at=params.get("start_at"), end_at=params.get("end_at"),
             )}
         elif query_type == "resource_ranking":
             return {"success": True, "data": get_doc_ranking_by_college(limit=params.get("limit", 20))}
@@ -505,14 +740,27 @@ def execute_query(route: dict, user) -> dict:
 # ------------------------------------------------------------------
 # Prompt 构造（将查询结果格式化为 LLM 上下文）
 # ------------------------------------------------------------------
-_SYSTEM_PROMPT_TEMPLATE = """你是成都东东学院的 AI 智能助手，负责回答用户关于文件管理和知识库的问题。
+_SYSTEM_PROMPT_TEMPLATE = """你是成都东软学院的 AI 智能助手，负责回答用户关于文件管理和知识库的问题。
 
 {context}
 
-用户查询了文件管理数据，以下是查询结果。请用自然语言回答用户的问题。
+用户查询了文件管理数据，以下是数据库确定性查询结果。请只根据这些结果用自然语言回答，不要编造。
 
 查询结果：
 {result}
+
+时间字段说明（全部为 Asia/Shanghai 北京时间）：
+- created_at / created_at_display：文件首次上传（入库）时间；回答“上传时间”只能用它。
+- indexed_at / indexed_at_display：索引完成时间；为 null 时说明“尚未完成索引/暂无索引完成时间”，
+  绝不能拿 created_at 或 freshness_date 冒充。
+- freshness_date：文件内容截止日期，不是上传时间，不能当作上传时间回答。
+- 所有 *_display 字段已经是北京时间，直接原样使用，禁止再加减时区或换算成 UTC。
+- range_start / range_end 是左闭右开区间（含开始，不含结束）；range_label 可直接引用。
+- scope_label 说明查询范围（如“本人上传”“当前账号可访问范围”）；不要扩大或缩小这个范围。
+- total/shown/truncated/notice 表示结果是否被截断；若 truncated=true，必须告知用户总数、
+  已展示数量以及“可能还有更多”，不要假装已列出全部。
+- need_filename=true：请让用户补充具体文件名；not_found=true：如实说明未找到或无权限访问。
+- ambiguous=true：存在多个同名/相近文件时，逐一列出文件名、上传人、上传时间让用户确认。
 
 请根据以上数据直接回答用户的问题。如果数据为空或没有找到，如实告知用户。
 回答要简洁、友好，使用中文。
@@ -521,15 +769,7 @@ _SYSTEM_PROMPT_TEMPLATE = """你是成都东东学院的 AI 智能助手，负�
 
 
 def build_data_query_prompt(question: str, result: dict) -> list:
-    """将数据查询结果转换为 LLM 消息。
-
-    Args:
-        question: 用户原始问题
-        result: execute_query() 的返回结果
-
-    Returns:
-        messages 列表，可直接传给 llm_client.chat_stream()
-    """
+    """将数据查询结果转换为 LLM 消息。"""
     import json
     from utils.context import build_system_context
     ctx = build_system_context()
@@ -537,7 +777,7 @@ def build_data_query_prompt(question: str, result: dict) -> list:
     if not result["success"]:
         system_content = (
             f"{ctx}\n\n"
-            "你是成都东东学院的 AI 智能助手。用户查询文件管理数据时出错了，"
+            "你是成都东软学院的 AI 智能助手。用户查询文件管理数据时出错了，"
             "请礼貌地告知用户暂时无法查询，建议稍后重试或联系管理员。"
         )
         messages = [
@@ -561,6 +801,7 @@ def build_data_query_prompt(question: str, result: dict) -> list:
 # ------------------------------------------------------------------
 def _format_size(size_bytes: int) -> str:
     """将字节数格式化为可读字符串。"""
+    size_bytes = size_bytes or 0
     if size_bytes < 1024:
         return f"{size_bytes} B"
     elif size_bytes < 1024 * 1024:

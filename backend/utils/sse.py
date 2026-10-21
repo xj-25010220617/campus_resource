@@ -13,6 +13,7 @@ import logging
 from django.http import StreamingHttpResponse
 
 from utils.error_codes import ErrorCode
+from utils.timefmt import format_business_time, to_iso
 
 logger = logging.getLogger(__name__)
 
@@ -275,6 +276,14 @@ def build_references_events(
                 'score': result.get('score', 0),
                 'content_snippet': result.get('content', '')[:200],
                 'source_url': doc.source_url or '',
+                # 上传时间与索引完成时间分开返回，前端不得混用
+                'created_at': to_iso(doc.created_at),
+                'created_at_display': format_business_time(doc.created_at),
+                'indexed_at': to_iso(doc.indexed_at),
+                'indexed_at_display': format_business_time(doc.indexed_at),
+                'freshness_date': (
+                    doc.freshness_date.isoformat() if doc.freshness_date else None
+                ),
             }
             if doc.oss_key:
                 try:
@@ -301,6 +310,11 @@ def build_references_events(
                 'content_snippet': result.get('content', '')[:200],
                 'source_url': source_url,
                 'download_url': '',
+                'created_at': None,
+                'created_at_display': '',
+                'indexed_at': None,
+                'indexed_at_display': '',
+                'freshness_date': None,
             })
 
     return {'references_detail': detail} if detail else {

@@ -12,6 +12,7 @@ from django.conf import settings
 
 from .llm import llm_client
 from .milvus import milvus_client
+from .timefmt import format_business_time, month_bounds, to_iso, year_bounds
 
 logger = logging.getLogger(__name__)
 
@@ -235,7 +236,11 @@ SYSTEM_PROMPT = """你是成都东软学院的AI智能助手，负责回答学�
    严禁把"当前时间""每日简报""学校内建知识库""系统实时注入时间"等内部来源当作参考文件列出
 5. 都不足以回答时，请如实告知
 6. 常识性问题可直接用自己的知识回答
-7. 回答使用中文，结构清晰"""
+7. 回答使用中文，结构清晰
+8. 参考资料中标注的「上传时间」来自数据库 created_at，「索引完成时间」来自 indexed_at，
+   均为 Asia/Shanghai 北京时间；回答文件上传/索引时间时只能引用这两个字段，
+   不得把文件内容里的日期、freshness_date 或当前时间当作上传时间。
+   若参考资料没有索引完成时间，必须说明“暂无索引完成时间/尚未完成索引”，禁止编造或拿上传时间代替。"""
 
 
 # ------------------------------------------------------------------
@@ -321,19 +326,9 @@ def _summarize_history(history: List[dict]) -> Optional[str]:
 def _format_upload_time(value) -> str:
     """把文档 created_at（UTC aware）格式化为北京时间字符串；空值/异常返回空串。
 
-    背景：USE_TZ=True 时 MySQL 存 UTC，LLM 若拿不到准确时间会编造回答（如问"文件几点上传的"），
-    因此参考资料块中注入按 TIME_ZONE（Asia/Shanghai）转换后的本地时间。
+    统一委托 utils.timefmt，避免各模块各自 strftime(UTC) 造成时区错位。
     """
-    if not value:
-        return ''
-    try:
-        from django.utils import timezone as dj_tz
-        if dj_tz.is_aware(value):
-            value = dj_tz.localtime(value)
-        return value.strftime('%Y-%m-%d %H:%M')
-    except Exception as e:
-        logger.debug('上传时间格式化失败 value=%s: %s', value, e)
-        return ''
+    return format_business_time(value, '%Y-%m-%d %H:%M')
 
 
 def build_rag_prompt(
@@ -356,15 +351,18 @@ def build_rag_prompt(
     """
     ref_lines = []
     total_chars = 0
-    # 按 doc_id 批量取上传时间（一次 IN 查询），注入参考资料块，
-    # 让 LLM 对"文件什么时候上传的"类问题有据可答，避免编造时间。
+    # 按 doc_id 批量取上传/索引时间（一次 IN 查询），注入参考资料块，
+    # 让 LLM 对"文件什么时候上传/索引完成"类问题有据可答，避免编造时间。
     doc_ids = [c.get('doc_id') for c in chunks if c.get('doc_id')]
-    upload_times = {}
+    doc_times = {}
     if doc_ids:
         from apps.knowledge.models import KnowledgeDoc
-        upload_times = dict(
-            KnowledgeDoc.objects.filter(id__in=doc_ids).values_list('id', 'created_at'),
-        )
+        doc_times = {
+            row['id']: row
+            for row in KnowledgeDoc.objects.filter(id__in=doc_ids).values(
+                'id', 'created_at', 'indexed_at', 'freshness_date',
+            )
+        }
     for i, chunk in enumerate(chunks, 1):
         title = chunk.get('doc_title', '未知文档')
         page = chunk.get('page', 0)
@@ -372,9 +370,15 @@ def build_rag_prompt(
         ref_block = f'### 参考资料{i}（来源：{title}'
         if page:
             ref_block += f' 第{page}页'
-        upload_time = _format_upload_time(upload_times.get(chunk.get('doc_id')))
+        doc_time = doc_times.get(chunk.get('doc_id'), {})
+        upload_time = _format_upload_time(doc_time.get('created_at'))
         if upload_time:
             ref_block += f'，上传时间：{upload_time}'
+        indexed_time = format_business_time(doc_time.get('indexed_at'), '%Y-%m-%d %H:%M')
+        ref_block += f'，索引完成时间：{indexed_time or "暂无（尚未完成索引）"}'
+        freshness = doc_time.get('freshness_date')
+        if freshness:
+            ref_block += f'，内容截止日期：{freshness.isoformat()}'
         ref_block += f'）\n{content}'
         total_chars += len(ref_block)
         if total_chars > max_chars:
@@ -1099,13 +1103,21 @@ def _apply_hard_filters(
     qs = authorized_knowledge_docs(user_context).filter(status='indexed')
 
     # 不再默认只检索近一年；只有用户明确给出时间范围时才过滤。
-    if time_range:
+    # time_range 可能来自意图解析的自由输入，非字符串时直接忽略，避免 re.match 抛 TypeError。
+    if isinstance(time_range, str) and time_range:
         import re
-        if re.match(r'^\d{4}$', time_range):
-            qs = qs.filter(created_at__year=int(time_range))
-        elif re.match(r'^\d{4}-\d{2}$', time_range):
-            year, month = time_range.split('-')
-            qs = qs.filter(created_at__year=int(year), created_at__month=int(month))
+        # 用业务时区的左闭右开区间，而不是 __year/__month：
+        # 后者依赖数据库时区表，且跨时区边界时会把 UTC 年份/月份算错。
+        try:
+            if re.match(r'^\d{4}$', time_range):
+                start, end = year_bounds(int(time_range))
+                qs = qs.filter(created_at__gte=start, created_at__lt=end)
+            elif re.match(r'^\d{4}-\d{2}$', time_range):
+                year, month = (int(part) for part in time_range.split('-'))
+                start, end = month_bounds(year, month)
+                qs = qs.filter(created_at__gte=start, created_at__lt=end)
+        except ValueError:
+            logger.warning('忽略非法 time_range: %r', time_range)
 
     if (cid := filters.get('college_id')):
         qs = qs.filter(college_id=cid)
@@ -1162,6 +1174,7 @@ def _enrich_with_doc_meta(hits: List[dict], min_score: float) -> List[dict]:
             id__in=doc_ids, status='indexed',
         ).values(
             'id', 'title', 'source_type', 'source_url', 'file_name', 'oss_key',
+            'created_at', 'indexed_at', 'freshness_date',
         )
     }
 
@@ -1185,6 +1198,13 @@ def _enrich_with_doc_meta(hits: List[dict], min_score: float) -> List[dict]:
             'source_url': meta.get('source_url') or hit.get('source_url', ''),
             'file_name': meta.get('file_name') or hit.get('file_name', ''),
             'oss_key': meta.get('oss_key') or hit.get('oss_key', ''),
+            'created_at': to_iso(meta.get('created_at')),
+            'created_at_display': format_business_time(meta.get('created_at')),
+            'indexed_at': to_iso(meta.get('indexed_at')),
+            'indexed_at_display': format_business_time(meta.get('indexed_at')),
+            'freshness_date': (
+                meta['freshness_date'].isoformat() if meta.get('freshness_date') else None
+            ),
         })
         if len(results) >= 5:
             break
@@ -1260,7 +1280,16 @@ def find_pending_index_docs(
         .order_by('-created_at')[:top_k]
     )
     return [
-        {'doc_id': doc.id, 'doc_title': doc.title, 'status': doc.status}
+        {
+            'doc_id': doc.id,
+            'doc_title': doc.title,
+            'status': doc.status,
+            'status_display': doc.get_status_display(),
+            'created_at': to_iso(doc.created_at),
+            'created_at_display': format_business_time(doc.created_at),
+            'indexed_at': to_iso(doc.indexed_at),
+            'indexed_at_display': format_business_time(doc.indexed_at),
+        }
         for doc in docs
     ]
 

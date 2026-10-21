@@ -2,6 +2,7 @@ from rest_framework import serializers
 
 from .models import KnowledgeDoc, Keyword
 from utils.oss import oss_client
+from utils.timefmt import format_business_time
 
 
 class KnowledgeDocSerializer(serializers.ModelSerializer):
@@ -19,6 +20,9 @@ class KnowledgeDocSerializer(serializers.ModelSerializer):
     oss_url = serializers.SerializerMethodField()
     # 真实扩展名（docx/pptx/jpg…），由 file_name 解析，见 get_file_ext
     file_ext = serializers.SerializerMethodField()
+    # 业务时区展示值，避免前端各自处理时区
+    created_at_display = serializers.SerializerMethodField()
+    indexed_at_display = serializers.SerializerMethodField()
 
     class Meta:
         model = KnowledgeDoc
@@ -33,7 +37,8 @@ class KnowledgeDocSerializer(serializers.ModelSerializer):
             'status', 'index_error', 'index_attempts', 'index_started_at', 'failed_at',
             'chunk_count', 'is_sensitive', 'sensitive_checked',
             'freshness_date',
-            'created_at', 'updated_at', 'indexed_at',
+            'created_at', 'created_at_display', 'updated_at',
+            'indexed_at', 'indexed_at_display',
         ]
         read_only_fields = [
             'id', 'source_type', 'oss_key', 'file_name', 'file_type',
@@ -60,6 +65,12 @@ class KnowledgeDocSerializer(serializers.ModelSerializer):
         """真实扩展名（docx/pptx/jpg…）"""
         return get_file_ext(obj.file_name, obj.file_type)
 
+    def get_created_at_display(self, obj) -> str:
+        return format_business_time(obj.created_at)
+
+    def get_indexed_at_display(self, obj) -> str:
+        return format_business_time(obj.indexed_at)
+
 
 class KnowledgeDocListSerializer(serializers.ModelSerializer):
     """知识文档列表序列化器（简化版，用于列表页展示）"""
@@ -75,6 +86,8 @@ class KnowledgeDocListSerializer(serializers.ModelSerializer):
     )
     # 真实扩展名（docx/pptx/jpg…），由 file_name 解析，见 get_file_ext
     file_ext = serializers.SerializerMethodField()
+    created_at_display = serializers.SerializerMethodField()
+    indexed_at_display = serializers.SerializerMethodField()
 
     class Meta:
         model = KnowledgeDoc
@@ -83,12 +96,19 @@ class KnowledgeDocListSerializer(serializers.ModelSerializer):
             'index_error', 'index_attempts', 'index_started_at', 'failed_at',
             'college_name', 'discipline_name', 'uploader_name',
             'uploader_college_name', 'uploader_department_name',
-            'chunk_count', 'created_at',
+            'chunk_count', 'created_at', 'created_at_display',
+            'indexed_at', 'indexed_at_display',
         ]
 
     def get_file_ext(self, obj) -> str:
         """真实扩展名（docx/pptx/jpg…）"""
         return get_file_ext(obj.file_name, obj.file_type)
+
+    def get_created_at_display(self, obj) -> str:
+        return format_business_time(obj.created_at)
+
+    def get_indexed_at_display(self, obj) -> str:
+        return format_business_time(obj.indexed_at)
 
 
 # 文件大小限制常量（字节）

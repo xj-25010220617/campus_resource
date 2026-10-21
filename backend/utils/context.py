@@ -26,10 +26,11 @@ def get_current_time_str(now: Optional[datetime] = None) -> str:
     格式示例："现在是 2026年09月01日 星期二 14:30"
     """
     global _last_known_date
-    t = now or timezone.now()
-    # USE_TZ=True 时 timezone.now() 返回 UTC；直接 strftime 会输出 UTC 墙钟时间，
-    # 比北京时间（TIME_ZONE=Asia/Shanghai）慢 8 小时。必须先转成本地时区。
-    t = timezone.localtime(t)
+    from utils.timefmt import to_business_time
+
+    t = to_business_time(now or timezone.now())
+    if t is None:
+        return "当前时间获取失败"
     date_str = t.strftime('%Y年%m月%d日')
     weekday = WEEKDAY_CN[t.weekday()]
     time_str = t.strftime('%H:%M')
@@ -38,7 +39,7 @@ def get_current_time_str(now: Optional[datetime] = None) -> str:
         logger.info('检测到日期切换: %s -> %s', _last_known_date, date_str)
     _last_known_date = date_str
 
-    return f"现在是 {date_str} {weekday} {time_str}"
+    return f"现在是 {date_str} {weekday} {time_str}（北京时间）"
 
 
 def get_daily_briefing() -> str:
@@ -58,9 +59,14 @@ def get_daily_briefing() -> str:
         )
         if not agg['latest']:
             return ""
-        # updated_at 在库中为 UTC，转本地时区后再取日期，避免跨天边界日期偏一天
-        latest = timezone.localtime(agg['latest']).strftime('%Y-%m-%d')
-        earliest = timezone.localtime(agg['earliest']).strftime('%Y-%m-%d') if agg['earliest'] else latest
+        # updated_at 在库中为 UTC，统一转业务时区后再取日期，避免跨天边界日期偏一天
+        from utils.timefmt import format_business_time
+
+        latest = format_business_time(agg['latest'], '%Y-%m-%d')
+        earliest = (
+            format_business_time(agg['earliest'], '%Y-%m-%d')
+            if agg['earliest'] else latest
+        )
         count = agg['doc_count'] or 0
         return (
             f'知识库最新文档日期：{latest}（最早 {earliest}，共 {count} 条）。'
