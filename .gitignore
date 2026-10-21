@@ -46,3 +46,7 @@ test_page.html
 # 向量库数据（本地二进制，不入库）
 chroma_db/
 *.bin
+
+# Local test venv & Django filebased cache
+.testenv/
+backend/cache/
