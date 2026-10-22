@@ -255,6 +255,19 @@ RAG_SCORE_THRESHOLD = 0.30      # 低于此分数不放入 LLM 上下文（Reran
 RAG_REFERENCE_THRESHOLD = 0.65  # 低于此分数不作为引用展示
 CONTEXT_MAX_CHARS = 8000
 
+# ------------------------------------------------------------------
+# 二次检索（检索失败/低置信时扩大范围重试一次）
+# ------------------------------------------------------------------
+# 首次检索为空、最高分过低，或只有一条且分数不高时，放宽硬过滤条件、
+# 扩大召回数量并降低最低分阈值再检索一次；两次结果按现有分数合并去重。
+RAG_RETRY_TOP_K = 30            # 重试时的召回数量（首次为 RAG_TOP_K）
+RAG_RETRY_MIN_SCORE = 0.15      # 重试时允许进入上下文的最低分
+RAG_RETRY_TRIGGER_SCORE = 0.50  # 首次最高分低于此值触发重试
+RAG_RETRY_SINGLE_RESULT_SCORE = 0.65  # 只有一条结果且低于此值时视为“明显不足”
+RAG_RETRY_MIN_RESULTS = 2       # 低于此结果数且分数不足时触发重试
+RAG_RETRY_MAX_ATTEMPTS = 1      # 重试上限，禁止无限扩大检索
+_RAG_RETRY_DROP_FILTERS = ('time_range', 'file_type', 'category_ids')
+
 
 # ------------------------------------------------------------------
 # 分角色严谨度（管理员低置信拒答 + 强制引用）
@@ -1405,43 +1418,85 @@ def retrieve_images(
 # ------------------------------------------------------------------
 # 检索主入口（升级版）
 # ------------------------------------------------------------------
-def retrieve(
+def _retrieval_top_score(results: List[dict]) -> float:
+    """返回结果中的最高分；空结果返回 0。"""
+    return max((r.get('score', 0) or 0) for r in results) if results else 0.0
+
+
+def _should_retry_retrieval(results: List[dict]) -> Tuple[bool, str]:
+    """判断首次检索是否需要扩大范围重试。
+
+    - 空结果：必然重试；
+    - 最高分低于 RAG_RETRY_TRIGGER_SCORE：视为低置信；
+    - 只有一条且分数低于 RAG_RETRY_SINGLE_RESULT_SCORE：视为明显不足。
+    """
+    if not results:
+        return True, 'empty'
+    top_score = _retrieval_top_score(results)
+    if top_score < RAG_RETRY_TRIGGER_SCORE:
+        return True, f'low_top_score={top_score:.3f}'
+    if (
+        len(results) < RAG_RETRY_MIN_RESULTS
+        and top_score < RAG_RETRY_SINGLE_RESULT_SCORE
+    ):
+        return True, f'few_results={len(results)},top_score={top_score:.3f}'
+    return False, ''
+
+
+def _widen_retrieval_filters(parsed_filters: Optional[dict]) -> dict:
+    """重试时放宽可能误杀候选的硬过滤条件。
+
+    只去掉时间、文件类型、分类三个限制；学院/学科等权限相关范围保留，
+    最终仍由 authorized_knowledge_docs() 做授权过滤。
+    """
+    return {
+        key: value for key, value in (parsed_filters or {}).items()
+        if key not in _RAG_RETRY_DROP_FILTERS
+    }
+
+
+def _merge_retry_results(first: List[dict], second: List[dict]) -> List[dict]:
+    """合并首次与重试结果：按 (doc_id, chunk_index) 去重，保留高分项。"""
+    merged: Dict[tuple, dict] = {}
+    for item in list(first or []) + list(second or []):
+        key = (item.get('doc_id'), item.get('chunk_index'))
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = item
+            continue
+        item_score = item.get('score', 0) or 0
+        existing_score = existing.get('score', 0) or 0
+        # 同一分块只保留高分项；文档级结果与分块级结果 key 不同，各自保留
+        if item_score > existing_score:
+            merged[key] = item
+    return sorted(
+        merged.values(), key=lambda r: (r.get('score', 0) or 0), reverse=True,
+    )
+
+
+def _retrieve_pipeline(
     question: str,
-    user_context: Optional[dict] = None,
-    parsed_filters: Optional[dict] = None,
-    top_k: int = RAG_TOP_K,
-    min_score: float = RAG_SCORE_THRESHOLD,
+    user_context: dict,
+    parsed_filters: Optional[dict],
+    top_k: int,
+    min_score: float,
+    rewrite_questions: Optional[List[str]] = None,
 ) -> List[dict]:
+    """执行一次完整检索管道（硬过滤 → 多路召回 → 合并精排 → 权限校验）。
+
+    retrieve() 与 retrieve_wider() 共用此管道，避免二次检索重复实现一套逻辑。
     """
-    检索管道（三层检索升级版）：硬过滤 → 双路召回 → 关键词权重 → 权限校验。
-
-    Args:
-        question: 用户问题
-        user_context: 用户上下文 {'user_id': int, 'role': str, 'college_id': int}
-        parsed_filters: parse() 输出的过滤条件
-        top_k: Milvus 召回数量
-        min_score: 最低分阈值（低于此分数不返回）
-
-    Returns:
-        [{'doc_id': int, 'doc_title': str, 'content': str, 'score': float, 'page': int}, ...]
-    """
-    user_context = user_context or {'role': 'user'}
-    parsed_filters = parsed_filters or {}
-
-    # 纯时间/日期问题直接跳过检索（由系统注入的「当前时间」回答），
-    # 避免命中无关文档、污染参考答案。
-    if _is_time_question(question):
-        logger.info('纯时间问题，跳过 RAG 检索: %s', question[:30])
-        return []
+    parsed_filters = dict(parsed_filters or {})
 
     # 检测用户是否需要历史数据（含"历年/历史/全部"等关键词则不限时间）
     parsed_filters['need_history'] = _detect_history_intent(question)
 
     # 0. Query 改写：口语化提问 → 多个检索词（多路检索后合并去重）
-    from utils.query_rewriter import rewrite_query
-    rewrite_questions = rewrite_query(question)
-    if len(rewrite_questions) > 1:
-        logger.debug('Query 改写: %s -> %s', question[:30], rewrite_questions)
+    if rewrite_questions is None:
+        from utils.query_rewriter import rewrite_query
+        rewrite_questions = rewrite_query(question)
+        if len(rewrite_questions) > 1:
+            logger.debug('Query 改写: %s -> %s', question[:30], rewrite_questions)
 
     # 1. SQL 硬过滤 → 候选 ID 列表
     candidate_ids = _apply_hard_filters(parsed_filters, user_context, top_k=500)
@@ -1552,4 +1607,107 @@ def retrieve(
             logger.info(f'向量检索无结果，标题降级搜索命中 {len(title_matches)} 条')
             return title_matches
 
+    return results
+
+
+def retrieve_wider(
+    question: str,
+    user_context: Optional[dict] = None,
+    parsed_filters: Optional[dict] = None,
+    top_k: int = RAG_RETRY_TOP_K,
+    min_score: float = RAG_RETRY_MIN_SCORE,
+    rewrite_questions: Optional[List[str]] = None,
+) -> List[dict]:
+    """扩大范围检索：放宽时间/类型/分类过滤，扩大召回并降低最低分。
+
+    供 retrieve() 在首次结果为空或低置信时调用一次；也可单独用于诊断。
+    不改动向量库与数据结构。
+    """
+    if _is_time_question(question):
+        return []
+    return _retrieve_pipeline(
+        question=question,
+        user_context=user_context or {'role': 'user'},
+        parsed_filters=_widen_retrieval_filters(parsed_filters),
+        top_k=top_k,
+        min_score=min_score,
+        rewrite_questions=rewrite_questions,
+    )
+
+
+def retrieve(
+    question: str,
+    user_context: Optional[dict] = None,
+    parsed_filters: Optional[dict] = None,
+    top_k: int = RAG_TOP_K,
+    min_score: float = RAG_SCORE_THRESHOLD,
+) -> List[dict]:
+    """
+    检索管道（三层检索升级版）：硬过滤 → 双路召回 → 关键词权重 → 权限校验。
+
+    首次结果为空或低置信时，自动扩大范围重试一次（RAG_RETRY_MAX_ATTEMPTS），
+    两次结果按现有分数合并去重后返回。
+
+    Args:
+        question: 用户问题
+        user_context: 用户上下文 {'user_id': int, 'role': str, 'college_id': int}
+        parsed_filters: parse() 输出的过滤条件
+        top_k: Milvus 召回数量
+        min_score: 最低分阈值（低于此分数不返回）
+
+    Returns:
+        [{'doc_id': int, 'doc_title': str, 'content': str, 'score': float, 'page': int}, ...]
+    """
+    user_context = user_context or {'role': 'user'}
+    parsed_filters = dict(parsed_filters or {})
+
+    # 纯时间/日期问题直接跳过检索（由系统注入的「当前时间」回答），
+    # 避免命中无关文档、污染参考答案。
+    if _is_time_question(question):
+        logger.info('纯时间问题，跳过 RAG 检索: %s', question[:30])
+        return []
+
+    # Query 改写只做一次，首次与重试共用，避免重复调用改写模型。
+    from utils.query_rewriter import rewrite_query
+    rewrite_questions = rewrite_query(question)
+    if len(rewrite_questions) > 1:
+        logger.debug('Query 改写: %s -> %s', question[:30], rewrite_questions)
+
+    results = _retrieve_pipeline(
+        question=question,
+        user_context=user_context,
+        parsed_filters=parsed_filters,
+        top_k=top_k,
+        min_score=min_score,
+        rewrite_questions=rewrite_questions,
+    )
+
+    # 二次检索：只在首次为空/低置信时触发，次数受 RAG_RETRY_MAX_ATTEMPTS 限制。
+    attempts = 0
+    while attempts < RAG_RETRY_MAX_ATTEMPTS:
+        need_retry, reason = _should_retry_retrieval(results)
+        if not need_retry:
+            break
+        attempts += 1
+        first_count = len(results)
+        first_top = _retrieval_top_score(results)
+        retry_results = retrieve_wider(
+            question=question,
+            user_context=user_context,
+            parsed_filters=parsed_filters,
+            top_k=RAG_RETRY_TOP_K,
+            min_score=RAG_RETRY_MIN_SCORE,
+            rewrite_questions=rewrite_questions,
+        )
+        results = _merge_retry_results(results, retry_results)
+        logger.info(
+            '[RAG二次检索] 第%d次 触发=%s 首次=%d(最高%.3f) 重试=%d 合并=%d',
+            attempts, reason, first_count, first_top,
+            len(retry_results), len(results),
+        )
+        if not retry_results:
+            break
+
+    if top_k and len(results) > top_k:
+        results = results[:top_k]
     return results
