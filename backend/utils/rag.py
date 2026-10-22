@@ -909,8 +909,8 @@ def _merge_and_rerank(
 def authorized_knowledge_docs(user_context: Optional[dict] = None):
     """返回当前用户可检索的 KnowledgeDoc QuerySet。
 
-    授权逻辑必须在召回和引用签名前保持一致。超管可查看全部文档，
-    其他角色仅可查看公开的学校/本部门或本人上传文档。
+    授权逻辑必须在召回和引用签名前保持一致。超管可查看全部文档（其他超管上传的
+    private 文档除外），其他角色仅可查看公开的学校/本部门或本人上传文档。
     """
     from django.db.models import Q
     from apps.knowledge.models import KnowledgeDoc
@@ -922,8 +922,11 @@ def authorized_knowledge_docs(user_context: Optional[dict] = None):
     department_id = user_context.get('department_id')
 
     qs = KnowledgeDoc.objects.all()
+
+    # 超管上传的私密文档：仅该超管本人可见（与浏览链路 _admin_scope_filter 对齐）
+    super_private = Q(visibility='private', uploader__role='super_admin')
     if role == 'super_admin':
-        return qs
+        return qs.exclude(super_private & ~Q(uploader_id=user_id))
 
     qs = qs.filter(visibility='public')
     school_level = Q(college_id__isnull=True, department_id__isnull=True)

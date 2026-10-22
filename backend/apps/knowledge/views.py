@@ -141,7 +141,7 @@ class KnowledgeDocListView(generics.ListAPIView):
     @staticmethod
     def _admin_scope_filter(queryset, user):
         """管理后台权限过滤（通过 college_id/department_id 判断归属）：
-        - super_admin：全量
+        - super_admin：全量，但其他超管上传的 private 文档不可见（仅该超管本人可见）
         - college_admin / admin：校级文档 + 本院文档（含部门级） + 自己上传的
         - dept_admin：校级文档 + 本部门文档 + 自己上传的
         - user：仅本人上传的文档（对齐接口文档「普通用户仅能查看/下载自己上传的文档」，
@@ -150,8 +150,17 @@ class KnowledgeDocListView(generics.ListAPIView):
         # 校级文档：college_id 和 department_id 均为 null
         SCHOOL_LEVEL = Q(college_id__isnull=True, department_id__isnull=True)
 
+        # 超管上传的私密文档：仅该超管本人可见。超管上传时 college_id/department_id
+        # 均为 null（校级文档），会被下文的 SCHOOL_LEVEL 命中而向所有管理角色泄露，
+        # 故在角色过滤前先按「private + 上传者为超管」剔除（上传者本人除外）。
+        super_private = Q(visibility='private', uploader__role='super_admin')
+
         if user.role == 'super_admin':
-            return queryset
+            return queryset.exclude(super_private & ~Q(uploader_id=user.id))
+
+        # 非超管：超管上传的私密文档一律不可见
+        queryset = queryset.exclude(super_private)
+
         if user.role in ('college_admin', 'admin'):
             return queryset.filter(
                 SCHOOL_LEVEL

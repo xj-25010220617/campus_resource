@@ -1,0 +1,42 @@
+Collecting celery
+  Downloading celery-5.6.3-py3-none-any.whl (451 kB)
+     -------------------------------------- 451.2/451.2 kB 2.2 MB/s eta 0:00:00
+Collecting redis
+  Downloading redis-8.1.0-py3-none-any.whl (560 kB)
+     ------------------------------------ 560.6/560.6 kB 839.0 kB/s eta 0:00:00
+Requirement already satisfied: click<9.0,>=8.1.2 in c:\users\ziton\.pyenv\pyenv-win\versions\3.10.11\lib\site-packages (from celery) (8.4.2)
+Collecting click-plugins>=1.1.1
+  Downloading click_plugins-1.1.1.2-py2.py3-none-any.whl (11 kB)
+Collecting click-repl>=0.2.0
+  Downloading click_repl-0.4.1-py3-none-any.whl (14 kB)
+Requirement already satisfied: exceptiongroup>=1.3.0 in c:\users\ziton\.pyenv\pyenv-win\versions\3.10.11\lib\site-packages (from celery) (1.3.1)
+Collecting vine<6.0,>=5.1.0
+  Downloading vine-5.1.0-py3-none-any.whl (9.6 kB)
+Requirement already satisfied: python-dateutil>=2.8.2 in c:\users\ziton\.pyenv\pyenv-win\versions\3.10.11\lib\site-packages (from celery) (2.9.0.post0)
+Collecting tzlocal
+  Downloading tzlocal-5.4.4-py3-none-any.whl (18 kB)
+Collecting billiard<5.0,>=4.2.1
+  Downloading billiard-4.3.1-py3-none-any.whl (90 kB)
+     ---------------------------------------- 90.2/90.2 kB ? eta 0:00:00
+Collecting kombu>=5.6.0
+  Downloading kombu-5.6.2-py3-none-any.whl (214 kB)
+     -------------------------------------- 214.2/214.2 kB 6.6 MB/s eta 0:00:00
+Collecting click-didyoumean>=0.3.0
+  Downloading click_didyoumean-0.3.1-py3-none-any.whl (3.6 kB)
+Requirement already satisfied: async-timeout>=4.0.3 in c:\users\ziton\.pyenv\pyenv-win\versions\3.10.11\lib\site-packages (from redis) (5.0.1)
+Requirement already satisfied: colorama in c:\users\ziton\.pyenv\pyenv-win\versions\3.10.11\lib\site-packages (from click<9.0,>=8.1.2->celery) (0.4.6)
+Requirement already satisfied: typing-extensions>=4.7.0 in c:\users\ziton\.pyenv\pyenv-win\versions\3.10.11\lib\site-packages (from click-repl>=0.2.0->celery) (4.15.0)
+Collecting prompt_toolkit>=3.0.36
+  Downloading prompt_toolkit-3.0.53-py3-none-any.whl (392 kB)
+     -------------------------------------- 392.3/392.3 kB 1.6 MB/s eta 0:00:00
+Requirement already satisfied: tzdata>=2025.2 in c:\users\ziton\.pyenv\pyenv-win\versions\3.10.11\lib\site-packages (from kombu>=5.6.0->celery) (2026.2)
+Collecting amqp<6.0.0,>=5.1.1
+  Downloading amqp-5.4.1-py3-none-any.whl (51 kB)
+     ---------------------------------------- 51.9/51.9 kB 2.8 MB/s eta 0:00:00
+Requirement already satisfied: packaging in c:\users\ziton\.pyenv\pyenv-win\versions\3.10.11\lib\site-packages (from kombu>=5.6.0->celery) (26.2)
+Requirement already satisfied: six>=1.5 in c:\users\ziton\.pyenv\pyenv-win\versions\3.10.11\lib\site-packages (from python-dateutil>=2.8.2->celery) (1.17.0)
+Collecting wcwidth>=0.1.4
+  Downloading wcwidth-0.9.3-cp310-abi3-win_amd64.whl (597 kB)
+     -------------------------------------- 597.7/597.7 kB 2.1 MB/s eta 0:00:00
+Installing collected packages: wcwidth, vine, tzlocal, redis, billiard, prompt_toolkit, click-plugins, click-didyoumean, amqp, kombu, click-repl, celery
+Successfully installed amqp-5.4.1 billiard-4.3.1 celery-5.6.3 click-didyoumean-0.3.1 click-plugins-1.1.1.2 click-repl-0.4.1 kombu-5.6.2 prompt_toolkit-3.0.53 redis-8.1.0 tzlocal-5.4.4 vine-5.1.0 wcwidth-0.9.3

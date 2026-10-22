@@ -275,3 +275,65 @@ class RagRetrievalTests(TestCase):
             results = rag.retrieve(question, user_context=self.user_ctx)
 
         self.assertEqual(results, [])
+
+
+class SuperAdminPrivateDocTests(TestCase):
+    """超管上传的 private 文档仅该超管本人可见（浏览 + AI 检索两条链路一致）。"""
+
+    def setUp(self):
+        self.owner = User.objects.create_user(
+            username='sa_owner', password='testpass123', role='super_admin',
+        )
+        self.other_sa = User.objects.create_user(
+            username='sa_other', password='testpass123', role='super_admin',
+        )
+        self.college_admin = User.objects.create_user(
+            username='sa_college_admin', password='testpass123', role='college_admin',
+        )
+        self.dept_admin = User.objects.create_user(
+            username='sa_dept_admin', password='testpass123', role='dept_admin',
+        )
+        # 超管上传的文档：college_id / department_id 均为 null（校级文档），
+        # 修复前会命中 SCHOOL_LEVEL 向所有管理角色泄露。
+        self.doc = KnowledgeDoc.objects.create(
+            title='超管私密文档',
+            source_type='upload',
+            file_name='secret.pdf',
+            file_type='pdf',
+            uploader=self.owner,
+            status='indexed',
+            visibility='private',
+        )
+
+    def _browsable_ids(self, user):
+        from apps.knowledge.views import KnowledgeDocListView
+        return set(
+            KnowledgeDocListView._admin_scope_filter(
+                KnowledgeDoc.objects.all(), user,
+            ).values_list('id', flat=True)
+        )
+
+    def _retrievable_ids(self, user):
+        from utils.rag import authorized_knowledge_docs
+        return set(
+            authorized_knowledge_docs({'role': user.role, 'user_id': user.id})
+            .values_list('id', flat=True)
+        )
+
+    def test_owner_super_admin_can_browse(self):
+        self.assertIn(self.doc.id, self._browsable_ids(self.owner))
+
+    def test_other_super_admin_cannot_browse(self):
+        self.assertNotIn(self.doc.id, self._browsable_ids(self.other_sa))
+
+    def test_college_admin_cannot_browse(self):
+        self.assertNotIn(self.doc.id, self._browsable_ids(self.college_admin))
+
+    def test_dept_admin_cannot_browse(self):
+        self.assertNotIn(self.doc.id, self._browsable_ids(self.dept_admin))
+
+    def test_owner_super_admin_can_retrieve(self):
+        self.assertIn(self.doc.id, self._retrievable_ids(self.owner))
+
+    def test_other_super_admin_cannot_retrieve(self):
+        self.assertNotIn(self.doc.id, self._retrievable_ids(self.other_sa))
