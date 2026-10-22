@@ -202,6 +202,12 @@ QWEN_VL_MODEL = config('QWEN_VL_MODEL', default='qwen-vl-plus')
 # 后期本地部署问答模型时改 .env 的 LLM_PROVIDER=local 即可，不改代码。
 LLM_PROVIDER = config('LLM_PROVIDER', default='qwen')
 
+# 意图路由 LLM 兜底：仅当正则/规则无法判断时调用一次短超时分类。
+# 关闭后路由完全走原有确定性规则（测试环境默认关闭，见 settings_test.py）。
+QUERY_ROUTER_LLM_ENABLED = config('QUERY_ROUTER_LLM_ENABLED', default=True, cast=bool)
+QUERY_ROUTER_LLM_TIMEOUT = config('QUERY_ROUTER_LLM_TIMEOUT', default=3.0, cast=float)
+QUERY_ROUTER_LLM_CACHE_TTL = config('QUERY_ROUTER_LLM_CACHE_TTL', default=600, cast=int)
+
 # Embedding 后端切换（aliyun / local / mock）
 EMBED_BACKEND = config('EMBED_BACKEND', default='local')
 ALIYUN_EMBED_API_KEY = config('ALIYUN_EMBED_API_KEY', default='')

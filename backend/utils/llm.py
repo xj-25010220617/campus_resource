@@ -249,8 +249,12 @@ class LLMClient:
     # ------------------------------------------------------------------
     # Chat（对话/视觉/流式）— 委托给 LLMProvider
     # ------------------------------------------------------------------
-    def chat(self, messages, model=None, temperature=0.7, max_tokens=2048):
-        return self._provider.chat(messages, model=model, temperature=temperature, max_tokens=max_tokens)
+    def chat(self, messages, model=None, temperature=0.7, max_tokens=2048,
+             timeout=None, max_retries=None):
+        return self._provider.chat(
+            messages, model=model, temperature=temperature, max_tokens=max_tokens,
+            timeout=timeout, max_retries=max_retries,
+        )
 
     def chat_vision(self, text, image_data_urls, model=None, temperature=0.0, max_tokens=800):
         return self._provider.chat_vision(text, image_data_urls, model=model, temperature=temperature, max_tokens=max_tokens)

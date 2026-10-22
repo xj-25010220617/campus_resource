@@ -130,7 +130,10 @@ def _turn_doc_context(conversation, turn_msg, upper_msg, user):
             return ids, len(ids) > 1, 'rag_log'
         # 该轮日志没有可用 doc_id（如语音数据查询轮），继续按重放解析
 
-    route = route_text_question(turn_msg.content, user, context=None)
+    # 回放历史轮次只走确定性规则，不重复调用模型分类。
+    route = route_text_question(
+        turn_msg.content, user, context=None, allow_llm=False,
+    )
     if route.get('query_type') not in _DOC_CONTEXT_REPLAY_TYPES:
         return None
 
@@ -145,7 +148,7 @@ def _is_text_time_followup(text, user):
     """该轮本身是否只是“这个文件/什么时候上传的”这类无具体文件名的追问。"""
     from utils.query_router import route_text_question
 
-    route = route_text_question(text, user, context=None)
+    route = route_text_question(text, user, context=None, allow_llm=False)
     if route.get('query_type') not in _DOC_TIME_QUERY_TYPES:
         return False
     params = route.get('params') or {}

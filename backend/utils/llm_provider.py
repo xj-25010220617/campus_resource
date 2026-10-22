@@ -56,7 +56,8 @@ def _check_ascii(name: str, value: str) -> bool:
 class LLMProvider:
     """聊天/视觉模型 Provider 抽象基类。"""
 
-    def chat(self, messages: List[dict], model: str = None, temperature: float = 0.7, max_tokens: int = 2048) -> Optional[str]:
+    def chat(self, messages: List[dict], model: str = None, temperature: float = 0.7, max_tokens: int = 2048,
+             timeout: float = None, max_retries: int = None) -> Optional[str]:
         raise NotImplementedError
 
     def chat_stream(self, messages: List[dict], model: str = None, temperature: float = 0.3, max_tokens: int = 2048) -> Generator[str, None, None]:
@@ -85,12 +86,20 @@ class QwenProvider(LLMProvider):
             'Content-Type': 'application/json',
         }
 
-    def chat(self, messages, model=None, temperature=0.7, max_tokens=2048):
+    def chat(self, messages, model=None, temperature=0.7, max_tokens=2048,
+             timeout=None, max_retries=None):
         if not self.api_key:
             return self._mock_chat(messages)
 
+        # 意图分类等内部短调用可传入更短超时与更少重试次数，避免继承
+        # 通用对话的长超时/3 次指数退避（最长可能阻塞数分钟）。
+        retries = MAX_RETRIES if max_retries is None else max(1, int(max_retries))
+        request_kwargs = {}
+        if timeout is not None:
+            request_kwargs['timeout'] = timeout
+
         last_error = None
-        for attempt in range(MAX_RETRIES):
+        for attempt in range(retries):
             try:
                 resp = ExternalClient.post(
                     'llm_chat',
@@ -103,18 +112,19 @@ class QwenProvider(LLMProvider):
                         'max_tokens': max_tokens,
                         'stream': False,
                     },
+                    **request_kwargs,
                 )
                 resp.raise_for_status()
                 data = resp.json()
                 return data['choices'][0]['message']['content']
             except requests.Timeout as e:
                 last_error = e
-                logger.warning(f'Chat 超时 (attempt {attempt+1}/{MAX_RETRIES})')
+                logger.warning(f'Chat 超时 (attempt {attempt+1}/{retries})')
             except requests.RequestException as e:
                 last_error = e
-                logger.warning(f'Chat 请求失败 (attempt {attempt+1}/{MAX_RETRIES}): {e}')
+                logger.warning(f'Chat 请求失败 (attempt {attempt+1}/{retries}): {e}')
 
-            if attempt < MAX_RETRIES - 1:
+            if attempt < retries - 1:
                 _retry_sleep(attempt + 1)
 
         logger.error(f'Chat 最终失败: {last_error}')
@@ -294,7 +304,8 @@ class LocalProvider(LLMProvider):
     def _not_ready(self):
         raise NotImplementedError('本地 LLM 尚未接入，请在 .env 设置 LLM_PROVIDER=qwen 使用云端模型')
 
-    def chat(self, messages, model=None, temperature=0.7, max_tokens=2048):
+    def chat(self, messages, model=None, temperature=0.7, max_tokens=2048,
+             timeout=None, max_retries=None):
         self._not_ready()
 
     def chat_stream(self, messages, model=None, temperature=0.3, max_tokens=2048):
