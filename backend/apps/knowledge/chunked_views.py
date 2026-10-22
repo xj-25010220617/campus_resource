@@ -236,7 +236,7 @@ class ChunkMergeView(APIView):
     """
     POST /api/knowledge/upload/chunk/merge/
     参数：upload_id, file_md5；可选 title / description / visibility /
-          discipline_id / college_id / department_id / keywords
+          discipline_id / college_id / department_id / keywords / tags / relations
     OSS 服务端合并分片 → MD5 二次去重 → 创建 KnowledgeDoc → 触发异步索引
     """
     permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
@@ -337,6 +337,11 @@ class ChunkMergeView(APIView):
                 doc=new_doc, phrase=phrase,
                 match_type='fuzzy', weight=1, created_by=request.user,
             )
+
+        # 人工打标签 + 建立文档关联（复用 views 中的工具函数，延迟导入避免循环依赖）
+        from .views import _create_doc_relations, _create_doc_tags, _normalize_relations, _normalize_tags
+        _create_doc_tags(new_doc, _normalize_tags(request, request.data.get('tags')), request.user)
+        _create_doc_relations(new_doc, _normalize_relations(request, request.data.get('relations')), request.user)
 
         safe_delay(extract_freshness_task, new_doc.id)
         safe_delay(index_document_task, new_doc.id)

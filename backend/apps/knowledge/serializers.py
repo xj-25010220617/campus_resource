@@ -1,6 +1,6 @@
 from rest_framework import serializers
 
-from .models import KnowledgeDoc, Keyword
+from .models import DocRelation, DocTag, KnowledgeDoc, Keyword, Tag
 from utils.oss import oss_client
 from utils.timefmt import format_business_time
 
@@ -293,6 +293,10 @@ class UploadCallbackSerializer(serializers.Serializer):
         child=serializers.CharField(), required=False, default=list,
         help_text='关键词列表（可选，未提供时 AI 提取）',
     )
+    tags = serializers.ListField(
+        child=serializers.CharField(max_length=64), required=False, default=list,
+        help_text='标签名称列表（可选，人工打标，与关键词分离）',
+    )
     visibility = serializers.ChoiceField(
         choices=['public', 'private'],
         default='public',
@@ -336,6 +340,68 @@ class KeywordCreateSerializer(serializers.Serializer):
     )
 
 
+class TagSerializer(serializers.ModelSerializer):
+    """标签序列化器（标签字典，全平台共享）"""
+
+    class Meta:
+        model = Tag
+        fields = ['id', 'name', 'created_at']
+        read_only_fields = ['id', 'created_at']
+
+
+class DocTagSerializer(serializers.ModelSerializer):
+    """文档-标签关联序列化器（展平标签名）"""
+
+    tag_id = serializers.IntegerField(source='tag_id', read_only=True)
+    tag_name = serializers.CharField(source='tag.name', read_only=True)
+
+    class Meta:
+        model = DocTag
+        fields = ['id', 'tag_id', 'tag_name', 'created_at']
+        read_only_fields = ['id', 'tag_id', 'tag_name', 'created_at']
+
+
+class DocRelationSerializer(serializers.ModelSerializer):
+    """文档关联序列化器（展平目标文档摘要）"""
+
+    source_doc_id = serializers.IntegerField(source='source_doc_id', read_only=True)
+    target_doc_id = serializers.IntegerField(source='target_doc_id', read_only=True)
+    target_doc_title = serializers.CharField(source='target_doc.title', read_only=True)
+    relation_type_name = serializers.CharField(source='get_relation_type_display', read_only=True)
+
+    class Meta:
+        model = DocRelation
+        fields = [
+            'id', 'source_doc_id', 'target_doc_id', 'target_doc_title',
+            'relation_type', 'relation_type_name', 'created_at',
+        ]
+        read_only_fields = [
+            'id', 'source_doc_id', 'target_doc_id', 'target_doc_title',
+            'relation_type_name', 'created_at',
+        ]
+
+
+class DocTagCreateSerializer(serializers.Serializer):
+    """批量打标签请求参数"""
+
+    names = serializers.ListField(
+        child=serializers.CharField(max_length=64),
+        min_length=1, max_length=20,
+        help_text='标签名称列表（不存在则自动创建）',
+    )
+
+
+class DocRelationCreateSerializer(serializers.Serializer):
+    """创建文档关联请求参数"""
+
+    target_doc_id = serializers.IntegerField(min_value=1, help_text='目标文档 ID')
+    relation_type = serializers.ChoiceField(
+        choices=[c[0] for c in DocRelation.RELATION_TYPE_CHOICES],
+        default='supplement',
+        help_text='关联类型（prerequisite/supplement/same_course/citation/replaces）',
+    )
+
+
 def _sanitize_content(value: str) -> str:
     """清理文本内容中的控制字符，防止 JSON 解析错误"""
     # 移除不可见的控制字符（保留换行符和制表符）
@@ -363,6 +429,10 @@ class TextUploadSerializer(serializers.Serializer):
         child=serializers.CharField(), required=False, default=list,
         help_text='关键词列表（可选，未提供时 AI 提取）',
     )
+    tags = serializers.ListField(
+        child=serializers.CharField(max_length=64), required=False, default=list,
+        help_text='标签名称列表（可选，人工打标，与关键词分离）',
+    )
     visibility = serializers.ChoiceField(
         choices=['public', 'private'],
         default='public',
@@ -387,6 +457,10 @@ class FileUploadSerializer(serializers.Serializer):
     keywords = serializers.ListField(
         child=serializers.CharField(), required=False, default=list,
         help_text='关键词列表（可选，未提供时 AI 提取）',
+    )
+    tags = serializers.ListField(
+        child=serializers.CharField(max_length=64), required=False, default=list,
+        help_text='标签名称列表（可选，人工打标，与关键词分离）',
     )
     visibility = serializers.ChoiceField(
         choices=['public', 'private'],

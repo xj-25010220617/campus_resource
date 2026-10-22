@@ -20,6 +20,13 @@ from .views import (
     KnowledgeDocDownloadView,
     KnowledgeDocListView,
     KnowledgeDocPreviewView,
+    DocRelationCreateView,
+    DocRelationDeleteView,
+    DocRelationListView,
+    DocTagCreateView,
+    DocTagDeleteView,
+    DocTagListView,
+    TagListView,
     TextUploadView,
     UploadCallbackView,
     UploadSTSView,
@@ -56,4 +63,15 @@ urlpatterns = [
     path('docs/<int:doc_id>/keywords/create/', KeywordCreateView.as_view(), name='keyword_create'),
     path('keywords/<int:pk>/', KeywordUpdateView.as_view(), name='keyword_update'),
     path('keywords/<int:pk>/delete/', KeywordDeleteView.as_view(), name='keyword_delete'),
+
+    # 标签
+    path('tags/', TagListView.as_view(), name='tag_list'),
+    path('docs/<int:doc_id>/tags/', DocTagListView.as_view(), name='doc_tag_list'),
+    path('docs/<int:doc_id>/tags/create/', DocTagCreateView.as_view(), name='doc_tag_create'),
+    path('docs/<int:doc_id>/tags/<int:tag_id>/delete/', DocTagDeleteView.as_view(), name='doc_tag_delete'),
+
+    # 文档关联（文件网）
+    path('docs/<int:doc_id>/relations/', DocRelationListView.as_view(), name='doc_relation_list'),
+    path('docs/<int:doc_id>/relations/create/', DocRelationCreateView.as_view(), name='doc_relation_create'),
+    path('docs/<int:doc_id>/relations/<int:relation_id>/delete/', DocRelationDeleteView.as_view(), name='doc_relation_delete'),
 ]

@@ -33,18 +33,23 @@ from utils.error_codes import ErrorCode
 from utils.parsers import CleanJSONParser
 
 from .extractor import extract_freshness_for_doc
-from .models import Keyword, KnowledgeDoc
+from .models import DocRelation, DocTag, Keyword, KnowledgeDoc, Tag
 from .serializers import (
     AIClassifySerializer,
     ALLOWED_FILE_TYPES,
     FILE_SIZE_LIMITS,
     IMAGE_FILE_TYPES,
+    DocRelationCreateSerializer,
+    DocRelationSerializer,
+    DocTagCreateSerializer,
+    DocTagSerializer,
     FileUploadSerializer,
     KeywordCreateSerializer,
     KeywordSerializer,
     KnowledgeDocListSerializer,
     KnowledgeDocSerializer,
     normalize_file_type,
+    TagSerializer,
     TextUploadSerializer,
     UploadCallbackSerializer,
     UploadSTSRequestSerializer,
@@ -610,6 +615,233 @@ class KeywordDeleteView(APIView):
 
 
 @extend_schema(
+    summary='标签字典列表',
+    description='返回全平台共享的标签词表（未删除），供上传打标与筛选使用',
+    tags=['标签管理'],
+    operation_id='标签列表',
+)
+class TagListView(APIView):
+    """标签字典列表
+
+    GET /api/knowledge/tags/
+    功能：返回全平台共享的标签词表（软删除的不返回），按创建顺序排列
+    返回：标签数组，每条包含 id / name / created_at
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        tags = Tag.objects.filter(is_deleted=False).order_by('id')
+        return Response(TagSerializer(tags, many=True).data)
+
+
+@extend_schema(
+    summary='文档标签列表',
+    description='返回指定文档被打上的标签',
+    tags=['标签管理'],
+    operation_id='文档标签列表',
+)
+class DocTagListView(APIView):
+    """文档标签列表
+
+    GET /api/knowledge/docs/{doc_id}/tags/
+    功能：返回指定文档被打上的标签，所有登录用户可查看（文档需在可浏览范围内）
+    返回：标签关联数组，每条包含 id / tag_id / tag_name / created_at
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, doc_id):
+        doc = get_object_or_404(
+            KnowledgeDocListView._admin_scope_filter(
+                KnowledgeDoc.objects.all(), request.user,
+            ),
+            id=doc_id,
+        )
+        doc_tags = doc.doc_tags.select_related('tag').order_by('id')
+        return Response(DocTagSerializer(doc_tags, many=True).data)
+
+
+@extend_schema(
+    summary='批量打标签',
+    description='为指定文档批量添加标签（名称不存在则自动创建，重复打标幂等）',
+    tags=['标签管理'],
+    operation_id='批量打标签',
+)
+class DocTagCreateView(APIView):
+    """为文档批量打标签
+
+    POST /api/knowledge/docs/{doc_id}/tags/
+    功能：为指定文档批量打标签，标签名不存在则自动创建（全平台共享词表）
+    请求参数：
+        - names (list[str], required): 标签名称列表
+    权限规则：
+        - super_admin（超级管理员）: 可给任意文档打标
+        - admin（学院管理员）: 仅能给自己上传的文档打标
+    返回：
+        - 200: {"created": N, "tags": [{id, tag_id, tag_name, created_at}, ...]}
+    """
+    permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
+
+    def post(self, request, doc_id):
+        doc = get_object_or_404(KnowledgeDoc, id=doc_id)
+
+        # 权限校验：超管全放行，其余仅允许操作自己上传的文档
+        if request.user.role != 'super_admin' and doc.uploader_id != request.user.id:
+            raise PermissionDenied('只能给自己上传的文档打标签')
+
+        serializer = DocTagCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        names = serializer.validated_data['names']
+
+        created_count = _create_doc_tags(doc, names, request.user)
+        doc_tags = doc.doc_tags.select_related('tag').order_by('id')
+        return Response({
+            'created': created_count,
+            'tags': DocTagSerializer(doc_tags, many=True).data,
+        })
+
+
+@extend_schema(
+    summary='删除文档标签',
+    description='移除文档上的指定标签（仅删除关联，不删除标签词条）',
+    tags=['标签管理'],
+    operation_id='删除文档标签',
+)
+class DocTagDeleteView(APIView):
+    """删除文档上的标签关联
+
+    DELETE /api/knowledge/docs/{doc_id}/tags/{tag_id}/
+    功能：移除文档上的指定标签（仅删除关联记录，不删除标签词条本身）
+    权限规则：
+        - super_admin（超级管理员）: 可删除任意文档的标签
+        - admin（学院管理员）: 仅能删除自己上传文档的标签
+    返回：{"detail": "删除成功"}
+    """
+    permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
+
+    def delete(self, request, doc_id, tag_id):
+        doc = get_object_or_404(KnowledgeDoc, id=doc_id)
+
+        # 权限校验：超管全放行，其余仅允许操作自己上传的文档
+        if request.user.role != 'super_admin' and doc.uploader_id != request.user.id:
+            raise PermissionDenied('只能删除自己上传的文档的标签')
+
+        DocTag.objects.filter(doc_id=doc_id, tag_id=tag_id).delete()
+        return Response({'detail': '删除成功'})
+
+
+@extend_schema(
+    summary='文档关联列表',
+    description='返回指定文档的对外关联（文件网出边），按创建时间倒序',
+    tags=['文档关联'],
+    operation_id='文档关联列表',
+)
+class DocRelationListView(APIView):
+    """文档关联列表（文件网出边）
+
+    GET /api/knowledge/docs/{doc_id}/relations/
+    功能：返回源文档指向其他文档的有向边，所有登录用户可查看（文档需在可浏览范围内）
+    返回：关联边数组，每条包含 id / source_doc_id / target_doc_id / target_doc_title / relation_type / relation_type_name / created_at
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, doc_id):
+        doc = get_object_or_404(
+            KnowledgeDocListView._admin_scope_filter(
+                KnowledgeDoc.objects.all(), request.user,
+            ),
+            id=doc_id,
+        )
+        relations = doc.outgoing_relations.filter(is_deleted=False).select_related('target_doc').order_by('-created_at')
+        return Response(DocRelationSerializer(relations, many=True).data)
+
+
+@extend_schema(
+    summary='创建文档关联',
+    description='为源文档创建一条指向目标文档的有向关联（目标须在可浏览范围内）',
+    tags=['文档关联'],
+    operation_id='创建文档关联',
+)
+class DocRelationCreateView(APIView):
+    """创建文档关联（文件网有向边）
+
+    POST /api/knowledge/docs/{doc_id}/relations/
+    功能：为源文档创建一条指向目标文档的有向关联
+    请求参数：
+        - target_doc_id (int, required): 目标文档 ID
+        - relation_type (str, default=supplement): 关联类型（prerequisite/supplement/same_course/citation/replaces）
+    权限规则：
+        - super_admin（超级管理员）: 可为任意文档建边
+        - admin（学院管理员）: 仅能为自己上传的文档建边
+    约束：目标文档须在用户可浏览范围内，且不可为源文档自身；重复边返回既有记录
+    返回：
+        - 201: {id, source_doc_id, target_doc_id, target_doc_title, relation_type, relation_type_name, created_at}
+    """
+    permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
+
+    def post(self, request, doc_id):
+        doc = get_object_or_404(KnowledgeDoc, id=doc_id)
+
+        # 权限校验：超管全放行，其余仅允许操作自己上传的文档
+        if request.user.role != 'super_admin' and doc.uploader_id != request.user.id:
+            raise PermissionDenied('只能给自己上传的文档创建关联')
+
+        serializer = DocRelationCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        # 目标文档须在用户可浏览范围内（复用浏览权限过滤，防止越权建边泄露私密文档存在性）
+        target = KnowledgeDocListView._admin_scope_filter(
+            KnowledgeDoc.objects.all(), request.user,
+        ).filter(id=data['target_doc_id']).first()
+        if target is None:
+            raise ValidationError({'target_doc_id': '目标文档不存在或不在可浏览范围内'})
+        if target.id == doc.id:
+            raise ValidationError({'target_doc_id': '不能关联到文档自身'})
+
+        relation, _ = DocRelation.objects.get_or_create(
+            source_doc=doc,
+            target_doc=target,
+            relation_type=data.get('relation_type', 'supplement'),
+            defaults={'created_by': request.user},
+        )
+        return Response(DocRelationSerializer(relation).data, status=status.HTTP_201_CREATED)
+
+
+@extend_schema(
+    summary='删除文档关联',
+    description='软删除指定文档关联边（is_deleted=1，保留历史）',
+    tags=['文档关联'],
+    operation_id='删除文档关联',
+)
+class DocRelationDeleteView(APIView):
+    """删除文档关联（软删，保留历史）
+
+    DELETE /api/knowledge/docs/{doc_id}/relations/{relation_id}/
+    功能：软删除指定关联边（is_deleted=1），保留历史记录
+    权限规则：
+        - super_admin（超级管理员）: 可删除任意关联
+        - admin（学院管理员）: 仅能删除自己上传文档的关联
+    返回：{"detail": "删除成功"}
+    """
+    permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
+
+    def delete(self, request, doc_id, relation_id):
+        relation = get_object_or_404(
+            DocRelation.objects.select_related('source_doc'),
+            id=relation_id, source_doc_id=doc_id, is_deleted=False,
+        )
+
+        # 权限校验：超管全放行，其余仅允许删除自己上传文档的关联
+        if request.user.role != 'super_admin' and relation.source_doc.uploader_id != request.user.id:
+            raise PermissionDenied('只能删除自己上传文档的关联')
+
+        relation.is_deleted = True
+        relation.deleted_at = timezone.now()
+        relation.save(update_fields=['is_deleted', 'deleted_at'])
+        return Response({'detail': '删除成功'})
+
+
+@extend_schema(
     summary='获取上传凭证',
     description='校验文件 MD5 去重后，签发阿里云 OSS STS 临时凭证供前端直传',
     tags=['文件上传'],
@@ -761,6 +993,11 @@ class UploadCallbackView(APIView):
                     doc=new_doc, phrase=p,
                     defaults={'match_type': 'fuzzy', 'weight': 1, 'created_by': request.user},
                 )
+
+        # 人工打标签（标签与关键词分离，标签名不存在则自动创建）
+        _create_doc_tags(new_doc, _normalize_tags(request, data.get('tags', [])), request.user)
+        # 建立文档关联（文件网有向边，目标需在可浏览范围内）
+        _create_doc_relations(new_doc, _normalize_relations(request, request.data.get('relations')), request.user)
 
         # 自动触发 AI 日期提取（异步，不阻塞上传主链路）
         # 遵循 CONVENTIONS.md 第 9 节：异常处理下沉到 utils 层，视图层不写 try/except
@@ -936,6 +1173,11 @@ class TextUploadView(APIView):
                     doc=new_doc, phrase=p,
                     defaults={'match_type': 'fuzzy', 'weight': 1, 'created_by': request.user},
                 )
+
+        # 人工打标签（标签与关键词分离，标签名不存在则自动创建）
+        _create_doc_tags(new_doc, _normalize_tags(request, data.get('tags', [])), request.user)
+        # 建立文档关联（文件网有向边，目标需在可浏览范围内）
+        _create_doc_relations(new_doc, _normalize_relations(request, request.data.get('relations')), request.user)
 
         # 触发异步索引（切片 + 向量化），使文档可被 AI 智能问答检索
         from utils.celery_dispatcher import safe_delay
@@ -1387,6 +1629,11 @@ class FileUploadView(APIView):
                     defaults={'match_type': 'fuzzy', 'weight': 1, 'created_by': request.user},
                 )
 
+        # 人工打标签（标签与关键词分离，标签名不存在则自动创建）
+        _create_doc_tags(new_doc, _normalize_tags(request, data.get('tags', [])), request.user)
+        # 建立文档关联（文件网有向边，目标需在可浏览范围内）
+        _create_doc_relations(new_doc, _normalize_relations(request, request.data.get('relations')), request.user)
+
         # 触发异步索引（切片 + 向量化），使文档可被 AI 智能问答检索
         # 遵循规范第 9 节：异常处理下沉到 utils 层，视图层不写 try/except
         from utils.celery_dispatcher import safe_delay
@@ -1594,6 +1841,11 @@ class BatchFileUploadView(APIView):
                             defaults={'match_type': 'fuzzy', 'weight': 1, 'created_by': user},
                         )
 
+                # 人工打标签（标签与关键词分离，标签名不存在则自动创建）
+                _create_doc_tags(new_doc, _normalize_tags(request, request.data.get('tags', [])), user)
+                # 建立文档关联（文件网有向边，目标需在可浏览范围内）
+                _create_doc_relations(new_doc, _normalize_relations(request, request.data.get('relations')), user)
+
                 # 4g. 创建上传日志
                 try:
                     UploadLog.objects.create(
@@ -1647,22 +1899,23 @@ class BatchFileUploadView(APIView):
         })
 
 
-def _normalize_keywords(request, validated_value) -> list:
-    """稳健提取关键词列表，兼容 JSON body 与 multipart 的多种发送格式。
+def _normalize_string_list(request, field_name: str, validated_value) -> list:
+    """通用字符串列表归一：兼容 JSON body 与 multipart 的多种发送格式。
 
-    multipart/form-data 上传文件时，前端可能以下列任意形式发送关键词：
-        - 真数组（JSON body 或重复字段 keywords=a&keywords=b）
-        - 单个 JSON 字符串，如 keywords='["关键词1","关键词2"]'
-        - 数组命名字段 keywords[]=a&keywords[]=b
+    前端可能以下列任意形式发送列表字段（关键词 / 标签）：
+        - 真数组（JSON body 或重复字段 field=a&field=b）
+        - 单个 JSON 字符串，如 field='["a","b"]'
+        - 数组命名字段 field[]=a&field[]=b
 
-    统一归整为「去空后的字符串列表」，避免因格式不符被误判为空而触发 AI 重跑。
+    统一归整为「去空后的字符串列表」，避免因格式不符被误判为空。
 
     Args:
         request: DRF Request，用于在 multipart 下回读原始字段
+        field_name: 字段名（如 'keywords' / 'tags'）
         validated_value: 序列化器 ListField 解析出的值（list 或其它）
 
     Returns:
-        规整后的关键词字符串列表（可能为空）
+        规整后的字符串列表（可能为空）
     """
     import json
 
@@ -1672,9 +1925,9 @@ def _normalize_keywords(request, validated_value) -> list:
     elif isinstance(validated_value, str) and validated_value.strip():
         candidates = [validated_value]
 
-    # multipart 下若序列化器没接到，回读原始请求（兼容 keywords / keywords[] 两种命名）
+    # multipart 下若序列化器没接到，回读原始请求（兼容 field / field[] 两种命名）
     if not candidates and hasattr(request.data, 'getlist'):
-        candidates = request.data.getlist('keywords') or request.data.getlist('keywords[]')
+        candidates = request.data.getlist(field_name) or request.data.getlist(f'{field_name}[]')
 
     # 单元素且是 JSON 数组字符串时展开，如 ['["a","b"]'] → ['a', 'b']
     if len(candidates) == 1 and isinstance(candidates[0], str):
@@ -1687,8 +1940,129 @@ def _normalize_keywords(request, validated_value) -> list:
             except (json.JSONDecodeError, TypeError):
                 pass
 
-    # 归整为非空字符串列表
     return [str(k).strip() for k in candidates if str(k).strip()]
+
+
+def _normalize_keywords(request, validated_value) -> list:
+    """提取关键词字符串列表（委托通用归一），详见 _normalize_string_list。"""
+    return _normalize_string_list(request, 'keywords', validated_value)
+
+
+def _normalize_tags(request, validated_value) -> list:
+    """提取标签名称字符串列表（委托通用归一），详见 _normalize_string_list。"""
+    return _normalize_string_list(request, 'tags', validated_value)
+
+
+def _normalize_relations(request, validated_value) -> list:
+    """归一文档关联入参为 [{target_doc_id, relation_type}, ...] 列表。
+
+    兼容 JSON body（list/dict）与 multipart（JSON 字符串）两种形式，
+    忽略无法解析的非法项。
+
+    Args:
+        request: DRF Request（multipart 下回读原始字段）
+        validated_value: 原始请求中的 relations 值（list / str / None）
+
+    Returns:
+        规整后的关联 dict 列表（可能为空）
+    """
+    import json
+
+    raw = validated_value
+    # 单个 JSON 字符串（multipart 常见）：'[{"target_doc_id":1,"relation_type":"supplement"}]'
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw.strip())
+        except (json.JSONDecodeError, TypeError):
+            parsed = None
+        if isinstance(parsed, list):
+            raw = parsed
+        elif isinstance(parsed, dict):
+            raw = [parsed]
+        else:
+            raw = []
+    # multipart 下序列化器/原始取值没接到，回读 getlist
+    elif not raw and hasattr(request.data, 'getlist'):
+        raw = request.data.getlist('relations') or request.data.getlist('relations[]')
+
+    result = []
+    for item in (raw or []):
+        if isinstance(item, dict):
+            result.append(item)
+        elif isinstance(item, str):
+            try:
+                parsed = json.loads(item)
+                if isinstance(parsed, dict):
+                    result.append(parsed)
+            except (json.JSONDecodeError, TypeError):
+                pass
+    return result
+
+
+def _create_doc_tags(doc, tag_names: list, user) -> int:
+    """为文档批量打标签：标签名不存在则自动创建（全平台共享词表），重复打标幂等。
+
+    Args:
+        doc: KnowledgeDoc 实例
+        tag_names: 归一后的标签名称列表
+        user: 打标人
+
+    Returns:
+        实际新增的标签关联数量
+    """
+    created_count = 0
+    for name in tag_names:
+        name = str(name).strip()
+        if not name:
+            continue
+        tag, _ = Tag.objects.get_or_create(name=name)
+        _, created = DocTag.objects.get_or_create(
+            doc=doc, tag=tag, defaults={'created_by': user},
+        )
+        if created:
+            created_count += 1
+    return created_count
+
+
+def _create_doc_relations(doc, relations: list, user) -> int:
+    """为文档创建有向关联（文件网）：目标文档须在用户可浏览范围内，防止越权建边。
+
+    关联目标不可为文档自身；relation_type 非法时回退为 supplement；重复边幂等。
+
+    Args:
+        doc: 源文档
+        relations: 归一后的 [{target_doc_id, relation_type}, ...] 列表
+        user: 建边人
+
+    Returns:
+        实际新增的关联边数量
+    """
+    valid_types = {c[0] for c in DocRelation.RELATION_TYPE_CHOICES}
+    created_count = 0
+    for rel in relations:
+        if not isinstance(rel, dict):
+            continue
+        target_doc_id = rel.get('target_doc_id') or rel.get('target_doc')
+        relation_type = rel.get('relation_type', 'supplement')
+        if relation_type not in valid_types:
+            relation_type = 'supplement'
+        if not target_doc_id:
+            continue
+        # 目标文档须在用户可浏览范围内（复用浏览权限过滤），越权目标静默跳过
+        target = KnowledgeDocListView._admin_scope_filter(
+            KnowledgeDoc.objects.all(), user,
+        ).filter(id=target_doc_id).first()
+        if target is None or target.id == doc.id:
+            continue
+        _, created = DocRelation.objects.get_or_create(
+            source_doc=doc,
+            target_doc=target,
+            relation_type=relation_type,
+            defaults={'created_by': user},
+        )
+        if created:
+            created_count += 1
+    return created_count
 
 
 def _decode_image_base64(image_str: str) -> Optional[bytes]:

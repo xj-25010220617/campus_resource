@@ -188,6 +188,123 @@ class Keyword(models.Model):
         return f'{self.phrase}（权重:{self.weight}）'
 
 
+class Tag(models.Model):
+    """标签——人工为文档打上的分类标记，与关键词（Keyword）概念/操作分离。
+
+    标签不带检索权重、不做同义/语义匹配，仅用于浏览、筛选与聚合；
+    全平台共享一套词表（无学院隔离），上传时不存在即自动创建。
+    """
+    name = models.CharField(max_length=64, unique=True, verbose_name='标签名')
+    is_deleted = models.BooleanField(default=False, verbose_name='软删除标记')
+    deleted_at = models.DateTimeField(null=True, blank=True, verbose_name='删除时间')
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        db_table = 'tag'
+        verbose_name = '标签'
+        verbose_name_plural = verbose_name
+        ordering = ['id']
+        db_table_comment = '标签字典表(全平台共享，与keyword分离，仅人工打标/浏览筛选聚合，不带检索权重)'
+
+    def __str__(self):
+        return self.name
+
+
+class DocTag(models.Model):
+    """文档-标签关联——记录某文档被打上哪些标签及打标人。"""
+    doc = models.ForeignKey(
+        KnowledgeDoc,
+        on_delete=models.CASCADE,
+        related_name='doc_tags',
+        verbose_name='所属文档',
+    )
+    tag = models.ForeignKey(
+        Tag,
+        on_delete=models.CASCADE,
+        related_name='doc_tags',
+        verbose_name='标签',
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='created_doc_tags',
+        verbose_name='打标人',
+    )
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True, verbose_name='创建时间')
+
+    class Meta:
+        db_table = 'doc_tag'
+        verbose_name = '文档标签'
+        verbose_name_plural = verbose_name
+        constraints = [
+            models.UniqueConstraint(fields=['doc', 'tag'], name='uk_doc_tag'),
+        ]
+
+    def __str__(self):
+        return f'{self.doc_id} - {self.tag_id}'
+
+
+class DocRelation(models.Model):
+    """文档关联——文档间有向边（文件网），源文档指向目标文档并带关联类型。"""
+    RELATION_TYPE_CHOICES = [
+        ('prerequisite', '前置知识'),
+        ('supplement', '补充材料'),
+        ('same_course', '同课相关'),
+        ('citation', '引用来源'),
+        ('replaces', '替代/新版'),
+    ]
+
+    source_doc = models.ForeignKey(
+        KnowledgeDoc,
+        on_delete=models.CASCADE,
+        related_name='outgoing_relations',
+        verbose_name='源文档',
+    )
+    target_doc = models.ForeignKey(
+        KnowledgeDoc,
+        on_delete=models.CASCADE,
+        related_name='incoming_relations',
+        verbose_name='目标文档',
+    )
+    relation_type = models.CharField(
+        max_length=16, choices=RELATION_TYPE_CHOICES, default='supplement',
+        verbose_name='关联类型',
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='created_doc_relations',
+        verbose_name='建边人',
+    )
+    is_deleted = models.BooleanField(default=False, verbose_name='软删除标记')
+    deleted_at = models.DateTimeField(null=True, blank=True, verbose_name='删除时间')
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        db_table = 'doc_relation'
+        verbose_name = '文档关联'
+        verbose_name_plural = verbose_name
+        ordering = ['-created_at']
+        db_table_comment = '文档关联表(文件网有向边，is_deleted=1表示撤边；关联目标需在用户可浏览范围内)'
+        constraints = [
+            models.UniqueConstraint(
+                fields=['source_doc', 'target_doc', 'relation_type'],
+                name='uk_doc_relation',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['source_doc'], name='idx_rel_source'),
+            models.Index(fields=['target_doc'], name='idx_rel_target'),
+        ]
+
+    def __str__(self):
+        return f'{self.source_doc_id} -{self.relation_type}-> {self.target_doc_id}'
+
+
 class DocChunk(models.Model):
     """文档切片——文档解析分块后的文本片段，向量存 Milvus，MySQL 存引用"""
     doc = models.ForeignKey(
