@@ -842,6 +842,38 @@ class DocRelationDeleteView(APIView):
 
 
 @extend_schema(
+    summary='AI 推荐关联',
+    description='调用 LLM 从用户可浏览范围内为源文档推荐可关联的候选文档（推荐不入库，人工确认后建边）',
+    tags=['文档关联'],
+    operation_id='AI推荐关联',
+)
+class DocRelationRecommendView(APIView):
+    """AI 推荐关联（文件网）
+
+    POST /api/knowledge/docs/{doc_id}/relations/recommend/
+    功能：调用 LLM 从「用户可浏览范围」内为源文档推荐可关联的候选文档。
+          仅返回推荐结果、不落库；用户勾选确认后调用创建接口落成 DocRelation 边。
+    权限规则：
+        - super_admin（超级管理员）: 可为任意文档推荐
+        - admin（学院管理员）: 仅能为自己上传的文档推荐
+    返回：
+        - 200: {"recommendations": [{target_doc_id, target_doc_title,
+                relation_type, relation_type_name, reason}, ...]}
+    """
+    permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
+
+    def post(self, request, doc_id):
+        doc = get_object_or_404(KnowledgeDoc, id=doc_id)
+
+        # 权限校验：超管全放行，其余仅允许操作自己上传的文档
+        if request.user.role != 'super_admin' and doc.uploader_id != request.user.id:
+            raise PermissionDenied('只能为自己上传的文档推荐关联')
+
+        recommendations = _ai_recommend_relations(doc, request.user)
+        return Response({'recommendations': recommendations})
+
+
+@extend_schema(
     summary='获取上传凭证',
     description='校验文件 MD5 去重后，签发阿里云 OSS STS 临时凭证供前端直传',
     tags=['文件上传'],
@@ -2189,6 +2221,108 @@ def _ai_classify(title: str = '', content: str = '', image_bytes: Optional[bytes
         'visibility': ai_visibility,
         'confidence': result.get('confidence', 'medium'),
     }
+
+
+def _ai_recommend_relations(doc, user, limit: int = 60) -> list:
+    """调用 LLM 为文档推荐可关联的候选文档（推荐不入库，人工确认后建边）。
+
+    候选池 = 用户可浏览范围内的文档，排除文档自身与已关联目标，按最近上传取前 limit 条；
+    由 LLM 从候选池中按 ID 挑选相关项并给出关联类型与理由。返回的 target_doc_id 均已
+    校验落在候选池内，LLM 编造或越权的 ID 会被丢弃。LLM 不可用或返回异常时返回空列表。
+
+    Args:
+        doc: 源文档
+        user: 当前用户（决定候选池范围，复用浏览权限过滤）
+        limit: 送入 LLM 的候选数量上限（控制 prompt 长度与调用成本）
+
+    Returns:
+        推荐列表（可能为空），元素为 {target_doc_id, target_doc_title,
+        relation_type, relation_type_name, reason}
+    """
+    import json
+    import re
+
+    # 已关联目标先排除，避免重复推荐
+    existing_target_ids = set(
+        doc.outgoing_relations.filter(is_deleted=False).values_list('target_doc_id', flat=True)
+    )
+    candidates = list(
+        KnowledgeDocListView._admin_scope_filter(KnowledgeDoc.objects.all(), user)
+        .exclude(id=doc.id)
+        .exclude(id__in=existing_target_ids)
+        .order_by('-created_at')[:limit]
+    )
+    if not candidates:
+        return []
+
+    id_to_doc = {c.id: c for c in candidates}
+    candidate_lines = '\n'.join(f'{c.id}. {c.title}' for c in candidates)
+
+    keyword_phrases = list(doc.keywords.values_list('phrase', flat=True)[:10])
+    source_desc = (
+        f"标题：{doc.title}\n"
+        f"描述：{(doc.description or '')[:500]}\n"
+        f"关键词：{'、'.join(keyword_phrases) or '（无）'}"
+    )
+    relation_types = ' / '.join(f'{k}={v}' for k, v in DocRelation.RELATION_TYPE_CHOICES)
+
+    prompt = (
+        f"你是校园知识库的关联推荐助手。请从下面的候选文档列表中，为「源文档」挑选最相关的若干文档，"
+        f"并给出推荐理由与关联类型。\n\n"
+        f"源文档：\n{source_desc}\n\n"
+        f"候选文档（编号. 标题）：\n{candidate_lines}\n\n"
+        f"关联类型只能从以下取值中选择：{relation_types}\n"
+        f"只返回 JSON（不要 markdown 代码块标记），格式为：\n"
+        f'[{{"target_doc_id": 编号, "relation_type": "supplement", "reason": "推荐理由"}}]\n'
+        f"最多推荐 10 个；若无明显相关文档，返回空数组 []。"
+    )
+
+    raw = None
+    try:
+        from utils.llm import llm_client
+        raw = llm_client.chat(
+            messages=[{'role': 'user', 'content': prompt}],
+            temperature=0.0, max_tokens=800,
+        )
+    except Exception as e:
+        logger.error(f'LLM 关联推荐失败: {e}')
+        return []
+
+    if not raw:
+        return []
+    try:
+        match = re.search(r'\[.*\]', raw, re.DOTALL)
+        parsed = json.loads(match.group(0)) if match else json.loads(raw)
+    except (json.JSONDecodeError, AttributeError):
+        logger.warning(f'LLM 关联推荐返回非 JSON raw={raw[:200]!r}')
+        return []
+    if not isinstance(parsed, list):
+        return []
+
+    valid_types = {c[0] for c in DocRelation.RELATION_TYPE_CHOICES}
+    type_names = dict(DocRelation.RELATION_TYPE_CHOICES)
+    recommendations = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        try:
+            target_id = int(item.get('target_doc_id'))
+        except (TypeError, ValueError):
+            continue
+        target = id_to_doc.get(target_id)
+        if target is None:
+            continue  # 丢弃 LLM 编造/越权的 ID
+        relation_type = item.get('relation_type', 'supplement')
+        if relation_type not in valid_types:
+            relation_type = 'supplement'
+        recommendations.append({
+            'target_doc_id': target.id,
+            'target_doc_title': target.title,
+            'relation_type': relation_type,
+            'relation_type_name': type_names[relation_type],
+            'reason': str(item.get('reason', '')).strip(),
+        })
+    return recommendations
 
 
 class AIClassifyView(APIView):
