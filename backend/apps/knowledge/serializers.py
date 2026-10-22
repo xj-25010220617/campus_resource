@@ -23,6 +23,9 @@ class KnowledgeDocSerializer(serializers.ModelSerializer):
     # 业务时区展示值，避免前端各自处理时区
     created_at_display = serializers.SerializerMethodField()
     indexed_at_display = serializers.SerializerMethodField()
+    # 标签与关联图谱（文件网），详情页懒加载
+    tags = serializers.SerializerMethodField()
+    relations = serializers.SerializerMethodField()
 
     class Meta:
         model = KnowledgeDoc
@@ -39,6 +42,7 @@ class KnowledgeDocSerializer(serializers.ModelSerializer):
             'freshness_date',
             'created_at', 'created_at_display', 'updated_at',
             'indexed_at', 'indexed_at_display',
+            'tags', 'relations',
         ]
         read_only_fields = [
             'id', 'source_type', 'oss_key', 'file_name', 'file_type',
@@ -70,6 +74,20 @@ class KnowledgeDocSerializer(serializers.ModelSerializer):
 
     def get_indexed_at_display(self, obj) -> str:
         return format_business_time(obj.indexed_at)
+
+    def get_tags(self, obj) -> list:
+        """文档标签（人工打标，与关键词分离）"""
+        return DocTagSerializer(
+            obj.doc_tags.select_related('tag').order_by('id'), many=True,
+        ).data
+
+    def get_relations(self, obj) -> list:
+        """文档对外关联（文件网出边，含目标文档标题）"""
+        return DocRelationSerializer(
+            obj.outgoing_relations.filter(is_deleted=False)
+            .select_related('target_doc').order_by('-created_at'),
+            many=True,
+        ).data
 
 
 class KnowledgeDocListSerializer(serializers.ModelSerializer):
