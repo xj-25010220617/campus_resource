@@ -1482,6 +1482,7 @@ def _retrieve_pipeline(
     top_k: int,
     min_score: float,
     rewrite_questions: Optional[List[str]] = None,
+    apply_rerank: bool = True,
 ) -> List[dict]:
     """执行一次完整检索管道（硬过滤 → 多路召回 → 合并精排 → 权限校验）。
 
@@ -1566,13 +1567,16 @@ def _retrieve_pipeline(
     )
 
     # 3.5 Cross-Encoder 精排（候选 >=3 即触发）
-    try:
-        from utils.reranker import CROSS_ENCODER_TOP_K_OUTPUT, rerank_with_cross_encoder
-        if len(merged) >= 3:
-            merged = rerank_with_cross_encoder(question, merged)
-            logger.debug('Cross-Encoder 重排序后: %d 条', len(merged))
-    except ImportError:
-        pass  # reranker 模块不存在，静默跳过
+    # 二次检索的重试轮传 apply_rerank=False：精排只在首轮跑一次，
+    # 避免 CPU 上精排耗时随重试翻倍（曾导致 80~100s 超时）
+    if apply_rerank:
+        try:
+            from utils.reranker import CROSS_ENCODER_TOP_K_OUTPUT, rerank_with_cross_encoder
+            if len(merged) >= 3:
+                merged = rerank_with_cross_encoder(question, merged)
+                logger.debug('Cross-Encoder 重排序后: %d 条', len(merged))
+        except ImportError:
+            pass  # reranker 模块不存在，静默跳过
 
     # 4. 加载 doc 元信息
     enriched = _enrich_with_doc_meta(merged, min_score)
@@ -1618,6 +1622,7 @@ def retrieve_wider(
     top_k: int = RAG_RETRY_TOP_K,
     min_score: float = RAG_RETRY_MIN_SCORE,
     rewrite_questions: Optional[List[str]] = None,
+    apply_rerank: bool = True,
 ) -> List[dict]:
     """扩大范围检索：放宽时间/类型/分类过滤，扩大召回并降低最低分。
 
@@ -1633,6 +1638,7 @@ def retrieve_wider(
         top_k=top_k,
         min_score=min_score,
         rewrite_questions=rewrite_questions,
+        apply_rerank=apply_rerank,
     )
 
 
@@ -1699,6 +1705,7 @@ def retrieve(
             top_k=RAG_RETRY_TOP_K,
             min_score=RAG_RETRY_MIN_SCORE,
             rewrite_questions=rewrite_questions,
+            apply_rerank=False,  # 重试轮跳过精排，整个请求最多精排一次
         )
         results = _merge_retry_results(results, retry_results)
         logger.info(
