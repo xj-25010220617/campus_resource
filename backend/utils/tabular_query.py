@@ -194,7 +194,10 @@ def _load_grid(file_path: str, extension: str, sheet_name: str):
 
     import openpyxl
 
-    wb = openpyxl.load_workbook(file_path, data_only=True, read_only=True)
+    # 不用 read_only=True：部分工具生成的 xlsx dimension 元数据损坏，
+    # read_only 模式会按错误的 dimension 截断（如只能读到 1 行），
+    # 与 extractor._parse_xlsx 保持一致用普通模式
+    wb = openpyxl.load_workbook(file_path, data_only=True)
     try:
         if sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
