@@ -16,6 +16,9 @@ import uuid
 from contextvars import ContextVar
 
 logger = logging.getLogger('tracing')
+# 生产环境 gunicorn 把 root logger 设为 WARNING，INFO 级记录会被过滤掉。
+# 链路日志本身是排查用的关键信息，这里显式放开到 INFO。
+logger.setLevel(logging.INFO)
 
 _trace_id: ContextVar[str] = ContextVar('trace_id', default='')
 _t0: ContextVar[float] = ContextVar('trace_t0', default=0.0)
