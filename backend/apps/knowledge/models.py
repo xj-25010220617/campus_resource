@@ -134,6 +134,10 @@ class KnowledgeDoc(models.Model):
     )
     updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
     indexed_at = models.DateTimeField(null=True, blank=True, verbose_name='索引完成时间')
+    table_schema = models.JSONField(
+        null=True, blank=True, verbose_name='表格结构元数据',
+        help_text='仅 xlsx/csv 结构化文档：{"sheets":[{"name","columns","row_count","sample_rows"}]}，供表格问答引擎生成 SQL',
+    )
 
     class Meta:
         db_table = 'knowledge_doc'

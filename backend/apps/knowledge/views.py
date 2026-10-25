@@ -1911,17 +1911,24 @@ def _create_doc_tags(doc, tag_names: list, user) -> int:
     Returns:
         实际新增的标签关联数量
     """
+    from utils.rag import invalidate_tag_cache
+
     created_count = 0
+    vocab_changed = False
     for name in tag_names:
         name = str(name).strip()
         if not name:
             continue
-        tag, _ = Tag.objects.get_or_create(name=name)
+        tag, tag_created = Tag.objects.get_or_create(name=name)
+        if tag_created:
+            vocab_changed = True
         _, created = DocTag.objects.get_or_create(
             doc=doc, tag=tag, defaults={'created_by': user},
         )
         if created:
             created_count += 1
+    if vocab_changed:
+        invalidate_tag_cache()  # 新标签立即可被问答检索命中，不等缓存 TTL
     return created_count
 
 

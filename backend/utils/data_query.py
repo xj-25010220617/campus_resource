@@ -773,6 +773,18 @@ def execute_query(route: dict, user) -> dict:
         elif query_type == "doc_stats":
             return {"success": True, "data": get_doc_stats()}
 
+        elif query_type == "tabular_query":
+            # 表格内容统计/分析（Text-to-SQL）；失败时返回 fallback='rag'，
+            # 由调用方静默回退到 RAG 主链路。
+            from utils.tabular_query import run_tabular_query
+
+            return run_tabular_query(
+                user,
+                params.get("question", ""),
+                doc_id=params.get("doc_id"),
+                keywords=params.get("keywords"),
+            )
+
         # Compatibility for routes persisted by older clients.
         elif query_type == "resource_popular":
             return {"success": True, "data": get_popular_knowledge_docs(
@@ -956,6 +968,19 @@ def build_text_data_query_prompt(question: str, result: dict) -> list:
     """
     status = (result or {}).get("status")
     messages = build_data_query_prompt(question, result)
+
+    # 表格问答（Text-to-SQL）确定性结果：SQL 是调试信息，禁止展示给用户
+    data = (result or {}).get("data")
+    if (result or {}).get("success") and isinstance(data, dict) and "sql" in data:
+        messages[0]["content"] = messages[0]["content"] + (
+            "\n\n当前结果来自对用户表格执行的确定性 SQL 查询："
+            "columns 是结果列名，rows 是结果行，row_count 是精确结果条数（直接引用，不要估算）；"
+            "truncated=true 时说明结果仅展示部分，需告知用户；"
+            "sql 字段仅供调试，禁止向用户展示或解释 SQL 语句本身；"
+            "ambiguous=true 时逐一列出候选文件名请用户确认，不要替用户选择。"
+        )
+        return messages
+
     if status in (None, "ok"):
         return messages
 

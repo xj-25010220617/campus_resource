@@ -267,9 +267,11 @@ def index_document_task(self, doc_id: int):
         doc.failed_at = None
         doc.chunk_count = len(raw_chunks)
         doc.indexed_at = timezone.now()
+        # 表格结构元数据（仅 xlsx/csv 结构化文档非空），供表格问答引擎生成 SQL
+        doc.table_schema = parsed.table_schema
         doc.save(update_fields=[
             'status', 'index_error', 'failed_at', 'chunk_count',
-            'indexed_at', 'updated_at',
+            'indexed_at', 'table_schema', 'updated_at',
         ])
 
         logger.info(

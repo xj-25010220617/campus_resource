@@ -208,6 +208,11 @@ QUERY_ROUTER_LLM_ENABLED = config('QUERY_ROUTER_LLM_ENABLED', default=True, cast
 QUERY_ROUTER_LLM_TIMEOUT = config('QUERY_ROUTER_LLM_TIMEOUT', default=3.0, cast=float)
 QUERY_ROUTER_LLM_CACHE_TTL = config('QUERY_ROUTER_LLM_CACHE_TTL', default=600, cast=int)
 
+# 表格问答引擎（utils/tabular_query.py，sqlite3 内存表执行）
+TABULAR_SQL_LLM_TIMEOUT = config('TABULAR_SQL_LLM_TIMEOUT', default=8.0, cast=float)
+TABULAR_MAX_ROWS = config('TABULAR_MAX_ROWS', default=100000, cast=int)
+TABULAR_RESULT_MAX_ROWS = config('TABULAR_RESULT_MAX_ROWS', default=100, cast=int)
+
 # Embedding 后端切换（aliyun / local / mock）
 EMBED_BACKEND = config('EMBED_BACKEND', default='local')
 ALIYUN_EMBED_API_KEY = config('ALIYUN_EMBED_API_KEY', default='')

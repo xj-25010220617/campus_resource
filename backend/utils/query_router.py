@@ -96,6 +96,16 @@ _KNOWLEDGE_DOC_QUERY_PATTERNS = {
     ],
 }
 
+# 表格内容统计/分析（xlsx/csv 内部数据，Text-to-SQL 通道）
+# 与文件管理查询的边界：模式本身不含"文件/文档/资料"，路由时另有排除词兜底。
+_TABULAR_QUERY_PATTERNS = [
+    r"(多少|有多少|有几)个?(人|名|位|条|本|门|种|班)",
+    r"(人数|总数|平均值?|最多|最少|前几|前\s*\d+\s*[名个本门]|排名|排行|分组|占比|比例|对比|订购率|合格率|通过率)",
+    r"(按|根据|分).*(班级|专业|部门|年级|类别|类型|科目|教材).*(统计|汇总|排序|分布)",
+    r"(筛选|过滤|找出|查).*(记录|行|条目)",
+]
+_TABULAR_EXCLUDE_RE = re.compile(r"文件|文档|资料|上传|索引|下载|存储|空间|容量")
+
 # 时间范围关键词（保留给旧调用方；实际区间解析见 _extract_date_range）
 _TIME_PATTERNS = {
     "this_year": [r"今年", r"本年度", r"202[4-9]年"],
@@ -490,6 +500,7 @@ _LLM_ROUTE_TYPES = {'data_query', 'rag', 'general'}
 _LLM_DATA_QUERY_TYPES = {
     'count_docs', 'recent_docs', 'storage_stats', 'doc_categories', 'find_docs',
     'popular_docs', 'recent_docs_platform', 'doc_ranking', 'doc_stats',
+    'tabular_query',
 }
 _LLM_ROUTE_CACHE_PREFIX = 'query_router_llm:'
 
@@ -509,7 +520,9 @@ _LLM_ROUTER_SYSTEM_PROMPT = (
     '- general：问候、闲聊、与校园资料无关的常识问题。\n'
     'type 为 data_query 时必须额外给出 query_type，且只能是：'
     'count_docs、recent_docs、storage_stats、doc_categories、find_docs、'
-    'popular_docs、recent_docs_platform、doc_ranking、doc_stats。\n'
+    'popular_docs、recent_docs_platform、doc_ranking、doc_stats、tabular_query。\n'
+    '其中 tabular_query 表示：询问某份表格/名单（xlsx/csv）内部数据的统计、'
+    '筛选、排序、对比、聚合，例如“软件工程25206有多少人”“各班人数排名”。\n'
     '示例：{"type":"data_query","query_type":"count_docs"}'
 )
 
@@ -623,6 +636,12 @@ def _llm_route_question(
         keywords = _extract_keywords(question)
         if keywords:
             params['keywords'] = keywords
+    elif query_type == 'tabular_query':
+        # question 原文必须透传：execute_query 签名不含问题文本
+        params['question'] = question
+        file_kws = _extract_file_keywords(question)
+        if file_kws:
+            params['keywords'] = file_kws
     elif query_type in ('list_docs_by_range', 'recent_docs'):
         params.setdefault('limit', 20)
     return {
@@ -732,6 +751,22 @@ def _route_question(question: str, user=None, allow_llm: bool = True) -> dict:
             "confidence": 0.9,
         }
 
+    # 4.5 表格内容统计/分析（xlsx/csv 内部数据 → Text-to-SQL 通道）
+    #     排除词防止与文件管理查询（count_docs 等）冲突；
+    #     question 原文必须透传，execute_query 签名不含问题文本。
+    if (not _TABULAR_EXCLUDE_RE.search(question)
+            and _match_pattern(question, _TABULAR_QUERY_PATTERNS)):
+        params = {"question": question}
+        file_kws = _extract_file_keywords(question)
+        if file_kws:
+            params["keywords"] = file_kws
+        return {
+            "type": "data_query",
+            "query_type": "tabular_query",
+            "params": params,
+            "confidence": 0.85,
+        }
+
     # 5. 原有文件管理查询（补充日期区间、范围语义）
     for query_type, patterns in _DATA_QUERY_PATTERNS.items():
         if _match_pattern(question, patterns):
@@ -812,7 +847,7 @@ def is_data_query(question: str) -> bool:
 # 语音入口（AskView._stream_answer）继续调用 route_question，
 # 不经过下面任何代码；新增逻辑只服务于文字提问入口。
 
-_TEXT_TIME_QUERY_TYPES = ("doc_upload_time", "doc_index_time")
+_TEXT_TIME_QUERY_TYPES = ("doc_upload_time", "doc_index_time", "tabular_query")
 
 # 只在文字入口剔除的指代/时间副词；“刚才”等词不在共享噪声正则里，
 # 以免改变语音入口的关键词提取结果。
