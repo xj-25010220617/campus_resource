@@ -167,9 +167,8 @@ def _split_header(grid) -> Tuple[Optional[List[str]], List[List[str]]]:
         return None, []
 
     header = [clean[header_idx][i] if i < len(clean[header_idx]) else '' for i in range(ncols)]
-    for i, h in enumerate(header):
-        if not h:
-            header[i] = f'列{i + 1}'
+    from apps.knowledge.extractor import normalize_header
+    header = normalize_header(header)
 
     rows = []
     for cells in clean[header_idx + 1:]:

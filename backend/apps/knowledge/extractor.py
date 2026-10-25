@@ -325,10 +325,9 @@ def _records_from_grid(rows) -> Tuple[str, int, bool]:
         text = '\n'.join('\t'.join(r).rstrip() for r in clean)
         return text, 0, False
 
-    header = [clean[header_idx][i] if i < len(clean[header_idx]) else '' for i in range(ncols)]
-    for i, h in enumerate(header):
-        if not h:
-            header[i] = f'列{i + 1}'
+    header = normalize_header(
+        [clean[header_idx][i] if i < len(clean[header_idx]) else '' for i in range(ncols)]
+    )
 
     records = []
     for cells in clean[header_idx + 1:]:
@@ -343,6 +342,26 @@ def _records_from_grid(rows) -> Tuple[str, int, bool]:
 
     summary = f'本表格共 {len(records)} 条记录；字段：{"、".join(header)}'
     return summary + '\n' + '\n'.join(records), len(records), True
+
+
+def normalize_header(header):
+    """规范化表头：换行/制表符压成空格、去重加后缀。
+
+    表格问答链路中 schema 与 sqlite 建表必须用同一套列名，否则 LLM 生成
+    SQL 时省略换行会导致列名不匹配（SQLite 双引号 fallback 会把不存在的
+    列名静默当作字符串字面量返回，产生错误答案）。
+    """
+    import re as _re
+    out, seen = [], {}
+    for i, h in enumerate(header):
+        name = _re.sub(r'\s+', ' ', str(h or '')).strip() or f'列{i + 1}'
+        if name in seen:
+            seen[name] += 1
+            name = f'{name}_{seen[name]}'
+        else:
+            seen[name] = 1
+        out.append(name)
+    return out
 
 
 def extract_schema_from_grid(rows, sheet_name: str) -> Optional[dict]:
@@ -375,10 +394,9 @@ def extract_schema_from_grid(rows, sheet_name: str) -> Optional[dict]:
     if ncols <= 1 or len(clean) - header_idx < 2:
         return None
 
-    header = [clean[header_idx][i] if i < len(clean[header_idx]) else '' for i in range(ncols)]
-    for i, h in enumerate(header):
-        if not h:
-            header[i] = f'列{i + 1}'
+    header = normalize_header(
+        [clean[header_idx][i] if i < len(clean[header_idx]) else '' for i in range(ncols)]
+    )
 
     data_rows = []
     for cells in clean[header_idx + 1:]:
