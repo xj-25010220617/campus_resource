@@ -13,6 +13,7 @@ from django.conf import settings
 from .llm import llm_client
 from .milvus import milvus_client
 from .timefmt import format_business_time, month_bounds, to_iso, year_bounds
+from .tracing import trace_log
 
 logger = logging.getLogger(__name__)
 
@@ -1702,6 +1703,11 @@ def retrieve(
         results = _merge_retry_results(results, retry_results)
         logger.info(
             '[RAG二次检索] 第%d次 触发=%s 首次=%d(最高%.3f) 重试=%d 合并=%d',
+            attempts, reason, first_count, first_top,
+            len(retry_results), len(results),
+        )
+        trace_log(
+            'rag_retry', 'attempt=%d reason=%s first=%d(%.3f) retry=%d merged=%d',
             attempts, reason, first_count, first_top,
             len(retry_results), len(results),
         )

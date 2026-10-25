@@ -1,0 +1,59 @@
+{
+  "created_at": "2026-10-25T17:34:47",
+  "config": {
+    "role": "super_admin",
+    "user_id": null,
+    "college_id": null,
+    "top_k": 15,
+    "retry": 0,
+    "rewrite": false,
+    "rerank": true,
+    "dataset": "auto"
+  },
+  "metrics": {
+    "samples": 2,
+    "errors": 0,
+    "recall@1": 1.0,
+    "recall@3": 1.0,
+    "recall@5": 1.0,
+    "mrr@5": 1.0,
+    "zero_recall_rate": 0.0,
+    "avg_elapsed_ms": 37083.0,
+    "max_elapsed_ms": 52317.1,
+    "avg_hit_count": 3.0
+  },
+  "details": [
+    {
+      "question": "校园活动名录_查找测试用",
+      "expected_doc_ids": [
+        262
+      ],
+      "rank": 1,
+      "hit_count": 1,
+      "top_doc_ids": [
+        262
+      ],
+      "top_score": 0.8987,
+      "elapsed_ms": 52317.1,
+      "source": "auto"
+    },
+    {
+      "question": "MathorCup数学应用挑战赛——大数据竞赛报名通知",
+      "expected_doc_ids": [
+        261
+      ],
+      "rank": 1,
+      "hit_count": 5,
+      "top_doc_ids": [
+        261,
+        261,
+        261,
+        261,
+        261
+      ],
+      "top_score": 0.9999,
+      "elapsed_ms": 21848.9,
+      "source": "auto"
+    }
+  ]
+}
