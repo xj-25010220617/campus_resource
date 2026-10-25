@@ -101,6 +101,16 @@ class IntentRouteTests(TestCase):
         route = route_question('各班人数排名')
         self.assertEqual(route['query_type'], 'tabular_query')
 
+    def test_student_id_queries_route_to_tabular(self):
+        # 学号类精确记录查询必须走表格问答，而非 find_docs（标题检索必空）
+        for q in ('25021220122', '学号25021220122的学生是谁',
+                  '查一下学号25021220122', '25021220122订了哪些教材'):
+            route = route_question(q)
+            self.assertEqual(
+                route['query_type'], 'tabular_query',
+                msg=f'{q} 被路由到 {route.get("query_type")}',
+            )
+
 
 # ------------------------------------------------------------------
 # 执行链路（sqlite 内存表）
