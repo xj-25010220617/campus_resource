@@ -20,10 +20,8 @@ from .views import (
     KnowledgeDocDownloadView,
     KnowledgeDocListView,
     KnowledgeDocPreviewView,
-    DocRelationCreateView,
     DocRelationDeleteView,
     DocRelationListView,
-    DocRelationRecommendView,
     DocTagCreateView,
     DocTagDeleteView,
     DocTagListView,
@@ -73,7 +71,5 @@ urlpatterns = [
 
     # 文档关联（文件网）
     path('docs/<int:doc_id>/relations/', DocRelationListView.as_view(), name='doc_relation_list'),
-    path('docs/<int:doc_id>/relations/create/', DocRelationCreateView.as_view(), name='doc_relation_create'),
-    path('docs/<int:doc_id>/relations/recommend/', DocRelationRecommendView.as_view(), name='doc_relation_recommend'),
     path('docs/<int:doc_id>/relations/<int:relation_id>/delete/', DocRelationDeleteView.as_view(), name='doc_relation_delete'),
 ]

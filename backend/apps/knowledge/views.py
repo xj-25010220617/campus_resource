@@ -39,7 +39,6 @@ from .serializers import (
     ALLOWED_FILE_TYPES,
     FILE_SIZE_LIMITS,
     IMAGE_FILE_TYPES,
-    DocRelationCreateSerializer,
     DocRelationSerializer,
     DocTagCreateSerializer,
     DocTagSerializer,
@@ -756,58 +755,6 @@ class DocRelationListView(APIView):
 
 
 @extend_schema(
-    summary='创建文档关联',
-    description='为源文档创建一条指向目标文档的有向关联（目标须在可浏览范围内）',
-    tags=['文档关联'],
-    operation_id='创建文档关联',
-)
-class DocRelationCreateView(APIView):
-    """创建文档关联（文件网有向边）
-
-    POST /api/knowledge/docs/{doc_id}/relations/
-    功能：为源文档创建一条指向目标文档的有向关联
-    请求参数：
-        - target_doc_id (int, required): 目标文档 ID
-        - relation_type (str, default=supplement): 关联类型（prerequisite/supplement/same_course/citation/replaces）
-    权限规则：
-        - super_admin（超级管理员）: 可为任意文档建边
-        - admin（学院管理员）: 仅能为自己上传的文档建边
-    约束：目标文档须在用户可浏览范围内，且不可为源文档自身；重复边返回既有记录
-    返回：
-        - 201: {id, source_doc_id, target_doc_id, target_doc_title, relation_type, relation_type_name, created_at}
-    """
-    permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
-
-    def post(self, request, doc_id):
-        doc = get_object_or_404(KnowledgeDoc, id=doc_id)
-
-        # 权限校验：超管全放行，其余仅允许操作自己上传的文档
-        if request.user.role != 'super_admin' and doc.uploader_id != request.user.id:
-            raise PermissionDenied('只能给自己上传的文档创建关联')
-
-        serializer = DocRelationCreateSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        data = serializer.validated_data
-
-        # 目标文档须在用户可浏览范围内（复用浏览权限过滤，防止越权建边泄露私密文档存在性）
-        target = KnowledgeDocListView._admin_scope_filter(
-            KnowledgeDoc.objects.all(), request.user,
-        ).filter(id=data['target_doc_id']).first()
-        if target is None:
-            raise ValidationError({'target_doc_id': '目标文档不存在或不在可浏览范围内'})
-        if target.id == doc.id:
-            raise ValidationError({'target_doc_id': '不能关联到文档自身'})
-
-        relation, _ = DocRelation.objects.get_or_create(
-            source_doc=doc,
-            target_doc=target,
-            relation_type=data.get('relation_type', 'supplement'),
-            defaults={'created_by': request.user},
-        )
-        return Response(DocRelationSerializer(relation).data, status=status.HTTP_201_CREATED)
-
-
-@extend_schema(
     summary='删除文档关联',
     description='软删除指定文档关联边（is_deleted=1，保留历史）',
     tags=['文档关联'],
@@ -839,38 +786,6 @@ class DocRelationDeleteView(APIView):
         relation.deleted_at = timezone.now()
         relation.save(update_fields=['is_deleted', 'deleted_at'])
         return Response({'detail': '删除成功'})
-
-
-@extend_schema(
-    summary='AI 推荐关联',
-    description='调用 LLM 从用户可浏览范围内为源文档推荐可关联的候选文档（推荐不入库，人工确认后建边）',
-    tags=['文档关联'],
-    operation_id='AI推荐关联',
-)
-class DocRelationRecommendView(APIView):
-    """AI 推荐关联（文件网）
-
-    POST /api/knowledge/docs/{doc_id}/relations/recommend/
-    功能：调用 LLM 从「用户可浏览范围」内为源文档推荐可关联的候选文档。
-          仅返回推荐结果、不落库；用户勾选确认后调用创建接口落成 DocRelation 边。
-    权限规则：
-        - super_admin（超级管理员）: 可为任意文档推荐
-        - admin（学院管理员）: 仅能为自己上传的文档推荐
-    返回：
-        - 200: {"recommendations": [{target_doc_id, target_doc_title,
-                relation_type, relation_type_name, reason}, ...]}
-    """
-    permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
-
-    def post(self, request, doc_id):
-        doc = get_object_or_404(KnowledgeDoc, id=doc_id)
-
-        # 权限校验：超管全放行，其余仅允许操作自己上传的文档
-        if request.user.role != 'super_admin' and doc.uploader_id != request.user.id:
-            raise PermissionDenied('只能为自己上传的文档推荐关联')
-
-        recommendations = _ai_recommend_relations(doc, request.user)
-        return Response({'recommendations': recommendations})
 
 
 @extend_schema(
@@ -1028,15 +943,15 @@ class UploadCallbackView(APIView):
 
         # 人工打标签（标签与关键词分离，标签名不存在则自动创建）
         _create_doc_tags(new_doc, _normalize_tags(request, data.get('tags', [])), request.user)
-        # 建立文档关联（文件网有向边，目标需在可浏览范围内）
-        _create_doc_relations(new_doc, _normalize_relations(request, request.data.get('relations')), request.user)
 
         # 自动触发 AI 日期提取（异步，不阻塞上传主链路）
         # 遵循 CONVENTIONS.md 第 9 节：异常处理下沉到 utils 层，视图层不写 try/except
         from utils.celery_dispatcher import safe_delay
-        from .tasks import extract_freshness_task, index_document_task
+        from .tasks import auto_link_relations_task, extract_freshness_task, index_document_task
         safe_delay(extract_freshness_task, new_doc.id)
         safe_delay(index_document_task, new_doc.id)
+        # AI 自动关联：上传后异步分析并直接关联到相关公开文档（用户无需手动选择、也看不到他人文档）
+        safe_delay(auto_link_relations_task, new_doc.id)
 
         return Response({
             'id': new_doc.id,
@@ -1208,14 +1123,14 @@ class TextUploadView(APIView):
 
         # 人工打标签（标签与关键词分离，标签名不存在则自动创建）
         _create_doc_tags(new_doc, _normalize_tags(request, data.get('tags', [])), request.user)
-        # 建立文档关联（文件网有向边，目标需在可浏览范围内）
-        _create_doc_relations(new_doc, _normalize_relations(request, request.data.get('relations')), request.user)
 
         # 触发异步索引（切片 + 向量化），使文档可被 AI 智能问答检索
         from utils.celery_dispatcher import safe_delay
-        from .tasks import extract_freshness_task, index_document_task
+        from .tasks import auto_link_relations_task, extract_freshness_task, index_document_task
         safe_delay(extract_freshness_task, new_doc.id)
         safe_delay(index_document_task, new_doc.id)
+        # AI 自动关联：上传后异步分析并直接关联到相关公开文档（用户无需手动选择、也看不到他人文档）
+        safe_delay(auto_link_relations_task, new_doc.id)
 
         return Response({
             'id': new_doc.id,
@@ -1663,15 +1578,15 @@ class FileUploadView(APIView):
 
         # 人工打标签（标签与关键词分离，标签名不存在则自动创建）
         _create_doc_tags(new_doc, _normalize_tags(request, data.get('tags', [])), request.user)
-        # 建立文档关联（文件网有向边，目标需在可浏览范围内）
-        _create_doc_relations(new_doc, _normalize_relations(request, request.data.get('relations')), request.user)
 
         # 触发异步索引（切片 + 向量化），使文档可被 AI 智能问答检索
         # 遵循规范第 9 节：异常处理下沉到 utils 层，视图层不写 try/except
         from utils.celery_dispatcher import safe_delay
-        from .tasks import extract_freshness_task, index_document_task
+        from .tasks import auto_link_relations_task, extract_freshness_task, index_document_task
         safe_delay(extract_freshness_task, new_doc.id)
         safe_delay(index_document_task, new_doc.id)
+        # AI 自动关联：上传后异步分析并直接关联到相关公开文档（用户无需手动选择、也看不到他人文档）
+        safe_delay(auto_link_relations_task, new_doc.id)
 
         # 确保 raw_keywords 始终是列表（给前端返回用）
         if not isinstance(raw_keywords, list):
@@ -1875,8 +1790,6 @@ class BatchFileUploadView(APIView):
 
                 # 人工打标签（标签与关键词分离，标签名不存在则自动创建）
                 _create_doc_tags(new_doc, _normalize_tags(request, request.data.get('tags', [])), user)
-                # 建立文档关联（文件网有向边，目标需在可浏览范围内）
-                _create_doc_relations(new_doc, _normalize_relations(request, request.data.get('relations')), user)
 
                 # 4g. 创建上传日志
                 try:
@@ -1897,9 +1810,11 @@ class BatchFileUploadView(APIView):
 
                 # 4g-2. 触发异步索引（切片 + 向量化），使文档可被 AI 智能问答检索
                 from utils.celery_dispatcher import safe_delay
-                from .tasks import extract_freshness_task, index_document_task
+                from .tasks import auto_link_relations_task, extract_freshness_task, index_document_task
                 safe_delay(extract_freshness_task, new_doc.id)
                 safe_delay(index_document_task, new_doc.id)
+                # AI 自动关联：上传后异步分析并直接关联到相关公开文档（用户无需手动选择、也看不到他人文档）
+                safe_delay(auto_link_relations_task, new_doc.id)
 
                 # 4h. 记录成功
                 success_results.append({
@@ -1985,52 +1900,6 @@ def _normalize_tags(request, validated_value) -> list:
     return _normalize_string_list(request, 'tags', validated_value)
 
 
-def _normalize_relations(request, validated_value) -> list:
-    """归一文档关联入参为 [{target_doc_id, relation_type}, ...] 列表。
-
-    兼容 JSON body（list/dict）与 multipart（JSON 字符串）两种形式，
-    忽略无法解析的非法项。
-
-    Args:
-        request: DRF Request（multipart 下回读原始字段）
-        validated_value: 原始请求中的 relations 值（list / str / None）
-
-    Returns:
-        规整后的关联 dict 列表（可能为空）
-    """
-    import json
-
-    raw = validated_value
-    # 单个 JSON 字符串（multipart 常见）：'[{"target_doc_id":1,"relation_type":"supplement"}]'
-    if isinstance(raw, str) and raw.strip():
-        try:
-            parsed = json.loads(raw.strip())
-        except (json.JSONDecodeError, TypeError):
-            parsed = None
-        if isinstance(parsed, list):
-            raw = parsed
-        elif isinstance(parsed, dict):
-            raw = [parsed]
-        else:
-            raw = []
-    # multipart 下序列化器/原始取值没接到，回读 getlist
-    elif not raw and hasattr(request.data, 'getlist'):
-        raw = request.data.getlist('relations') or request.data.getlist('relations[]')
-
-    result = []
-    for item in (raw or []):
-        if isinstance(item, dict):
-            result.append(item)
-        elif isinstance(item, str):
-            try:
-                parsed = json.loads(item)
-                if isinstance(parsed, dict):
-                    result.append(parsed)
-            except (json.JSONDecodeError, TypeError):
-                pass
-    return result
-
-
 def _create_doc_tags(doc, tag_names: list, user) -> int:
     """为文档批量打标签：标签名不存在则自动创建（全平台共享词表），重复打标幂等。
 
@@ -2050,47 +1919,6 @@ def _create_doc_tags(doc, tag_names: list, user) -> int:
         tag, _ = Tag.objects.get_or_create(name=name)
         _, created = DocTag.objects.get_or_create(
             doc=doc, tag=tag, defaults={'created_by': user},
-        )
-        if created:
-            created_count += 1
-    return created_count
-
-
-def _create_doc_relations(doc, relations: list, user) -> int:
-    """为文档创建有向关联（文件网）：目标文档须在用户可浏览范围内，防止越权建边。
-
-    关联目标不可为文档自身；relation_type 非法时回退为 supplement；重复边幂等。
-
-    Args:
-        doc: 源文档
-        relations: 归一后的 [{target_doc_id, relation_type}, ...] 列表
-        user: 建边人
-
-    Returns:
-        实际新增的关联边数量
-    """
-    valid_types = {c[0] for c in DocRelation.RELATION_TYPE_CHOICES}
-    created_count = 0
-    for rel in relations:
-        if not isinstance(rel, dict):
-            continue
-        target_doc_id = rel.get('target_doc_id') or rel.get('target_doc')
-        relation_type = rel.get('relation_type', 'supplement')
-        if relation_type not in valid_types:
-            relation_type = 'supplement'
-        if not target_doc_id:
-            continue
-        # 目标文档须在用户可浏览范围内（复用浏览权限过滤），越权目标静默跳过
-        target = KnowledgeDocListView._admin_scope_filter(
-            KnowledgeDoc.objects.all(), user,
-        ).filter(id=target_doc_id).first()
-        if target is None or target.id == doc.id:
-            continue
-        _, created = DocRelation.objects.get_or_create(
-            source_doc=doc,
-            target_doc=target,
-            relation_type=relation_type,
-            defaults={'created_by': user},
         )
         if created:
             created_count += 1
@@ -2223,37 +2051,40 @@ def _ai_classify(title: str = '', content: str = '', image_bytes: Optional[bytes
     }
 
 
-def _ai_recommend_relations(doc, user, limit: int = 60) -> list:
-    """调用 LLM 为文档推荐可关联的候选文档（推荐不入库，人工确认后建边）。
+def _ai_auto_link_relations(doc, limit: int = 100) -> int:
+    """AI 自动关联：分析文档并从「上传者可浏览范围的公开文档」中挑选相关项，直接创建有向关联边。
 
-    候选池 = 用户可浏览范围内的文档，排除文档自身与已关联目标，按最近上传取前 limit 条；
-    由 LLM 从候选池中按 ID 挑选相关项并给出关联类型与理由。返回的 target_doc_id 均已
-    校验落在候选池内，LLM 编造或越权的 ID 会被丢弃。LLM 不可用或返回异常时返回空列表。
+    候选池 = 上传者可浏览范围内、visibility='public' 的文档，排除文档自身与已关联目标，
+    按最近上传取前 limit 条；LLM 按 ID 挑选相关项并给出关联类型，直接落成 DocRelation 边。
+    用户无需（也不应）手动选择目标文档，关联由 AI 静默完成。LLM 不可用/解析失败时返回 0。
 
     Args:
-        doc: 源文档
-        user: 当前用户（决定候选池范围，复用浏览权限过滤）
+        doc: 源文档（其 uploader 决定候选池范围）
         limit: 送入 LLM 的候选数量上限（控制 prompt 长度与调用成本）
 
     Returns:
-        推荐列表（可能为空），元素为 {target_doc_id, target_doc_title,
-        relation_type, relation_type_name, reason}
+        实际新建的关联边数量
     """
     import json
     import re
 
-    # 已关联目标先排除，避免重复推荐
+    uploader = doc.uploader
+    if uploader is None:
+        return 0
+
+    # 已关联目标先排除，避免重复建边
     existing_target_ids = set(
         doc.outgoing_relations.filter(is_deleted=False).values_list('target_doc_id', flat=True)
     )
     candidates = list(
-        KnowledgeDocListView._admin_scope_filter(KnowledgeDoc.objects.all(), user)
+        KnowledgeDocListView._admin_scope_filter(KnowledgeDoc.objects.all(), uploader)
+        .filter(visibility='public')
         .exclude(id=doc.id)
         .exclude(id__in=existing_target_ids)
         .order_by('-created_at')[:limit]
     )
     if not candidates:
-        return []
+        return 0
 
     id_to_doc = {c.id: c for c in candidates}
     candidate_lines = '\n'.join(f'{c.id}. {c.title}' for c in candidates)
@@ -2267,14 +2098,14 @@ def _ai_recommend_relations(doc, user, limit: int = 60) -> list:
     relation_types = ' / '.join(f'{k}={v}' for k, v in DocRelation.RELATION_TYPE_CHOICES)
 
     prompt = (
-        f"你是校园知识库的关联推荐助手。请从下面的候选文档列表中，为「源文档」挑选最相关的若干文档，"
-        f"并给出推荐理由与关联类型。\n\n"
+        f"你是校园知识库的关联助手。请从下面的候选文档列表中，为「源文档」挑选最相关的若干文档，"
+        f"并判断关联类型。\n\n"
         f"源文档：\n{source_desc}\n\n"
         f"候选文档（编号. 标题）：\n{candidate_lines}\n\n"
         f"关联类型只能从以下取值中选择：{relation_types}\n"
         f"只返回 JSON（不要 markdown 代码块标记），格式为：\n"
-        f'[{{"target_doc_id": 编号, "relation_type": "supplement", "reason": "推荐理由"}}]\n'
-        f"最多推荐 10 个；若无明显相关文档，返回空数组 []。"
+        f'[{{"target_doc_id": 编号, "relation_type": "supplement"}}]\n'
+        f"最多关联 10 个；若无明显相关文档，返回空数组 []。"
     )
 
     raw = None
@@ -2285,23 +2116,22 @@ def _ai_recommend_relations(doc, user, limit: int = 60) -> list:
             temperature=0.0, max_tokens=800,
         )
     except Exception as e:
-        logger.error(f'LLM 关联推荐失败: {e}')
-        return []
+        logger.error(f'AI 自动关联失败: {e}')
+        return 0
 
     if not raw:
-        return []
+        return 0
     try:
         match = re.search(r'\[.*\]', raw, re.DOTALL)
         parsed = json.loads(match.group(0)) if match else json.loads(raw)
     except (json.JSONDecodeError, AttributeError):
-        logger.warning(f'LLM 关联推荐返回非 JSON raw={raw[:200]!r}')
-        return []
+        logger.warning(f'AI 自动关联返回非 JSON raw={raw[:200]!r}')
+        return 0
     if not isinstance(parsed, list):
-        return []
+        return 0
 
     valid_types = {c[0] for c in DocRelation.RELATION_TYPE_CHOICES}
-    type_names = dict(DocRelation.RELATION_TYPE_CHOICES)
-    recommendations = []
+    created_count = 0
     for item in parsed:
         if not isinstance(item, dict):
             continue
@@ -2310,19 +2140,20 @@ def _ai_recommend_relations(doc, user, limit: int = 60) -> list:
         except (TypeError, ValueError):
             continue
         target = id_to_doc.get(target_id)
-        if target is None:
-            continue  # 丢弃 LLM 编造/越权的 ID
+        if target is None or target.id == doc.id:
+            continue  # 丢弃 LLM 编造/越权 ID 与自关联
         relation_type = item.get('relation_type', 'supplement')
         if relation_type not in valid_types:
             relation_type = 'supplement'
-        recommendations.append({
-            'target_doc_id': target.id,
-            'target_doc_title': target.title,
-            'relation_type': relation_type,
-            'relation_type_name': type_names[relation_type],
-            'reason': str(item.get('reason', '')).strip(),
-        })
-    return recommendations
+        _, created = DocRelation.objects.get_or_create(
+            source_doc=doc,
+            target_doc=target,
+            relation_type=relation_type,
+            defaults={'created_by': uploader},
+        )
+        if created:
+            created_count += 1
+    return created_count
 
 
 class AIClassifyView(APIView):

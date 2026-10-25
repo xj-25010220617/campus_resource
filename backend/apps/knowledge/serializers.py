@@ -409,17 +409,6 @@ class DocTagCreateSerializer(serializers.Serializer):
     )
 
 
-class DocRelationCreateSerializer(serializers.Serializer):
-    """创建文档关联请求参数"""
-
-    target_doc_id = serializers.IntegerField(min_value=1, help_text='目标文档 ID')
-    relation_type = serializers.ChoiceField(
-        choices=[c[0] for c in DocRelation.RELATION_TYPE_CHOICES],
-        default='supplement',
-        help_text='关联类型（prerequisite/supplement/same_course/citation/replaces）',
-    )
-
-
 def _sanitize_content(value: str) -> str:
     """清理文本内容中的控制字符，防止 JSON 解析错误"""
     # 移除不可见的控制字符（保留换行符和制表符）

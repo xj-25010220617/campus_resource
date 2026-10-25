@@ -31,7 +31,7 @@ from utils.oss import guess_content_type, oss_client
 
 from .models import ChunkedUploadSession, Keyword, KnowledgeDoc
 from .serializers import ALLOWED_FILE_TYPES, normalize_file_type
-from .tasks import extract_freshness_task, index_document_task
+from .tasks import auto_link_relations_task, extract_freshness_task, index_document_task
 
 logger = logging.getLogger(__name__)
 
@@ -338,13 +338,14 @@ class ChunkMergeView(APIView):
                 match_type='fuzzy', weight=1, created_by=request.user,
             )
 
-        # 人工打标签 + 建立文档关联（复用 views 中的工具函数，延迟导入避免循环依赖）
-        from .views import _create_doc_relations, _create_doc_tags, _normalize_relations, _normalize_tags
+        # 人工打标签（复用 views 中的工具函数，延迟导入避免循环依赖）
+        from .views import _create_doc_tags, _normalize_tags
         _create_doc_tags(new_doc, _normalize_tags(request, request.data.get('tags')), request.user)
-        _create_doc_relations(new_doc, _normalize_relations(request, request.data.get('relations')), request.user)
 
         safe_delay(extract_freshness_task, new_doc.id)
         safe_delay(index_document_task, new_doc.id)
+        # AI 自动关联：上传后异步分析并直接关联到相关公开文档（用户无需手动选择、也看不到他人文档）
+        safe_delay(auto_link_relations_task, new_doc.id)
 
         return Response({
             'id': new_doc.id,

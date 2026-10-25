@@ -42,6 +42,38 @@ def extract_freshness_task(self, doc_id: int):
         raise self.retry(exc=e)
 
 
+@shared_task(bind=True, max_retries=1, default_retry_delay=60, ignore_result=True)
+def auto_link_relations_task(self, doc_id: int):
+    """上传完成后异步执行 AI 自动关联：分析文档并自动创建与相关文档的有向关联边（文件网）。
+
+    关联目标由 AI 在「上传者可浏览范围内的公开文档」中直接挑选并落边，
+    用户无需（也不应）手动选择目标文档，避免暴露他人文档供挑选。
+
+    Args:
+        doc_id: KnowledgeDoc 主键
+
+    异常处理:
+        - 任意异常 → 自动重试 1 次（间隔 60s）
+        - 最终失败仅记录日志，不影响上传主流程；关联可后续由管理员删除修正
+    """
+    from apps.knowledge.models import KnowledgeDoc
+    from apps.knowledge.views import _ai_auto_link_relations
+
+    try:
+        doc = KnowledgeDoc.objects.get(id=doc_id)
+    except KnowledgeDoc.DoesNotExist:
+        logger.warning(f'auto_link_relations_task: doc_id={doc_id} 不存在')
+        return None
+
+    try:
+        created = _ai_auto_link_relations(doc)
+        logger.info(f'AI 自动关联完成 doc_id={doc_id} 新建 {created} 条关联')
+        return None
+    except Exception as e:
+        logger.error(f'auto_link_relations_task doc_id={doc_id} 失败: {e}')
+        raise self.retry(exc=e)
+
+
 @shared_task(bind=True, max_retries=3, default_retry_delay=120, ignore_result=True)
 def crawl_neusoft_website_task(
     self, max_pages: int = 100,
