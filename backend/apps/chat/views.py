@@ -16,6 +16,7 @@ from apps.knowledge.serializers import KnowledgeDocListSerializer
 from apps.knowledge.views import KnowledgeDocListView
 
 from utils import rag
+from utils import tracing
 from utils.llm import llm_client, LLMTimeoutError
 from utils.sensitive_filter import check_sensitive
 from utils.sse import _format_sse, build_images_events, build_references_events
@@ -482,6 +483,9 @@ class AskView(APIView):
         # 思考时长计时起点：用户发送问题 → AI 输出首字（含意图解析/知识检索/LLM 首 token 等待）
         t0 = time.time()
 
+        # 链路追踪：本次问答的所有阶段日志共用同一 trace_id
+        trace_id = tracing.new_trace_id()
+
         question = serializer.validated_data['question']
         conversation_id = serializer.validated_data.get('conversation_id')
 
@@ -498,6 +502,7 @@ class AskView(APIView):
 
         # 0. 敏感内容检查
         sensitive_result = check_sensitive(question)
+        tracing.trace_log('sensitive', 'hit=%s role=%s', sensitive_result.is_sensitive, user_role)
         if sensitive_result.is_sensitive:
             logger.warning(
                 '敏感内容拦截: user=%s question=%s... rules=%s',
@@ -543,6 +548,7 @@ class AskView(APIView):
         from utils.data_query import execute_query, build_data_query_prompt
         route = route_question(question, user)
         is_data_query = route['type'] == 'data_query'
+        tracing.trace_log('route', 'type=%s params=%s', route['type'], route.get('params'))
 
         # 匿名用户不支持文件管理查询
         if is_data_query and not user:
@@ -579,6 +585,9 @@ class AskView(APIView):
             text_route = route_text_question(question, user, context=doc_context)
             if text_route.get('type') == 'data_query':
                 route = text_route
+            tracing.trace_log(
+                'data_query', 'type=%s params=%s', route.get('type'), route.get('params'),
+            )
             return self._handle_data_query(
                 question, user, conversation, route, doc_context,
             )
@@ -593,6 +602,7 @@ class AskView(APIView):
 
         # 3.1 问题解析（LLM 抽取硬过滤条件，失败走规则回退）
         parsed = parse_query(question, user_context)
+        tracing.trace_log('parse', 'filters=%s', parsed)
         logger.debug(f'parsed_filters: {parsed}')
 
         # 3.1.5 FAQ 短路：高频问题走 FAQ 表（如果有）
@@ -617,10 +627,17 @@ class AskView(APIView):
             pass  # 没有 FAQ 表或字段不匹配，静默跳过
 
         # 3.2 RAG 检索（新版：硬过滤 + 双路召回 + 权限校验）
+        t_retrieve = time.time()
         results = rag.retrieve(
             question=question,
             user_context=user_context,
             parsed_filters=parsed,
+        )
+        tracing.trace_log(
+            'retrieve', 'hits=%d top=%s cost=%dms',
+            len(results),
+            round(max((r.get('score', 0) for r in results), default=0.0), 3),
+            int((time.time() - t_retrieve) * 1000),
         )
 
         # 3.2d 穷举类问题扩展：名单类查询把目标文档全部分块拉进上下文，
@@ -630,6 +647,10 @@ class AskView(APIView):
             results, enum_doc_title = rag.try_expand_enumeration(
                 question, results, user_context,
             )
+            if enum_doc_title:
+                tracing.trace_log(
+                    'expand', 'target=%s chunks=%d', enum_doc_title, len(results),
+                )
 
         # 3.2a 分角色严谨度：管理员（需精准引用）知识库无可靠命中时直接拒答，
         #      不调用 LLM、不联网兜底（联网摘要非知识库权威来源，不能作为管理员依据）。
@@ -670,6 +691,7 @@ class AskView(APIView):
             search_results = search_school(question, max_results=5)
             if search_results:
                 web_search_used = True
+                web_count = len(search_results)
                 if low_confidence:
                     # 低分召回是泛化内容，丢弃，避免干扰模型；联网结果作唯一事实来源
                     results[:] = []
@@ -689,6 +711,11 @@ class AskView(APIView):
                 logger.info('联网搜索兜底命中 %d 条', len(search_results))
             else:
                 logger.info('联网搜索也无结果')
+            tracing.trace_log(
+                'web_search', 'used=%s hits=%d pending_docs=%d',
+                web_search_used, len(search_results) if web_search_used else 0,
+                len(pending_docs),
+            )
 
         # 3.2c 图片检索（用于回答内联展示相关图片）
         image_intent = rag._detect_image_intent(question)
@@ -705,6 +732,7 @@ class AskView(APIView):
             user=user,
             conversation=conversation,
             question=question,
+            trace_id=trace_id,
             parsed_filters=parsed,
             hit_count=len(results),
             top_doc_ids=[r['doc_id'] for r in results],
@@ -763,6 +791,7 @@ class AskView(APIView):
                 yield _format_sse('start', {
                     'conversation_id': conversation.id,
                     'message_id': assistant_msg.id,
+                    'trace_id': trace_id,
                 })
 
                 # 流式生成（管理员低置信时拒绝生成，直接返回固定提示，不调用 LLM）
@@ -792,6 +821,10 @@ class AskView(APIView):
                 # 保存 AI 回答（流结束后写库）
                 if full_answer:
                     _persist_partial()
+                    tracing.trace_log(
+                        'generate', 'answer_chars=%d tokens=%d',
+                        len(full_answer), len(collected_tokens),
+                    )
                     logger.info(
                         'AI 回答完成 msg_id=%d conv_id=%d tokens=%d',
                         assistant_msg.id, conversation.id, len(collected_tokens),
@@ -862,6 +895,10 @@ class AskView(APIView):
                     QueryLog.objects.filter(id=query_log.id).update(response_ms=elapsed_ms)
                 except Exception:
                     logger.warning('回填 response_ms 失败 query_log.id=%d', query_log.id)
+                tracing.trace_log(
+                    'done', 'msg_id=%d response_ms=%d total_ms=%d',
+                    assistant_msg.id, elapsed_ms, tracing.elapsed_ms(),
+                )
 
         response = StreamingHttpResponse(
             event_stream(),
@@ -870,6 +907,7 @@ class AskView(APIView):
         response['Cache-Control'] = 'no-cache'
         response['X-Accel-Buffering'] = 'no'
         response['Access-Control-Allow-Origin'] = '*'
+        response['X-Trace-Id'] = trace_id
         return response
 
     def _handle_data_query(self, question, user, conversation, route, doc_context=None):

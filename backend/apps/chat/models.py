@@ -72,6 +72,10 @@ class QueryLog(models.Model):
         verbose_name='关联会话'
     )
     question = models.TextField(verbose_name='用户问题')
+    trace_id = models.CharField(
+        max_length=16, blank=True, default='', db_index=True,
+        verbose_name='链路追踪ID',
+    )
     parsed_filters = models.JSONField(null=True, blank=True, verbose_name='LLM解析出的硬过滤条件')
     hit_count = models.IntegerField(default=0, verbose_name='召回命中数')
     top_doc_ids = models.JSONField(null=True, blank=True, verbose_name='召回Top-K的doc_id列表')
