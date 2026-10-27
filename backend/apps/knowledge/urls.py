@@ -25,7 +25,10 @@ from .views import (
     DocTagCreateView,
     DocTagDeleteView,
     DocTagListView,
+    TagDeleteView,
     TagListView,
+    TagMergeView,
+    TagRenameView,
     TextUploadView,
     UploadCallbackView,
     UploadSTSView,
@@ -65,6 +68,9 @@ urlpatterns = [
 
     # 标签
     path('tags/', TagListView.as_view(), name='tag_list'),
+    path('tags/<int:tag_id>/rename/', TagRenameView.as_view(), name='tag_rename'),
+    path('tags/merge/', TagMergeView.as_view(), name='tag_merge'),
+    path('tags/<int:tag_id>/delete/', TagDeleteView.as_view(), name='tag_delete'),
     path('docs/<int:doc_id>/tags/', DocTagListView.as_view(), name='doc_tag_list'),
     path('docs/<int:doc_id>/tags/create/', DocTagCreateView.as_view(), name='doc_tag_create'),
     path('docs/<int:doc_id>/tags/<int:tag_id>/delete/', DocTagDeleteView.as_view(), name='doc_tag_delete'),

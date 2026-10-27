@@ -106,6 +106,8 @@ class KnowledgeDocListSerializer(serializers.ModelSerializer):
     file_ext = serializers.SerializerMethodField()
     created_at_display = serializers.SerializerMethodField()
     indexed_at_display = serializers.SerializerMethodField()
+    # 文档标签（人工打标）：列表页仅回显 {id, name}，供前端渲染标签徽章
+    tags = serializers.SerializerMethodField()
 
     class Meta:
         model = KnowledgeDoc
@@ -115,7 +117,7 @@ class KnowledgeDocListSerializer(serializers.ModelSerializer):
             'college_name', 'discipline_name', 'uploader_name',
             'uploader_college_name', 'uploader_department_name',
             'chunk_count', 'created_at', 'created_at_display',
-            'indexed_at', 'indexed_at_display',
+            'indexed_at', 'indexed_at_display', 'tags',
         ]
 
     def get_file_ext(self, obj) -> str:
@@ -127,6 +129,10 @@ class KnowledgeDocListSerializer(serializers.ModelSerializer):
 
     def get_indexed_at_display(self, obj) -> str:
         return format_business_time(obj.indexed_at)
+
+    def get_tags(self, obj) -> list:
+        """文档标签（人工打标）：列表页仅回显 {id, name}，供前端渲染标签徽章/点击筛选"""
+        return [{'id': t.tag_id, 'name': t.tag.name} for t in obj.doc_tags.all()]
 
 
 # 文件大小限制常量（字节）
