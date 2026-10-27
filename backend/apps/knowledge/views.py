@@ -12,7 +12,7 @@ import requests
 import oss2
 
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import Count, Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 
@@ -74,12 +74,16 @@ class KnowledgeDocFilter(django_filters.FilterSet):
     status = django_filters.CharFilter(field_name='status')
     source_type = django_filters.CharFilter(field_name='source_type')
     days_back = django_filters.NumberFilter(method='filter_days_back')
+    # 按标签筛选：tag_id 按 ID，tag 按名称（返回打了该标签的文档）
+    tag_id = django_filters.NumberFilter(method='filter_tag_id')
+    tag = django_filters.CharFilter(method='filter_tag_name')
 
     class Meta:
         model = KnowledgeDoc
         fields = [
             'college_id', 'department_id', 'discipline_id',
             'file_type', 'status', 'source_type', 'days_back',
+            'tag_id', 'tag',
         ]
 
     def filter_days_back(self, queryset, name, value):
@@ -88,6 +92,18 @@ class KnowledgeDocFilter(django_filters.FilterSet):
             since_date = timezone.now() - timedelta(days=value)
             return queryset.filter(created_at__gte=since_date)
         return queryset
+
+    def filter_tag_id(self, queryset, name, value):
+        """按标签 ID 精确筛选（返回打了该标签的文档）"""
+        if not value:
+            return queryset
+        return queryset.filter(doc_tags__tag_id=value)
+
+    def filter_tag_name(self, queryset, name, value):
+        """按标签名称精确筛选"""
+        if not value:
+            return queryset
+        return queryset.filter(doc_tags__tag__name=value)
 
 
 @extend_schema(
@@ -111,6 +127,8 @@ class KnowledgeDocListView(generics.ListAPIView):
         - file_type (str, optional): 按文件类型精确筛选（pdf/doc/ppt/xls/image/video/audio/md/txt/html/other）
         - status (str, optional): 按状态精确筛选（uploaded/parsing/chunking/embedding/indexed/failed）
         - source_type (str, optional): 按来源类型精确筛选（upload/website/library）
+        - tag_id (int, optional): 按标签ID精确筛选（返回打了该标签的文档）
+        - tag (str, optional): 按标签名称精确筛选
     权限规则：
         - super_admin（超级管理员）: 可查看平台全部文档
         - admin（学院管理员）: 仅能查看自己所属学院下的所有文档
@@ -131,7 +149,7 @@ class KnowledgeDocListView(generics.ListAPIView):
         queryset = KnowledgeDoc.objects.select_related(
             'college', 'discipline', 'uploader',
             'uploader__college', 'uploader__department',
-        ).all()
+        ).prefetch_related('doc_tags__tag').all()
 
         # 可见性权限过滤
         queryset = self._admin_scope_filter(queryset, user)
@@ -631,17 +649,137 @@ class KeywordDeleteView(APIView):
     operation_id='标签列表',
 )
 class TagListView(APIView):
-    """标签字典列表
+    """标签字典列表（含各标签可浏览文档数）
 
     GET /api/knowledge/tags/
     功能：返回全平台共享的标签词表（软删除的不返回），按创建顺序排列
-    返回：标签数组，每条包含 id / name / created_at
+    返回：标签数组，每条包含 id / name / created_at / doc_count
+          doc_count = 当前用户可浏览范围内打了该标签的文档数（随权限变化）
     """
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        tags = Tag.objects.filter(is_deleted=False).order_by('id')
-        return Response(TagSerializer(tags, many=True).data)
+        tags = list(Tag.objects.filter(is_deleted=False).order_by('id'))
+
+        # 各标签在「当前用户可浏览范围」内的文档数（单次聚合，避免逐标签查询）
+        scope_docs = KnowledgeDocListView._admin_scope_filter(
+            KnowledgeDoc.objects.all(), request.user,
+        )
+        counts = dict(
+            DocTag.objects.filter(tag__is_deleted=False, doc__in=scope_docs)
+            .values('tag_id')
+            .annotate(c=Count('doc', distinct=True))
+            .values_list('tag_id', 'c')
+        )
+
+        data = TagSerializer(tags, many=True).data
+        for item in data:
+            item['doc_count'] = counts.get(item['id'], 0)
+        return Response(data)
+
+
+class TagRenameView(APIView):
+    """重命名标签（词表管理，仅超级管理员）
+
+    POST /api/knowledge/tags/{tag_id}/rename/
+    请求参数：
+        - name (str, required): 新标签名（≤64 字符，全局唯一）
+    返回：重命名后的标签 {id, name, created_at}
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, tag_id):
+        if request.user.role != 'super_admin':
+            raise PermissionDenied('仅超级管理员可管理标签词表')
+        tag = get_object_or_404(Tag, id=tag_id, is_deleted=False)
+
+        name = (request.data.get('name') or '').strip()
+        if not name:
+            raise ValidationError({'name': '标签名不能为空'})
+        if len(name) > 64:
+            raise ValidationError({'name': '标签名长度不能超过 64 字符'})
+        if Tag.objects.filter(name=name, is_deleted=False).exclude(id=tag_id).exists():
+            raise ValidationError({'name': f'标签「{name}」已存在，可直接使用或走合并'})
+
+        tag.name = name
+        tag.save(update_fields=['name', 'updated_at'])
+        return Response(TagSerializer(tag).data)
+
+
+class TagMergeView(APIView):
+    """合并重复标签（词表管理，仅超级管理员）
+
+    POST /api/knowledge/tags/merge/
+    请求参数：
+        - source_tag_id (int, required): 被合并（随后软删）的源标签 ID
+        - target_tag_id (int, required): 保留的目标标签 ID
+    行为：源标签的所有文档关联改指向目标标签（文档已有目标标签时跳过），
+          随后软删源标签词条。
+    返回：{detail, moved, tag}
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        if request.user.role != 'super_admin':
+            raise PermissionDenied('仅超级管理员可管理标签词表')
+
+        source_id = request.data.get('source_tag_id')
+        target_id = request.data.get('target_tag_id')
+        if not source_id or not target_id:
+            raise ValidationError({'detail': 'source_tag_id 与 target_tag_id 均为必填'})
+        if source_id == target_id:
+            raise ValidationError({'detail': '源标签与目标标签不能相同'})
+
+        source = get_object_or_404(Tag, id=source_id, is_deleted=False)
+        target = get_object_or_404(Tag, id=target_id, is_deleted=False)
+
+        # 目标标签已关联的文档集合（避免 uk_doc_tag 唯一约束冲突）
+        already_doc_ids = set(
+            DocTag.objects.filter(tag=target).values_list('doc_id', flat=True)
+        )
+        source_doc_tags = list(DocTag.objects.filter(tag=source).select_related('doc'))
+        to_create = []
+        for dt in source_doc_tags:
+            if dt.doc_id not in already_doc_ids:
+                to_create.append(DocTag(
+                    doc_id=dt.doc_id, tag=target, created_by_id=dt.created_by_id,
+                ))
+        if to_create:
+            DocTag.objects.bulk_create(to_create)
+
+        # 删除源标签的所有关联，再软删源词条
+        DocTag.objects.filter(tag=source).delete()
+        source.is_deleted = True
+        source.deleted_at = timezone.now()
+        source.save(update_fields=['is_deleted', 'deleted_at', 'updated_at'])
+
+        return Response({
+            'detail': '合并成功',
+            'moved': len(to_create),
+            'tag': TagSerializer(target).data,
+        })
+
+
+class TagDeleteView(APIView):
+    """软删除标签词条（词表管理，仅超级管理员）
+
+    DELETE /api/knowledge/tags/{tag_id}/delete/
+    行为：软删标签词条（is_deleted=1），并移除该标签在全部文档上的关联；
+          不影响文档本身，也不影响其他标签。
+    返回：{"detail": "删除成功"}
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def delete(self, request, tag_id):
+        if request.user.role != 'super_admin':
+            raise PermissionDenied('仅超级管理员可管理标签词表')
+        tag = get_object_or_404(Tag, id=tag_id, is_deleted=False)
+
+        DocTag.objects.filter(tag=tag).delete()
+        tag.is_deleted = True
+        tag.deleted_at = timezone.now()
+        tag.save(update_fields=['is_deleted', 'deleted_at', 'updated_at'])
+        return Response({'detail': '删除成功'})
 
 
 @extend_schema(
