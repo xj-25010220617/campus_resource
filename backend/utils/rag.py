@@ -740,6 +740,96 @@ def _keyword_table_search(
     return _build_doc_results(docs, keywords, score=0.6)
 
 
+# ------------------------------------------------------------------
+# 标签检索通道（第 5 路召回）
+# ------------------------------------------------------------------
+# 标签是人工打标、全平台共享的词表，不带检索权重、不做同义扩展，
+# 因此匹配方式必须是"词表倒查问题文本"（tag.name in question），
+# 而不是把问题切碎去匹配标签——后者受 _extract_query_terms 的
+# 8 词上限和停用词表截断，长标签会被切碎漏配。
+_TAG_CACHE_TTL = 60.0  # 标签词表内存缓存有效期（秒），打标后最迟 1 分钟生效
+_tag_cache: dict = {'terms': None, 'expires_at': 0.0}
+_tag_cache_lock = threading.Lock()
+
+
+def _get_tag_terms() -> List[Tuple[int, str]]:
+    """全量标签词表 [(tag_id, name)]，按名称长度降序（长标签优先）。"""
+    now = time.time()
+    if _tag_cache['terms'] is not None and now < _tag_cache['expires_at']:
+        return _tag_cache['terms']
+    with _tag_cache_lock:
+        now = time.time()
+        if _tag_cache['terms'] is not None and now < _tag_cache['expires_at']:
+            return _tag_cache['terms']
+        from apps.knowledge.models import Tag
+        terms = sorted(
+            Tag.objects.filter(is_deleted=False).values_list('id', 'name'),
+            key=lambda t: len(t[1]), reverse=True,
+        )
+        _tag_cache['terms'] = terms
+        _tag_cache['expires_at'] = now + _TAG_CACHE_TTL
+        return terms
+
+
+def invalidate_tag_cache():
+    """标签增删后调用，立即失效词表缓存（不等 TTL）。"""
+    _tag_cache['terms'] = None
+    _tag_cache['expires_at'] = 0.0
+
+
+def _match_tags(question: str) -> List[dict]:
+    """倒查标签词表：返回问题文本中出现的标签。
+
+    纯内存子串匹配，零 LLM 调用（问答链路首字延迟预算 30s，
+    不能再加一次模型调用）。去掉被更长命中标签名包含的短标签
+    （如同时命中"奖学金"与"奖学金评定"时只保留后者），降低歧义。
+
+    Returns:
+        [{'tag_id': int, 'name': str}, ...]，按名称长度降序。
+    """
+    q = (question or '').lower()
+    if not q:
+        return []
+    matched = [
+        {'tag_id': tid, 'name': name}
+        for tid, name in _get_tag_terms()
+        if len(name) >= 2 and name.lower() in q
+    ]
+    return [
+        m for m in matched
+        if not any(o['name'] != m['name'] and m['name'] in o['name'] for o in matched)
+    ]
+
+
+def _tag_table_search(
+    tags: List[dict],
+    user_context: Optional[dict] = None,
+    top_k: int = 5,
+    doc_ids: Optional[List[int]] = None,
+) -> List[dict]:
+    """标签表检索通道：按人工标签反查文档。
+
+    与 _keyword_table_search 同构：先查 DocTag 得到 doc_id 集合，
+    再统一经过 authorized_knowledge_docs() 权限过滤和 status='indexed'
+    限制，标签通道不得成为越权读取通道。
+    """
+    if not tags:
+        return []
+
+    from apps.knowledge.models import DocTag
+
+    tag_ids = [t['tag_id'] for t in tags]
+    doc_id_qs = DocTag.objects.filter(tag_id__in=tag_ids).values('doc_id')
+    docs = authorized_knowledge_docs(user_context).filter(
+        id__in=doc_id_qs, status='indexed',
+    )
+    if doc_ids is not None:
+        docs = docs.filter(id__in=[d for d in doc_ids if d > 0])
+    docs = docs.order_by('-created_at')[:top_k]
+
+    return _build_doc_results(docs, [t['name'] for t in tags], score=0.6)
+
+
 def _chunk_content_search(
     keywords: List[str],
     user_context: Optional[dict] = None,
@@ -1103,6 +1193,90 @@ def try_expand_enumeration(
     ]
     others = [r for r in results if r.get('doc_id') != doc_id]
     return expanded + others, target.get('doc_title', '')
+
+
+# ------------------------------------------------------------------
+# 标签穷举通道（"列出标签X下所有文件"类查询返回全量文档列表）
+# ------------------------------------------------------------------
+# 文件列举意图词：穷举/聚合词表偏向"人员名单"语义，补充文件维度说法
+_TAG_LISTING_INTENT_KEYWORDS = (
+    '哪些文件', '哪些文档', '哪些资料', '都有什么', '有什么文件',
+    '有什么文档', '文件有哪些', '文档有哪些', '文件列表', '文档列表', '大全',
+)
+
+TAG_LISTING_MAX_DOCS = 50  # 单次列举文档上限（50 条 × ~150 字 ≈ 7.5K，低于穷举字符上限）
+
+
+def is_tag_listing_question(question: str) -> bool:
+    """检测文件列举意图：与穷举/聚合意图并列为标签穷举的触发条件。"""
+    q = (question or '').strip()
+    return any(k in q for k in _TAG_LISTING_INTENT_KEYWORDS)
+
+
+def try_expand_tag_listing(
+    question: str,
+    user_context: Optional[dict] = None,
+    max_docs: int = TAG_LISTING_MAX_DOCS,
+) -> Tuple[Optional[List[dict]], Optional[str]]:
+    """标签穷举：问题命中恰好一个标签且含列举意图时，返回该标签下全部文档列表。
+
+    与 try_expand_enumeration（单文档全部分块）互补：本通道以"每文档一条"
+    的形式给出标签范围内的完整文件清单，实现"用标签提问→快速定位文件"。
+
+    触发条件（全部满足）：
+    - 穷举 / 聚合 / 文件列举意图之一
+    - _match_tags 恰好命中 1 个标签（0 个无目标，≥2 个歧义不猜）
+    - 该标签下存在授权且已索引的文档
+
+    必须复用 authorized_knowledge_docs() 权限过滤 + status='indexed'，
+    标签穷举不得成为越权读取通道。
+
+    Returns:
+        (文档列表, 标签名)；未触发时 (None, None)。
+    """
+    if not (
+        is_enumeration_question(question)
+        or is_aggregation_question(question)
+        or is_tag_listing_question(question)
+    ):
+        return None, None
+
+    tags = _match_tags(question)
+    if len(tags) != 1:
+        return None, None
+    tag = tags[0]
+
+    from apps.knowledge.models import DocTag
+    doc_id_qs = DocTag.objects.filter(tag_id=tag['tag_id']).values('doc_id')
+    docs = authorized_knowledge_docs(user_context).filter(
+        id__in=doc_id_qs, status='indexed',
+    ).order_by('-created_at')[:max_docs]
+
+    results = []
+    for doc in docs:
+        desc = (doc.description or '').strip()
+        summary = f"《{doc.title}》（标签：{tag['name']}"
+        if doc.file_name:
+            summary += f"，文件名：{doc.file_name}"
+        summary += '）'
+        if desc:
+            summary += f' 简介：{desc[:120]}'
+        results.append({
+            'doc_id': doc.id,
+            'doc_title': doc.title,
+            'content': summary,
+            'score': 0.7,  # 高于 RAG_REFERENCE_THRESHOLD，保证进入引用列表
+            'page': 0,
+            'chunk_index': None,
+            'vector_id': '',
+            'source_type': doc.source_type,
+            'source_url': doc.source_url,
+            'file_name': doc.file_name,
+            'oss_key': doc.oss_key,
+        })
+    if not results:
+        return None, None
+    return results, tag['name']
 
 
 # ------------------------------------------------------------------
@@ -1482,6 +1656,7 @@ def _retrieve_pipeline(
     top_k: int,
     min_score: float,
     rewrite_questions: Optional[List[str]] = None,
+    apply_rerank: bool = True,
 ) -> List[dict]:
     """执行一次完整检索管道（硬过滤 → 多路召回 → 合并精排 → 权限校验）。
 
@@ -1558,21 +1733,31 @@ def _retrieve_pipeline(
         query_terms, user_context, top_k=top_k, doc_ids=candidate_ids,
     )
 
+    # 2c. 标签表通道（第 5 路召回）：问题文本命中人工标签时软增强，
+    #     命中标签的文档并入关键词侧统一聚合，不做硬过滤
+    matched_tags = _match_tags(question)
+    tag_hits = _tag_table_search(
+        matched_tags, user_context, top_k=top_k, doc_ids=candidate_ids,
+    ) if matched_tags else []
+
     # 3. 合并 + 关键词权重加成
     merged = _merge_and_rerank(
         vector_hits,
-        keyword_hits + keyword_table_hits + chunk_hits,
+        keyword_hits + keyword_table_hits + chunk_hits + tag_hits,
         keywords_boost=_keywords_boost_from_filters(parsed_filters),
     )
 
     # 3.5 Cross-Encoder 精排（候选 >=3 即触发）
-    try:
-        from utils.reranker import CROSS_ENCODER_TOP_K_OUTPUT, rerank_with_cross_encoder
-        if len(merged) >= 3:
-            merged = rerank_with_cross_encoder(question, merged)
-            logger.debug('Cross-Encoder 重排序后: %d 条', len(merged))
-    except ImportError:
-        pass  # reranker 模块不存在，静默跳过
+    # 二次检索的重试轮传 apply_rerank=False：精排只在首轮跑一次，
+    # 避免 CPU 上精排耗时随重试翻倍（曾导致 80~100s 超时）
+    if apply_rerank:
+        try:
+            from utils.reranker import CROSS_ENCODER_TOP_K_OUTPUT, rerank_with_cross_encoder
+            if len(merged) >= 3:
+                merged = rerank_with_cross_encoder(question, merged)
+                logger.debug('Cross-Encoder 重排序后: %d 条', len(merged))
+        except ImportError:
+            pass  # reranker 模块不存在，静默跳过
 
     # 4. 加载 doc 元信息
     enriched = _enrich_with_doc_meta(merged, min_score)
@@ -1588,17 +1773,17 @@ def _retrieve_pipeline(
     if results:
         top3_scores = [round(r.get('score', 0), 3) for r in results[:3]]
         logger.info(
-            '[RAG监控] 候选=%d 向量=%d 向量命中率=%.3f 关键词=%d 关键词表=%d 分块=%d Rerank后Top3=%s 返回=%d',
+            '[RAG监控] 候选=%d 向量=%d 向量命中率=%.3f 关键词=%d 关键词表=%d 分块=%d 标签=%d Rerank后Top3=%s 返回=%d',
             len(candidate_ids), len(vector_hits), vector_hit_rate,
             len(keyword_hits), len(keyword_table_hits), len(chunk_hits),
-            top3_scores, len(results),
+            len(tag_hits), top3_scores, len(results),
         )
     else:
         logger.warning(
-            '[RAG监控] 零召回 q=%s 候选=%d 向量=%d 向量命中率=%.3f 关键词=%d 关键词表=%d 分块=%d',
+            '[RAG监控] 零召回 q=%s 候选=%d 向量=%d 向量命中率=%.3f 关键词=%d 关键词表=%d 分块=%d 标签=%d',
             question[:50], len(candidate_ids),
             len(vector_hits), vector_hit_rate, len(keyword_hits),
-            len(keyword_table_hits), len(chunk_hits),
+            len(keyword_table_hits), len(chunk_hits), len(tag_hits),
         )
 
     # 6. 兜底：向量检索无结果时，按标题/描述关键词搜索
@@ -1618,6 +1803,7 @@ def retrieve_wider(
     top_k: int = RAG_RETRY_TOP_K,
     min_score: float = RAG_RETRY_MIN_SCORE,
     rewrite_questions: Optional[List[str]] = None,
+    apply_rerank: bool = True,
 ) -> List[dict]:
     """扩大范围检索：放宽时间/类型/分类过滤，扩大召回并降低最低分。
 
@@ -1633,6 +1819,7 @@ def retrieve_wider(
         top_k=top_k,
         min_score=min_score,
         rewrite_questions=rewrite_questions,
+        apply_rerank=apply_rerank,
     )
 
 
@@ -1699,6 +1886,7 @@ def retrieve(
             top_k=RAG_RETRY_TOP_K,
             min_score=RAG_RETRY_MIN_SCORE,
             rewrite_questions=rewrite_questions,
+            apply_rerank=False,  # 重试轮跳过精排，整个请求最多精排一次
         )
         results = _merge_retry_results(results, retry_results)
         logger.info(

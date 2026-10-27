@@ -208,6 +208,11 @@ QUERY_ROUTER_LLM_ENABLED = config('QUERY_ROUTER_LLM_ENABLED', default=True, cast
 QUERY_ROUTER_LLM_TIMEOUT = config('QUERY_ROUTER_LLM_TIMEOUT', default=3.0, cast=float)
 QUERY_ROUTER_LLM_CACHE_TTL = config('QUERY_ROUTER_LLM_CACHE_TTL', default=600, cast=int)
 
+# 表格问答引擎（utils/tabular_query.py，sqlite3 内存表执行）
+TABULAR_SQL_LLM_TIMEOUT = config('TABULAR_SQL_LLM_TIMEOUT', default=8.0, cast=float)
+TABULAR_MAX_ROWS = config('TABULAR_MAX_ROWS', default=100000, cast=int)
+TABULAR_RESULT_MAX_ROWS = config('TABULAR_RESULT_MAX_ROWS', default=100, cast=int)
+
 # Embedding 后端切换（aliyun / local / mock）
 EMBED_BACKEND = config('EMBED_BACKEND', default='local')
 ALIYUN_EMBED_API_KEY = config('ALIYUN_EMBED_API_KEY', default='')
@@ -335,7 +340,10 @@ SYNONYM_DICT_CUSTOM_PATH = config('SYNONYM_DICT_CUSTOM_PATH', default='')
 # ------------------------------------------------------------------
 # Cross-Encoder 重排序
 # ------------------------------------------------------------------
-CROSS_ENCODER_ENABLED = config('CROSS_ENCODER_ENABLED', default=True, cast=bool)
+# 默认关闭：当前服务器为纯 CPU，bge-reranker-v2-m3 对 20 个候选精排单次需 40~60s，
+# 叠加低置信二次检索后问答首字要 80~100s，超过前端 30s 超时导致"AI回答超时"。
+# 关闭后走 rag._merge_and_rerank 的加权融合（原有兜底逻辑）；部署到 GPU 机器可在 .env 置 True 开启。
+CROSS_ENCODER_ENABLED = config('CROSS_ENCODER_ENABLED', default=False, cast=bool)
 CROSS_ENCODER_MODEL = config('CROSS_ENCODER_MODEL', default='BAAI/bge-reranker-v2-m3')
 
 # ------------------------------------------------------------------

@@ -588,9 +588,22 @@ class AskView(APIView):
             tracing.trace_log(
                 'data_query', 'type=%s params=%s', route.get('type'), route.get('params'),
             )
-            return self._handle_data_query(
-                question, user, conversation, route, doc_context,
-            )
+
+            # 表格问答：失败时静默回退到 RAG 主链路，不向用户暴露 SQL/加载错误
+            precomputed = None
+            tabular_fallback = False
+            if route.get('query_type') == 'tabular_query':
+                precomputed = execute_query(route, user)
+                if not precomputed.get('success') and precomputed.get('fallback') == 'rag':
+                    logger.info('表格问答回退 RAG 主链路: %s', precomputed.get('error'))
+                    tabular_fallback = True
+                    precomputed = None
+
+            if not tabular_fallback:
+                return self._handle_data_query(
+                    question, user, conversation, route, doc_context,
+                    precomputed_result=precomputed,
+                )
 
         # 3. 获取历史消息（用于多轮对话上下文）
         history = list(
@@ -640,10 +653,26 @@ class AskView(APIView):
             int((time.time() - t_retrieve) * 1000),
         )
 
+        # 3.2c 标签穷举：问题命中唯一标签且含列举意图时，返回该标签下
+        #     全部文档清单（每文档一条），实现"用标签提问→快速定位文件"
+        tag_list_name = None
+        tag_listing, tag_list_name = rag.try_expand_tag_listing(
+            question, user_context,
+        )
+        if tag_listing is not None:
+            listed_ids = {r['doc_id'] for r in tag_listing}
+            results = tag_listing + [
+                r for r in results if r.get('doc_id') not in listed_ids
+            ]
+            tracing.trace_log(
+                'expand', 'tag=%s docs=%d', tag_list_name, len(tag_listing),
+            )
+
         # 3.2d 穷举类问题扩展：名单类查询把目标文档全部分块拉进上下文，
-        #     避免"15级优秀毕业生"这类跨 13 块的名单被 top-5 槽位截断
+        #     避免"15级优秀毕业生"这类跨 13 块的名单被 top-5 槽位截断；
+        #     标签穷举已给出完整文件清单时不再叠加单文档扩展
         enum_doc_title = None
-        if results:
+        if results and tag_list_name is None:
             results, enum_doc_title = rag.try_expand_enumeration(
                 question, results, user_context,
             )
@@ -742,6 +771,13 @@ class AskView(APIView):
         # 5. 构造 Prompt（含历史上下文）
         llm_question = question
         suffix_parts = []
+        if tag_list_name:
+            suffix_parts.append(
+                f'（系统已按标签「{tag_list_name}」检索到该标签下的全部文档'
+                f'（共{len(tag_listing)}份，参考资料每份一条）。'
+                f'请完整罗列所有文件的名称，不得省略，不得用"等"字概括；'
+                f'并提示用户可在参考来源中查看或下载对应文件。）'
+            )
         if enum_doc_title:
             suffix_parts.append(
                 f'（系统已检索到《{enum_doc_title}》的完整内容分块。'
@@ -757,7 +793,7 @@ class AskView(APIView):
             llm_question = f'{question}\n\n' + '\n'.join(suffix_parts)
         messages = rag.build_rag_prompt(
             llm_question, results, history=history,
-            max_chars=rag.ENUM_CONTEXT_MAX_CHARS if enum_doc_title else rag.CONTEXT_MAX_CHARS,
+            max_chars=rag.ENUM_CONTEXT_MAX_CHARS if (enum_doc_title or tag_list_name) else rag.CONTEXT_MAX_CHARS,
         )
 
         # 6. 创建 AI 消息占位（流结束后写入完整内容）
@@ -804,7 +840,7 @@ class AskView(APIView):
                     # 穷举类问题名单可能很长，放宽输出上限防止答案尾部被 max_tokens 截断
                     stream = llm_client.chat_stream(
                         messages,
-                        max_tokens=4096 if enum_doc_title else 2048,
+                        max_tokens=4096 if (enum_doc_title or tag_list_name) else 2048,
                     )
                     for token in stream:
                         if token:
@@ -910,15 +946,20 @@ class AskView(APIView):
         response['X-Trace-Id'] = trace_id
         return response
 
-    def _handle_data_query(self, question, user, conversation, route, doc_context=None):
-        """处理文件管理类查询：查询数据库 → LLM 格式化 → SSE 流式输出。"""
+    def _handle_data_query(self, question, user, conversation, route, doc_context=None,
+                           precomputed_result=None):
+        """处理文件管理类查询：查询数据库 → LLM 格式化 → SSE 流式输出。
+
+        precomputed_result：调用方已预执行的查询结果（表格问答用于失败回退前
+        预检），传入后不再重复执行 execute_query。
+        """
         from utils.data_query import (
             annotate_doc_time_status, build_text_data_query_prompt, execute_query,
         )
         from utils.sse import _format_sse
 
         # 执行查询
-        query_result = execute_query(route, user)
+        query_result = precomputed_result if precomputed_result is not None else execute_query(route, user)
 
         # 上一轮多候选：不猜测文件，标记为需要澄清（仅文字入口）
         if doc_context and doc_context.get('ambiguous') and query_result.get('success'):
@@ -1374,13 +1415,34 @@ class VoiceAskView(APIView):
                     parsed_filters=parsed, top_k=rag.RAG_TOP_K,
                     min_score=rag.RAG_SCORE_THRESHOLD,
                 )
-                # 穷举类问题扩展：名单类查询拉取目标文档全部分块，避免名单被截断
-                hits, enum_doc_title = rag.try_expand_enumeration(
-                    question, hits, user_context,
+                # 标签穷举：命中唯一标签且含列举意图时给出全量文件清单
+                tag_list_name = None
+                tag_listing, tag_list_name = rag.try_expand_tag_listing(
+                    question, user_context,
                 )
+                if tag_listing is not None:
+                    listed_ids = {r['doc_id'] for r in tag_listing}
+                    hits = tag_listing + [
+                        h for h in hits if h.get('doc_id') not in listed_ids
+                    ]
+
+                # 穷举类问题扩展：名单类查询拉取目标文档全部分块，避免名单被截断
+                enum_doc_title = None
+                if hits and tag_list_name is None:
+                    hits, enum_doc_title = rag.try_expand_enumeration(
+                        question, hits, user_context,
+                    )
+                llm_q = question
+                if tag_list_name:
+                    llm_q = (
+                        f'{question}\n\n（系统已按标签「{tag_list_name}」检索到该标签下的'
+                        f'全部文档（共{len(tag_listing)}份，参考资料每份一条）。'
+                        f'请完整罗列所有文件的名称，不得省略，不得用"等"字概括；'
+                        f'并提示用户可在参考来源中查看或下载对应文件。）'
+                    )
                 messages = rag.build_rag_prompt(
-                    question, hits,
-                    max_chars=rag.ENUM_CONTEXT_MAX_CHARS if enum_doc_title else rag.CONTEXT_MAX_CHARS,
+                    llm_q, hits,
+                    max_chars=rag.ENUM_CONTEXT_MAX_CHARS if (enum_doc_title or tag_list_name) else rag.CONTEXT_MAX_CHARS,
                 )
 
                 # 更新查询日志的 hits 信息
@@ -1395,7 +1457,7 @@ class VoiceAskView(APIView):
                 # 3. LLM 流式输出（穷举类问题放宽输出上限防止名单尾部截断）
                 for chunk in llm_client.chat_stream(
                     messages,
-                    max_tokens=4096 if enum_doc_title else 2048,
+                    max_tokens=4096 if (enum_doc_title or tag_list_name) else 2048,
                 ):
                     if chunk and first_ts is None:
                         first_ts = time.time()  # 思考时长终点：首字到达

@@ -68,6 +68,7 @@ class ParseResult:
     truncated: bool = False         # 是否发生截断（OCR 预算耗尽后仍有页面需要 OCR）
     structured: bool = False        # 表格/名单类文档已按『字段名：值』结构化
     record_count: int = 0           # 结构化记录条数（供计数类问题精确作答）
+    table_schema: Optional[dict] = None  # 表格结构元数据（供表格问答引擎生成 SQL）
 
     @property
     def is_empty(self) -> bool:
@@ -324,10 +325,9 @@ def _records_from_grid(rows) -> Tuple[str, int, bool]:
         text = '\n'.join('\t'.join(r).rstrip() for r in clean)
         return text, 0, False
 
-    header = [clean[header_idx][i] if i < len(clean[header_idx]) else '' for i in range(ncols)]
-    for i, h in enumerate(header):
-        if not h:
-            header[i] = f'列{i + 1}'
+    header = normalize_header(
+        [clean[header_idx][i] if i < len(clean[header_idx]) else '' for i in range(ncols)]
+    )
 
     records = []
     for cells in clean[header_idx + 1:]:
@@ -342,6 +342,90 @@ def _records_from_grid(rows) -> Tuple[str, int, bool]:
 
     summary = f'本表格共 {len(records)} 条记录；字段：{"、".join(header)}'
     return summary + '\n' + '\n'.join(records), len(records), True
+
+
+def normalize_header(header):
+    """规范化表头：换行/制表符压成空格、去重加后缀。
+
+    表格问答链路中 schema 与 sqlite 建表必须用同一套列名，否则 LLM 生成
+    SQL 时省略换行会导致列名不匹配（SQLite 双引号 fallback 会把不存在的
+    列名静默当作字符串字面量返回，产生错误答案）。
+    """
+    import re as _re
+    out, seen = [], {}
+    for i, h in enumerate(header):
+        name = _re.sub(r'\s+', ' ', str(h or '')).strip() or f'列{i + 1}'
+        if name in seen:
+            seen[name] += 1
+            name = f'{name}_{seen[name]}'
+        else:
+            seen[name] = 1
+        out.append(name)
+    return out
+
+
+def extract_schema_from_grid(rows, sheet_name: str) -> Optional[dict]:
+    """从二维表格网格提取结构元数据，供表格问答引擎生成 SQL。
+
+    表头识别与 _records_from_grid 保持一致（跳过跨列合并标题行）。
+    dtype 按前若干样本行推断：纯数字 → DOUBLE，其余 → VARCHAR。
+
+    Returns:
+        {"name", "columns": [{"name", "dtype"}], "row_count", "sample_rows"}
+        非结构化网格（单列/无数据行）返回 None。
+    """
+    if not rows:
+        return None
+
+    clean = [[str(c or '').strip() for c in r] for r in rows]
+    clean = [r for r in clean if any(r)]
+    if not clean:
+        return None
+
+    ncols = max(len(r) for r in clean)
+
+    def _fill(row):
+        return sum(1 for c in row if c)
+
+    header_idx = 0
+    if len(clean) >= 2 and _fill(clean[0]) <= 1 and _fill(clean[1]) >= 2:
+        header_idx = 1
+
+    if ncols <= 1 or len(clean) - header_idx < 2:
+        return None
+
+    header = normalize_header(
+        [clean[header_idx][i] if i < len(clean[header_idx]) else '' for i in range(ncols)]
+    )
+
+    data_rows = []
+    for cells in clean[header_idx + 1:]:
+        row = [cells[i] if i < len(cells) else '' for i in range(ncols)]
+        if any(row):
+            data_rows.append(row)
+    if not data_rows:
+        return None
+
+    def _is_number(value: str) -> bool:
+        try:
+            float(value)
+            return True
+        except (TypeError, ValueError):
+            return False
+
+    sample_rows = data_rows[:3]
+    columns = []
+    for i, name in enumerate(header):
+        samples = [r[i] for r in sample_rows if r[i]]
+        dtype = 'DOUBLE' if samples and all(_is_number(v) for v in samples) else 'VARCHAR'
+        columns.append({'name': name, 'dtype': dtype})
+
+    return {
+        'name': sheet_name,
+        'columns': columns,
+        'row_count': len(data_rows),
+        'sample_rows': sample_rows,
+    }
 
 
 def _pdf_page_tables(page_no: int, page) -> Tuple[str, int]:
@@ -441,6 +525,11 @@ def _parse_xlsx(file_path: str) -> ParseResult:
                 continue
             result.record_count += n
             result.structured = result.structured or structured
+            if structured:
+                schema = extract_schema_from_grid(grid, sheet_name)
+                if schema:
+                    result.table_schema = result.table_schema or {'sheets': []}
+                    result.table_schema['sheets'].append(schema)
             prefix = f'工作表「{sheet_name}」\n' if structured else f'=== 工作表: {sheet_name} ===\n'
             parts.append(prefix + text)
         result.text = '\n\n'.join(parts)
@@ -463,6 +552,10 @@ def _parse_csv(file_path: str) -> ParseResult:
             result.text = text
             result.record_count = n
             result.structured = structured
+            if structured:
+                schema = extract_schema_from_grid(rows, file_path.rsplit('\\', 1)[-1].rsplit('/', 1)[-1])
+                if schema:
+                    result.table_schema = {'sheets': [schema]}
             return result
         except UnicodeDecodeError:
             continue
@@ -492,6 +585,11 @@ def _parse_xls(file_path: str) -> ParseResult:
                 continue
             result.record_count += n
             result.structured = result.structured or structured
+            if structured:
+                schema = extract_schema_from_grid(grid, sheet.name)
+                if schema:
+                    result.table_schema = result.table_schema or {'sheets': []}
+                    result.table_schema['sheets'].append(schema)
             prefix = f'工作表「{sheet.name}」\n' if structured else f'=== 工作表: {sheet.name} ===\n'
             parts.append(prefix + text)
         workbook.release_resources()

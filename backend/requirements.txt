@@ -48,3 +48,7 @@ openpyxl>=3.1.0
 # xlrd 必须固定 1.2.0：2.0+ 移除 .xlsx 支持且 API 变化，_parse_xls 依赖旧版接口
 xlrd==1.2.0
 docx2txt>=0.8
+# 表格问答引擎（utils/tabular_query.py）：sqlparse 做 SQL 白名单校验
+# 执行引擎用 Python 标准库 sqlite3（:memory: 内存表），不引入 duckdb：
+# 本地 WDAC 策略拦截 duckdb 原生 DLL，sqlite3 零依赖且跨平台行为一致
+sqlparse>=0.5.0
