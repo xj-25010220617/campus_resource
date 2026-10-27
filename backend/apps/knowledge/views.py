@@ -1061,6 +1061,10 @@ class UploadCallbackView(APIView):
             doc_college_id = request.user.college_id
             doc_department_id = request.user.department_id
 
+        # 审核：非超管上传必须能落到学院或部门（否则没有审核人可接）；超管上传免审
+        ensure_reviewable_scope(request.user, doc_college_id, doc_department_id)
+        review_status = initial_review_status(request.user)
+
         new_doc = KnowledgeDoc.objects.create(
             oss_key=data['oss_key'],
             title=data['title'],
@@ -1072,6 +1076,7 @@ class UploadCallbackView(APIView):
             source_type='upload',
             uploader=request.user,
             status='uploaded',
+            review_status=review_status,
             college_id=doc_college_id,
             department_id=doc_department_id,
             discipline_id=data.get('discipline_id'),
@@ -1093,14 +1098,9 @@ class UploadCallbackView(APIView):
         # 人工打标签（标签与关键词分离，标签名不存在则自动创建）
         _create_doc_tags(new_doc, _normalize_tags(request, data.get('tags', [])), request.user)
 
-        # 自动触发 AI 日期提取（异步，不阻塞上传主链路）
-        # 遵循 CONVENTIONS.md 第 9 节：异常处理下沉到 utils 层，视图层不写 try/except
-        from utils.celery_dispatcher import safe_delay
-        from .tasks import auto_link_relations_task, extract_freshness_task, index_document_task
-        safe_delay(extract_freshness_task, new_doc.id)
-        safe_delay(index_document_task, new_doc.id)
-        # AI 自动关联：上传后异步分析并直接关联到相关公开文档（用户无需手动选择、也看不到他人文档）
-        safe_delay(auto_link_relations_task, new_doc.id)
+        # 审核通过后才派发解析/向量化/自动关联任务（先审后索引）
+        if review_status == APPROVED:
+            dispatch_index_tasks(new_doc.id)
 
         return Response({
             'id': new_doc.id,

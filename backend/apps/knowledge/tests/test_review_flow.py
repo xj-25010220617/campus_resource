@@ -366,6 +366,46 @@ class PendingListViewTests(ReviewTestBase):
         self.assertEqual(resp.status_code, 403)
 
 
+class StsCallbackReviewTests(ReviewTestBase):
+    """STS 直传回调入口（前端直传 OSS 后回调建记录）同样受审核约束。"""
+
+    CALLBACK_URL = '/api/knowledge/upload/callback/'
+
+    def _callback(self, user):
+        self._auth(user)
+        return self.client.post(self.CALLBACK_URL, {
+            'oss_key': 'knowledge/college/1/2026-10/abcdef123456.pdf',
+            'title': '直传文档',
+            'file_name': '直传.pdf',
+            'file_size': 1024,
+            'file_type': 'pdf',
+            'md5': 'd41d8cd98f00b204e9800998ecf8427e',
+            'visibility': 'public',
+        }, format='json')
+
+    def test_dept_admin_callback_is_pending_and_does_not_dispatch(self):
+        with patch('apps.knowledge.views.oss_client') as mock_oss, \
+                patch('utils.celery_dispatcher.safe_delay') as mock_delay:
+            mock_oss.check_duplicate.return_value = None
+            resp = self._callback(self.dept_admin)
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        doc = KnowledgeDoc.objects.get(id=resp.data['id'])
+        self.assertEqual(doc.review_status, 'pending')
+        mock_delay.assert_not_called()
+
+    def test_super_admin_callback_is_approved_and_dispatches(self):
+        with patch('apps.knowledge.views.oss_client') as mock_oss, \
+                patch('utils.celery_dispatcher.safe_delay') as mock_delay:
+            mock_oss.check_duplicate.return_value = None
+            resp = self._callback(self.super_admin)
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        doc = KnowledgeDoc.objects.get(id=resp.data['id'])
+        self.assertEqual(doc.review_status, 'approved')
+        self.assertEqual(mock_delay.call_count, 3)
+
+
 class RetrievalVisibilityTests(ReviewTestBase):
     """审核状态对 RAG 检索授权集合的影响。"""
 
