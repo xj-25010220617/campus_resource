@@ -128,6 +128,12 @@ class UserUpdateSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({'department': '部门管理员必须设置部门'})
             if college is not None:
                 raise serializers.ValidationError({'college': '部门管理员不能设置学院'})
+        elif role == 'reviewer':
+            # 审核员归属二选一：绑部门=审本部门文档，绑学院=审本学院「学院级」文档
+            if bool(department) == bool(college):
+                raise serializers.ValidationError({
+                    'role': '审核员必须在「所属部门」和「所属学院」之间二选一',
+                })
         elif role == 'user':
             if college is None:
                 raise serializers.ValidationError({'college': '学生必须设置所属学院'})

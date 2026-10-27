@@ -5,6 +5,13 @@ from .chunked_views import (
     ChunkUploadInitView,
     ChunkUploadView,
 )
+from .review_views import (
+    DocReviewApproveView,
+    DocReviewHistoryView,
+    DocReviewRejectView,
+    DocReviewResubmitView,
+    PendingReviewListView,
+)
 from .views import (
     AIClassifyView,
     BatchFileUploadView,
@@ -49,6 +56,13 @@ urlpatterns = [
     path('upload/chunk/init/', ChunkUploadInitView.as_view(), name='upload_chunk_init'),
     path('upload/chunk/', ChunkUploadView.as_view(), name='upload_chunk'),
     path('upload/chunk/merge/', ChunkMergeView.as_view(), name='upload_chunk_merge'),
+
+    # 文档审核（reviewer 专用；super_admin 不参与审核）
+    path('reviews/pending/', PendingReviewListView.as_view(), name='doc_review_pending'),
+    path('reviews/history/', DocReviewHistoryView.as_view(), name='doc_review_history'),
+    path('docs/<int:pk>/review/approve/', DocReviewApproveView.as_view(), name='doc_review_approve'),
+    path('docs/<int:pk>/review/reject/', DocReviewRejectView.as_view(), name='doc_review_reject'),
+    path('docs/<int:pk>/review/resubmit/', DocReviewResubmitView.as_view(), name='doc_review_resubmit'),
 
     # 文档
     path('docs/', KnowledgeDocListView.as_view(), name='knowledge_doc_list'),

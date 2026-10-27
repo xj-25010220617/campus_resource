@@ -1025,7 +1025,7 @@ def authorized_knowledge_docs(user_context: Optional[dict] = None):
     college_id = user_context.get('college_id')
     department_id = user_context.get('department_id')
 
-    qs = KnowledgeDoc.objects.all()
+    qs = KnowledgeDoc.objects.filter(review_status='approved')
 
     # 超管上传的私密文档：仅该超管本人可见（与浏览链路 _admin_scope_filter 对齐）
     super_private = Q(visibility='private', uploader__role='super_admin')

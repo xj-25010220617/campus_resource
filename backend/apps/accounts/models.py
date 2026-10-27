@@ -39,6 +39,7 @@ class User(AbstractUser):
         ('super_admin', '超级管理员'),
         ('college_admin', '学院管理员'),
         ('dept_admin', '部门管理员'),
+        ('reviewer', '审核员'),
         ('admin', '管理员（兼容旧角色）'),
         ('user', '普通用户'),
     ]
@@ -90,6 +91,12 @@ class User(AbstractUser):
                 raise ValidationError({'department': '部门管理员必须设置所属部门'})
             if self.college_id:
                 raise ValidationError({'college': '部门管理员不能归属学院'})
+        elif role == 'reviewer':
+            # 审核员：归属二选一——绑部门=审本部门文档，绑学院=审本学院「学院级」文档
+            if bool(self.department_id) == bool(self.college_id):
+                raise ValidationError({
+                    'role': '审核员必须在「所属部门」和「所属学院」之间二选一',
+                })
         elif role == 'user':
             if not self.college_id:
                 raise ValidationError({'college': '学生必须设置所属学院'})
