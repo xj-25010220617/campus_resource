@@ -38,26 +38,29 @@ def _visible_docs_qs(user, mine_only: bool = False):
     """
     from apps.knowledge.models import KnowledgeDoc
 
+    # 审核闸口：未通过审核的文档一律不参与结构化/表格问答（与 RAG 检索口径一致）
+    base = KnowledgeDoc.objects.filter(review_status='approved')
+
     user_role = getattr(user, 'role', None) if user else None
     if not user or not user_role:
         return KnowledgeDoc.objects.none()
     if mine_only:
-        return KnowledgeDoc.objects.filter(uploader=user)
+        return base.filter(uploader=user)
     if user_role == 'super_admin':
-        return KnowledgeDoc.objects.all()
+        return base
     if user_role in ('admin', 'college_admin'):
-        return KnowledgeDoc.objects.filter(
+        return base.filter(
             Q(college_id__isnull=True, department_id__isnull=True)
             | Q(college_id=user.college_id)
             | Q(uploader=user)
         )
     if user_role == 'dept_admin':
-        return KnowledgeDoc.objects.filter(
+        return base.filter(
             Q(college_id__isnull=True, department_id__isnull=True)
             | Q(department_id=user.department_id)
             | Q(uploader=user)
         )
-    return KnowledgeDoc.objects.filter(uploader=user)
+    return base.filter(uploader=user)
 
 
 def _parse_bound_or_raise(value, name: str):

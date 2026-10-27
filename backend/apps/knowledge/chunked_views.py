@@ -25,13 +25,17 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from config.permissions import IsAdminOrSuperAdmin
-from utils.celery_dispatcher import safe_delay
 from utils.error_codes import ErrorCode
 from utils.oss import guess_content_type, oss_client
 
 from .models import ChunkedUploadSession, Keyword, KnowledgeDoc
+from .review import (
+    APPROVED,
+    dispatch_index_tasks,
+    ensure_reviewable_scope,
+    initial_review_status,
+)
 from .serializers import ALLOWED_FILE_TYPES, normalize_file_type
-from .tasks import auto_link_relations_task, extract_freshness_task, index_document_task
 
 logger = logging.getLogger(__name__)
 
@@ -315,6 +319,10 @@ class ChunkMergeView(APIView):
             doc_college_id = request.user.college_id
             doc_department_id = request.user.department_id
 
+        # 审核：非超管上传必须能落到学院或部门（否则没有审核人可接）；超管上传免审
+        ensure_reviewable_scope(request.user, doc_college_id, doc_department_id)
+        review_status = initial_review_status(request.user)
+
         new_doc = KnowledgeDoc.objects.create(
             oss_key=session.oss_key,
             title=title,
@@ -330,6 +338,7 @@ class ChunkMergeView(APIView):
             department_id=doc_department_id,
             discipline_id=request.data.get('discipline_id') or None,
             visibility=visibility,
+            review_status=review_status,
         )
 
         for phrase in _parse_keywords(request.data.get('keywords')):
@@ -342,10 +351,9 @@ class ChunkMergeView(APIView):
         from .views import _create_doc_tags, _normalize_tags
         _create_doc_tags(new_doc, _normalize_tags(request, request.data.get('tags')), request.user)
 
-        safe_delay(extract_freshness_task, new_doc.id)
-        safe_delay(index_document_task, new_doc.id)
-        # AI 自动关联：上传后异步分析并直接关联到相关公开文档（用户无需手动选择、也看不到他人文档）
-        safe_delay(auto_link_relations_task, new_doc.id)
+        # 审核通过后才触发异步索引（切片 + 向量化）
+        if review_status == APPROVED:
+            dispatch_index_tasks(new_doc.id)
 
         return Response({
             'id': new_doc.id,
