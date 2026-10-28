@@ -33,6 +33,14 @@ class UserSerializer(serializers.ModelSerializer):
         if role == 'dept_admin':
             ret.pop('college', None)
             ret.pop('college_name', None)
+        elif role == 'reviewer':
+            # 审核员归属二选一：绑部门隐藏学院字段，绑学院隐藏部门字段
+            if instance.department_id:
+                ret.pop('college', None)
+                ret.pop('college_name', None)
+            else:
+                ret.pop('department', None)
+                ret.pop('department_name', None)
         elif role in ('college_admin', 'user'):
             ret.pop('department', None)
             ret.pop('department_name', None)

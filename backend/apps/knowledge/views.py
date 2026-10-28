@@ -34,6 +34,13 @@ from utils.parsers import CleanJSONParser
 
 from .extractor import extract_freshness_for_doc
 from .models import DocRelation, DocTag, Keyword, KnowledgeDoc, Tag
+from .review import (
+    APPROVED,
+    dispatch_index_tasks,
+    ensure_reviewable_scope,
+    initial_review_status,
+    reviewer_scope_q,
+)
 from .serializers import (
     AIClassifySerializer,
     ALLOWED_FILE_TYPES,
@@ -182,6 +189,10 @@ class KnowledgeDocListView(generics.ListAPIView):
 
         # 非超管：超管上传的私密文档一律不可见
         queryset = queryset.exclude(super_private)
+
+        if user.role == 'reviewer':
+            # 审核员：可见范围与审核范围一致（本部门文档 / 本学院学院级文档）
+            return queryset.filter(reviewer_scope_q(user) | Q(uploader_id=user.id))
 
         if user.role in ('college_admin', 'admin'):
             return queryset.filter(
@@ -1050,6 +1061,10 @@ class UploadCallbackView(APIView):
             doc_college_id = request.user.college_id
             doc_department_id = request.user.department_id
 
+        # 审核：非超管上传必须能落到学院或部门（否则没有审核人可接）；超管上传免审
+        ensure_reviewable_scope(request.user, doc_college_id, doc_department_id)
+        review_status = initial_review_status(request.user)
+
         new_doc = KnowledgeDoc.objects.create(
             oss_key=data['oss_key'],
             title=data['title'],
@@ -1061,6 +1076,7 @@ class UploadCallbackView(APIView):
             source_type='upload',
             uploader=request.user,
             status='uploaded',
+            review_status=review_status,
             college_id=doc_college_id,
             department_id=doc_department_id,
             discipline_id=data.get('discipline_id'),
@@ -1082,14 +1098,9 @@ class UploadCallbackView(APIView):
         # 人工打标签（标签与关键词分离，标签名不存在则自动创建）
         _create_doc_tags(new_doc, _normalize_tags(request, data.get('tags', [])), request.user)
 
-        # 自动触发 AI 日期提取（异步，不阻塞上传主链路）
-        # 遵循 CONVENTIONS.md 第 9 节：异常处理下沉到 utils 层，视图层不写 try/except
-        from utils.celery_dispatcher import safe_delay
-        from .tasks import auto_link_relations_task, extract_freshness_task, index_document_task
-        safe_delay(extract_freshness_task, new_doc.id)
-        safe_delay(index_document_task, new_doc.id)
-        # AI 自动关联：上传后异步分析并直接关联到相关公开文档（用户无需手动选择、也看不到他人文档）
-        safe_delay(auto_link_relations_task, new_doc.id)
+        # 审核通过后才派发解析/向量化/自动关联任务（先审后索引）
+        if review_status == APPROVED:
+            dispatch_index_tasks(new_doc.id)
 
         return Response({
             'id': new_doc.id,
@@ -1157,6 +1168,13 @@ class TextUploadView(APIView):
 
         # 校验分类关联数据合法性（复用 UploadCallbackView 的校验逻辑）
         UploadCallbackView._validate_classification(data)
+
+        # 审核前置校验：非超管上传必须能落到学院或部门，放在写 OSS 之前
+        ensure_reviewable_scope(
+            request.user,
+            data.get('college_id') or request.user.college_id,
+            data.get('department_id') or request.user.department_id,
+        )
 
         # 判断用户是否显式传了 visibility（检查原始请求，排除序列化器默认值）
         user_provided_visibility = 'visibility' in request.data
@@ -1229,6 +1247,9 @@ class TextUploadView(APIView):
             doc_college_id = data.get('college_id') or request.user.college_id
             doc_department_id = data.get('department_id') or request.user.department_id
 
+        # 超管上传免审（approved），其余管理员上传待审核（pending）
+        review_status = initial_review_status(request.user)
+
         # 创建 KnowledgeDoc 记录
         new_doc = KnowledgeDoc.objects.create(
             title=title,
@@ -1245,6 +1266,7 @@ class TextUploadView(APIView):
             discipline_id=data.get('discipline_id'),
             uploader=request.user,
             status='uploaded',
+            review_status=review_status,
             visibility=visibility,
         )
 
@@ -1262,13 +1284,9 @@ class TextUploadView(APIView):
         # 人工打标签（标签与关键词分离，标签名不存在则自动创建）
         _create_doc_tags(new_doc, _normalize_tags(request, data.get('tags', [])), request.user)
 
-        # 触发异步索引（切片 + 向量化），使文档可被 AI 智能问答检索
-        from utils.celery_dispatcher import safe_delay
-        from .tasks import auto_link_relations_task, extract_freshness_task, index_document_task
-        safe_delay(extract_freshness_task, new_doc.id)
-        safe_delay(index_document_task, new_doc.id)
-        # AI 自动关联：上传后异步分析并直接关联到相关公开文档（用户无需手动选择、也看不到他人文档）
-        safe_delay(auto_link_relations_task, new_doc.id)
+        # 审核通过后才触发异步索引（切片 + 向量化），使文档可被 AI 智能问答检索
+        if review_status == APPROVED:
+            dispatch_index_tasks(new_doc.id)
 
         return Response({
             'id': new_doc.id,
@@ -1501,6 +1519,14 @@ class FileUploadView(APIView):
         # 校验分类关联数据合法性
         UploadCallbackView._validate_classification(data)
 
+        # 审核前置校验：非超管上传必须能落到学院或部门（否则没有审核人可接），
+        # 放在 OSS 上传之前，避免白传文件。
+        ensure_reviewable_scope(
+            request.user,
+            data.get('college_id') or request.user.college_id,
+            data.get('department_id') or request.user.department_id,
+        )
+
         # 校验文件类型
         ext = uploaded_file.name.rsplit('.', 1)[-1].lower() if '.' in uploaded_file.name else 'other'
         if ext not in ALLOWED_FILE_TYPES:
@@ -1667,6 +1693,9 @@ class FileUploadView(APIView):
             doc_college_id = data.get('college_id') or request.user.college_id
             doc_department_id = data.get('department_id') or request.user.department_id
 
+        # 超管上传免审（approved），其余管理员上传待审核（pending）
+        review_status = initial_review_status(request.user)
+
         # 创建 KnowledgeDoc 记录
         new_doc = KnowledgeDoc.objects.create(
             title=title,
@@ -1683,6 +1712,7 @@ class FileUploadView(APIView):
             discipline_id=data.get('discipline_id'),
             uploader=request.user,
             status='uploaded',
+            review_status=review_status,
             visibility=visibility,
         )
 
@@ -1717,14 +1747,10 @@ class FileUploadView(APIView):
         # 人工打标签（标签与关键词分离，标签名不存在则自动创建）
         _create_doc_tags(new_doc, _normalize_tags(request, data.get('tags', [])), request.user)
 
-        # 触发异步索引（切片 + 向量化），使文档可被 AI 智能问答检索
+        # 审核通过后才触发异步索引（切片 + 向量化），使文档可被 AI 智能问答检索
         # 遵循规范第 9 节：异常处理下沉到 utils 层，视图层不写 try/except
-        from utils.celery_dispatcher import safe_delay
-        from .tasks import auto_link_relations_task, extract_freshness_task, index_document_task
-        safe_delay(extract_freshness_task, new_doc.id)
-        safe_delay(index_document_task, new_doc.id)
-        # AI 自动关联：上传后异步分析并直接关联到相关公开文档（用户无需手动选择、也看不到他人文档）
-        safe_delay(auto_link_relations_task, new_doc.id)
+        if review_status == APPROVED:
+            dispatch_index_tasks(new_doc.id)
 
         # 确保 raw_keywords 始终是列表（给前端返回用）
         if not isinstance(raw_keywords, list):
@@ -1807,6 +1833,10 @@ class BatchFileUploadView(APIView):
             doc_department_id = user.department_id
             oss_scope = 'college'
             owner_id = user.college_id or 0
+
+        # 审核：非超管上传必须能落到学院或部门（否则没有审核人可接）；超管上传免审
+        ensure_reviewable_scope(user, doc_college_id, doc_department_id)
+        review_status = initial_review_status(user)
 
         # 4. 逐个处理文件
         success_results = []
@@ -1912,6 +1942,7 @@ class BatchFileUploadView(APIView):
                     department_id=doc_department_id,
                     uploader=user,
                     status='uploaded',
+                    review_status=review_status,
                     visibility=visibility,
                 )
 
@@ -1946,13 +1977,9 @@ class BatchFileUploadView(APIView):
                 except Exception as e:
                     logger.error(f'批量上传创建日志失败 file={file_name}: {e}')
 
-                # 4g-2. 触发异步索引（切片 + 向量化），使文档可被 AI 智能问答检索
-                from utils.celery_dispatcher import safe_delay
-                from .tasks import auto_link_relations_task, extract_freshness_task, index_document_task
-                safe_delay(extract_freshness_task, new_doc.id)
-                safe_delay(index_document_task, new_doc.id)
-                # AI 自动关联：上传后异步分析并直接关联到相关公开文档（用户无需手动选择、也看不到他人文档）
-                safe_delay(auto_link_relations_task, new_doc.id)
+                # 4g-2. 审核通过后才触发异步索引（切片 + 向量化），使文档可被 AI 智能问答检索
+                if review_status == APPROVED:
+                    dispatch_index_tasks(new_doc.id)
 
                 # 4h. 记录成功
                 success_results.append({

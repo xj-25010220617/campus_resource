@@ -1,6 +1,6 @@
 from rest_framework import serializers
 
-from .models import DocRelation, DocTag, KnowledgeDoc, Keyword, Tag
+from .models import DocRelation, DocTag, KnowledgeDoc, KnowledgeDocReview, Keyword, Tag
 from utils.oss import oss_client
 from utils.timefmt import format_business_time
 
@@ -13,6 +13,9 @@ class KnowledgeDocSerializer(serializers.ModelSerializer):
     category_name = serializers.CharField(source='category.name', read_only=True)
     college_name = serializers.CharField(source='college.name', read_only=True)
     uploader_name = serializers.CharField(source='uploader.username', read_only=True)
+    reviewer_name = serializers.CharField(
+        source='reviewer.username', read_only=True, default='',
+    )
 
     # 下载：带原始文件名的签名附件 URL（下载文件名与上传时一致，见 oss.get_download_url）
     download_url = serializers.SerializerMethodField()
@@ -38,6 +41,7 @@ class KnowledgeDocSerializer(serializers.ModelSerializer):
             'college', 'college_name',
             'uploader', 'uploader_name',
             'status', 'index_error', 'index_attempts', 'index_started_at', 'failed_at',
+            'review_status', 'reviewer', 'reviewer_name', 'reviewed_at', 'review_comment',
             'chunk_count', 'is_sensitive', 'sensitive_checked',
             'freshness_date',
             'created_at', 'created_at_display', 'updated_at',
@@ -96,6 +100,9 @@ class KnowledgeDocListSerializer(serializers.ModelSerializer):
     college_name = serializers.CharField(source='college.name', read_only=True)
     discipline_name = serializers.CharField(source='discipline.name', read_only=True)
     uploader_name = serializers.CharField(source='uploader.username', read_only=True)
+    reviewer_name = serializers.CharField(
+        source='reviewer.username', read_only=True, default='',
+    )
     uploader_college_name = serializers.CharField(
         source='uploader.college.name', read_only=True, default='',
     )
@@ -114,6 +121,7 @@ class KnowledgeDocListSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'title', 'file_name', 'file_type', 'file_ext', 'file_size', 'status',
             'index_error', 'index_attempts', 'index_started_at', 'failed_at',
+            'review_status', 'reviewer_name', 'reviewed_at', 'review_comment',
             'college_name', 'discipline_name', 'uploader_name',
             'uploader_college_name', 'uploader_department_name',
             'chunk_count', 'created_at', 'created_at_display',
@@ -376,7 +384,7 @@ class TagSerializer(serializers.ModelSerializer):
 class DocTagSerializer(serializers.ModelSerializer):
     """文档-标签关联序列化器（展平标签名）"""
 
-    tag_id = serializers.IntegerField(source='tag_id', read_only=True)
+    tag_id = serializers.IntegerField(read_only=True)
     tag_name = serializers.CharField(source='tag.name', read_only=True)
 
     class Meta:
@@ -388,8 +396,8 @@ class DocTagSerializer(serializers.ModelSerializer):
 class DocRelationSerializer(serializers.ModelSerializer):
     """文档关联序列化器（展平目标文档摘要）"""
 
-    source_doc_id = serializers.IntegerField(source='source_doc_id', read_only=True)
-    target_doc_id = serializers.IntegerField(source='target_doc_id', read_only=True)
+    source_doc_id = serializers.IntegerField(read_only=True)
+    target_doc_id = serializers.IntegerField(read_only=True)
     target_doc_title = serializers.CharField(source='target_doc.title', read_only=True)
     relation_type_name = serializers.CharField(source='get_relation_type_display', read_only=True)
 
@@ -506,3 +514,50 @@ class BatchDeleteSerializer(serializers.Serializer):
         child=serializers.IntegerField(min_value=1), min_length=1, max_length=100,
         help_text='要删除的文档 ID 列表，最多 100 条',
     )
+
+
+class DocReviewRejectSerializer(serializers.Serializer):
+    """驳回请求参数：理由必填"""
+
+    comment = serializers.CharField(
+        max_length=500, allow_blank=False, trim_whitespace=True,
+        help_text='驳回理由（必填）',
+    )
+
+    def validate_comment(self, value):
+        if not value.strip():
+            raise serializers.ValidationError('驳回理由不能为空')
+        return value
+
+
+class DocReviewResubmitSerializer(serializers.Serializer):
+    """重新提交请求参数：说明可选"""
+
+    comment = serializers.CharField(
+        max_length=500, required=False, allow_blank=True, default='',
+        help_text='重新提交说明（可选）',
+    )
+
+
+class KnowledgeDocReviewRecordSerializer(serializers.ModelSerializer):
+    """审核流水记录"""
+
+    reviewer_name = serializers.CharField(
+        source='reviewer.username', read_only=True, default='',
+    )
+    action_display = serializers.CharField(source='get_action_display', read_only=True)
+    doc_title = serializers.CharField(source='doc.title', read_only=True)
+    doc_file_name = serializers.CharField(source='doc.file_name', read_only=True)
+    created_at_display = serializers.SerializerMethodField()
+
+    class Meta:
+        model = KnowledgeDocReview
+        fields = [
+            'id', 'doc', 'doc_title', 'doc_file_name',
+            'action', 'action_display',
+            'reviewer', 'reviewer_name', 'comment',
+            'created_at', 'created_at_display',
+        ]
+
+    def get_created_at_display(self, obj) -> str:
+        return format_business_time(obj.created_at)

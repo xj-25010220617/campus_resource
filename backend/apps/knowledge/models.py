@@ -39,6 +39,11 @@ class KnowledgeDoc(models.Model):
         ('college', '学院'),
         ('department', '部门'),
     ]
+    REVIEW_STATUS_CHOICES = [
+        ('pending', '待审核'),
+        ('approved', '已通过'),
+        ('rejected', '已驳回'),
+    ]
 
     title = models.CharField(max_length=512, verbose_name='文档标题')
     description = models.TextField(default='', verbose_name='文档描述')
@@ -111,6 +116,19 @@ class KnowledgeDoc(models.Model):
         max_length=16, choices=STATUS_CHOICES, default='uploaded',
         db_index=True, verbose_name='状态',
     )
+    # 审核状态：默认 approved，仅「管理员上传」显式置 pending。
+    # 官网爬虫/图书馆摘要等非上传来源不经审核，保持默认值即可被检索。
+    review_status = models.CharField(
+        max_length=16, choices=REVIEW_STATUS_CHOICES, default='approved',
+        db_index=True, verbose_name='审核状态',
+    )
+    reviewer = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='reviewed_docs',
+        verbose_name='审核人',
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True, verbose_name='审核时间')
+    review_comment = models.TextField(blank=True, default='', verbose_name='审核意见（驳回理由）')
     index_error = models.TextField(
         blank=True, default='', verbose_name='索引错误信息',
     )
@@ -148,6 +166,47 @@ class KnowledgeDoc(models.Model):
 
     def __str__(self):
         return self.title
+
+
+class KnowledgeDocReview(models.Model):
+    """文档审核流水——每次通过 / 驳回 / 重新提交都留一条记录，不覆盖历史。
+
+    文档当前审核状态记在 KnowledgeDoc.review_status 上；本表只负责留痕，
+    便于追责与「被驳回后重新提交」的历史回溯。
+    """
+    ACTION_CHOICES = [
+        ('approve', '通过'),
+        ('reject', '驳回'),
+        ('resubmit', '重新提交'),
+    ]
+
+    doc = models.ForeignKey(
+        KnowledgeDoc, on_delete=models.CASCADE,
+        related_name='reviews', verbose_name='所属文档',
+    )
+    action = models.CharField(
+        max_length=16, choices=ACTION_CHOICES, verbose_name='审核动作',
+    )
+    reviewer = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='doc_reviews',
+        verbose_name='操作人',
+    )
+    comment = models.TextField(blank=True, default='', verbose_name='审核意见')
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True, verbose_name='操作时间')
+
+    class Meta:
+        db_table = 'knowledge_doc_review'
+        verbose_name = '文档审核记录'
+        verbose_name_plural = verbose_name
+        ordering = ['-created_at']
+        db_table_comment = '文档审核流水表(每次通过/驳回/重新提交留痕，不覆盖历史)'
+        indexes = [
+            models.Index(fields=['doc', 'created_at'], name='idx_doc_review_doc_created'),
+        ]
+
+    def __str__(self):
+        return f'{self.doc_id} {self.action} by {self.reviewer_id}'
 
 
 class Keyword(models.Model):
