@@ -384,7 +384,7 @@ class TagSerializer(serializers.ModelSerializer):
 class DocTagSerializer(serializers.ModelSerializer):
     """文档-标签关联序列化器（展平标签名）"""
 
-    tag_id = serializers.IntegerField(source='tag_id', read_only=True)
+    tag_id = serializers.IntegerField(read_only=True)
     tag_name = serializers.CharField(source='tag.name', read_only=True)
 
     class Meta:
@@ -396,8 +396,8 @@ class DocTagSerializer(serializers.ModelSerializer):
 class DocRelationSerializer(serializers.ModelSerializer):
     """文档关联序列化器（展平目标文档摘要）"""
 
-    source_doc_id = serializers.IntegerField(source='source_doc_id', read_only=True)
-    target_doc_id = serializers.IntegerField(source='target_doc_id', read_only=True)
+    source_doc_id = serializers.IntegerField(read_only=True)
+    target_doc_id = serializers.IntegerField(read_only=True)
     target_doc_title = serializers.CharField(source='target_doc.title', read_only=True)
     relation_type_name = serializers.CharField(source='get_relation_type_display', read_only=True)
 
