@@ -336,17 +336,17 @@ class MessageViewSet(ModelViewSet):
     def references(self, request, pk=None):
         """
         GET /api/chat/message/{id}/references/
-        查看引用来源文档（仅 admin/super_admin 可用）
+        查看引用来源文档（管理员与审核员可用）
 
         返回每条引用对应的 KnowledgeDoc 元数据 + AI 提取的发布日期，
         前端可在不调 extract-freshness 接口的情况下拿到 freshness_date。
         freshness_date 为 null 时，前端可继续调
         POST /api/knowledge/docs/{doc_id}/extract-freshness/ 主动触发提取。
         """
-        # 权限检查
-        if request.user.role not in ('admin', 'college_admin', 'dept_admin', 'super_admin'):
+        # 权限检查（审核员已开放教研问答，与管理员同样可查看引用来源）
+        if request.user.role not in ('admin', 'college_admin', 'dept_admin', 'super_admin', 'reviewer'):
             return Response(
-                {'detail': '仅管理员可查看引用来源'},
+                {'detail': '仅管理员/审核员可查看引用来源'},
                 status=status.HTTP_403_FORBIDDEN
             )
 
@@ -797,7 +797,8 @@ class AskView(APIView):
         )
 
         # 6. 创建 AI 消息占位（流结束后写入完整内容）
-        is_authorized = user_role in ('admin', 'super_admin')
+        # 审核员已开放教研问答，引用详情与管理员一致
+        is_authorized = user_role in ('admin', 'super_admin', 'reviewer')
         references_detail = build_references_events(
             results, user_role, user_id, user_context=user_context,
         ).get('references_detail', [])
@@ -1477,7 +1478,7 @@ class VoiceAskView(APIView):
                 log.save()
                 if 'references' in references:
                     yield _format_sse('references', references['references'])
-                if 'references_detail' in references and user.role in ('admin', 'super_admin'):
+                if 'references_detail' in references and user.role in ('admin', 'super_admin', 'reviewer'):
                     yield _format_sse('references_detail', references['references_detail'])
                 # 未索引文档提示（知识库有匹配文件但暂不可检索，不作为 LLM 来源）
                 if pending_docs:

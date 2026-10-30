@@ -191,8 +191,11 @@ class KnowledgeDocListView(generics.ListAPIView):
         queryset = queryset.exclude(super_private)
 
         if user.role == 'reviewer':
-            # 审核员：可见范围与审核范围一致（本部门文档 / 本学院学院级文档）
-            return queryset.filter(reviewer_scope_q(user) | Q(uploader_id=user.id))
+            # 审核员：审核范围（本部门文档 / 本学院学院级文档）+ 校级文档。
+            # 校级文档为公开资料，教研问答会引用，需允许预览，否则引用条目点开即 404。
+            return queryset.filter(
+                SCHOOL_LEVEL | reviewer_scope_q(user) | Q(uploader_id=user.id),
+            )
 
         if user.role in ('college_admin', 'admin'):
             return queryset.filter(
