@@ -2,6 +2,53 @@ from django.conf import settings
 from django.db import models
 
 
+class KnowledgeFolder(models.Model):
+    """部门资料目录（树形）。
+
+    目录按学院 / 部门隔离：部门管理员只能看到并维护本部门目录，
+    学院管理员维护学院级目录，超管维护校级目录。系统目录由首次访问时
+    自动初始化，用户目录可自由新建、重命名和删除。
+    """
+    name = models.CharField(max_length=64, verbose_name='目录名称')
+    parent = models.ForeignKey(
+        'self', null=True, blank=True, on_delete=models.CASCADE,
+        related_name='children', verbose_name='上级目录',
+    )
+    college = models.ForeignKey(
+        'accounts.College', null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='knowledge_folders', verbose_name='所属学院',
+    )
+    department = models.ForeignKey(
+        'classify.Department', null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='knowledge_folders', verbose_name='所属部门',
+    )
+    is_system = models.BooleanField(default=False, verbose_name='系统自动分类')
+    system_key = models.CharField(
+        max_length=64, blank=True, default='', verbose_name='系统分类标识',
+    )
+    sort_order = models.IntegerField(default=0, verbose_name='排序')
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='knowledge_folders', verbose_name='创建人',
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        db_table = 'knowledge_folder'
+        verbose_name = '资料目录'
+        verbose_name_plural = verbose_name
+        ordering = ['sort_order', 'id']
+        indexes = [
+            models.Index(fields=['department', 'parent'], name='idx_folder_dept_parent'),
+            models.Index(fields=['college', 'parent'], name='idx_folder_college_parent'),
+        ]
+        db_table_comment = '部门资料目录表(按college_id/department_id隔离，is_system=AI自动分类目录)'
+
+    def __str__(self):
+        return f'{self.parent.name} / {self.name}' if self.parent_id else self.name
+
+
 class KnowledgeDoc(models.Model):
     """知识文档——系统核心表，存储知识文档元数据、OSS 信息和索引状态"""
     STATUS_CHOICES = [
@@ -104,6 +151,14 @@ class KnowledgeDoc(models.Model):
         related_name='knowledge_docs',
         verbose_name='所属部门',
         db_comment='所属部门(1=校级领导,2=党政,3=教学管理,4=学生工作,5=科研服务,6=后勤,7=继续教育)',
+    )
+    folder = models.ForeignKey(
+        'knowledge.KnowledgeFolder',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='docs',
+        verbose_name='所属目录',
+        db_comment='部门资料目录；为空表示待分类',
     )
     uploader = models.ForeignKey(
         settings.AUTH_USER_MODEL,

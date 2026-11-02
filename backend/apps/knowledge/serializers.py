@@ -12,6 +12,7 @@ class KnowledgeDocSerializer(serializers.ModelSerializer):
     discipline_name = serializers.CharField(source='discipline.name', read_only=True)
     category_name = serializers.CharField(source='category.name', read_only=True)
     college_name = serializers.CharField(source='college.name', read_only=True)
+    folder_name = serializers.CharField(source='folder.name', read_only=True, default='')
     uploader_name = serializers.CharField(source='uploader.username', read_only=True)
     reviewer_name = serializers.CharField(
         source='reviewer.username', read_only=True, default='',
@@ -33,11 +34,12 @@ class KnowledgeDocSerializer(serializers.ModelSerializer):
     class Meta:
         model = KnowledgeDoc
         fields = [
-            'id', 'title', 'description', 'source_type', 'source_url',
+            'id', 'title', 'description', 'visibility', 'source_type', 'source_url',
             'oss_key', 'oss_url', 'download_url', 'file_name', 'file_type', 'file_ext', 'file_size',
             'md5_hash', 'page_count',
             'discipline', 'discipline_name',
             'category', 'category_name',
+            'folder', 'folder_name',
             'college', 'college_name',
             'uploader', 'uploader_name',
             'status', 'index_error', 'index_attempts', 'index_started_at', 'failed_at',
@@ -53,6 +55,7 @@ class KnowledgeDocSerializer(serializers.ModelSerializer):
             'file_size', 'md5_hash', 'page_count', 'uploader',
             'chunk_count', 'created_at', 'updated_at', 'indexed_at',
             'index_error', 'index_attempts', 'index_started_at', 'failed_at',
+            'folder',
         ]
 
     def get_download_url(self, obj) -> str:
@@ -99,6 +102,7 @@ class KnowledgeDocListSerializer(serializers.ModelSerializer):
 
     college_name = serializers.CharField(source='college.name', read_only=True)
     discipline_name = serializers.CharField(source='discipline.name', read_only=True)
+    folder_name = serializers.CharField(source='folder.name', read_only=True, default='')
     uploader_name = serializers.CharField(source='uploader.username', read_only=True)
     reviewer_name = serializers.CharField(
         source='reviewer.username', read_only=True, default='',
@@ -122,6 +126,7 @@ class KnowledgeDocListSerializer(serializers.ModelSerializer):
             'id', 'title', 'file_name', 'file_type', 'file_ext', 'file_size', 'status',
             'index_error', 'index_attempts', 'index_started_at', 'failed_at',
             'review_status', 'reviewer_name', 'reviewed_at', 'review_comment',
+            'folder', 'folder_name',
             'college_name', 'discipline_name', 'uploader_name',
             'uploader_college_name', 'uploader_department_name',
             'chunk_count', 'created_at', 'created_at_display',
@@ -321,6 +326,7 @@ class UploadCallbackSerializer(serializers.Serializer):
     college_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属学院ID（默认取上传者学院）')
     department_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属部门ID（默认取上传者部门）')
     discipline_id = serializers.IntegerField(required=False, allow_null=True, help_text='学科方向ID（可选）')
+    folder_id = serializers.IntegerField(required=False, allow_null=True, help_text='资料目录ID（可选，为空表示待分类）')
     keywords = serializers.ListField(
         child=serializers.CharField(), required=False, default=list,
         help_text='关键词列表（可选，未提供时 AI 提取）',
@@ -446,6 +452,7 @@ class TextUploadSerializer(serializers.Serializer):
     college_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属学院ID（默认取上传者学院）')
     department_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属部门ID（默认取上传者部门）')
     discipline_id = serializers.IntegerField(required=False, allow_null=True, help_text='学科方向ID（可选）')
+    folder_id = serializers.IntegerField(required=False, allow_null=True, help_text='资料目录ID（可选，为空表示待分类）')
     keywords = serializers.ListField(
         child=serializers.CharField(), required=False, default=list,
         help_text='关键词列表（可选，未提供时 AI 提取）',
@@ -475,6 +482,7 @@ class FileUploadSerializer(serializers.Serializer):
     college_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属学院ID（默认取上传者学院）')
     department_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属部门ID（默认取上传者部门）')
     discipline_id = serializers.IntegerField(required=False, allow_null=True, help_text='学科方向ID（可选）')
+    folder_id = serializers.IntegerField(required=False, allow_null=True, help_text='资料目录ID（可选，为空表示待分类）')
     keywords = serializers.ListField(
         child=serializers.CharField(), required=False, default=list,
         help_text='关键词列表（可选，未提供时 AI 提取）',

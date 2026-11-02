@@ -33,6 +33,12 @@ from utils.error_codes import ErrorCode
 from utils.parsers import CleanJSONParser
 
 from .extractor import extract_freshness_for_doc
+from .folders import (
+    find_accessible_folder,
+    folder_subtree_ids,
+    resolve_folder_scope,
+    suggest_system_folder,
+)
 from .models import DocRelation, DocTag, Keyword, KnowledgeDoc, Tag
 from .review import (
     APPROVED,
@@ -77,13 +83,15 @@ class KnowledgeDocFilter(django_filters.FilterSet):
     # 按标签筛选：tag_id 按 ID，tag 按名称（返回打了该标签的文档）
     tag_id = django_filters.NumberFilter(method='filter_tag_id')
     tag = django_filters.CharFilter(method='filter_tag_name')
+    folder_id = django_filters.NumberFilter(method='filter_folder')
+    unfiled = django_filters.BooleanFilter(method='filter_unfiled')
 
     class Meta:
         model = KnowledgeDoc
         fields = [
             'college_id', 'department_id', 'discipline_id',
             'file_type', 'status', 'source_type', 'days_back',
-            'tag_id', 'tag',
+            'tag_id', 'tag', 'folder_id', 'unfiled',
         ]
 
     def filter_days_back(self, queryset, name, value):
@@ -104,6 +112,24 @@ class KnowledgeDocFilter(django_filters.FilterSet):
         if not value:
             return queryset
         return queryset.filter(doc_tags__tag__name=value)
+
+    def filter_folder(self, queryset, name, value):
+        """按目录筛选；folder_id=0 表示待分类（未归档）。
+
+        选中上级目录时包含其全部子目录中的文件，例如「教学资料」包含
+        「教学资料 / 课程大纲」下的资料。
+        """
+        if value is None:
+            return queryset
+        if value == 0:
+            return queryset.filter(folder__isnull=True)
+        return queryset.filter(folder_id__in=folder_subtree_ids(value))
+
+    def filter_unfiled(self, queryset, name, value):
+        """待分类文件：folder_id 为空。"""
+        if value:
+            return queryset.filter(folder__isnull=True)
+        return queryset
 
 
 @extend_schema(
@@ -147,7 +173,7 @@ class KnowledgeDocListView(generics.ListAPIView):
         user = self.request.user
 
         queryset = KnowledgeDoc.objects.select_related(
-            'college', 'discipline', 'uploader',
+            'college', 'discipline', 'folder', 'uploader',
             'uploader__college', 'uploader__department',
         ).prefetch_related('doc_tags__tag').all()
 
@@ -295,7 +321,7 @@ class KnowledgeDocDetailView(generics.RetrieveUpdateAPIView):
     def get_queryset(self):
         user = self.request.user
         queryset = KnowledgeDoc.objects.select_related(
-            'college', 'discipline', 'uploader',
+            'college', 'discipline', 'folder', 'uploader',
         ).all()
         return KnowledgeDocListView._admin_scope_filter(queryset, user)
 
@@ -1041,6 +1067,13 @@ class UploadCallbackView(APIView):
         # 校验分类关联数据合法性
         self._validate_classification(data)
 
+        # 目录归属：只允许落到当前账号可维护的目录；未传则保持待分类
+        folder = None
+        if data.get('folder_id'):
+            folder = find_accessible_folder(data['folder_id'], resolve_folder_scope(request.user))
+            if folder is None:
+                raise ValidationError({'folder_id': '资料目录不存在或无权访问'})
+
         # 再次 MD5 去重（防止并发上传导致重复）
         # 仅当已存在文档对当前上传者可见时才提示重复，避免泄露他人文档存在性
         duplicate_doc = oss_client.check_duplicate(data['md5'])
@@ -1083,6 +1116,7 @@ class UploadCallbackView(APIView):
             college_id=doc_college_id,
             department_id=doc_department_id,
             discipline_id=data.get('discipline_id'),
+            folder=folder,
             visibility=data.get('visibility', 'public'),
         )
 
@@ -1171,6 +1205,13 @@ class TextUploadView(APIView):
 
         # 校验分类关联数据合法性（复用 UploadCallbackView 的校验逻辑）
         UploadCallbackView._validate_classification(data)
+
+        # 目录归属：只允许落到当前账号可维护的目录；未传则保持待分类
+        folder = None
+        if data.get('folder_id'):
+            folder = find_accessible_folder(data['folder_id'], resolve_folder_scope(request.user))
+            if folder is None:
+                raise ValidationError({'folder_id': '资料目录不存在或无权访问'})
 
         # 审核前置校验：非超管上传必须能落到学院或部门，放在写 OSS 之前
         ensure_reviewable_scope(
@@ -1267,6 +1308,7 @@ class TextUploadView(APIView):
             college_id=doc_college_id,
             department_id=doc_department_id,
             discipline_id=data.get('discipline_id'),
+            folder=folder,
             uploader=request.user,
             status='uploaded',
             review_status=review_status,
@@ -1522,6 +1564,13 @@ class FileUploadView(APIView):
         # 校验分类关联数据合法性
         UploadCallbackView._validate_classification(data)
 
+        # 目录归属：只允许落到当前账号可维护的目录；未传则保持待分类
+        folder = None
+        if data.get('folder_id'):
+            folder = find_accessible_folder(data['folder_id'], resolve_folder_scope(request.user))
+            if folder is None:
+                raise ValidationError({'folder_id': '资料目录不存在或无权访问'})
+
         # 审核前置校验：非超管上传必须能落到学院或部门（否则没有审核人可接），
         # 放在 OSS 上传之前，避免白传文件。
         ensure_reviewable_scope(
@@ -1713,6 +1762,7 @@ class FileUploadView(APIView):
             college_id=doc_college_id,
             department_id=doc_department_id,
             discipline_id=data.get('discipline_id'),
+            folder=folder,
             uploader=request.user,
             status='uploaded',
             review_status=review_status,
@@ -2370,11 +2420,19 @@ class AIClassifyView(APIView):
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
 
+        suggested = suggest_system_folder(
+            ai_result['title'] or title,
+            ai_result['keywords'],
+            resolve_folder_scope(request.user),
+        )
         return Response({
             'title': ai_result['title'],
             'description': ai_result['description'],
             'keywords': ai_result['keywords'],
             'visibility': ai_result['visibility'],
             'confidence': ai_result['confidence'],
+            'suggested_folder': (
+                {'id': suggested.id, 'name': suggested.name} if suggested else None
+            ),
         })
 

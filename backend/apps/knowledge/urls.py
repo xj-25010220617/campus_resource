@@ -5,6 +5,12 @@ from .chunked_views import (
     ChunkUploadInitView,
     ChunkUploadView,
 )
+from .folder_views import (
+    DocBatchMoveView,
+    DocMoveView,
+    FolderDetailView,
+    FolderListCreateView,
+)
 from .review_views import (
     DocReviewApproveView,
     DocReviewHistoryView,
@@ -64,11 +70,17 @@ urlpatterns = [
     path('docs/<int:pk>/review/reject/', DocReviewRejectView.as_view(), name='doc_review_reject'),
     path('docs/<int:pk>/review/resubmit/', DocReviewResubmitView.as_view(), name='doc_review_resubmit'),
 
+    # 部门资料目录
+    path('folders/', FolderListCreateView.as_view(), name='knowledge_folder_list'),
+    path('folders/<int:pk>/', FolderDetailView.as_view(), name='knowledge_folder_detail'),
+    path('docs/batch-move/', DocBatchMoveView.as_view(), name='knowledge_doc_batch_move'),
+
     # 文档
     path('docs/', KnowledgeDocListView.as_view(), name='knowledge_doc_list'),
     path('docs/<int:pk>/', KnowledgeDocDetailView.as_view(), name='knowledge_doc_detail'),
     path('docs/batch/', KnowledgeDocBatchDeleteView.as_view(), name='knowledge_doc_batch_delete'),
     path('docs/<int:pk>/delete/', KnowledgeDocDeleteView.as_view(), name='knowledge_doc_delete'),
+    path('docs/<int:pk>/move/', DocMoveView.as_view(), name='knowledge_doc_move'),
     path('docs/<int:pk>/download/', KnowledgeDocDownloadView.as_view(), name='knowledge_doc_download'),
 
     path('docs/<int:pk>/preview/', KnowledgeDocPreviewView.as_view(), name='knowledge_doc_preview'),
