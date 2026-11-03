@@ -60,7 +60,10 @@ class PendingReviewListView(generics.ListAPIView):
             KnowledgeDoc.objects
             .filter(review_status=PENDING)
             .filter(reviewer_scope_q(user))
-            .select_related('college', 'discipline', 'uploader', 'reviewer')
+            .select_related(
+                'college', 'department', 'discipline', 'uploader', 'reviewer',
+                'uploader__college', 'uploader__department',
+            )
         )
 
         search = self.request.query_params.get('search', '').strip()

@@ -101,6 +101,12 @@ class KnowledgeDocListSerializer(serializers.ModelSerializer):
     """知识文档列表序列化器（简化版，用于列表页展示）"""
 
     college_name = serializers.CharField(source='college.name', read_only=True)
+    # 文档归属（供超级管理员按部门树筛选；与上传者所属学院/部门区分）
+    college_id = serializers.IntegerField(read_only=True)
+    department_id = serializers.IntegerField(read_only=True)
+    department_name = serializers.CharField(
+        source='department.name', read_only=True, default='',
+    )
     discipline_name = serializers.CharField(source='discipline.name', read_only=True)
     folder_name = serializers.CharField(source='folder.name', read_only=True, default='')
     uploader_name = serializers.CharField(source='uploader.username', read_only=True)
@@ -127,7 +133,8 @@ class KnowledgeDocListSerializer(serializers.ModelSerializer):
             'index_error', 'index_attempts', 'index_started_at', 'failed_at',
             'review_status', 'reviewer_name', 'reviewed_at', 'review_comment',
             'visibility', 'folder', 'folder_name',
-            'college_name', 'discipline_name', 'uploader_name',
+            'college_id', 'college_name', 'department_id', 'department_name',
+            'discipline_name', 'uploader_name',
             'uploader_college_name', 'uploader_department_name',
             'chunk_count', 'created_at', 'created_at_display',
             'indexed_at', 'indexed_at_display', 'tags',

@@ -69,6 +69,9 @@ from .serializers import (
 
 logger = logging.getLogger(__name__)
 
+# AI 自动识别关键词的个数上限（前后端保持一致）
+AI_KEYWORD_LIMIT = 5
+
 
 class KnowledgeDocFilter(django_filters.FilterSet):
     """知识文档多条件精确过滤器"""
@@ -174,7 +177,7 @@ class KnowledgeDocListView(generics.ListAPIView):
         user = self.request.user
 
         queryset = KnowledgeDoc.objects.select_related(
-            'college', 'discipline', 'folder', 'uploader',
+            'college', 'department', 'discipline', 'folder', 'uploader',
             'uploader__college', 'uploader__department',
         ).prefetch_related('doc_tags__tag').all()
 
@@ -2271,7 +2274,7 @@ def _ai_classify(title: str = '', content: str = '', image_bytes: Optional[bytes
             f"你是校园知识库智能助手。这是一张上传到校园知识库的图片，请直接观察图片画面内容，完成以下任务：\n"
             f"1. 根据图片内容生成一个简洁的标题（20字以内）\n"
             f"2. 生成一段100-200字的描述，准确概括图片画面内容（禁止只写文件名或图片类型）\n"
-            f"3. 提取5-10个与图片内容相关的关键词\n"
+            f"3. 提取最多5个与图片内容相关的关键词\n"
             f"4. 推荐可见性（visibility）：\n"
             f"   - public: 公开（一般资料、教学图片等）\n"
             f"   - private: 私密（涉及人事、财务、敏感信息等）\n\n"
@@ -2295,7 +2298,7 @@ def _ai_classify(title: str = '', content: str = '', image_bytes: Optional[bytes
             f"你是校园知识库智能助手。请根据文档信息完成以下任务：\n"
             f"1. 根据文档内容生成一个简洁的推荐标题（20字以内），不要直接照抄原文件名\n"
             f"2. 如果内容非空，生成一段100-200字的文档描述\n"
-            f"3. 提取5-10个关键词\n"
+            f"3. 提取最多5个关键词\n"
             f"4. 推荐可见性（visibility）：\n"
             f"   - public: 公开（一般文档、教学资料等）\n"
             f"   - private: 私密（涉及人事、财务、敏感信息等）\n\n"
@@ -2322,10 +2325,24 @@ def _ai_classify(title: str = '', content: str = '', image_bytes: Optional[bytes
     if ai_visibility not in ('public', 'private'):
         ai_visibility = 'public'
 
+    # 关键词归一：兼容字符串 / 数组，去空去重，最多保留 5 个
+    raw_keywords = result.get('keywords') or []
+    if isinstance(raw_keywords, str):
+        raw_keywords = re.split(r'[,，、;；\n]', raw_keywords)
+    if not isinstance(raw_keywords, (list, tuple)):
+        raw_keywords = []
+    ai_keywords = []
+    for item in raw_keywords:
+        phrase = str(item).strip()
+        if phrase and phrase not in ai_keywords:
+            ai_keywords.append(phrase)
+        if len(ai_keywords) >= AI_KEYWORD_LIMIT:
+            break
+
     return {
         'title': result.get('title', '') or title or '未命名文档',
         'description': result.get('description', ''),
-        'keywords': result.get('keywords', []),
+        'keywords': ai_keywords,
         'visibility': ai_visibility,
         'confidence': result.get('confidence', 'medium'),
     }
