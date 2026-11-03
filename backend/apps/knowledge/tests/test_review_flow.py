@@ -48,6 +48,9 @@ class ReviewTestBase(TestCase):
         self.super_admin = User.objects.create_user(
             username='root', password='pass12345', role='super_admin',
         )
+        self.super_admin_b = User.objects.create_user(
+            username='root2', password='pass12345', role='super_admin',
+        )
         self.college_admin = User.objects.create_user(
             username='ca', password='pass12345', role='college_admin',
             college=self.college_a,
@@ -451,3 +454,128 @@ class RetrievalVisibilityTests(ReviewTestBase):
 
         self.assertIn(own_dept.id, visible)
         self.assertNotIn(other_dept.id, visible)
+
+
+class PersonalSpaceTests(ReviewTestBase):
+    """超管专属空间：私有文档的隔离、上传归属与 MD5 去重。"""
+
+    DOC_LIST_URL = '/api/knowledge/docs/'
+
+    def _private_doc(self, uploader, title):
+        return self._make_doc(
+            uploader, title=title, visibility='private',
+            college_id=None, department_id=None,
+        )
+
+    def test_private_scope_returns_only_callers_private_docs(self):
+        mine = self._private_doc(self.super_admin, 'A 的私密资料')
+        self._private_doc(self.super_admin_b, 'B 的私密资料')
+        self._make_doc(
+            self.super_admin, title='A 的公开资料',
+            visibility='public', college_id=None, department_id=None,
+        )
+
+        self._auth(self.super_admin)
+        resp = self.client.get(
+            self.DOC_LIST_URL,
+            {'visibility': 'private', 'uploader_id': self.super_admin.id},
+        )
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        ids = {row['id'] for row in resp.data['results']}
+        self.assertEqual(ids, {mine.id})
+
+    def test_other_super_admin_cannot_open_or_delete_private_doc(self):
+        mine = self._private_doc(self.super_admin, 'A 的私密资料')
+        self._auth(self.super_admin_b)
+
+        detail = self.client.get(f'/api/knowledge/docs/{mine.id}/')
+        self.assertEqual(detail.status_code, 404)
+
+        deleted = self.client.delete(f'/api/knowledge/docs/{mine.id}/delete/')
+        self.assertEqual(deleted.status_code, 404)
+
+    def test_non_super_admin_cannot_delete_super_private_doc(self):
+        mine = self._private_doc(self.super_admin, 'A 的私密资料')
+        self._auth(self.dept_admin)
+
+        deleted = self.client.delete(f'/api/knowledge/docs/{mine.id}/delete/')
+        self.assertEqual(deleted.status_code, 404)
+
+    def test_super_admin_text_upload_honors_college_scope(self):
+        with patch('apps.knowledge.views.oss_client', _oss_stub()), \
+                patch('utils.celery_dispatcher.safe_delay'):
+            resp = self._text_upload(
+                self.super_admin, college_id=self.college_a.id, visibility='private',
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        doc = KnowledgeDoc.objects.get(id=resp.data['id'])
+        self.assertEqual(doc.college_id, self.college_a.id)
+        self.assertIsNone(doc.department_id)
+        self.assertEqual(doc.visibility, 'private')
+
+    def test_super_admin_text_upload_honors_department_scope(self):
+        with patch('apps.knowledge.views.oss_client', _oss_stub()), \
+                patch('utils.celery_dispatcher.safe_delay'):
+            resp = self._text_upload(
+                self.super_admin, department_id=self.dept_a.id,
+            )
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        doc = KnowledgeDoc.objects.get(id=resp.data['id'])
+        self.assertEqual(doc.department_id, self.dept_a.id)
+        self.assertIsNone(doc.college_id)
+
+    def test_private_callback_does_not_reuse_public_duplicate(self):
+        existing = self._make_doc(
+            self.college_admin, title='同 MD5 公开文档',
+            visibility='public',
+        )
+        self._auth(self.super_admin)
+        payload = {
+            'oss_key': 'knowledge/school/0/2026-11/abcdef123456.pdf',
+            'title': '专属空间文档',
+            'file_name': '专属.pdf',
+            'file_size': 1024,
+            'file_type': 'pdf',
+            'md5': 'd41d8cd98f00b204e9800998ecf8427e',
+            'visibility': 'private',
+        }
+        with patch('apps.knowledge.views.oss_client') as mock_oss, \
+                patch('utils.celery_dispatcher.safe_delay'):
+            mock_oss.check_duplicate.return_value = existing
+            resp = self.client.post('/api/knowledge/upload/callback/', payload, format='json')
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertNotEqual(resp.data['id'], existing.id)
+        doc = KnowledgeDoc.objects.get(id=resp.data['id'])
+        self.assertEqual(doc.visibility, 'private')
+        self.assertEqual(doc.uploader_id, self.super_admin.id)
+        self.assertIsNone(doc.college_id)
+        self.assertIsNone(doc.department_id)
+
+    def test_private_sts_skips_duplicate_shortcut(self):
+        existing = self._make_doc(
+            self.college_admin, title='同 MD5 公开文档',
+            md5_hash='d41d8cd98f00b204e9800998ecf8427e',
+        )
+        with patch('apps.knowledge.views.oss_client') as mock_oss:
+            mock_oss.check_duplicate.return_value = existing
+            mock_oss.get_sts_credentials.return_value = {
+                'oss_key': 'knowledge/school/0/2026-11/abcdef123456.pdf',
+                'upload_url': 'https://example.com/upload',
+                'sts_credentials': {'access_key_id': 'key'},
+            }
+            self._auth(self.super_admin)
+            resp = self.client.post('/api/knowledge/upload/sts/', {
+                'file_name': '专属.pdf',
+                'file_size': 1024,
+                'file_type': 'pdf',
+                'md5': 'd41d8cd98f00b204e9800998ecf8427e',
+                'visibility': 'private',
+            }, format='json')
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertFalse(resp.data.get('duplicate', False))
+        self.assertIn('upload_url', resp.data)

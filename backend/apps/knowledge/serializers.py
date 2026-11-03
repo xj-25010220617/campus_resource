@@ -126,7 +126,7 @@ class KnowledgeDocListSerializer(serializers.ModelSerializer):
             'id', 'title', 'file_name', 'file_type', 'file_ext', 'file_size', 'status',
             'index_error', 'index_attempts', 'index_started_at', 'failed_at',
             'review_status', 'reviewer_name', 'reviewed_at', 'review_comment',
-            'folder', 'folder_name',
+            'visibility', 'folder', 'folder_name',
             'college_name', 'discipline_name', 'uploader_name',
             'uploader_college_name', 'uploader_department_name',
             'chunk_count', 'created_at', 'created_at_display',
@@ -298,6 +298,10 @@ class UploadSTSRequestSerializer(serializers.Serializer):
         max_length=16, default='other', help_text='文件类型（用于大小限制校验）',
     )
     md5 = serializers.CharField(max_length=32, help_text='文件MD5哈希值')
+    visibility = serializers.ChoiceField(
+        choices=['public', 'private'], required=False, default='public',
+        help_text='可见性：私密上传不做 MD5 秒传复用',
+    )
 
     def validate_file_size(self, value):
         _validate_file_size(value, self.initial_data.get('file_type', 'other'))
@@ -327,6 +331,10 @@ class UploadCallbackSerializer(serializers.Serializer):
     department_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属部门ID（默认取上传者部门）')
     discipline_id = serializers.IntegerField(required=False, allow_null=True, help_text='学科方向ID（可选）')
     folder_id = serializers.IntegerField(required=False, allow_null=True, help_text='资料目录ID（可选，为空表示待分类）')
+    personal = serializers.BooleanField(
+        required=False, default=False,
+        help_text='是否归入我的专属空间（仅超级管理员生效，文件仅本人可见）',
+    )
     keywords = serializers.ListField(
         child=serializers.CharField(), required=False, default=list,
         help_text='关键词列表（可选，未提供时 AI 提取）',
@@ -453,6 +461,10 @@ class TextUploadSerializer(serializers.Serializer):
     department_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属部门ID（默认取上传者部门）')
     discipline_id = serializers.IntegerField(required=False, allow_null=True, help_text='学科方向ID（可选）')
     folder_id = serializers.IntegerField(required=False, allow_null=True, help_text='资料目录ID（可选，为空表示待分类）')
+    personal = serializers.BooleanField(
+        required=False, default=False,
+        help_text='是否归入我的专属空间（仅超级管理员生效，文件仅本人可见）',
+    )
     keywords = serializers.ListField(
         child=serializers.CharField(), required=False, default=list,
         help_text='关键词列表（可选，未提供时 AI 提取）',
@@ -483,6 +495,10 @@ class FileUploadSerializer(serializers.Serializer):
     department_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属部门ID（默认取上传者部门）')
     discipline_id = serializers.IntegerField(required=False, allow_null=True, help_text='学科方向ID（可选）')
     folder_id = serializers.IntegerField(required=False, allow_null=True, help_text='资料目录ID（可选，为空表示待分类）')
+    personal = serializers.BooleanField(
+        required=False, default=False,
+        help_text='是否归入我的专属空间（仅超级管理员生效，文件仅本人可见）',
+    )
     keywords = serializers.ListField(
         child=serializers.CharField(), required=False, default=list,
         help_text='关键词列表（可选，未提供时 AI 提取）',

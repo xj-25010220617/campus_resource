@@ -31,6 +31,10 @@ class KnowledgeFolder(models.Model):
         settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
         related_name='knowledge_folders', verbose_name='创建人',
     )
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.CASCADE,
+        related_name='personal_knowledge_folders', verbose_name='个人空间所有者',
+    )
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
 
@@ -42,8 +46,9 @@ class KnowledgeFolder(models.Model):
         indexes = [
             models.Index(fields=['department', 'parent'], name='idx_folder_dept_parent'),
             models.Index(fields=['college', 'parent'], name='idx_folder_college_parent'),
+            models.Index(fields=['owner', 'parent'], name='idx_folder_owner_parent'),
         ]
-        db_table_comment = '部门资料目录表(按college_id/department_id隔离，is_system=AI自动分类目录)'
+        db_table_comment = '部门资料目录表(按college_id/department_id/owner_id隔离，is_system=AI自动分类目录)'
 
     def __str__(self):
         return f'{self.parent.name} / {self.name}' if self.parent_id else self.name

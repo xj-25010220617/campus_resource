@@ -37,7 +37,6 @@ from .folders import (
     find_accessible_folder,
     folder_subtree_ids,
     resolve_folder_scope,
-    suggest_system_folder,
 )
 from .models import DocRelation, DocTag, Keyword, KnowledgeDoc, Tag
 from .review import (
@@ -79,6 +78,8 @@ class KnowledgeDocFilter(django_filters.FilterSet):
     file_type = django_filters.CharFilter(field_name='file_type')
     status = django_filters.CharFilter(field_name='status')
     source_type = django_filters.CharFilter(field_name='source_type')
+    visibility = django_filters.CharFilter(field_name='visibility')
+    uploader_id = django_filters.NumberFilter(field_name='uploader_id')
     days_back = django_filters.NumberFilter(method='filter_days_back')
     # 按标签筛选：tag_id 按 ID，tag 按名称（返回打了该标签的文档）
     tag_id = django_filters.NumberFilter(method='filter_tag_id')
@@ -90,8 +91,8 @@ class KnowledgeDocFilter(django_filters.FilterSet):
         model = KnowledgeDoc
         fields = [
             'college_id', 'department_id', 'discipline_id',
-            'file_type', 'status', 'source_type', 'days_back',
-            'tag_id', 'tag', 'folder_id', 'unfiled',
+            'file_type', 'status', 'source_type', 'visibility', 'uploader_id',
+            'days_back', 'tag_id', 'tag', 'folder_id', 'unfiled',
         ]
 
     def filter_days_back(self, queryset, name, value):
@@ -388,9 +389,15 @@ class KnowledgeDocDeleteView(generics.DestroyAPIView):
         """按角色过滤可删除的文档（通过 college_id/department_id 判断归属）"""
         # 校级文档：college_id 和 department_id 均为 null
         SCHOOL_LEVEL = Q(college_id__isnull=True, department_id__isnull=True)
+        # 超管上传的私密文档仅本人可见，删除权限也保持一致
+        super_private = Q(visibility='private', uploader__role='super_admin')
 
         if user.role == 'super_admin':
-            return queryset
+            return queryset.exclude(super_private & ~Q(uploader_id=user.id))
+
+        # 非超管：超管上传的私密文档一律不可见/不可删
+        queryset = queryset.exclude(super_private)
+
         if user.role in ('college_admin', 'admin'):
             return queryset.filter(
                 SCHOOL_LEVEL
@@ -995,10 +1002,10 @@ class UploadSTSView(APIView):
 
         md5_hash = serializer.validated_data['md5']
         file_name = serializer.validated_data['file_name']
-        college_id = request.user.college_id or 0
+        visibility = serializer.validated_data.get('visibility', 'public')
 
-        # MD5 去重检查
-        duplicate_doc = oss_client.check_duplicate(md5_hash)
+        # MD5 去重检查：私密上传必须生成独立记录，不能复用公开文档
+        duplicate_doc = oss_client.check_duplicate(md5_hash) if visibility != 'private' else None
         if duplicate_doc:
             return Response({
                 'duplicate': True,
@@ -1067,20 +1074,31 @@ class UploadCallbackView(APIView):
         # 校验分类关联数据合法性
         self._validate_classification(data)
 
+        # 我的专属空间：仅超管生效，文件固定校级归属且仅本人可见
+        personal = bool(data.get('personal')) and request.user.role == 'super_admin'
+        folder_scope = resolve_folder_scope(
+            request.user,
+            department_id=data.get('department_id'),
+            college_id=data.get('college_id'),
+            personal=personal,
+        )
+
         # 目录归属：只允许落到当前账号可维护的目录；未传则保持待分类
         folder = None
         if data.get('folder_id'):
-            folder = find_accessible_folder(data['folder_id'], resolve_folder_scope(request.user))
+            folder = find_accessible_folder(data['folder_id'], folder_scope)
             if folder is None:
                 raise ValidationError({'folder_id': '资料目录不存在或无权访问'})
 
         # 再次 MD5 去重（防止并发上传导致重复）
-        # 仅当已存在文档对当前上传者可见时才提示重复，避免泄露他人文档存在性
+        # 复用已有文档必须同时满足「可见性一致」与「对当前上传者可见」，
+        # 否则专属空间的私密文件会被同 MD5 的公开文档替代，或泄露他人私密文档。
+        intended_visibility = 'private' if personal else data.get('visibility', 'public')
         duplicate_doc = oss_client.check_duplicate(data['md5'])
         if duplicate_doc and (
-            request.user.role == 'super_admin'
-            or duplicate_doc.uploader_id == request.user.id
-            or duplicate_doc.visibility == 'public'
+            (duplicate_doc.uploader_id == request.user.id
+             and duplicate_doc.visibility == intended_visibility)
+            or (intended_visibility == 'public' and duplicate_doc.visibility == 'public')
         ):
             return Response({
                 'id': duplicate_doc.id,
@@ -1090,7 +1108,10 @@ class UploadCallbackView(APIView):
 
         # 创建文档记录
         # 文档归属根据上传者角色自动确定：非超管强制使用本人归属，防止跨学院/跨部门污染
-        if request.user.role == 'super_admin':
+        if personal:
+            doc_college_id = None
+            doc_department_id = None
+        elif request.user.role == 'super_admin':
             doc_college_id = data.get('college_id') or None
             doc_department_id = data.get('department_id') or None
         else:
@@ -1117,7 +1138,7 @@ class UploadCallbackView(APIView):
             department_id=doc_department_id,
             discipline_id=data.get('discipline_id'),
             folder=folder,
-            visibility=data.get('visibility', 'public'),
+            visibility=intended_visibility,
         )
 
         # 创建关联关键词（去重：同一文档内 phrase 不重复）
@@ -1206,10 +1227,19 @@ class TextUploadView(APIView):
         # 校验分类关联数据合法性（复用 UploadCallbackView 的校验逻辑）
         UploadCallbackView._validate_classification(data)
 
+        # 我的专属空间：仅超管生效，文件固定校级归属且仅本人可见
+        personal = bool(data.get('personal')) and request.user.role == 'super_admin'
+        folder_scope = resolve_folder_scope(
+            request.user,
+            department_id=data.get('department_id'),
+            college_id=data.get('college_id'),
+            personal=personal,
+        )
+
         # 目录归属：只允许落到当前账号可维护的目录；未传则保持待分类
         folder = None
         if data.get('folder_id'):
-            folder = find_accessible_folder(data['folder_id'], resolve_folder_scope(request.user))
+            folder = find_accessible_folder(data['folder_id'], folder_scope)
             if folder is None:
                 raise ValidationError({'folder_id': '资料目录不存在或无权访问'})
 
@@ -1271,6 +1301,7 @@ class TextUploadView(APIView):
 
         # 上传文本到 OSS
         success = oss_client.upload_text(content, oss_key)
+
         if not success:
             return Response(
                 {'detail': '文本上传到 OSS 失败，请稍后重试', 'code': ErrorCode.UPLOAD_FAILED.value},
@@ -1283,10 +1314,14 @@ class TextUploadView(APIView):
         # 生成 OSS 访问 URL
         oss_url = f'https://{oss_client.bucket_name}.{oss_client.endpoint}/{oss_key}'
 
-        # 文档归属根据上传者角色自动确定
-        if request.user.role == 'super_admin':
+        # 文档归属根据上传者角色自动确定；超管可按所选学院/部门显式归属
+        if personal:
             doc_college_id = None
             doc_department_id = None
+            visibility = 'private'
+        elif request.user.role == 'super_admin':
+            doc_college_id = data.get('college_id') or None
+            doc_department_id = data.get('department_id') or None
         else:
             doc_college_id = data.get('college_id') or request.user.college_id
             doc_department_id = data.get('department_id') or request.user.department_id
@@ -1564,10 +1599,19 @@ class FileUploadView(APIView):
         # 校验分类关联数据合法性
         UploadCallbackView._validate_classification(data)
 
+        # 我的专属空间：仅超管生效，文件固定校级归属且仅本人可见
+        personal = bool(data.get('personal')) and request.user.role == 'super_admin'
+        folder_scope = resolve_folder_scope(
+            request.user,
+            department_id=data.get('department_id'),
+            college_id=data.get('college_id'),
+            personal=personal,
+        )
+
         # 目录归属：只允许落到当前账号可维护的目录；未传则保持待分类
         folder = None
         if data.get('folder_id'):
-            folder = find_accessible_folder(data['folder_id'], resolve_folder_scope(request.user))
+            folder = find_accessible_folder(data['folder_id'], folder_scope)
             if folder is None:
                 raise ValidationError({'folder_id': '资料目录不存在或无权访问'})
 
@@ -1737,10 +1781,14 @@ class FileUploadView(APIView):
             title = title or fallback_title
             description = description or ''
 
-        # 文档归属根据上传者角色自动确定
-        if request.user.role == 'super_admin':
+        # 文档归属根据上传者角色自动确定；超管可按所选学院/部门显式归属
+        if personal:
             doc_college_id = None
             doc_department_id = None
+            visibility = 'private'
+        elif request.user.role == 'super_admin':
+            doc_college_id = data.get('college_id') or None
+            doc_department_id = data.get('department_id') or None
         else:
             doc_college_id = data.get('college_id') or request.user.college_id
             doc_department_id = data.get('department_id') or request.user.department_id
@@ -1869,13 +1917,20 @@ class BatchFileUploadView(APIView):
         if visibility not in ('public', 'private'):
             visibility = 'public'
 
-        # 3. 根据上传者角色确定文档归属
+        # 3. 根据上传者角色确定文档归属；超管可按所选学院/部门显式归属
         user = request.user
         if user.role == 'super_admin':
-            doc_college_id = None
-            doc_department_id = None
-            oss_scope = 'school'
-            owner_id = 0
+            doc_college_id = request.data.get('college_id') or None
+            doc_department_id = request.data.get('department_id') or None
+            if doc_college_id or doc_department_id:
+                UploadCallbackView._validate_classification({
+                    'college_id': doc_college_id,
+                    'department_id': doc_department_id,
+                })
+            oss_scope = 'department' if doc_department_id else (
+                'college' if doc_college_id else 'school'
+            )
+            owner_id = doc_department_id or doc_college_id or 0
         elif user.role == 'dept_admin' and user.department_id:
             doc_college_id = user.college_id
             doc_department_id = user.department_id
@@ -2420,19 +2475,11 @@ class AIClassifyView(APIView):
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
 
-        suggested = suggest_system_folder(
-            ai_result['title'] or title,
-            ai_result['keywords'],
-            resolve_folder_scope(request.user),
-        )
         return Response({
             'title': ai_result['title'],
             'description': ai_result['description'],
             'keywords': ai_result['keywords'],
             'visibility': ai_result['visibility'],
             'confidence': ai_result['confidence'],
-            'suggested_folder': (
-                {'id': suggested.id, 'name': suggested.name} if suggested else None
-            ),
         })
 

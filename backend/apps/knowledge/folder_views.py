@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from django.db import transaction
-from django.db.models import Count
+from django.db.models import Count, Q
 from django.shortcuts import get_object_or_404
 from drf_spectacular.utils import extend_schema
 
@@ -13,10 +13,11 @@ from rest_framework.views import APIView
 
 from config.permissions import IsAdminOrSuperAdmin
 
+from apps.accounts.models import College
+from apps.classify.models import Department
+
 from .folders import (
-    ensure_default_folders,
     find_accessible_folder,
-    folder_depth,
     folder_path_map,
     resolve_folder_scope,
     rollup_folder_counts,
@@ -62,31 +63,41 @@ class FolderListCreateView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        scope = resolve_folder_scope(request.user)
-        if scope.can_manage:
-            ensure_default_folders(scope, request.user)
-
-        folders = list(
-            KnowledgeFolder.objects.filter(scope.q()).select_related('created_by').order_by(
-                '-is_system', 'sort_order', 'id',
+        try:
+            scope = resolve_folder_scope(
+                request.user,
+                department_id=request.query_params.get('department_id'),
+                college_id=request.query_params.get('college_id'),
+                personal=request.query_params.get('personal'),
             )
+        except ValueError as exc:
+            raise ValidationError({'scope': str(exc)}) from exc
+
+        # 旧版 AI/系统目录不再展示；若尚未执行清理迁移，其下文件按待分类统计
+        folders = list(
+            KnowledgeFolder.objects.filter(scope.q(), is_system=False)
+            .select_related('created_by')
+            .order_by('sort_order', 'id')
         )
         paths = folder_path_map(folders)
 
         scoped_docs = KnowledgeDocListView._admin_scope_filter(
             KnowledgeDoc.objects.all(), request.user,
-        )
+        ).filter(scope.doc_q())
         # 子目录中的文件同时计入上级目录（教学资料包含课程大纲下的文件）
         counts = rollup_folder_counts(
             folders,
             {
                 row['folder_id']: row['total']
-                for row in scoped_docs.exclude(folder__isnull=True)
+                for row in scoped_docs.filter(folder__is_system=False)
+                .exclude(folder__isnull=True)
                 .values('folder_id')
                 .annotate(total=Count('id'))
             },
         )
-        unfiled_count = scoped_docs.filter(folder__isnull=True).count()
+        unfiled_count = scoped_docs.filter(
+            Q(folder__isnull=True) | Q(folder__is_system=True),
+        ).count()
 
         return Response({
             'folders': [_folder_payload(item, paths, counts) for item in folders],
@@ -96,14 +107,35 @@ class FolderListCreateView(APIView):
                 'kind': scope.label,
                 'college_id': scope.college_id,
                 'department_id': scope.department_id,
+                'all_departments': scope.all_departments,
+                'personal': scope.personal,
                 'can_manage': scope.can_manage,
             },
         })
 
     def post(self, request):
-        scope = resolve_folder_scope(request.user)
+        try:
+            scope = resolve_folder_scope(
+                request.user,
+                department_id=request.data.get('department_id'),
+                college_id=request.data.get('college_id'),
+                personal=request.data.get('personal'),
+            )
+        except ValueError as exc:
+            raise ValidationError({'scope': str(exc)}) from exc
         if not scope.can_manage:
             raise PermissionDenied('当前账号无权维护资料目录')
+        if scope.all_departments:
+            raise ValidationError({'department_id': '请先选择具体学院或部门，再创建目录'})
+        if scope.role == 'super_admin':
+            if scope.department_id and not Department.objects.filter(
+                id=scope.department_id,
+            ).exists():
+                raise ValidationError({'department_id': '部门不存在'})
+            if scope.college_id and not College.objects.filter(
+                id=scope.college_id,
+            ).exists():
+                raise ValidationError({'college_id': '学院不存在'})
 
         name = str(request.data.get('name', '')).strip()
         if not name:
@@ -137,7 +169,10 @@ class FolderDetailView(APIView):
     permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
 
     def get_object(self, request, pk):
-        scope = resolve_folder_scope(request.user)
+        scope = resolve_folder_scope(
+            request.user,
+            personal=request.query_params.get('personal'),
+        )
         folder = find_accessible_folder(pk, scope)
         if folder is None:
             raise ValidationError({'folder_id': '资料目录不存在或无权访问'})
@@ -145,8 +180,6 @@ class FolderDetailView(APIView):
 
     def patch(self, request, pk):
         folder, scope = self.get_object(request, pk)
-        if folder.is_system:
-            raise PermissionDenied('系统分类目录不可重命名')
         name = str(request.data.get('name', '')).strip()
         if not name:
             raise ValidationError({'name': '目录名称不能为空'})
@@ -161,8 +194,6 @@ class FolderDetailView(APIView):
 
     def delete(self, request, pk):
         folder, scope = self.get_object(request, pk)
-        if folder.is_system:
-            raise PermissionDenied('系统分类目录不可删除')
 
         with transaction.atomic():
             all_folders = list(KnowledgeFolder.objects.filter(scope.q()))
@@ -185,13 +216,18 @@ class DocMoveView(APIView):
     permission_classes = [permissions.IsAuthenticated, IsAdminOrSuperAdmin]
 
     def post(self, request, pk):
-        scope = resolve_folder_scope(request.user)
+        scope = resolve_folder_scope(
+            request.user, personal=request.data.get('personal'),
+        )
         folder_id = request.data.get('folder_id')
         folder = find_accessible_folder(folder_id, scope) if folder_id not in (None, '', 0, '0') else None
         if folder_id not in (None, '', 0, '0') and folder is None:
             raise ValidationError({'folder_id': '资料目录不存在或无权访问'})
 
         queryset = KnowledgeDocListView._admin_scope_filter(KnowledgeDoc.objects.all(), request.user)
+        if scope.personal:
+            # 个人目录只收纳本人的私密文件
+            queryset = queryset.filter(scope.doc_q())
         doc = get_object_or_404(queryset, id=pk)
         doc.folder = folder
         doc.save(update_fields=['folder', 'updated_at'])
@@ -219,7 +255,9 @@ class DocBatchMoveView(APIView):
         except (TypeError, ValueError) as exc:
             raise ValidationError({'ids': '文档 ID 不合法'}) from exc
 
-        scope = resolve_folder_scope(request.user)
+        scope = resolve_folder_scope(
+            request.user, personal=request.data.get('personal'),
+        )
         raw_folder_id = request.data.get('folder_id')
         folder = (
             find_accessible_folder(raw_folder_id, scope)
@@ -229,6 +267,9 @@ class DocBatchMoveView(APIView):
             raise ValidationError({'folder_id': '资料目录不存在或无权访问'})
 
         queryset = KnowledgeDocListView._admin_scope_filter(KnowledgeDoc.objects.all(), request.user)
+        if scope.personal:
+            # 个人目录只收纳本人的私密文件
+            queryset = queryset.filter(scope.doc_q())
         docs = queryset.filter(id__in=ids)
         moved = docs.update(folder=folder)
         return Response({

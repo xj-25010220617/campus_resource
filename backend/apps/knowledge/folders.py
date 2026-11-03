@@ -1,8 +1,8 @@
 """部门资料目录的领域辅助函数。
 
 目录与文档归属使用同一套权限边界：学院级、部门级、校级目录互不串用，
-部门管理员只能维护本部门目录。系统目录在首次访问时按固定模板初始化，
-让 AI 分类结果有稳定的落点。
+部门管理员只能维护本部门目录。所有目录均由部门用户自行创建，不再初始化
+系统默认目录。超级管理员默认可跨部门查看，也可收窄到指定部门。
 """
 from __future__ import annotations
 
@@ -12,37 +12,6 @@ from typing import Iterable, Optional
 from django.db.models import Q
 
 from .models import KnowledgeFolder
-
-# 系统自动分类目录模板：(key, 名称, 子目录)
-DEFAULT_FOLDER_TREE: tuple[tuple[str, str, tuple[tuple[str, str], ...]], ...] = (
-    ('teaching', '教学资料', (
-        ('teaching-outline', '课程大纲'),
-        ('teaching-lab', '实验指导书'),
-        ('teaching-courseware', '课件与习题'),
-        ('teaching-exam', '试题库'),
-    )),
-    ('research', '科研与项目', (
-        ('research-project', '项目申报'),
-        ('research-result', '成果材料'),
-    )),
-    ('admin', '行政制度', (
-        ('admin-meeting', '会议纪要'),
-        ('admin-rules', '规章制度'),
-    )),
-)
-
-# AI 关键词 → 系统目录。顺序即优先级，先命中先落目录。
-KEYWORD_FOLDER_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
-    (('会议', '纪要', '例会', '座谈', '议程'), 'admin-meeting'),
-    (('制度', '规章', '办法', '规定', '条例', '细则', '通知'), 'admin-rules'),
-    (('实验', '实训', '指导书', '操作手册'), 'teaching-lab'),
-    (('试题', '试卷', '题库', '答案', '考试', '测验'), 'teaching-exam'),
-    (('大纲', '教学计划', '课程标准', '培养方案'), 'teaching-outline'),
-    (('课件', '讲义', '习题', '教案', 'ppt', '演示'), 'teaching-courseware'),
-    (('科研', '课题', '项目', '申报', '立项', '基金'), 'research-project'),
-    (('成果', '论文', '专利', '获奖', '结题'), 'research-result'),
-    (('教学', '课程', '课堂', '教材'), 'teaching-courseware'),
-)
 
 DEFAULT_MAX_DEPTH = 5
 
@@ -54,6 +23,13 @@ class FolderScope:
     college_id: Optional[int]
     department_id: Optional[int]
     role: str
+    all_departments: bool = False
+    # 我的专属空间：目录仅属于该用户本人（owner_id 非空即个人空间）
+    owner_id: Optional[int] = None
+
+    @property
+    def personal(self) -> bool:
+        return self.owner_id is not None
 
     @property
     def can_manage(self) -> bool:
@@ -61,6 +37,10 @@ class FolderScope:
 
     @property
     def label(self) -> str:
+        if self.personal:
+            return 'personal'
+        if self.all_departments:
+            return 'school'
         if self.department_id:
             return 'department'
         if self.college_id:
@@ -68,22 +48,74 @@ class FolderScope:
         return 'school'
 
     def q(self) -> Q:
-        """仅命中本范围的目录（不含跨级目录）。"""
+        """仅命中本范围的目录（不含跨级目录）。
+
+        个人目录只属于 owner 本人，任何非个人范围都不得命中。
+        """
+        if self.personal:
+            return Q(owner_id=self.owner_id)
+        if self.all_departments:
+            return Q(owner__isnull=True)
         if self.department_id:
-            return Q(department_id=self.department_id)
+            return Q(department_id=self.department_id, owner__isnull=True)
         if self.college_id:
-            return Q(college_id=self.college_id, department__isnull=True)
-        return Q(college__isnull=True, department__isnull=True)
+            return Q(college_id=self.college_id, department__isnull=True, owner__isnull=True)
+        return Q(college__isnull=True, department__isnull=True, owner__isnull=True)
+
+    def doc_q(self) -> Q:
+        """超级管理员收窄到指定部门/学院时，文档计数也只统计该范围。"""
+        if self.personal:
+            return Q(uploader_id=self.owner_id, visibility='private')
+        if self.all_departments:
+            # 专属空间文件只计入个人空间，不混入校级总览的待分类统计
+            return ~Q(visibility='private', uploader__role='super_admin')
+        if self.role == 'super_admin':
+            if self.department_id:
+                return Q(department_id=self.department_id)
+            if self.college_id:
+                return Q(college_id=self.college_id)
+        return Q()
 
     def values(self) -> dict:
-        return {'college_id': self.college_id, 'department_id': self.department_id}
+        return {
+            'college_id': self.college_id,
+            'department_id': self.department_id,
+            'owner_id': self.owner_id,
+        }
 
 
-def resolve_folder_scope(user) -> FolderScope:
-    """按角色解析目录范围，与文档列表的权限口径保持一致。"""
+def resolve_folder_scope(
+    user, department_id=None, college_id=None, personal=False,
+) -> FolderScope:
+    """按角色解析目录范围，与文档列表的权限口径保持一致。
+
+    仅超级管理员接受显式 ``department_id`` / ``college_id`` / ``personal``：
+    传入部门或学院时收窄到对应范围；``personal`` 为真时使用本人的专属空间
+    目录；都不传时保持全校范围。其他角色忽略这些参数，继续使用自身归属。
+    """
     role = getattr(user, 'role', 'user')
+    if personal in (True, '1', 'true', 'True', 'yes'):
+        personal = True
+    else:
+        personal = False
     if role == 'super_admin':
-        return FolderScope(None, None, role)
+        if personal:
+            return FolderScope(
+                None, None, role, all_departments=False, owner_id=user.id,
+            )
+        if department_id not in (None, '', '0', 0):
+            try:
+                scoped_id = int(department_id)
+            except (TypeError, ValueError) as exc:
+                raise ValueError('部门 ID 不合法') from exc
+            return FolderScope(None, scoped_id, role, all_departments=False)
+        if college_id not in (None, '', '0', 0):
+            try:
+                scoped_college_id = int(college_id)
+            except (TypeError, ValueError) as exc:
+                raise ValueError('学院 ID 不合法') from exc
+            return FolderScope(scoped_college_id, None, role, all_departments=False)
+        return FolderScope(None, None, role, all_departments=True)
     if role in ('college_admin', 'admin'):
         return FolderScope(getattr(user, 'college_id', None), None, role)
     if role == 'dept_admin':
@@ -168,36 +200,6 @@ def folder_depth(folder: KnowledgeFolder) -> int:
     return depth
 
 
-def ensure_default_folders(scope: FolderScope, user=None) -> None:
-    """初始化当前范围的系统分类目录（幂等）。"""
-    if not scope.can_manage:
-        return
-    for sort_index, (root_key, root_name, children) in enumerate(DEFAULT_FOLDER_TREE, start=1):
-        root, _ = KnowledgeFolder.objects.get_or_create(
-            system_key=root_key,
-            parent=None,
-            **scope.values(),
-            defaults={
-                'name': root_name,
-                'is_system': True,
-                'sort_order': sort_index,
-                'created_by': user if getattr(user, 'is_authenticated', False) else None,
-            },
-        )
-        for child_index, (child_key, child_name) in enumerate(children, start=1):
-            KnowledgeFolder.objects.get_or_create(
-                system_key=child_key,
-                parent=root,
-                **scope.values(),
-                defaults={
-                    'name': child_name,
-                    'is_system': True,
-                    'sort_order': sort_index * 100 + child_index,
-                    'created_by': user if getattr(user, 'is_authenticated', False) else None,
-                },
-            )
-
-
 def find_accessible_folder(folder_id, scope: FolderScope) -> Optional[KnowledgeFolder]:
     """按范围取目录；None / 非法 ID 返回 None。"""
     try:
@@ -206,7 +208,7 @@ def find_accessible_folder(folder_id, scope: FolderScope) -> Optional[KnowledgeF
         return None
     if folder_id <= 0:
         return None
-    return KnowledgeFolder.objects.filter(scope.q(), id=folder_id).first()
+    return KnowledgeFolder.objects.filter(scope.q(), is_system=False, id=folder_id).first()
 
 
 def validate_folder_parent(parent_id, scope: FolderScope) -> Optional[KnowledgeFolder]:
@@ -229,28 +231,6 @@ def sibling_name_exists(
     if exclude_id:
         qs = qs.exclude(id=exclude_id)
     return qs.exists()
-
-
-def suggest_system_folder(
-    title: str, keywords: Iterable[str], scope: FolderScope,
-) -> Optional[KnowledgeFolder]:
-    """根据标题与 AI 关键词推荐系统分类目录。
-
-    仅返回已经初始化在当前范围内的系统目录；无命中时返回 None（保持待分类）。
-    """
-    haystack = f'{title or ""} {" ".join(k or "" for k in keywords or [])}'.lower()
-    if not haystack.strip():
-        return None
-    matched_key = ''
-    for tokens, key in KEYWORD_FOLDER_RULES:
-        if any(token.lower() in haystack for token in tokens):
-            matched_key = key
-            break
-    if not matched_key:
-        return None
-    return KnowledgeFolder.objects.filter(
-        scope.q(), system_key=matched_key, is_system=True,
-    ).first()
 
 
 def folder_tree_payload(folders: list[KnowledgeFolder]) -> list[dict]:
