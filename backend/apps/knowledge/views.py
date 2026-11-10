@@ -32,6 +32,7 @@ from utils.oss import guess_content_type, oss_client
 from utils.error_codes import ErrorCode
 from utils.parsers import CleanJSONParser
 
+from .acl import school_level_q
 from .extractor import extract_freshness_for_doc
 from .folders import (
     find_accessible_folder,
@@ -205,9 +206,11 @@ class KnowledgeDocListView(generics.ListAPIView):
         - dept_admin：校级文档 + 本部门文档 + 自己上传的
         - user：仅本人上传的文档（对齐接口文档「普通用户仅能查看/下载自己上传的文档」，
           避免泄露他人私密/未完成文档）
+        未绑定学院/部门的账号不能参与范围匹配：Q(college_id=None) 会命中所有
+        学院字段为空的部门级文档，导致越权看到其他部门的文件，故 fail-closed。
         """
-        # 校级文档：college_id 和 department_id 均为 null
-        SCHOOL_LEVEL = Q(college_id__isnull=True, department_id__isnull=True)
+        # 校级文档：无学院/部门归属，且没有残留的旧 scope 标记（见 acl.py）
+        SCHOOL_LEVEL = school_level_q()
 
         # 超管上传的私密文档：仅该超管本人可见。超管上传时 college_id/department_id
         # 均为 null（校级文档），会被下文的 SCHOOL_LEVEL 命中而向所有管理角色泄露，
@@ -228,17 +231,15 @@ class KnowledgeDocListView(generics.ListAPIView):
             )
 
         if user.role in ('college_admin', 'admin'):
-            return queryset.filter(
-                SCHOOL_LEVEL
-                | Q(college_id=user.college_id)
-                | Q(uploader_id=user.id),
-            )
+            conditions = SCHOOL_LEVEL | Q(uploader_id=user.id)
+            if user.college_id:
+                conditions |= Q(college_id=user.college_id)
+            return queryset.filter(conditions)
         if user.role == 'dept_admin':
-            return queryset.filter(
-                SCHOOL_LEVEL
-                | Q(department_id=user.department_id)
-                | Q(uploader_id=user.id),
-            )
+            conditions = SCHOOL_LEVEL | Q(uploader_id=user.id)
+            if user.department_id:
+                conditions |= Q(department_id=user.department_id)
+            return queryset.filter(conditions)
         # user（普通用户）：仅本人上传
         return queryset.filter(uploader_id=user.id)
 
@@ -251,8 +252,8 @@ class KnowledgeDocListView(generics.ListAPIView):
         - dept_admin：校级文档 + 本部门文档 + 自己上传
         - user：校级文档 + 本院文档 + 本部门文档 + 自己上传
         """
-        # 校级文档：college_id 和 department_id 均为 null
-        SCHOOL_LEVEL = Q(college_id__isnull=True, department_id__isnull=True)
+        # 校级文档：无学院/部门归属，且没有残留的旧 scope 标记（见 acl.py）
+        SCHOOL_LEVEL = school_level_q()
 
         role = user_context.get('role', 'user')
         user_id = user_context.get('user_id')
@@ -389,9 +390,13 @@ class KnowledgeDocDeleteView(generics.DestroyAPIView):
 
     @staticmethod
     def _filter_deletable(queryset, user):
-        """按角色过滤可删除的文档（通过 college_id/department_id 判断归属）"""
-        # 校级文档：college_id 和 department_id 均为 null
-        SCHOOL_LEVEL = Q(college_id__isnull=True, department_id__isnull=True)
+        """按角色过滤可删除的文档（通过 college_id/department_id 判断归属）
+
+        未绑定学院/部门的账号 fail-closed，避免 Q(college_id=None) 命中
+        其他部门的文档（与 _admin_scope_filter 保持一致）。
+        """
+        # 校级文档：无学院/部门归属，且没有残留的旧 scope 标记（见 acl.py）
+        SCHOOL_LEVEL = school_level_q()
         # 超管上传的私密文档仅本人可见，删除权限也保持一致
         super_private = Q(visibility='private', uploader__role='super_admin')
 
@@ -402,17 +407,15 @@ class KnowledgeDocDeleteView(generics.DestroyAPIView):
         queryset = queryset.exclude(super_private)
 
         if user.role in ('college_admin', 'admin'):
-            return queryset.filter(
-                SCHOOL_LEVEL
-                | Q(college_id=user.college_id)
-                | Q(uploader_id=user.id),
-            )
+            conditions = SCHOOL_LEVEL | Q(uploader_id=user.id)
+            if user.college_id:
+                conditions |= Q(college_id=user.college_id)
+            return queryset.filter(conditions)
         if user.role == 'dept_admin':
-            return queryset.filter(
-                SCHOOL_LEVEL
-                | Q(department_id=user.department_id)
-                | Q(uploader_id=user.id),
-            )
+            conditions = SCHOOL_LEVEL | Q(uploader_id=user.id)
+            if user.department_id:
+                conditions |= Q(department_id=user.department_id)
+            return queryset.filter(conditions)
         return queryset.none()
 
 

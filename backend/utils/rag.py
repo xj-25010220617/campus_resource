@@ -1017,6 +1017,7 @@ def authorized_knowledge_docs(user_context: Optional[dict] = None):
     private 文档除外），其他角色仅可查看公开的学校/本部门或本人上传文档。
     """
     from django.db.models import Q
+    from apps.knowledge.acl import school_level_q
     from apps.knowledge.models import KnowledgeDoc
 
     user_context = user_context or {}
@@ -1033,11 +1034,23 @@ def authorized_knowledge_docs(user_context: Optional[dict] = None):
         return qs.exclude(super_private & ~Q(uploader_id=user_id))
 
     qs = qs.filter(visibility='public')
-    school_level = Q(college_id__isnull=True, department_id__isnull=True)
+    # 校级文档：无学院/部门归属，且没有残留的旧 scope 标记（与浏览链路共用判定）
+    school_level = school_level_q()
     if role in ('admin', 'college_admin'):
-        return qs.filter(school_level | Q(college_id=college_id) | Q(uploader_id=user_id))
+        conditions = school_level
+        if user_id:
+            conditions |= Q(uploader_id=user_id)
+        if college_id:
+            # 未绑定学院时不拼 Q(college_id=None)，否则会命中所有部门级文档
+            conditions |= Q(college_id=college_id)
+        return qs.filter(conditions)
     if role == 'dept_admin':
-        return qs.filter(school_level | Q(department_id=department_id) | Q(uploader_id=user_id))
+        conditions = school_level
+        if user_id:
+            conditions |= Q(uploader_id=user_id)
+        if department_id:
+            conditions |= Q(department_id=department_id)
+        return qs.filter(conditions)
 
     conditions = school_level
     if college_id:
