@@ -2,11 +2,19 @@ from django.db import models
 
 
 class Discipline(models.Model):
-    """学科方向（覆盖工学/管理学/艺术学/文学/医学5大门类）"""
+    """专业/学科方向（覆盖工学/管理学/艺术学/文学/医学5大门类）"""
+
+    LEVEL_CHOICES = [
+        ('bachelor', '本科'),
+        ('vocational', '高职专科'),
+        ('minor', '第二学士学位'),
+        ('international', '中外合作办学(本科)'),
+    ]
+
     name = models.CharField(
         max_length=64, unique=True,
-        verbose_name='学科方向名称',
-        db_comment='学科方向名称(如：软件工程/计算机科学与技术)',
+        verbose_name='专业名称',
+        db_comment='专业名称(如：软件工程/计算机科学与技术)',
     )
     category = models.CharField(
         max_length=16,
@@ -22,15 +30,36 @@ class Discipline(models.Model):
     )
     sort_order = models.IntegerField(default=0, verbose_name='排序')
 
+    # —— 新增扩展字段 ——
+    college = models.ForeignKey(
+        'accounts.College',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='majors',
+        verbose_name='所属学院',
+    )
+    major_code = models.CharField(max_length=16, blank=True, default='', verbose_name='专业代码(国标)')
+    level = models.CharField(max_length=16, choices=LEVEL_CHOICES, default='bachelor', verbose_name='培养层次')
+    duration = models.CharField(max_length=32, blank=True, default='', verbose_name='学制(如"4年"/"3年")')
+    is_first_class = models.BooleanField(default=False, verbose_name='是否一流专业建设点')
+    specialty_type = models.CharField(max_length=32, blank=True, default='', verbose_name='一流专业类型(国家级/省级)')
+    admission_batch = models.CharField(max_length=64, blank=True, default='', verbose_name='招生批次(一本/二本等)')
+
+    core_courses = models.TextField(blank=True, default='', verbose_name='核心课程')
+    training_goal = models.TextField(blank=True, default='', verbose_name='培养目标')
+    career = models.TextField(blank=True, default='', verbose_name='就业方向')
+    feature_major = models.TextField(blank=True, default='', verbose_name='专业特色')
+
     class Meta:
         db_table = 'discipline'
-        verbose_name = '学科方向'
+        verbose_name = '专业'
         verbose_name_plural = verbose_name
         ordering = ['sort_order', 'id']
-        db_table_comment = '学科方向表(工学/管理学/艺术学/文学/医学5大门类)'
+        db_table_comment = '专业表(工学/管理学/艺术学/文学/医学5大门类，含所属学院)'
 
     def __str__(self):
-        return f'{self.name}（{self.category}）'
+        college_name = f' — {self.college.name}' if self.college else ''
+        return f'{self.name}（{self.get_category_display()}{college_name}）'
 
 
 class Category(models.Model):

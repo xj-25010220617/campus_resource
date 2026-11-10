@@ -10,6 +10,8 @@ urlpatterns = [
     path('api/docs/', SpectacularSwaggerView.as_view(url_name='schema'), name='swagger-ui'),
     # App routes
     path('api/auth/', include('apps.accounts.urls')),
+    # 学校基础信息（公开，无需 Token）
+    path('api/school/', include('apps.accounts.school_urls')),
     path('api/', include('apps.classify.urls')),
     path('api/knowledge/', include('apps.knowledge.urls')),
     path('api/chat/', include('apps.chat.urls')),

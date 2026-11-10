@@ -216,6 +216,169 @@ NEUSOFT_KNOWLEDGE = """## 学校概况
 - 招生邮箱：edu@nsu.edu.cn
 - 招生信息网：https://zs.nsu.edu.cn"""
 
+
+# ------------------------------------------------------------------
+# 动态学校知识库 —— 从数据库实时拼接，fallback 到 NEUSOFT_KNOWLEDGE
+# ------------------------------------------------------------------
+def build_school_knowledge_from_db() -> str:
+    """优先从数据库读取 SchoolProfile / College / Discipline /
+    Scholarship / Tuition / AdmissionRule / AcademicCalendar 拼出 Markdown。
+    任何环节异常（DB 未就绪 / 表不存在 / 种子数据未灌）均 fallback 到硬编码版本。
+    """
+    try:
+        from apps.accounts.models import (
+            SchoolProfile, College, Scholarship, Tuition,
+            AdmissionRule, AcademicCalendar,
+        )
+        from apps.classify.models import Discipline
+    except Exception:
+        return NEUSOFT_KNOWLEDGE
+
+    # —— 1. 学校概况 ——
+    try:
+        sp = SchoolProfile.objects.first()
+    except Exception:
+        sp = None
+    if not sp:
+        return NEUSOFT_KNOWLEDGE
+
+    lines = []
+    lines.append('## 学校概况')
+    lines.append(f'- 学校全称：{sp.name_full}（{sp.name_en}）' if sp.name_en else f'- 学校全称：{sp.name_full}')
+    if sp.website:
+        lines.append(f'- 官网：{sp.website}')
+    if sp.founded_at:
+        lines.append(f'- 成立时间：{sp.founded_at}年' +
+                     (f'（前身为成都东软信息技术职业学院）' if sp.founded_at == 2003 else ''))
+        if sp.upgraded_to_bachelor:
+            lines.append(f'- 升格本科：{sp.upgraded_to_bachelor}年')
+    if sp.nature:
+        lines.append(f'- 办学性质：{sp.nature}')
+    if sp.level:
+        lines.append(f'- 办学层次：{sp.level}')
+    if sp.address:
+        lines.append(f'- 所在地：{sp.address}')
+    if sp.area_m2:
+        lines.append(f'- 占地面积：约 {sp.area_m2} 万平方米' +
+                     (f'，建筑面积约 {sp.building_area_m2} 万平方米' if sp.building_area_m2 else ''))
+    if sp.student_count:
+        lines.append(f'- 在校生：约 {sp.student_count} 人')
+    if sp.teacher_count:
+        lines.append(f'- 教职工：{sp.teacher_count} 人，其中专任教师 {sp.fulltime_teacher_count} 人' +
+                     (f'，外聘教师 {sp.external_teacher_count} 人' if sp.external_teacher_count else '') +
+                     (f'；专任教师中"双师型"教师 {sp.double_qualified_count} 人' if sp.double_qualified_count else '') +
+                     (f'，高级职称 {sp.senior_title_count} 人' if sp.senior_title_count else '') +
+                     (f'，硕/博士 {sp.phd_master_count} 人（占比 {sp.phd_master_pct}%）' if sp.phd_master_count else ''))
+    if sp.motto:
+        lines.append(f'- 校训：{sp.motto}')
+    if sp.president:
+        lines.append(f'- 校长：{sp.president}')
+    if sp.school_code:
+        lines.append(f'- 学校标识码：{sp.school_code}' +
+                     (f'，四川省招生代码：{sp.admission_code_sichuan}' if sp.admission_code_sichuan else ''))
+    if sp.disciplines_text:
+        lines.append(f'- 学科门类：{sp.disciplines_text}')
+    if sp.major_count:
+        lines.append(f'- 本科专业：{sp.major_count} 个' +
+                     (f'，另有 {sp.vocational_major_count} 个高职专科专业' if sp.vocational_major_count else ''))
+    if sp.graduate_total:
+        lines.append(f'- 累计培养毕业生：{sp.graduate_total} 余人' +
+                     (f'，本科毕业生平均就业率 {sp.employment_rate}%' if sp.employment_rate else ''))
+    if sp.partner_text:
+        lines.append(f'- 合作企业：{sp.partner_text}')
+    if sp.training_model:
+        lines.append(f'- TOPCARES 一体化人才培养模式：{sp.training_model.strip()}')
+    if sp.semester_system:
+        lines.append(f'- 学期制度：{sp.semester_system.strip()}')
+
+    # —— 2. 院系设置 ——
+    colleges = list(College.objects.prefetch_related('majors').all().order_by('sort_order'))
+    if colleges:
+        lines.append('')
+        lines.append(f'## 院系设置（{len(colleges)} 个二级学院）')
+        for i, c in enumerate(colleges, 1):
+            lines.append('')
+            lines.append(f'### {i}. {c.name}（{c.code}）')
+            if c.intro:
+                lines.append(c.intro.strip())
+            majors = list(c.majors.all().order_by('sort_order'))
+            if majors:
+                # 只列专业名称 + 一流专业标记，避免太长
+                major_items = []
+                for m in majors:
+                    tag = ''
+                    if m.is_first_class:
+                        tag = '（国家级一流本科专业建设点）' if m.specialty_type == '国家级' else '（省级一流专业）'
+                    elif m.admission_batch == '一本':
+                        tag = '（一本招生）'
+                    major_items.append(f'{m.name}{tag}')
+                lines.append('- 专业：' + '、'.join(major_items))
+            elif c.specialties_text:
+                lines.append(f'- 专业：{c.specialties_text}')
+            if c.features:
+                lines.append(f'- 特色：{c.features.strip()}')
+
+    # —— 3. 奖助学金 ——
+    scholarships = list(Scholarship.objects.all().order_by('sort_order'))
+    if scholarships:
+        lines.append('')
+        lines.append('## 奖助学金')
+        # 按 level 分组
+        groups = {}
+        for s in scholarships:
+            groups.setdefault(s.level, []).append(s)
+        for level_label in ['enterprise', 'national', 'provincial', 'university']:
+            group = groups.get(level_label, [])
+            if not group:
+                continue
+            lines.append(f'- {dict(Scholarship.LEVEL_CHOICES).get(level_label, level_label)}：')
+            for s in group:
+                amt = f'（{s.amount}）' if s.amount else ''
+                lines.append(f'  - {s.name}{amt}')
+
+    # —— 4. 学费 ——
+    tuitions = list(Tuition.objects.all())
+    if tuitions:
+        lines.append('')
+        lines.append('## 学费标准')
+        for t in tuitions:
+            lines.append(f'- {t.category}：{t.amount_text}')
+
+    # —— 5. 录取规则（最新） ——
+    try:
+        admission = AdmissionRule.objects.order_by('-year').first()
+    except Exception:
+        admission = None
+    if admission and admission.content:
+        lines.append('')
+        lines.append(f'## {admission.year} 年录取规则')
+        lines.append(admission.content.strip())
+
+    # —— 6. 学期制度 ——
+    calendars = list(AcademicCalendar.objects.all().order_by('sort_order'))
+    if calendars:
+        lines.append('')
+        lines.append('## 学期与假期安排')
+        for cal in calendars:
+            note = f' — {cal.note}' if cal.note else ''
+            lines.append(f'- {cal.term_name}{note}')
+
+    # —— 7. 联系方式（如果概况里没有，硬编码补充）——
+    lines.append('')
+    lines.append('## 联系方式')
+    if sp.address:
+        lines.append(f'- 地址：{sp.address}' +
+                     (f'（邮编：{sp.postal_code}）' if sp.postal_code else ''))
+    if sp.admission_phone:
+        lines.append(f'- 招生电话：{sp.admission_phone}')
+    if sp.admission_email:
+        lines.append(f'- 招生邮箱：{sp.admission_email}')
+    if sp.admission_website:
+        lines.append(f'- 招生信息网：{sp.admission_website}')
+
+    return '\n'.join(lines)
+
+
 SYSTEM_PROMPT = """你是成都东软学院的AI智能助手，负责回答学院教学、科研、管理相关问题以及常识性问题。
 
 {context}
@@ -402,7 +565,7 @@ def build_rag_prompt(
     refs_text = '\n\n'.join(ref_lines) if ref_lines else '暂无相关参考资料。'
     from utils.context import build_system_context
     system_content = SYSTEM_PROMPT.format(
-        knowlege=NEUSOFT_KNOWLEDGE,
+        knowlege=build_school_knowledge_from_db(),
         references=refs_text,
         context=build_system_context(),
     )
@@ -1025,7 +1188,10 @@ def authorized_knowledge_docs(user_context: Optional[dict] = None):
     college_id = user_context.get('college_id')
     department_id = user_context.get('department_id')
 
-    qs = KnowledgeDoc.objects.filter(review_status='approved')
+    qs = KnowledgeDoc.objects.filter(
+        review_status='approved',
+        superseded_by__isnull=True,  # 已被新版本替代的旧版不参与问答检索
+    )
 
     # 超管上传的私密文档：仅该超管本人可见（与浏览链路 _admin_scope_filter 对齐）
     super_private = Q(visibility='private', uploader__role='super_admin')
