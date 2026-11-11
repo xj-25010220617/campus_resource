@@ -1,6 +1,8 @@
 from rest_framework import serializers
 
-from .models import DocRelation, DocTag, KnowledgeDoc, KnowledgeDocReview, Keyword, Tag
+from .models import (
+    DocRelation, DocTag, DocVersionCandidate, KnowledgeDoc, KnowledgeDocReview, Keyword, Tag,
+)
 from utils.oss import oss_client
 from utils.timefmt import format_business_time
 
@@ -30,6 +32,9 @@ class KnowledgeDocSerializer(serializers.ModelSerializer):
     # 标签与关联图谱（文件网），详情页懒加载
     tags = serializers.SerializerMethodField()
     relations = serializers.SerializerMethodField()
+    # 新旧版本：is_latest=false 表示已被新版本替代（仅保留浏览，不参与问答检索）
+    is_latest = serializers.SerializerMethodField()
+    superseded_by_title = serializers.SerializerMethodField()
 
     class Meta:
         model = KnowledgeDoc
@@ -46,6 +51,7 @@ class KnowledgeDocSerializer(serializers.ModelSerializer):
             'review_status', 'reviewer', 'reviewer_name', 'reviewed_at', 'review_comment',
             'chunk_count', 'is_sensitive', 'sensitive_checked',
             'freshness_date',
+            'is_latest', 'superseded_by', 'superseded_by_title', 'superseded_at',
             'created_at', 'created_at_display', 'updated_at',
             'indexed_at', 'indexed_at_display',
             'tags', 'relations',
@@ -55,7 +61,7 @@ class KnowledgeDocSerializer(serializers.ModelSerializer):
             'file_size', 'md5_hash', 'page_count', 'uploader',
             'chunk_count', 'created_at', 'updated_at', 'indexed_at',
             'index_error', 'index_attempts', 'index_started_at', 'failed_at',
-            'folder',
+            'folder', 'superseded_by', 'superseded_at',
         ]
 
     def get_download_url(self, obj) -> str:
@@ -96,6 +102,33 @@ class KnowledgeDocSerializer(serializers.ModelSerializer):
             many=True,
         ).data
 
+    def get_is_latest(self, obj) -> bool:
+        """是否为当前最新版（被新版本替代后为 False，问答检索不再召回）"""
+        return obj.superseded_by_id is None
+
+    def get_superseded_by_title(self, obj) -> str:
+        return obj.superseded_by.title if obj.superseded_by_id else ''
+
+
+class DocVersionCandidateSerializer(serializers.ModelSerializer):
+    """版本候选序列化器：供上传者确认"新版是否替代旧版"时查看判定依据"""
+    new_doc_title = serializers.CharField(source='new_doc.title', read_only=True)
+    new_doc_file_name = serializers.CharField(source='new_doc.file_name', read_only=True)
+    new_doc_created_at = serializers.DateTimeField(source='new_doc.created_at', read_only=True)
+    old_doc_title = serializers.CharField(source='old_doc.title', read_only=True)
+    old_doc_file_name = serializers.CharField(source='old_doc.file_name', read_only=True)
+    old_doc_created_at = serializers.DateTimeField(source='old_doc.created_at', read_only=True)
+
+    class Meta:
+        model = DocVersionCandidate
+        fields = [
+            'id', 'new_doc', 'new_doc_title', 'new_doc_file_name', 'new_doc_created_at',
+            'old_doc', 'old_doc_title', 'old_doc_file_name', 'old_doc_created_at',
+            'confidence', 'signals', 'reason', 'status',
+            'decided_by', 'decided_at', 'created_at',
+        ]
+        read_only_fields = fields
+
 
 class KnowledgeDocListSerializer(serializers.ModelSerializer):
     """知识文档列表序列化器（简化版，用于列表页展示）"""
@@ -125,6 +158,10 @@ class KnowledgeDocListSerializer(serializers.ModelSerializer):
     indexed_at_display = serializers.SerializerMethodField()
     # 文档标签（人工打标）：列表页仅回显 {id, name}，供前端渲染标签徽章
     tags = serializers.SerializerMethodField()
+    # 新旧版本：is_latest=false 表示已被新版本替代；列表默认隐藏，可按需展示
+    is_latest = serializers.SerializerMethodField()
+    superseded_by = serializers.PrimaryKeyRelatedField(read_only=True)
+    superseded_by_title = serializers.SerializerMethodField()
 
     class Meta:
         model = KnowledgeDoc
@@ -138,6 +175,7 @@ class KnowledgeDocListSerializer(serializers.ModelSerializer):
             'uploader_college_name', 'uploader_department_name',
             'chunk_count', 'created_at', 'created_at_display',
             'indexed_at', 'indexed_at_display', 'tags',
+            'is_latest', 'superseded_by', 'superseded_by_title', 'superseded_at',
         ]
 
     def get_file_ext(self, obj) -> str:
@@ -153,6 +191,13 @@ class KnowledgeDocListSerializer(serializers.ModelSerializer):
     def get_tags(self, obj) -> list:
         """文档标签（人工打标）：列表页仅回显 {id, name}，供前端渲染标签徽章/点击筛选"""
         return [{'id': t.tag_id, 'name': t.tag.name} for t in obj.doc_tags.all()]
+
+    def get_is_latest(self, obj) -> bool:
+        """是否为当前最新版"""
+        return obj.superseded_by_id is None
+
+    def get_superseded_by_title(self, obj) -> str:
+        return obj.superseded_by.title if obj.superseded_by_id else ''
 
 
 # 文件大小限制常量（字节）
@@ -330,6 +375,10 @@ class UploadCallbackSerializer(serializers.Serializer):
     description = serializers.CharField(
         default='', allow_blank=True, help_text='文档描述（可选，未提供时 AI 生成）',
     )
+    publish_date = serializers.DateField(
+        required=False, allow_null=True,
+        help_text='文档发布日期（用于多版本政策冲突时以最新版本为准）',
+    )
     file_name = serializers.CharField(max_length=256, help_text='原始文件名')
     file_size = serializers.IntegerField(min_value=0, help_text='文件大小（字节）')
     file_type = serializers.CharField(max_length=16, help_text='文件类型（pdf/doc/ppt/xls/image/video/audio/md/txt/html/other）')
@@ -464,6 +513,10 @@ class TextUploadSerializer(serializers.Serializer):
     description = serializers.CharField(
         default='', allow_blank=True, help_text='文档描述（可选，未提供时 AI 生成）',
     )
+    publish_date = serializers.DateField(
+        required=False, allow_null=True,
+        help_text='文档发布日期（用于多版本政策冲突时以最新版本为准）',
+    )
     college_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属学院ID（默认取上传者学院）')
     department_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属部门ID（默认取上传者部门）')
     discipline_id = serializers.IntegerField(required=False, allow_null=True, help_text='学科方向ID（可选）')
@@ -497,6 +550,10 @@ class FileUploadSerializer(serializers.Serializer):
     )
     description = serializers.CharField(
         default='', allow_blank=True, help_text='文档描述（可选，未提供时 AI 生成）',
+    )
+    publish_date = serializers.DateField(
+        required=False, allow_null=True,
+        help_text='文档发布日期（用于多版本政策冲突时以最新版本为准）',
     )
     college_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属学院ID（默认取上传者学院）')
     department_id = serializers.IntegerField(required=False, allow_null=True, help_text='所属部门ID（默认取上传者部门）')

@@ -8,7 +8,7 @@ from .views import (
     FAQDraftDetailView,
     FAQDraftActionView,
     FAQManageListView,
-    FAQManageDeleteView,
+    FAQManageItemView,
     FAQGenerationLogListView,
     FAQGenerationLogDetailView,
     FAQGenerateTriggerView,
@@ -28,7 +28,7 @@ urlpatterns = [
 
     # 管理端全量操作
     path('faq/manage/items/', FAQManageListView.as_view(), name='faq_manage_items'),
-    path('faq/manage/items/<int:pk>/', FAQManageDeleteView.as_view(), name='faq_manage_item_delete'),
+    path('faq/manage/items/<int:pk>/', FAQManageItemView.as_view(), name='faq_manage_item_detail'),
 
     # 手动触发 FAQ 生成（仅 super_admin）
     path('faq/generate/', FAQGenerateTriggerView.as_view(), name='faq_generate_trigger'),

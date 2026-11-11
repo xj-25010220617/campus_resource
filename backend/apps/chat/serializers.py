@@ -34,6 +34,14 @@ class AskSerializer(serializers.Serializer):
     """AI 问答请求参数"""
     conversation_id = serializers.IntegerField(required=False, allow_null=True, help_text='会话ID（不传则新建）')
     question = serializers.CharField(max_length=2000, help_text='用户提问')
+    doc_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1), required=False,
+        help_text='@引用的文档ID列表（限定只基于这些文档回答）',
+    )
+    tag_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1), required=False,
+        help_text='#引用的标签ID列表（限定只基于这些标签下的文档回答）',
+    )
 
 
 class FeedbackSerializer(serializers.Serializer):

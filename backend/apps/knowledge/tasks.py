@@ -74,6 +74,34 @@ def auto_link_relations_task(self, doc_id: int):
         raise self.retry(exc=e)
 
 
+@shared_task(bind=True, max_retries=1, default_retry_delay=120, ignore_result=True)
+def detect_version_task(self, doc_id: int):
+    """索引完成后异步识别"疑似新旧版本"，命中只生成待上传者确认的候选。
+
+    识别阶段不修改旧版文档；上传者确认后旧版才会被标记为历史版本并从问答检索中隔离。
+
+    Args:
+        doc_id: 新索引完成的 KnowledgeDoc 主键
+
+    异常处理:
+        - 任意异常 → 自动重试 1 次（间隔 120s）
+        - 最终失败仅记录日志，不影响上传与索引主流程
+    """
+    from apps.knowledge.versioning import detect_versions
+
+    try:
+        candidate = detect_versions(doc_id)
+        if candidate:
+            logger.info(
+                '版本识别完成 doc_id=%d 候选旧版=%d candidate_id=%d',
+                doc_id, candidate.old_doc_id, candidate.id,
+            )
+        return None
+    except Exception as e:
+        logger.error(f'detect_version_task doc_id={doc_id} 失败: {e}')
+        raise self.retry(exc=e)
+
+
 @shared_task(bind=True, max_retries=3, default_retry_delay=120, ignore_result=True)
 def crawl_neusoft_website_task(
     self, max_pages: int = 100,
@@ -278,6 +306,12 @@ def index_document_task(self, doc_id: int):
             '索引完成: doc_id=%d  %d 块 → Milvus + MySQL',
             doc_id, len(raw_chunks),
         )
+        # 索引成功后再做新旧版本识别：识别依赖已落库的 DocChunk 文本
+        try:
+            from utils.celery_dispatcher import safe_delay
+            safe_delay(detect_version_task, doc_id)
+        except Exception as e:
+            logger.warning(f'版本识别任务派发失败 doc_id={doc_id}: {e}')
         return None
 
     except Exception as e:

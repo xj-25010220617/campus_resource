@@ -15,6 +15,7 @@ from .serializers import (
     FAQItemDetailSerializer,
     FAQItemDraftSerializer,
     FAQItemPublishSerializer,
+    FAQManageUpdateSerializer,
 )
 
 logger = logging.getLogger(__name__)
@@ -265,15 +266,18 @@ class FAQManageListView(generics.ListAPIView):
         return qs.order_by('-frequency', '-created_at')
 
 
-class FAQManageDeleteView(generics.DestroyAPIView):
+class FAQManageItemView(generics.RetrieveUpdateDestroyAPIView):
     """
-    删除 FAQ
+    管理端 FAQ 编辑与删除
 
+    PATCH /api/faq/manage/items/{id}/
+    功能：编辑指定 FAQ（草稿 / 已发布 / 已驳回均可编辑，不改变 status）
     DELETE /api/faq/manage/items/{id}/
     功能：物理删除指定 FAQ；非 super_admin 仅能删除本学院或全局 FAQ
     权限：IsFAQAdmin（按 college 范围过滤可见集）
-    返回：204 No Content
+    返回：PATCH 返回更新后的 FAQ；DELETE 返回 204
     """
+    serializer_class = FAQManageUpdateSerializer
     permission_classes = [permissions.IsAuthenticated, IsFAQAdmin]
 
     def get_queryset(self):

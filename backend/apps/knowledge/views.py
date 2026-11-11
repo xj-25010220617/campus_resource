@@ -47,6 +47,7 @@ from .review import (
     initial_review_status,
     reviewer_scope_q,
 )
+from .versioning import latest_doc_of
 from .serializers import (
     AIClassifySerializer,
     ALLOWED_FILE_TYPES,
@@ -90,13 +91,15 @@ class KnowledgeDocFilter(django_filters.FilterSet):
     tag = django_filters.CharFilter(method='filter_tag_name')
     folder_id = django_filters.NumberFilter(method='filter_folder')
     unfiled = django_filters.BooleanFilter(method='filter_unfiled')
+    # 新旧版本：is_latest=true 只看最新版，false 只看已被替代的旧版
+    is_latest = django_filters.BooleanFilter(method='filter_is_latest')
 
     class Meta:
         model = KnowledgeDoc
         fields = [
             'college_id', 'department_id', 'discipline_id',
             'file_type', 'status', 'source_type', 'visibility', 'uploader_id',
-            'days_back', 'tag_id', 'tag', 'folder_id', 'unfiled',
+            'days_back', 'tag_id', 'tag', 'folder_id', 'unfiled', 'is_latest',
         ]
 
     def filter_days_back(self, queryset, name, value):
@@ -135,6 +138,10 @@ class KnowledgeDocFilter(django_filters.FilterSet):
         if value:
             return queryset.filter(folder__isnull=True)
         return queryset
+
+    def filter_is_latest(self, queryset, name, value):
+        """is_latest=true 只看当前最新版；false 只看已被新版本替代的旧版。"""
+        return queryset.filter(superseded_by__isnull=bool(value))
 
 
 @extend_schema(
@@ -184,6 +191,13 @@ class KnowledgeDocListView(generics.ListAPIView):
 
         # 可见性权限过滤
         queryset = self._admin_scope_filter(queryset, user)
+
+        # 新旧版本：默认隐藏已被替代的旧版；include_superseded=1 或显式传 is_latest 时放开
+        include_superseded = self.request.query_params.get(
+            'include_superseded', '',
+        ).lower() in ('1', 'true', 'yes')
+        if not include_superseded and 'is_latest' not in self.request.query_params:
+            queryset = queryset.filter(superseded_by__isnull=True)
 
         # 默认时间范围过滤：近一年（days_back=0 表示不限时间）
         days_back = self.request.query_params.get('days_back', '365')
@@ -1013,9 +1027,12 @@ class UploadSTSView(APIView):
         # MD5 去重检查：私密上传必须生成独立记录，不能复用公开文档
         duplicate_doc = oss_client.check_duplicate(md5_hash) if visibility != 'private' else None
         if duplicate_doc:
+            latest_doc = latest_doc_of(duplicate_doc)
             return Response({
                 'duplicate': True,
                 'knowledge_doc_id': duplicate_doc.id,
+                'is_latest': duplicate_doc.superseded_by_id is None,
+                'latest_doc_id': latest_doc.id,
             })
 
         # 获取 STS 临时凭证（scope 根据上传者角色自动确定）
@@ -1110,6 +1127,8 @@ class UploadCallbackView(APIView):
                 'id': duplicate_doc.id,
                 'status': duplicate_doc.status,
                 'duplicate': True,
+                'is_latest': duplicate_doc.superseded_by_id is None,
+                'latest_doc_id': latest_doc_of(duplicate_doc).id,
             })
 
         # 创建文档记录
@@ -1144,6 +1163,7 @@ class UploadCallbackView(APIView):
             department_id=doc_department_id,
             discipline_id=data.get('discipline_id'),
             folder=folder,
+            freshness_date=data.get('publish_date'),
             visibility=intended_visibility,
         )
 
@@ -1353,6 +1373,7 @@ class TextUploadView(APIView):
             uploader=request.user,
             status='uploaded',
             review_status=review_status,
+            freshness_date=data.get('publish_date'),
             visibility=visibility,
         )
 
@@ -1820,6 +1841,7 @@ class FileUploadView(APIView):
             uploader=request.user,
             status='uploaded',
             review_status=review_status,
+            freshness_date=data.get('publish_date'),
             visibility=visibility,
         )
 
@@ -1922,6 +1944,16 @@ class BatchFileUploadView(APIView):
         visibility = request.data.get('visibility', 'public')
         if visibility not in ('public', 'private'):
             visibility = 'public'
+
+        # 2b. 统一的发布日期：批量上传时对整批文件生效（用于多版本政策冲突取最新）
+        from django.utils.dateparse import parse_date
+        publish_date_raw = str(request.data.get('publish_date') or '').strip()
+        batch_publish_date = parse_date(publish_date_raw) if publish_date_raw else None
+        if publish_date_raw and batch_publish_date is None:
+            return Response(
+                {'detail': '发布日期格式应为 YYYY-MM-DD', 'code': ErrorCode.VALIDATION_ERROR.value},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         # 3. 根据上传者角色确定文档归属；超管可按所选学院/部门显式归属
         user = request.user
@@ -2057,6 +2089,7 @@ class BatchFileUploadView(APIView):
                     uploader=user,
                     status='uploaded',
                     review_status=review_status,
+                    freshness_date=batch_publish_date,
                     visibility=visibility,
                 )
 

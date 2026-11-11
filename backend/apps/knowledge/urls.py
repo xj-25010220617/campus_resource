@@ -18,6 +18,11 @@ from .review_views import (
     DocReviewResubmitView,
     PendingReviewListView,
 )
+from .version_views import (
+    VersionCandidateConfirmView,
+    VersionCandidateListView,
+    VersionCandidateRejectView,
+)
 from .views import (
     AIClassifyView,
     BatchFileUploadView,
@@ -104,4 +109,9 @@ urlpatterns = [
     # 文档关联（文件网）
     path('docs/<int:doc_id>/relations/', DocRelationListView.as_view(), name='doc_relation_list'),
     path('docs/<int:doc_id>/relations/<int:relation_id>/delete/', DocRelationDeleteView.as_view(), name='doc_relation_delete'),
+
+    # 新旧版本候选（上传者确认后旧版才从问答检索中隔离）
+    path('version-candidates/', VersionCandidateListView.as_view(), name='version_candidate_list'),
+    path('version-candidates/<int:pk>/confirm/', VersionCandidateConfirmView.as_view(), name='version_candidate_confirm'),
+    path('version-candidates/<int:pk>/reject/', VersionCandidateRejectView.as_view(), name='version_candidate_reject'),
 ]

@@ -39,7 +39,11 @@ def _visible_docs_qs(user, mine_only: bool = False):
     from apps.knowledge.models import KnowledgeDoc
 
     # 审核闸口：未通过审核的文档一律不参与结构化/表格问答（与 RAG 检索口径一致）
-    base = KnowledgeDoc.objects.filter(review_status='approved')
+    # 已被新版本替代的旧版文档同样排除，避免新旧内容混在一起统计
+    base = KnowledgeDoc.objects.filter(
+        review_status='approved',
+        superseded_by__isnull=True,
+    )
 
     user_role = getattr(user, 'role', None) if user else None
     if not user or not user_role:

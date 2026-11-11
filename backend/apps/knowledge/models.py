@@ -216,6 +216,15 @@ class KnowledgeDoc(models.Model):
         null=True, blank=True, verbose_name='表格结构元数据',
         help_text='仅 xlsx/csv 结构化文档：{"sheets":[{"name","columns","row_count","sample_rows"}]}，供表格问答引擎生成 SQL',
     )
+    # 新旧版本：superseded_by 指向替代它的新版文档；为空即"当前最新版"。
+    # 只在版本候选被上传者确认后写入，确认后问答检索会排除该文档。
+    superseded_by = models.ForeignKey(
+        'self', null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='supersedes', verbose_name='被新版本替代为',
+    )
+    superseded_at = models.DateTimeField(
+        null=True, blank=True, db_index=True, verbose_name='被替代时间',
+    )
 
     class Meta:
         db_table = 'knowledge_doc'
@@ -506,3 +515,62 @@ class ChunkedUploadSession(models.Model):
 
     def __str__(self):
         return f'{self.user.username} 分片上传 {self.file_name} [{self.status}]'
+
+
+class DocVersionCandidate(models.Model):
+    """新旧版本候选——自动识别出的"疑似同一份资料的新旧版本"，等待上传者确认。
+
+    上传者是唯一决策人（或超管）：确认后旧版写入 superseded_by 并在问答检索中隔离；
+    拒绝则保留两篇独立文档。识别阶段不直接修改旧版，避免误判导致资料被误下线。
+    """
+    STATUS_CHOICES = [
+        ('pending', '待确认'),
+        ('confirmed', '已确认'),
+        ('rejected', '已拒绝'),
+    ]
+
+    new_doc = models.ForeignKey(
+        KnowledgeDoc, on_delete=models.CASCADE,
+        related_name='version_candidates', verbose_name='新上传文档',
+    )
+    old_doc = models.ForeignKey(
+        KnowledgeDoc, on_delete=models.CASCADE,
+        related_name='superseded_candidates', verbose_name='疑似旧版文档',
+    )
+    confidence = models.FloatField(default=0.0, verbose_name='置信度(0-1)')
+    signals = models.JSONField(
+        default=dict, blank=True, verbose_name='判定依据',
+        help_text='文件名是否相同、标题相似度、正文 Jaccard、LLM 复核结论等',
+    )
+    reason = models.CharField(
+        max_length=512, default='', blank=True, verbose_name='判定说明',
+    )
+    status = models.CharField(
+        max_length=16, choices=STATUS_CHOICES, default='pending',
+        db_index=True, verbose_name='确认状态',
+    )
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='version_decisions',
+        verbose_name='确认人',
+    )
+    decided_at = models.DateTimeField(null=True, blank=True, verbose_name='确认时间')
+    created_at = models.DateTimeField(
+        auto_now_add=True, db_index=True, verbose_name='创建时间',
+    )
+
+    class Meta:
+        db_table = 'doc_version_candidate'
+        verbose_name = '文档版本候选'
+        verbose_name_plural = verbose_name
+        ordering = ['-created_at']
+        db_table_comment = '文档版本候选表(status=pending待上传者确认；confirmed后old_doc.superseded_by=new_doc并隔离问答检索)'
+        constraints = [
+            models.UniqueConstraint(
+                fields=['new_doc', 'old_doc'],
+                name='uq_version_candidate_pair',
+            ),
+        ]
+
+    def __str__(self):
+        return f'{self.new_doc_id} 疑似替代 {self.old_doc_id} [{self.status}]'

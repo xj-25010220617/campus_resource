@@ -21,7 +21,7 @@ class FAQItemListSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'question', 'answer', 'category', 'category_name',
             'college', 'college_name', 'tags', 'frequency',
-            'status', 'created_at',
+            'status', 'created_at', 'updated_at',
         ]
 
 
@@ -57,6 +57,21 @@ class FAQItemDraftSerializer(serializers.ModelSerializer):
             'related_doc_ids', 'reviewed_by', 'reviewed_at',
             'created_at', 'updated_at',
         ]
+
+
+class FAQManageUpdateSerializer(serializers.ModelSerializer):
+    """管理端 FAQ 编辑序列化器（草稿 / 已发布 / 已驳回均可编辑）。
+
+    状态由发布/驳回动作维护，编辑不改变 status；updated_at 由 auto_now 自动刷新。
+    """
+
+    class Meta:
+        model = FAQItem
+        fields = [
+            'id', 'question', 'answer', 'category', 'college',
+            'tags', 'status', 'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'status', 'created_at', 'updated_at']
 
 
 class FAQItemPublishSerializer(serializers.Serializer):

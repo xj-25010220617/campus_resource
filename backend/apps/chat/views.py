@@ -488,6 +488,9 @@ class AskView(APIView):
 
         question = serializer.validated_data['question']
         conversation_id = serializer.validated_data.get('conversation_id')
+        scope_doc_ids = serializer.validated_data.get('doc_ids') or []
+        scope_tag_ids = serializer.validated_data.get('tag_ids') or []
+        has_scope_request = bool(scope_doc_ids or scope_tag_ids)
 
         # 处理匿名用户
         user = request.user if request.user.is_authenticated else None
@@ -624,7 +627,7 @@ class AskView(APIView):
             from apps.faq.models import FAQ
             from django.db.models import Q
             from django.db.models.functions import Length
-            if len(question) <= 15:
+            if len(question) <= 15 and not has_scope_request:
                 # 只匹配问题长度相近的 FAQ，避免用长 FAQ 匹配短问题
                 faq_hit = FAQ.objects.filter(
                     Q(question__iexact=question) | Q(question__contains=question),
@@ -640,12 +643,34 @@ class AskView(APIView):
             pass  # 没有 FAQ 表或字段不匹配，静默跳过
 
         # 3.2 RAG 检索（新版：硬过滤 + 双路召回 + 权限校验）
+        # @/# 范围限定：用户显式 @文档 / #标签 时，检索范围收窄到这些文档；
+        # 引用解析为空（不存在/无权限/未索引）时走拒答，不做任何检索。
+        doc_scope = None
+        scope_info = None
+        scope_refuse = False
+        if has_scope_request:
+            scope_info = rag.resolve_scope_doc_ids(
+                doc_ids=scope_doc_ids, tag_ids=scope_tag_ids,
+                user_context=user_context,
+            )
+            doc_scope = scope_info['doc_ids']
+            if not doc_scope:
+                scope_refuse = True
+                logger.info(
+                    '@/# 引用解析为空: user=%s docs=%s tags=%s',
+                    user_id, scope_doc_ids, scope_tag_ids,
+                )
+
         t_retrieve = time.time()
-        results = rag.retrieve(
-            question=question,
-            user_context=user_context,
-            parsed_filters=parsed,
-        )
+        if scope_refuse:
+            results = []
+        else:
+            results = rag.retrieve(
+                question=question,
+                user_context=user_context,
+                parsed_filters=parsed,
+                doc_scope=doc_scope,
+            )
         tracing.trace_log(
             'retrieve', 'hits=%d top=%s cost=%dms',
             len(results),
@@ -655,10 +680,13 @@ class AskView(APIView):
 
         # 3.2c 标签穷举：问题命中唯一标签且含列举意图时，返回该标签下
         #     全部文档清单（每文档一条），实现"用标签提问→快速定位文件"
+        #     （@/# 已显式限定范围时不再做标签穷举扩展）
         tag_list_name = None
-        tag_listing, tag_list_name = rag.try_expand_tag_listing(
-            question, user_context,
-        )
+        tag_listing = None
+        if doc_scope is None:
+            tag_listing, tag_list_name = rag.try_expand_tag_listing(
+                question, user_context,
+            )
         if tag_listing is not None:
             listed_ids = {r['doc_id'] for r in tag_listing}
             results = tag_listing + [
@@ -684,7 +712,13 @@ class AskView(APIView):
         # 3.2a 分角色严谨度：管理员（需精准引用）知识库无可靠命中时直接拒答，
         #      不调用 LLM、不联网兜底（联网摘要非知识库权威来源，不能作为管理员依据）。
         should_refuse = False
-        if rag.is_strict_role(user_role):
+        if scope_refuse:
+            # @/# 引用的文档全部不可用（不存在/无权限/未索引），直接拒答
+            should_refuse = True
+            refuse_text = '你引用的文档不存在、无权限或尚未完成索引，无法基于它们回答。'
+        else:
+            refuse_text = '知识库暂无相关资料，无法给出可靠回答。'
+        if not should_refuse and rag.is_strict_role(user_role):
             top_score = max((r.get('score', 0) for r in results), default=0.0)
             if not results or top_score < rag.ADMIN_MIN_SCORE:
                 should_refuse = True
@@ -702,6 +736,7 @@ class AskView(APIView):
         low_confidence = bool(results) and top_score < rag.WEB_SEARCH_MIN_SCORE
         if (
             not should_refuse
+            and doc_scope is None  # @/# 限定范围时不联网兜底，答案只来自引用文档
             and not rag._is_time_question(question)
             and (not results or low_confidence)
         ):
@@ -771,6 +806,29 @@ class AskView(APIView):
         # 5. 构造 Prompt（含历史上下文）
         llm_question = question
         suffix_parts = []
+        if scope_info and doc_scope:
+            scope_labels = []
+            if scope_info['doc_titles']:
+                titles = '、'.join(f'《{t}》' for t in scope_info['doc_titles'][:10])
+                scope_labels.append(f'文档 {titles}')
+            if scope_info['tag_names']:
+                names = '、'.join(f'「{n}」' for n in scope_info['tag_names'])
+                scope_labels.append(f'标签 {names} 下的文档')
+            suffix_parts.append(
+                f'（用户通过 @/# 指定了回答范围：{"，以及".join(scope_labels)}。'
+                f'请仅依据这些文档对应的参考资料作答；若参考资料中没有相关内容，'
+                f'请明确告知用户所引用的文档里找不到答案，不要编造或引用其他资料。）'
+            )
+            superseded_pairs = scope_info.get('superseded_pairs') or []
+            if superseded_pairs:
+                pairs_text = '；'.join(
+                    f'《{p["title"]}》已被《{p["superseded_by_title"]}》取代'
+                    for p in superseded_pairs
+                )
+                suffix_parts.append(
+                    f'（注意：用户引用的文档中有历史版本——{pairs_text}。'
+                    f'回答时请明确说明该内容来自旧版，并提示用户以新版为准。）'
+                )
         if tag_list_name:
             suffix_parts.append(
                 f'（系统已按标签「{tag_list_name}」检索到该标签下的全部文档'
@@ -833,7 +891,6 @@ class AskView(APIView):
 
                 # 流式生成（管理员低置信时拒绝生成，直接返回固定提示，不调用 LLM）
                 if should_refuse:
-                    refuse_text = '知识库暂无相关资料，无法给出可靠回答。'
                     first_token_ts = time.time()
                     collected_tokens.append(refuse_text)
                     yield _format_sse('token', {'content': refuse_text})
