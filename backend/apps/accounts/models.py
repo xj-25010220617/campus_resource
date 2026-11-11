@@ -70,6 +70,9 @@ class SchoolProfile(models.Model):
     history = models.TextField(blank=True, default='', verbose_name='历史沿革')
     mission = models.TextField(blank=True, default='', verbose_name='办学定位')
 
+    # —— 校领导班子（完整文本快照，便于 RAG 拼接）——
+    leaders_text = models.TextField(blank=True, default='', verbose_name='校领导班子(文本快照)')
+
     # —— 管理 ——
     updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
 
@@ -108,6 +111,7 @@ class College(models.Model):
     # —— 新增扩展字段 ——
     intro = models.TextField(blank=True, default='', verbose_name='学院简介')
     dean = models.CharField(max_length=64, blank=True, default='', verbose_name='院长')
+    secretary = models.CharField(max_length=64, blank=True, default='', verbose_name='党委书记/党总支书记')
     website = models.URLField(max_length=256, blank=True, default='', verbose_name='学院官网')
     founded_at = models.IntegerField(null=True, blank=True, verbose_name='成立/升格年份')
     features = models.TextField(blank=True, default='', verbose_name='特色亮点')

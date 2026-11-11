@@ -275,6 +275,15 @@ def build_school_knowledge_from_db() -> str:
         lines.append(f'- 校训：{sp.motto}')
     if sp.president:
         lines.append(f'- 校长：{sp.president}')
+    if sp.party_secretary:
+        lines.append(f'- 党委书记：{sp.party_secretary}')
+    # 完整领导班子
+    if sp.leaders_text:
+        lines.append('- 校领导班子：')
+        for _line in sp.leaders_text.strip().splitlines():
+            _line = _line.strip()
+            if _line:
+                lines.append(f'  - {_line}')
     if sp.school_code:
         lines.append(f'- 学校标识码：{sp.school_code}' +
                      (f'，四川省招生代码：{sp.admission_code_sichuan}' if sp.admission_code_sichuan else ''))
@@ -303,6 +312,8 @@ def build_school_knowledge_from_db() -> str:
             lines.append(f'### {i}. {c.name}（{c.code}）')
             if c.dean:
                 lines.append(f'- 院长：{c.dean}')
+            if c.secretary:
+                lines.append(f'- 党委书记：{c.secretary}')
             if c.intro:
                 lines.append(c.intro.strip())
             majors = list(c.majors.all().order_by('sort_order'))
