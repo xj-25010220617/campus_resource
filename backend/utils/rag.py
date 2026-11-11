@@ -6,9 +6,11 @@ RAG 检索管道
 import logging
 import threading
 import time
+from datetime import timedelta
 from typing import Dict, List, Optional, Tuple
 
 from django.conf import settings
+from django.utils import timezone
 
 from .llm import llm_client
 from .milvus import milvus_client
@@ -299,6 +301,8 @@ def build_school_knowledge_from_db() -> str:
         for i, c in enumerate(colleges, 1):
             lines.append('')
             lines.append(f'### {i}. {c.name}（{c.code}）')
+            if c.dean:
+                lines.append(f'- 院长：{c.dean}')
             if c.intro:
                 lines.append(c.intro.strip())
             majors = list(c.majors.all().order_by('sort_order'))
@@ -403,8 +407,12 @@ SYSTEM_PROMPT = """你是成都东软学院的AI智能助手，负责回答学�
 7. 回答使用中文，结构清晰
 8. 参考资料中标注的「上传时间」来自数据库 created_at，「索引完成时间」来自 indexed_at，
    均为 Asia/Shanghai 北京时间；回答文件上传/索引时间时只能引用这两个字段，
-   不得把文件内容里的日期、freshness_date 或当前时间当作上传时间。
-   若参考资料没有索引完成时间，必须说明“暂无索引完成时间/尚未完成索引”，禁止编造或拿上传时间代替。"""
+   不得把文件内容里的日期、发布日期/内容截止日期或当前时间当作上传时间。
+   若参考资料没有索引完成时间，必须说明“暂无索引完成时间/尚未完成索引”，禁止编造或拿上传时间代替。
+9. 同一事项存在多份资料且「发布日期」不同时，必须以发布日期最新的一份为准；
+   若因用户明确要求而引用较早版本，必须说明“该版本发布于 YYYY-MM-DD，可能已被 YYYY-MM-DD 版本更新”，
+   并优先给出最新版本的结论。
+   参考资料中标注「已被《X》替代」的文档属于历史版本，只能用于说明沿革，不得作为现行规定作答。"""
 
 
 # ------------------------------------------------------------------
@@ -418,6 +426,18 @@ RAG_TOP_K = 15
 RAG_SCORE_THRESHOLD = 0.30      # 低于此分数不放入 LLM 上下文（Rerank 精排后重新评估）
 RAG_REFERENCE_THRESHOLD = 0.65  # 低于此分数不作为引用展示
 CONTEXT_MAX_CHARS = 8000
+
+# ------------------------------------------------------------------
+# 时效加权（多份政策冲突时优先采用最新版本）
+# ------------------------------------------------------------------
+# 只对时效敏感的类目做衰减：教学课件/试题库/实验指导等资料没有"过期"概念，
+# 统一衰减会把多年积累的优质资料压到后面，反而降低召回质量。
+# 衰减公式：MIN_FACTOR + (1-MIN_FACTOR) * 0.5 ** (days / HALF_LIFE)
+#   今天发布 → 1.0；一年前 → 0.75；两年后趋近于 0.5（只降权，不淘汰）。
+RAG_RECENCY_ENABLED = True
+RAG_RECENCY_HALF_LIFE_DAYS = 365
+RAG_RECENCY_MIN_FACTOR = 0.5
+RAG_RECENCY_CATEGORY_NAMES = ('规章制度', '培养方案', '官网公告', '新闻动态')
 
 # ------------------------------------------------------------------
 # 二次检索（检索失败/低置信时扩大范围重试一次）
@@ -538,6 +558,7 @@ def build_rag_prompt(
             row['id']: row
             for row in KnowledgeDoc.objects.filter(id__in=doc_ids).values(
                 'id', 'created_at', 'indexed_at', 'freshness_date',
+                'superseded_by__title',
             )
         }
     for i, chunk in enumerate(chunks, 1):
@@ -555,7 +576,11 @@ def build_rag_prompt(
         ref_block += f'，索引完成时间：{indexed_time or "暂无（尚未完成索引）"}'
         freshness = doc_time.get('freshness_date')
         if freshness:
-            ref_block += f'，内容截止日期：{freshness.isoformat()}'
+            # 明确标注为「发布日期」：LLM 据此判断新旧版本，不得当作上传时间
+            ref_block += f'，发布日期：{freshness.isoformat()}'
+        superseded_title = doc_time.get('superseded_by__title')
+        if superseded_title:
+            ref_block += f'，已被《{superseded_title}》替代（历史版本）'
         ref_block += f'）\n{content}'
         total_chars += len(ref_block)
         if total_chars > max_chars:
@@ -1173,11 +1198,18 @@ def _merge_and_rerank(
 # ------------------------------------------------------------------
 # 文档授权范围（所有检索路径共用）
 # ------------------------------------------------------------------
-def authorized_knowledge_docs(user_context: Optional[dict] = None):
+def authorized_knowledge_docs(
+    user_context: Optional[dict] = None,
+    include_superseded: bool = False,
+):
     """返回当前用户可检索的 KnowledgeDoc QuerySet。
 
     授权逻辑必须在召回和引用签名前保持一致。超管可查看全部文档（其他超管上传的
     private 文档除外），其他角色仅可查看公开的学校/本部门或本人上传文档。
+
+    include_superseded=True 时不再排除已被新版本替代的旧版文档：仅用于
+    「用户显式 @ 了旧版文档」的场景，让用户能针对历史版本提问；默认 False，
+    保证常规检索与标签召回不会混入过期版本。
     """
     from django.db.models import Q
     from apps.knowledge.acl import school_level_q
@@ -1189,10 +1221,10 @@ def authorized_knowledge_docs(user_context: Optional[dict] = None):
     college_id = user_context.get('college_id')
     department_id = user_context.get('department_id')
 
-    qs = KnowledgeDoc.objects.filter(
-        review_status='approved',
-        superseded_by__isnull=True,  # 已被新版本替代的旧版不参与问答检索
-    )
+    qs = KnowledgeDoc.objects.filter(review_status='approved')
+    if not include_superseded:
+        # 已被新版本替代的旧版默认不参与问答检索
+        qs = qs.filter(superseded_by__isnull=True)
 
     # 超管上传的私密文档：仅该超管本人可见（与浏览链路 _admin_scope_filter 对齐）
     super_private = Q(visibility='private', uploader__role='super_admin')
@@ -1226,6 +1258,98 @@ def authorized_knowledge_docs(user_context: Optional[dict] = None):
     if user_id:
         conditions |= Q(uploader_id=user_id)
     return qs.filter(conditions)
+
+
+# ------------------------------------------------------------------
+# 提问范围限定（@文档 / #标签）
+# ------------------------------------------------------------------
+SCOPE_MAX_DOCS = 20  # @/# 引用限定的文档数量上限，超出截断
+
+
+def resolve_scope_doc_ids(
+    doc_ids: Optional[List[int]] = None,
+    tag_ids: Optional[List[int]] = None,
+    user_context: Optional[dict] = None,
+) -> dict:
+    """把用户 @ 的文档与 # 的标签解析为可检索的 doc_id 集合。
+
+    - @文档：取显式指定的 doc_id（允许是已被新版本替代的旧版，便于针对历史版本提问）；
+    - #标签：取这些标签（多个取并集）关联的全部文档，旧版仍被排除；
+    - 统一经过 authorized_knowledge_docs() 权限过滤 + status='indexed'，
+      与浏览/检索链路的授权口径保持一致（无权/未索引的引用静默剔除）。
+
+    Returns:
+        {'doc_ids': [...], 'doc_titles': [...], 'tag_names': [...],
+         'superseded_pairs': [{'title': 旧版标题, 'superseded_by_title': 新版标题}]}
+    """
+    from apps.knowledge.models import DocTag, Tag
+
+    user_context = user_context or {'role': 'user'}
+    requested_doc_ids = sorted({
+        int(i) for i in (doc_ids or []) if isinstance(i, int) and i > 0
+    })
+    requested_tag_ids = sorted({
+        int(i) for i in (tag_ids or []) if isinstance(i, int) and i > 0
+    })
+
+    tag_names: List[str] = []
+    if requested_tag_ids:
+        tag_names = list(
+            Tag.objects.filter(id__in=requested_tag_ids, is_deleted=False)
+            .values_list('name', flat=True)
+        )
+
+    tag_doc_ids: List[int] = []
+    if requested_tag_ids:
+        tag_doc_ids = list(
+            DocTag.objects.filter(
+                tag_id__in=requested_tag_ids,
+                tag__is_deleted=False,
+            ).values_list('doc_id', flat=True)
+        )
+
+    field_names = ('id', 'title', 'superseded_by_id', 'superseded_by__title')
+    docs_by_id = {}
+
+    # @显式指定的文档：允许旧版（用户可能就是要查历史版本）
+    if requested_doc_ids:
+        for row in (
+            authorized_knowledge_docs(user_context, include_superseded=True)
+            .filter(id__in=requested_doc_ids, status='indexed')
+            .values(*field_names)
+        ):
+            docs_by_id[row['id']] = row
+
+    # #标签带出的文档：仍排除已被替代的旧版，避免范围里混入过期内容
+    tag_doc_id_set = set(tag_doc_ids) - set(requested_doc_ids)
+    if tag_doc_id_set:
+        for row in (
+            authorized_knowledge_docs(user_context)
+            .filter(id__in=tag_doc_id_set, status='indexed')
+            .values(*field_names)
+        ):
+            docs_by_id[row['id']] = row
+
+    if not docs_by_id:
+        return {
+            'doc_ids': [], 'doc_titles': [], 'tag_names': tag_names,
+            'superseded_pairs': [],
+        }
+
+    docs = sorted(docs_by_id.values(), key=lambda d: d['id'])[:SCOPE_MAX_DOCS]
+    superseded_pairs = [
+        {
+            'title': d['title'],
+            'superseded_by_title': d.get('superseded_by__title') or '',
+        }
+        for d in docs if d.get('superseded_by_id')
+    ]
+    return {
+        'doc_ids': [d['id'] for d in docs],
+        'doc_titles': [d['title'] for d in docs],
+        'tag_names': tag_names,
+        'superseded_pairs': superseded_pairs,
+    }
 
 
 # ------------------------------------------------------------------
@@ -1532,9 +1656,29 @@ def _filter_by_permission(
 # ------------------------------------------------------------------
 # 加载 doc 元信息
 # ------------------------------------------------------------------
+def _recency_factor(publish_date, today=None) -> float:
+    """按发布日期计算时效因子，用于「多份政策冲突取最新」。
+
+    发布日期为空时返回 1.0（不做任何惩罚），避免历史数据因缺日期被系统性压分。
+    """
+    if not publish_date:
+        return 1.0
+    try:
+        days = max((today or timezone.localdate()) - publish_date, timedelta()).days
+    except TypeError:
+        return 1.0
+    return RAG_RECENCY_MIN_FACTOR + (1 - RAG_RECENCY_MIN_FACTOR) * (
+        0.5 ** (days / RAG_RECENCY_HALF_LIFE_DAYS)
+    )
+
+
 def _enrich_with_doc_meta(hits: List[dict], min_score: float) -> List[dict]:
     """
     关键词命中返回 content 字段（标题 + 描述拼接），用于补充检索结果。
+
+    同时对「时效敏感类目」按发布日期做衰减加权：同一主题的新旧两版政策，
+    新版分数更高、排到前面；旧版仍会保留（分数不低于 MIN_FACTOR 倍），
+    以便回答「去年的规定是什么」这类回溯问题。
     """
     from apps.knowledge.models import KnowledgeDoc
 
@@ -1544,23 +1688,30 @@ def _enrich_with_doc_meta(hits: List[dict], min_score: float) -> List[dict]:
             id__in=doc_ids, status='indexed',
         ).values(
             'id', 'title', 'source_type', 'source_url', 'file_name', 'oss_key',
-            'created_at', 'indexed_at', 'freshness_date',
+            'created_at', 'indexed_at', 'freshness_date', 'category__name',
         )
     }
 
+    today = timezone.localdate()
     results = []
     for hit in hits:
-        if hit['score'] < min_score:
-            continue
         if not hit.get('content'):
             continue
         did = int(hit['doc_id'])
         meta = doc_title_map.get(did, {})
+
+        score = hit['score']
+        category_name = meta.get('category__name') or ''
+        if RAG_RECENCY_ENABLED and category_name in RAG_RECENCY_CATEGORY_NAMES:
+            score *= _recency_factor(meta.get('freshness_date'), today)
+        if score < min_score:
+            continue
+
         results.append({
             'doc_id': did,
             'doc_title': meta.get('title') or hit.get('doc_title', '未知文档'),
             'content': hit['content'],
-            'score': round(hit['score'], 4),
+            'score': round(score, 4),
             'page': hit.get('page', 0),
             'chunk_index': hit.get('chunk_index'),
             'vector_id': hit.get('vector_id', ''),
@@ -1576,10 +1727,10 @@ def _enrich_with_doc_meta(hits: List[dict], min_score: float) -> List[dict]:
                 meta['freshness_date'].isoformat() if meta.get('freshness_date') else None
             ),
         })
-        if len(results) >= 5:
-            break
 
-    return results
+    # 衰减后分数顺序可能变化，必须重排后再取 Top-5
+    results.sort(key=lambda r: r['score'], reverse=True)
+    return results[:5]
 
 
 # ------------------------------------------------------------------
@@ -1836,10 +1987,13 @@ def _retrieve_pipeline(
     min_score: float,
     rewrite_questions: Optional[List[str]] = None,
     apply_rerank: bool = True,
+    doc_scope: Optional[List[int]] = None,
 ) -> List[dict]:
     """执行一次完整检索管道（硬过滤 → 多路召回 → 合并精排 → 权限校验）。
 
     retrieve() 与 retrieve_wider() 共用此管道，避免二次检索重复实现一套逻辑。
+    doc_scope 非 None 时启用 @/# 范围限定：候选集合直接取用户引用的文档，
+    跳过 SQL 硬过滤、时间降级重试与标题兜底搜索。
     """
     parsed_filters = dict(parsed_filters or {})
 
@@ -1854,13 +2008,18 @@ def _retrieve_pipeline(
             logger.debug('Query 改写: %s -> %s', question[:30], rewrite_questions)
 
     # 1. SQL 硬过滤 → 候选 ID 列表
-    candidate_ids = _apply_hard_filters(parsed_filters, user_context, top_k=500)
+    if doc_scope is not None:
+        # @/# 限定范围：候选即用户引用且通过权限/索引校验的文档
+        candidate_ids = list(doc_scope)
+        logger.debug('范围限定检索: %d 个指定文档', len(candidate_ids))
+    else:
+        candidate_ids = _apply_hard_filters(parsed_filters, user_context, top_k=500)
 
     # 1b. 时间条件清零时降级去掉时间重试：
     #     "15级/2015届"指内容的届别年份，而 time_range 过滤的是文档上传
     #     时间（created_at）。意图解析把届别映射成 time_range 会误杀全部
     #     候选（历史届别文档都是近期上传的），宁可放宽时间也不能零召回。
-    if not candidate_ids and parsed_filters.get('time_range'):
+    if doc_scope is None and not candidate_ids and parsed_filters.get('time_range'):
         stripped = {k: v for k, v in parsed_filters.items() if k != 'time_range'}
         candidate_ids = _apply_hard_filters(stripped, user_context, top_k=500)
         if candidate_ids:
@@ -1870,6 +2029,9 @@ def _retrieve_pipeline(
             )
 
     if not candidate_ids:
+        if doc_scope is not None:
+            # 限定范围内无候选：不做标题兜底，直接空召回
+            return []
         logger.info(f'硬过滤后无候选，尝试标题降级搜索: question={question[:50]}')
         title_matches = _fallback_title_search(question, user_context, top_k=5)
         if title_matches:
@@ -1965,8 +2127,8 @@ def _retrieve_pipeline(
             len(keyword_table_hits), len(chunk_hits), len(tag_hits),
         )
 
-    # 6. 兜底：向量检索无结果时，按标题/描述关键词搜索
-    if not results:
+    # 6. 兜底：向量检索无结果时，按标题/描述关键词搜索（@/# 限定范围时不兜底）
+    if not results and doc_scope is None:
         title_matches = _fallback_title_search(question, user_context, top_k=5)
         if title_matches:
             logger.info(f'向量检索无结果，标题降级搜索命中 {len(title_matches)} 条')
@@ -2008,12 +2170,14 @@ def retrieve(
     parsed_filters: Optional[dict] = None,
     top_k: int = RAG_TOP_K,
     min_score: float = RAG_SCORE_THRESHOLD,
+    doc_scope: Optional[List[int]] = None,
 ) -> List[dict]:
     """
     检索管道（三层检索升级版）：硬过滤 → 双路召回 → 关键词权重 → 权限校验。
 
     首次结果为空或低置信时，自动扩大范围重试一次（RAG_RETRY_MAX_ATTEMPTS），
-    两次结果按现有分数合并去重后返回。
+    两次结果按现有分数合并去重后返回。doc_scope 非 None 时按用户 @/# 引用的
+    文档限定候选范围，此时不做二次检索（范围已由用户显式指定，扩大即越权）。
 
     Args:
         question: 用户问题
@@ -2021,6 +2185,7 @@ def retrieve(
         parsed_filters: parse() 输出的过滤条件
         top_k: Milvus 召回数量
         min_score: 最低分阈值（低于此分数不返回）
+        doc_scope: @/# 解析后的 doc_id 列表（None 表示不限定范围）
 
     Returns:
         [{'doc_id': int, 'doc_title': str, 'content': str, 'score': float, 'page': int}, ...]
@@ -2047,11 +2212,13 @@ def retrieve(
         top_k=top_k,
         min_score=min_score,
         rewrite_questions=rewrite_questions,
+        doc_scope=doc_scope,
     )
 
     # 二次检索：只在首次为空/低置信时触发，次数受 RAG_RETRY_MAX_ATTEMPTS 限制。
+    # @/# 限定范围时不重试——范围由用户显式指定，扩大范围违背用户意图。
     attempts = 0
-    while attempts < RAG_RETRY_MAX_ATTEMPTS:
+    while doc_scope is None and attempts < RAG_RETRY_MAX_ATTEMPTS:
         need_retry, reason = _should_retry_retrieval(results)
         if not need_retry:
             break
