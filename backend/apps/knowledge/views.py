@@ -54,6 +54,7 @@ from .serializers import (
     FILE_SIZE_LIMITS,
     IMAGE_FILE_TYPES,
     DocRelationSerializer,
+    DocRelationCreateSerializer,
     DocTagCreateSerializer,
     DocTagSerializer,
     FileUploadSerializer,
@@ -957,6 +958,59 @@ class DocRelationListView(APIView):
         )
         relations = doc.outgoing_relations.filter(is_deleted=False).select_related('target_doc').order_by('-created_at')
         return Response(DocRelationSerializer(relations, many=True).data)
+
+    def post(self, request, doc_id):
+        """手动创建文档关联边（文件网建边）
+
+        POST /api/knowledge/docs/{doc_id}/relations/
+        请求参数：target_doc_id (int), relation_type (choices)
+        权限：与删除一致——super_admin 全放行，其余仅允许为自己上传的文档建边；
+             目标文档必须在该用户可浏览范围内（防止通过建边探测无权文档）。
+        行为：禁止自环；已存在的同类型边幂等返回；软删过的同类型边恢复。
+        """
+        if request.user.role not in ('admin', 'super_admin'):
+            raise PermissionDenied('仅管理员可创建文档关联')
+
+        source_doc = get_object_or_404(
+            KnowledgeDocListView._admin_scope_filter(
+                KnowledgeDoc.objects.all(), request.user,
+            ),
+            id=doc_id,
+        )
+        if request.user.role != 'super_admin' and source_doc.uploader_id != request.user.id:
+            raise PermissionDenied('只能为自己上传的文档创建关联')
+
+        ser = DocRelationCreateSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        target_id = ser.validated_data['target_doc_id']
+        relation_type = ser.validated_data['relation_type']
+
+        if target_id == source_doc.id:
+            raise ValidationError({'detail': '不能关联文档自身'})
+
+        target_doc = get_object_or_404(
+            KnowledgeDocListView._admin_scope_filter(
+                KnowledgeDoc.objects.all(), request.user,
+            ),
+            id=target_id,
+        )
+
+        relation, created = DocRelation.objects.get_or_create(
+            source_doc=source_doc, target_doc=target_doc, relation_type=relation_type,
+            defaults={'created_by': request.user},
+        )
+        if not created and relation.is_deleted:
+            # 软删过的同类型边直接恢复，避免唯一约束冲突报错
+            relation.is_deleted = False
+            relation.deleted_at = None
+            relation.created_by = request.user
+            relation.save(update_fields=['is_deleted', 'deleted_at', 'created_by', 'updated_at'])
+            created = True
+
+        return Response(
+            DocRelationSerializer(relation).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
 
 
 @extend_schema(

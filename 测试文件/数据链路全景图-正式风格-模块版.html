@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>校园知识问答平台 · 数据链路全景图（模块版）</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    width:1440px;
+    font-family:"Microsoft YaHei","PingFang SC","Segoe UI",sans-serif;
+    background:#eef0f3;
+    color:#2f3742;
+    padding:36px 40px;
+    -webkit-font-smoothing:antialiased;
+  }
+  .main {
+    background:#f7f8fa;
+    border:1px solid #d5dae1;
+    border-radius:6px;
+    padding:32px 34px 28px;
+  }
+  /* ===== 标题 ===== */
+  h1 {
+    text-align:center;
+    font-size:28px;
+    font-weight:700;
+    color:#1f3a56;
+    letter-spacing:1.2px;
+  }
+  .subtitle {
+    text-align:center;
+    font-size:13.5px;
+    color:#5b6675;
+    margin-top:10px;
+    padding-bottom:20px;
+    border-bottom:1px solid #d9dee5;
+    letter-spacing:.3px;
+  }
+  /* ===== 三栏 ===== */
+  .cols {
+    display:grid;
+    grid-template-columns:1fr 100px 1.32fr 100px 1fr;
+    margin-top:24px;
+    align-items:stretch;
+  }
+  .col { display:flex; flex-direction:column; height:100%; }
+  .col-head {
+    background:#1f3a56;
+    color:#fff;
+    border-radius:5px 5px 0 0;
+    padding:14px 18px 13px;
+  }
+  .step {
+    display:inline-flex;
+    align-items:center;
+    justify-content:center;
+    width:24px; height:24px;
+    border-radius:4px;
+    background:rgba(255,255,255,.16);
+    color:#dbe8f5;
+    font-size:11.5px;
+    font-weight:700;
+    letter-spacing:.5px;
+  }
+  .col-head h2 { font-size:17px; font-weight:700; letter-spacing:.4px; margin-top:8px; }
+  .col-head p { font-size:12px; color:#c3d0de; margin-top:5px; line-height:1.5; }
+  .col-body {
+    display:flex;
+    flex-direction:column;
+    justify-content:space-between;
+    background:#fff;
+    border:1px solid #d5dae1;
+    border-top:none;
+    border-radius:0 0 5px 5px;
+    padding:18px;
+    flex:1;
+  }
+  /* ===== 卡片 ===== */
+  .card {
+    flex:none;
+    border:1px solid #d9dee5;
+    border-left:3px solid #4a6b8a;
+    border-radius:4px;
+    background:#fbfcfd;
+    padding:14px 16px;
+  }
+  .card h3 { font-size:15.5px; color:#1f3a56; font-weight:700; letter-spacing:.3px; }
+  .card p { font-size:12.5px; color:#5b6675; line-height:1.7; margin-top:7px; }
+  /* 列内箭头 */
+  .flow-arrow {
+    text-align:center;
+    font-size:11.5px;
+    color:#7d8b9c;
+    letter-spacing:.5px;
+  }
+  .flow-arrow b { color:#1f3a56; font-weight:600; }
+  /* 存储 / 引擎网格 */
+  .chips-grid {
+    display:grid;
+    grid-template-columns:1fr 1.15fr;
+    grid-auto-rows:min-content;
+    gap:10px;
+  }
+  .chip {
+    border:1px solid #d5dae1;
+    border-left:3px solid #4a6b8a;
+    border-radius:4px;
+    background:#fbfcfd;
+    padding:12px 14px;
+  }
+  .chip h4 { font-size:14px; color:#1f3a56; font-weight:700; }
+  .chip p { font-size:12px; color:#5b6675; line-height:1.6; margin-top:5px; }
+  .hint {
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    font-size:11px;
+    color:#7d8b9c;
+    letter-spacing:.4px;
+  }
+  /* 核心作用框 */
+  .core-box {
+    border:1px solid #b9c6d4;
+    background:#eef3f8;
+    border-radius:4px;
+    padding:13px 16px;
+    text-align:center;
+  }
+  .core-box h4 { font-size:14px; color:#1f3a56; font-weight:700; }
+  .core-box p { font-size:12px; color:#42505f; line-height:1.65; margin-top:5px; }
+  /* 标签行 */
+  .tags { display:flex; gap:6px; }
+  .tag {
+    flex:1;
+    min-width:0;
+    border:1px solid #d5dae1;
+    background:#f4f6f9;
+    border-radius:4px;
+    text-align:center;
+    padding:10px 3px;
+  }
+  .tag b { display:block; font-size:12.5px; color:#1f3a56; font-weight:700; }
+  .tag span { display:block; font-size:10px; color:#7d8b9c; margin-top:3px; white-space:nowrap; }
+  /* ===== 栏间连接器 ===== */
+  .connector { padding-top:104px; display:flex; flex-direction:column; align-items:center; gap:34px; }
+  .link {
+    width:100%;
+    text-align:center;
+    font-size:11px;
+    line-height:1.7;
+    color:#42505f;
+    padding:9px 6px;
+    border-radius:4px;
+  }
+  .link b { color:#1f3a56; font-weight:600; }
+  .link.solid { border:1px solid #b9c6d4; background:#eef3f8; }
+  .link.solid::after { content:"⟶"; display:block; color:#4a6b8a; font-size:15px; margin-top:1px; }
+  .link.dashed { border:1px dashed #a9b4c2; background:#fff; color:#5b6675; }
+  .link.dashed::after { content:"- - ⟶"; display:block; color:#8d99a9; font-size:12px; letter-spacing:-1px; margin-top:1px; }
+  /* ===== 底部总结 ===== */
+  .summary {
+    display:grid;
+    grid-template-columns:120px 1fr 24px 1fr 24px 1fr 24px 1fr 24px 1.25fr;
+    gap:0;
+    align-items:stretch;
+    margin-top:24px;
+    border:1px solid #d5dae1;
+    border-radius:5px;
+    overflow:hidden;
+    background:#fff;
+  }
+  .sum-title {
+    background:#1f3a56;
+    color:#fff;
+    display:flex; align-items:center; justify-content:center;
+    font-size:16px; font-weight:700;
+    text-align:center; line-height:1.5;
+    padding:14px 8px;
+  }
+  .sum-box { padding:14px 10px; text-align:center; border-left:1px solid #e3e8ee; }
+  .sum-box h4 { font-size:13.5px; color:#1f3a56; font-weight:700; margin-bottom:6px; }
+  .sum-box p { font-size:11.5px; color:#5b6675; line-height:1.75; }
+  .sum-arrow { display:flex; align-items:center; justify-content:center; color:#4a6b8a; font-size:16px; }
+  .sum-value { padding:14px 16px; border-left:1px solid #e3e8ee; background:#f4f6f9; }
+  .sum-value h4 { font-size:13px; color:#1f3a56; font-weight:700; margin-bottom:6px; text-align:center; }
+  .sum-value li { list-style:none; font-size:11.5px; color:#42505f; line-height:1.8; }
+  .sum-value li::before { content:"✓ "; color:#4a6b8a; font-weight:700; }
+  /* ===== 核心结论 ===== */
+  .conclusion {
+    margin-top:18px;
+    background:#2a4a68;
+    border-radius:5px;
+    padding:14px 22px;
+    text-align:center;
+    font-size:13.5px;
+    color:#dbe4ed;
+    line-height:1.85;
+    letter-spacing:.3px;
+  }
+  .conclusion b { color:#fff; font-weight:700; }
+  /* ===== 基础设施支撑层 ===== */
+  .infra-section {
+    margin-top:28px;
+    border:1px solid #b9c6d4;
+    border-radius:5px;
+    background:#fff;
+    overflow:hidden;
+  }
+  .infra-head {
+    background:linear-gradient(135deg,#2a4a68,#3a5d7d);
+    color:#fff;
+    padding:12px 20px 11px;
+    display:flex;
+    align-items:center;
+    gap:12px;
+  }
+  .infra-head .step { background:rgba(255,255,255,.2); }
+  .infra-head h2 { font-size:16px; font-weight:700; letter-spacing:.3px; }
+  .infra-head p { font-size:11.5px; color:#c3d0de; margin-left:auto; }
+  .infra-body {
+    padding:18px 20px 16px;
+    background:#f4f6f9;
+  }
+  .infra-connector {
+    display:flex;
+    justify-content:space-between;
+    padding:0 60px 4px;
+    margin-bottom:6px;
+  }
+  .infra-connector .infra-arrow {
+    text-align:center;
+    font-size:11px;
+    color:#7d8b9c;
+    width:33%;
+  }
+  .infra-arrow .down { display:block; color:#4a6b8a; font-size:16px; line-height:1; margin-bottom:2px; }
+  .infra-grid {
+    display:grid;
+    grid-template-columns:repeat(5,1fr);
+    gap:10px;
+  }
+  .infra-chip {
+    background:#fbfcfd;
+    border:1px solid #d5dae1;
+    border-radius:5px;
+    padding:12px 14px;
+    position:relative;
+  }
+  .infra-chip .ic-icon {
+    position:absolute;
+    top:10px; right:12px;
+    width:28px; height:28px;
+    border-radius:50%;
+    display:flex; align-items:center; justify-content:center;
+    font-size:14px; font-weight:700;
+  }
+  .infra-chip.cpu .ic-icon   { background:#e3f2fd; color:#1565c0; }
+  .infra-chip.gpu .ic-icon   { background:#fce4ec; color:#c2185b; }
+  .infra-chip.disk .ic-icon  { background:#e8f5e9; color:#2e7d32; }
+  .infra-chip.net .ic-icon   { background:#fff3e0; color:#ef6c00; }
+  .infra-chip.mq .ic-icon    { background:#f3e5f5; color:#7b1fa2; }
+  .infra-chip h4 { font-size:14px; color:#1f3a56; font-weight:700; padding-right:32px; }
+  .infra-chip p { font-size:11.5px; color:#5b6675; line-height:1.7; margin-top:5px; }
+  .infra-chip .hw-tag {
+    display:inline-block;
+    font-size:9.5px;
+    padding:1px 6px;
+    border-radius:3px;
+    margin-top:6px;
+    font-weight:600;
+    letter-spacing:.3px;
+  }
+  .infra-chip .hw-tag.ok  { background:#e8f5e9; color:#2e7d32; border:1px solid #a5d6a7; }
+  .infra-chip .hw-tag.opt { background:#fff3e0; color:#e65100; border:1px solid #ffcc80; }
+  .infra-chip .hw-tag.warn{ background:#ffebee; color:#c62828; border:1px solid #ef9a9a; }
+  /* ===== 硬件行（板块最开头，醒目锚点）===== */
+  .hw-row {
+    display:flex;
+    align-items:center;
+    gap:8px;
+    margin-bottom:6px;
+    padding-bottom:6px;
+    border-bottom:1px dashed #d9dee5;
+  }
+  .hw-emoji {
+    font-size:18px;
+    line-height:1;
+  }
+  .hw-label {
+    font-size:12.5px;
+    font-weight:700;
+    letter-spacing:.5px;
+    padding:2px 8px;
+    border-radius:3px;
+    line-height:1.4;
+  }
+  /* 硬件类型颜色 */
+  .hw-label.cpu    { background:#e3f2fd; color:#1565c0; border:1px solid #90caf9; }
+  .hw-label.gpu    { background:#fce4ec; color:#c2185b; border:1px solid #f48fb1; }
+  .hw-label.disk   { background:#e8f5e9; color:#2e7d32; border:1px solid #a5d6a7; }
+  .hw-label.net    { background:#fff3e0; color:#ef6c00; border:1px solid #ffcc80; }
+  .hw-label.memory { background:#fff8e1; color:#f57f17; border:1px solid #ffe082; }
+  .hw-label.mic    { background:#f3e5f5; color:#6a1b9a; border:1px solid #ce93d8; }
+  .hw-label.mq     { background:#ede7f6; color:#4527a0; border:1px solid #b39ddb; }
+  .hw-label.opt    { background:#fffde7; color:#f57f17; border:1px solid #fff176; }
+  .hw-label.warn   { background:#ffebee; color:#c62828; border:1px solid #ef9a9a; }
+  .hw-sep { color:#b0bec5; font-size:11px; margin:0 2px; }
+  /* 支撑关系表 */
+  .infra-mapping {
+    margin-top:12px;
+    border-top:1px dashed #b9c6d4;
+    padding-top:10px;
+    font-size:11px;
+    color:#5b6675;
+    display:grid;
+    grid-template-columns:repeat(3,1fr);
+    gap:8px 16px;
+  }
+  .infra-mapping .imap-item { line-height:1.7; }
+  .infra-mapping .imap-item b { color:#1f3a56; font-size:11.5px; }
+</style>
+</head>
+<body>
+<div class="main">
+  <h1>校园知识问答平台 · 知识汇入、知识中枢与 AI 问答的数据链路全景图</h1>
+  <div class="subtitle">多源汇入 + 审核治理 + 知识检索 + 反馈回流，共同支撑可信、可溯、越用越准的校园 AI 问答</div>
+
+  <div class="cols">
+    <!-- 数据源侧 -->
+    <div class="col">
+      <div class="col-head">
+        <span class="step">01</span>
+        <h2>数据源侧：知识汇入（数据原料）</h2>
+        <p>提供多样、持续更新、经过治理的知识原料</p>
+      </div>
+      <div class="col-body">
+        <div class="card">
+          <div class="hw-row">
+            <span class="hw-emoji">🌐</span><span class="hw-label net">网络</span>
+            <span class="hw-emoji">☁️</span><span class="hw-label disk">OSS</span>
+          </div>
+          <h3>文档上传（人工汇入）</h3>
+          <p>管理员后台上传 → OSS 存储 → AI 补标题分类</p>
+        </div>
+        <div class="flow-arrow"><b>自动采集</b> ↓</div>
+        <div class="card">
+          <div class="hw-row">
+            <span class="hw-emoji">🌐</span><span class="hw-label net">网络</span>
+            <span class="hw-emoji">🖥️</span><span class="hw-label cpu">CPU</span>
+            <span class="hw-emoji">📨</span><span class="hw-label mq">Redis</span>
+          </div>
+          <h3>官网爬虫（机器汇入）</h3>
+          <p>Celery 定时 · 每天 04:00 + 周日全量 · 免审直入知识库</p>
+        </div>
+        <div class="flow-arrow"><b>沉淀回流</b> ↓</div>
+        <div class="card">
+          <div class="hw-row">
+            <span class="hw-emoji">🖥️</span><span class="hw-label cpu">CPU</span>
+            <span class="hw-emoji">🧠</span><span class="hw-label gpu">可选 GPU</span>
+          </div>
+          <h3>问答沉淀（数据再生产）</h3>
+          <p>每周一 03:00 自动聚类 · 高频问答 → FAQ / 答疑池</p>
+        </div>
+        <div class="tags">
+          <div class="tag"><b>来源多元</b><span>三渠道汇入</span></div>
+          <div class="tag"><b>自动治理</b><span>AI 打标去重</span></div>
+          <div class="tag"><b>自我进化</b><span>问答反哺</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 连接器 1 -->
+    <div class="connector">
+      <div class="link solid"><b>审核通过</b><br>向量化入库</div>
+      <div class="link dashed"><b>爬虫免审</b><br>直接入库</div>
+    </div>
+
+    <!-- 知识中枢 -->
+    <div class="col">
+      <div class="col-head">
+        <span class="step">02</span>
+        <h2>知识中枢：加工与存储（数据载体）</h2>
+        <p>将原始文档转化为结构化、可检索、可溯源的知识</p>
+      </div>
+      <div class="col-body">
+        <div class="chips-grid">
+          <div class="chip">
+            <div class="hw-row">
+              <span class="hw-emoji">💾</span><span class="hw-label disk">磁盘</span>
+            </div>
+            <h4>Milvus 向量索引</h4>
+            <p>语义检索主力 · 嵌入式 Lite</p>
+          </div>
+          <div class="chip">
+            <div class="hw-row">
+              <span class="hw-emoji">🖥️</span><span class="hw-label cpu">CPU</span>
+            </div>
+            <h4>解析引擎</h4>
+            <p>多格式与扫描件解析 · OCR 兜底</p>
+          </div>
+          <div class="chip">
+            <div class="hw-row">
+              <span class="hw-emoji">💾</span><span class="hw-label disk">磁盘</span>
+              <span class="hw-emoji">🧠</span><span class="hw-label memory">内存</span>
+            </div>
+            <h4>MySQL 元数据</h4>
+            <p>文档 · 分块 · 审核状态</p>
+          </div>
+          <div class="chip">
+            <div class="hw-row">
+              <span class="hw-emoji">🖥️</span><span class="hw-label cpu">CPU</span>
+            </div>
+            <h4>分块引擎</h4>
+            <p>语义分块 · 表格不裁断</p>
+          </div>
+          <div class="chip">
+            <div class="hw-row">
+              <span class="hw-emoji">🌐</span><span class="hw-label net">网络</span>
+              <span class="hw-emoji">☁️</span><span class="hw-label disk">云存储</span>
+            </div>
+            <h4>OSS 对象存储</h4>
+            <p>原始文件留存 · 阿里云</p>
+          </div>
+          <div class="chip">
+            <div class="hw-row">
+              <span class="hw-emoji">🖥️</span><span class="hw-label cpu">CPU</span>
+              <span class="hw-emoji">🧠</span><span class="hw-label gpu">可选 GPU</span>
+            </div>
+            <h4>向量化</h4>
+            <p>本地 BGE / 云端百炼 两后端</p>
+          </div>
+          <div class="hint">向量 · 元数据 · 原件&nbsp;&nbsp;三层分工</div>
+          <div class="chip">
+            <div class="hw-row">
+              <span class="hw-emoji">🖥️</span><span class="hw-label cpu">CPU</span>
+              <span class="hw-emoji">📨</span><span class="hw-label mq">Redis</span>
+            </div>
+            <h4>索引管道</h4>
+            <p>Celery 异步 · 解析到入库</p>
+          </div>
+        </div>
+        <div class="core-box">
+          <h4>核心作用：先审核后索引</h4>
+          <p>未经审核的文档不进入检索，问答中完全不可见</p>
+        </div>
+        <div class="flow-arrow">↑ <b>提供知识服务</b></div>
+        <div class="tags">
+          <div class="tag"><b>知识检索</b><span>多路召回融合</span></div>
+          <div class="tag"><b>引用溯源</b><span>文档 + 页码</span></div>
+          <div class="tag"><b>数据查询</b><span>结构化查询</span></div>
+          <div class="tag"><b>表格问答</b><span>表格智能问答</span></div>
+          <div class="tag"><b>FAQ 快答</b><span>短问题直返</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 连接器 2 -->
+    <div class="connector">
+      <div class="link solid"><b>多路召回</b><br>输出知识上下文</div>
+      <div class="link dashed"><b>低置信兜底</b><br>拒答 / 联网搜索</div>
+    </div>
+
+    <!-- AI 问答侧 -->
+    <div class="col">
+      <div class="col-head">
+        <span class="step">03</span>
+        <h2>AI 问答侧：价值输出（数据消费）</h2>
+        <p>用户以自然语言获取知识，使用数据反哺系统进化</p>
+      </div>
+      <div class="col-body">
+        <div class="card">
+          <div class="hw-row">
+            <span class="hw-emoji">🌐</span><span class="hw-label net">网络</span>
+            <span class="hw-emoji">🧠</span><span class="hw-label memory">LLM API</span>
+          </div>
+          <h3>一次问答的完整链路</h3>
+          <p>敏感过滤 → 意图分流 → 知识检索 → 流式生成</p>
+        </div>
+        <div class="flow-arrow"><b>语音问答</b> ↓</div>
+        <div class="card">
+          <div class="hw-row">
+            <span class="hw-emoji">🎤</span><span class="hw-label mic">麦克风</span>
+            <span class="hw-emoji">🖥️</span><span class="hw-label cpu">CPU</span>
+            <span class="hw-emoji">🧠</span><span class="hw-label gpu">可选 GPU</span>
+          </div>
+          <h3>ASR 语音识别</h3>
+          <p>faster-whisper · 自动检测 CUDA<br>有 GPU 用 float16，无则 int8</p>
+        </div>
+        <div class="flow-arrow"><b>精排加速</b> ↓</div>
+        <div class="card">
+          <div class="hw-row">
+            <span class="hw-emoji">🧠</span><span class="hw-label gpu">需 GPU</span>
+            <span class="hw-emoji">⚠️</span><span class="hw-label warn">当前关闭</span>
+          </div>
+          <h3>Cross-Encoder Reranker</h3>
+          <p>bge-reranker-v2-m3 精排 Top-N<br>纯 CPU 单次 40~60s 超时，GPU 开启</p>
+        </div>
+        <div class="tags">
+          <div class="tag"><b>可信可溯</b><span>答案带引用</span></div>
+          <div class="tag"><b>流式体验</b><span>逐字输出</span></div>
+          <div class="tag"><b>权限隔离</b><span>学院 × 部门隔离</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 基础设施支撑层 -->
+  <div class="infra-section">
+    <div class="infra-head">
+      <span class="step">HW</span>
+      <h2>基础设施支撑层：硬件与平台依赖</h2>
+      <p>横跨三栏 · CPU 必选 · GPU 可选加速 · 网络/存储/消息队列缺一不可</p>
+    </div>
+    <div class="infra-body">
+      <div class="infra-connector">
+        <div class="infra-arrow"><span class="down">▲</span>数据源侧<br>爬虫/上传/沉淀</div>
+        <div class="infra-arrow"><span class="down">▲</span>知识中枢<br>解析/存储/检索</div>
+        <div class="infra-arrow"><span class="down">▲</span>AI 问答侧<br>生成/语音/精排</div>
+      </div>
+      <div class="infra-grid">
+        <div class="infra-chip cpu">
+          <div class="hw-row" style="border-bottom:1px dashed #bbdefb;">
+            <span class="hw-emoji">🖥️</span><span class="hw-label cpu">CPU</span>
+          </div>
+          <h4>CPU 计算<span class="hw-tag ok">必选</span></h4>
+          <p>解析引擎 · 分块引擎 · 本地 Embedding<br>ASR int8 · Reranker 兜底 · 问答生成</p>
+        </div>
+        <div class="infra-chip gpu">
+          <div class="hw-row" style="border-bottom:1px dashed #f8bbd0;">
+            <span class="hw-emoji">🧠</span><span class="hw-label gpu">GPU</span>
+          </div>
+          <h4>GPU 加速<span class="hw-tag opt">可选</span></h4>
+          <p>ASR float16 半精度提速<br>Cross-Encoder Reranker 精排开启<br>本地 Embedding 加速</p>
+        </div>
+        <div class="infra-chip disk">
+          <div class="hw-row" style="border-bottom:1px dashed #c8e6c9;">
+            <span class="hw-emoji">💾</span><span class="hw-label disk">磁盘</span>
+          </div>
+          <h4>磁盘存储<span class="hw-tag ok">必选</span></h4>
+          <p>MySQL 8.0 · Milvus Lite 向量库<br>Django 文件缓存 · 模型权重缓存</p>
+        </div>
+        <div class="infra-chip net">
+          <div class="hw-row" style="border-bottom:1px dashed #ffe0b2;">
+            <span class="hw-emoji">🌐</span><span class="hw-label net">网络</span>
+          </div>
+          <h4>网络 / 云服务<span class="hw-tag ok">必选</span></h4>
+          <p>阿里云 OSS 对象存储 · 百炼 LLM API<br>官网爬虫 · SSO · 钉钉扫码</p>
+        </div>
+        <div class="infra-chip mq">
+          <div class="hw-row" style="border-bottom:1px dashed #d1c4e9;">
+            <span class="hw-emoji">📨</span><span class="hw-label mq">消息队列</span>
+          </div>
+          <h4>Redis / 缓存<span class="hw-tag ok">必选</span></h4>
+          <p>Celery Broker + Result Backend<br>Celery Beat 定时调度<br>Django 文件缓存</p>
+        </div>
+      </div>
+      <div class="infra-mapping">
+        <div class="imap-item"><b>数据源侧 →</b> 爬虫依赖 Redis 调度 + 网络访问；上传走 OSS；沉淀依赖 CPU 聚类</div>
+        <div class="imap-item"><b>知识中枢 →</b> 全栈最重：CPU（解析/分块/Embedding）× 磁盘（MySQL/Milvus）× 网络（OSS）</div>
+        <div class="imap-item"><b>AI 问答侧 →</b> 网络（LLM API）必选；ASR/Reranker 有 GPU 开 float16，无则 CPU int8</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 底部总结 -->
+  <div class="summary">
+    <div class="sum-title">数据链路<br>总结</div>
+    <div class="sum-box">
+      <h4>知识汇入</h4>
+      <p>上传 / 爬虫 / 问答沉淀<br>提供数据原料</p>
+    </div>
+    <div class="sum-arrow">→</div>
+    <div class="sum-box">
+      <h4>知识中枢</h4>
+      <p>审核治理 → 解析分块<br>→ 向量化入库</p>
+    </div>
+    <div class="sum-arrow">→</div>
+    <div class="sum-box">
+      <h4>AI 问答</h4>
+      <p>检索召回 + 流式生成<br>输出可信回答</p>
+    </div>
+    <div class="sum-arrow">→</div>
+    <div class="sum-box">
+      <h4>反馈回流</h4>
+      <p>点赞点踩 / 提问日志<br>→ FAQ / 答疑池 → 新知识</p>
+    </div>
+    <div class="sum-arrow">→</div>
+    <div class="sum-value">
+      <h4>形成数据闭环价值</h4>
+      <ul>
+        <li>先审后索引，知识可信</li>
+        <li>引用到页码，答案可溯源</li>
+        <li>检索响应快，体验流畅</li>
+        <li>问答数据反哺，越用越准</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="conclusion">
+    核心结论：知识汇入解决 <b>“数据从哪里来”</b>，知识中枢解决 <b>“如何可靠存放”</b>，AI 问答解决 <b>“知识用来做什么”</b>；反馈再回流成新知识，四环相扣形成数据飞轮。<br>
+    硬件依赖上，<b>CPU + 磁盘 + 网络 + Redis</b> 四件必选即可跑通全链路，<b>GPU</b> 用于开启 Reranker 精排和 ASR float16 加速，属可选升级而非硬性门槛。
+  </div>
+</div>
+</body>
+</html>

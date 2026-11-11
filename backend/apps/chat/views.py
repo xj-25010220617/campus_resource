@@ -582,7 +582,9 @@ class AskView(APIView):
         )
 
         # 文件管理查询路由（文字入口：允许继承同一会话上一轮的唯一文件）
-        if is_data_query:
+        # @/# 已显式限定回答范围时不走 data_query：用户意图是"基于引用文档作答"，
+        # 而非全库结构化查询（表格问答除外情况由后续 RAG 链路内的表格内容覆盖）。
+        if is_data_query and not has_scope_request:
             from utils.query_router import route_text_question
             doc_context = _resolve_doc_context(conversation, user_msg, user)
             text_route = route_text_question(question, user, context=doc_context)
@@ -716,6 +718,18 @@ class AskView(APIView):
             # @/# 引用的文档全部不可用（不存在/无权限/未索引），直接拒答
             should_refuse = True
             refuse_text = '你引用的文档不存在、无权限或尚未完成索引，无法基于它们回答。'
+        elif doc_scope:
+            # 引用有效但检索为空：明确告知"已检索过这些文档但没找到"，
+            # 与"引用不可用"区分开，用户才知道是文档里确实没有相关内容。
+            if not results:
+                should_refuse = True
+                scope_doc_count = len(doc_scope)
+                refuse_text = (
+                    f'已在你引用的 {scope_doc_count} 份文档中检索，'
+                    f'未找到与该问题相关的内容。'
+                )
+            else:
+                refuse_text = '知识库暂无相关资料，无法给出可靠回答。'
         else:
             refuse_text = '知识库暂无相关资料，无法给出可靠回答。'
         if not should_refuse and rag.is_strict_role(user_role):
@@ -819,6 +833,12 @@ class AskView(APIView):
                 f'请仅依据这些文档对应的参考资料作答；若参考资料中没有相关内容，'
                 f'请明确告知用户所引用的文档里找不到答案，不要编造或引用其他资料。）'
             )
+            if scope_info.get('truncated'):
+                suffix_parts.append(
+                    '（注意：引用范围命中的文档过多，已仅纳入前 '
+                    f'{rag.SCOPE_MAX_DOCS} 份。请在回答开头提示用户：'
+                    '引用范围过大，建议缩小标签或改为引用具体文档以获得更准确的回答。）'
+                )
             superseded_pairs = scope_info.get('superseded_pairs') or []
             if superseded_pairs:
                 pairs_text = '；'.join(

@@ -483,6 +483,16 @@ class DocRelationSerializer(serializers.ModelSerializer):
         ]
 
 
+class DocRelationCreateSerializer(serializers.Serializer):
+    """手动创建文档关联的请求参数"""
+
+    target_doc_id = serializers.IntegerField(min_value=1, help_text='目标文档 ID')
+    relation_type = serializers.ChoiceField(
+        choices=DocRelation.RELATION_TYPE_CHOICES, default='supplement',
+        help_text='关联类型：prerequisite/supplement/same_course/citation/replaces',
+    )
+
+
 class DocTagCreateSerializer(serializers.Serializer):
     """批量打标签请求参数"""
 

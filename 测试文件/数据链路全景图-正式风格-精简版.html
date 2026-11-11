@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>校园知识问答平台 · 数据链路全景图（精简版）</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    width:1440px;
+    font-family:"Microsoft YaHei","PingFang SC","Segoe UI",sans-serif;
+    background:#eef0f3;
+    color:#2f3742;
+    padding:36px 40px;
+  }
+  .main {
+    background:#f7f8fa;
+    border:1px solid #d5dae1;
+    border-radius:6px;
+    padding:30px 32px 26px;
+  }
+  h1 {
+    text-align:center;
+    font-size:26px;
+    font-weight:700;
+    color:#1f3a56;
+    letter-spacing:1px;
+  }
+  .subtitle {
+    text-align:center;
+    font-size:13px;
+    color:#5b6675;
+    margin-top:8px;
+    padding-bottom:18px;
+    border-bottom:1px solid #d9dee5;
+  }
+  .cols {
+    display:grid;
+    grid-template-columns:1fr 108px 1.35fr 108px 1fr;
+    gap:0;
+    margin-top:22px;
+    align-items:start;
+  }
+  .col { display:flex; flex-direction:column; }
+  .col-head {
+    background:#1f3a56;
+    color:#fff;
+    border-radius:4px 4px 0 0;
+    padding:12px 16px;
+  }
+  .col-head h2 { font-size:16px; font-weight:700; letter-spacing:.5px; }
+  .col-head p { font-size:11.5px; color:#c3d0de; margin-top:4px; }
+  .col-body {
+    background:#fff;
+    border:1px solid #d5dae1;
+    border-top:none;
+    border-radius:0 0 4px 4px;
+    padding:14px;
+    flex:1;
+  }
+  .card {
+    border:1px solid #d9dee5;
+    border-left:3px solid #4a6b8a;
+    border-radius:3px;
+    background:#fbfcfd;
+    padding:10px 12px;
+    margin-bottom:10px;
+  }
+  .card h3 { font-size:13.5px; color:#1f3a56; font-weight:700; margin-bottom:6px; }
+  .card ul { list-style:none; }
+  .card li {
+    font-size:11.5px;
+    color:#42505f;
+    line-height:1.7;
+    padding-left:12px;
+    position:relative;
+  }
+  .card li::before {
+    content:"·";
+    position:absolute; left:2px;
+    color:#7d8b9c; font-weight:700;
+  }
+  .flow-arrow {
+    text-align:center;
+    font-size:11px;
+    color:#5b6675;
+    margin:2px 0 8px;
+    line-height:1.5;
+  }
+  .flow-arrow b { color:#1f3a56; font-weight:600; }
+  .chip {
+    border:1px solid #d5dae1;
+    border-left:3px solid #4a6b8a;
+    border-radius:3px;
+    background:#fbfcfd;
+    padding:8px 10px;
+    margin-bottom:8px;
+  }
+  .chip h4 { font-size:12.5px; color:#1f3a56; font-weight:700; }
+  .chip p { font-size:10.5px; color:#5b6675; line-height:1.55; margin-top:2px; }
+  .hint { font-size:10.5px; color:#7d8b9c; text-align:center; margin:2px 0 10px; }
+  .core-box {
+    border:1px solid #b9c6d4;
+    background:#eef3f8;
+    border-radius:3px;
+    padding:10px 14px;
+    text-align:center;
+    margin:4px 0 6px;
+  }
+  .core-box h4 { font-size:13px; color:#1f3a56; font-weight:700; }
+  .core-box p { font-size:11px; color:#42505f; line-height:1.65; margin-top:4px; }
+  .tags { display:flex; gap:6px; margin-top:10px; flex-wrap:wrap; }
+  .tag {
+    flex:1;
+    min-width:0;
+    border:1px solid #d5dae1;
+    background:#f4f6f9;
+    border-radius:3px;
+    text-align:center;
+    padding:7px 4px;
+  }
+  .tag b { display:block; font-size:11.5px; color:#1f3a56; font-weight:700; }
+  .tag span { display:block; font-size:9.5px; color:#7d8b9c; margin-top:2px; }
+  .connector { padding-top:64px; display:flex; flex-direction:column; align-items:center; gap:26px; }
+  .link {
+    width:100%;
+    text-align:center;
+    font-size:10.5px;
+    line-height:1.6;
+    color:#42505f;
+    padding:8px 6px;
+    border-radius:3px;
+  }
+  .link b { color:#1f3a56; font-weight:600; }
+  .link.solid { border:1px solid #b9c6d4; background:#eef3f8; }
+  .link.solid::after { content:"⟶"; display:block; color:#4a6b8a; font-size:14px; }
+  .link.dashed { border:1px dashed #a9b4c2; background:#fff; color:#5b6675; }
+  .link.dashed::after { content:"- - ⟶"; display:block; color:#8d99a9; font-size:11px; letter-spacing:-1px; }
+  .summary {
+    display:grid;
+    grid-template-columns:120px 1fr 24px 1fr 24px 1fr 24px 1fr 24px 1.25fr;
+    gap:0;
+    align-items:stretch;
+    margin-top:24px;
+    border:1px solid #d5dae1;
+    border-radius:4px;
+    overflow:hidden;
+    background:#fff;
+  }
+  .sum-title {
+    background:#1f3a56;
+    color:#fff;
+    display:flex; align-items:center; justify-content:center;
+    font-size:15px; font-weight:700;
+    text-align:center; line-height:1.5;
+    padding:12px 8px;
+  }
+  .sum-box { padding:12px 10px; text-align:center; border-left:1px solid #e3e8ee; }
+  .sum-box h4 { font-size:13px; color:#1f3a56; font-weight:700; margin-bottom:5px; }
+  .sum-box p { font-size:10.5px; color:#5b6675; line-height:1.6; }
+  .sum-arrow { display:flex; align-items:center; justify-content:center; color:#4a6b8a; font-size:15px; }
+  .sum-value { padding:12px 14px; border-left:1px solid #e3e8ee; background:#f4f6f9; }
+  .sum-value h4 { font-size:12.5px; color:#1f3a56; font-weight:700; margin-bottom:5px; text-align:center; }
+  .sum-value li { list-style:none; font-size:10.5px; color:#42505f; line-height:1.7; }
+  .sum-value li::before { content:"✓ "; color:#4a6b8a; font-weight:700; }
+  .conclusion {
+    margin-top:16px;
+    background:#2a4a68;
+    border-radius:4px;
+    padding:13px 20px;
+    text-align:center;
+    font-size:13px;
+    color:#dbe4ed;
+    line-height:1.8;
+  }
+  .conclusion b { color:#fff; font-weight:700; }
+</style>
+</head>
+<body>
+<div class="main">
+  <h1>校园知识问答平台 · 知识汇入、知识中枢与 AI 问答的数据链路全景图</h1>
+  <div class="subtitle">多源汇入 + 审核治理 + 知识检索 + 反馈回流，共同支撑可信、可溯、越用越准的校园 AI 问答</div>
+
+  <div class="cols">
+    <!-- 数据源侧 -->
+    <div class="col">
+      <div class="col-head">
+        <h2>数据源侧：知识汇入（数据原料）</h2>
+        <p>提供多样、持续更新、经过治理的知识原料</p>
+      </div>
+      <div class="col-body">
+        <div class="card">
+          <h3>文档上传（人工汇入）</h3>
+          <ul>
+            <li>管理员 / 部门学院管理员后台上传</li>
+            <li>支持大文件上传与断点续传</li>
+            <li>自动去重，避免重复入库</li>
+            <li>AI 自动补标题 / 关键词 / 分类</li>
+          </ul>
+        </div>
+        <div class="flow-arrow"><b>自动采集</b> ↓</div>
+        <div class="card">
+          <h3>官网爬虫（机器汇入）</h3>
+          <ul>
+            <li>定时爬取官网：每日增量 + 每周全量</li>
+            <li>爬虫文档免审查直入知识库</li>
+            <li>定时调度，失败自动重试</li>
+          </ul>
+        </div>
+        <div class="flow-arrow"><b>沉淀回流</b> ↓</div>
+        <div class="card">
+          <h3>问答沉淀（数据再生产）</h3>
+          <ul>
+            <li>高频问题定期聚类，自动生成草稿</li>
+            <li>人工答疑池：AI 答不好转人工回答</li>
+          </ul>
+        </div>
+        <div class="tags">
+          <div class="tag"><b>来源多元</b><span>三渠道汇入</span></div>
+          <div class="tag"><b>自动治理</b><span>AI 打标去重</span></div>
+          <div class="tag"><b>自我进化</b><span>问答反哺</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 连接器 1 -->
+    <div class="connector">
+      <div class="link solid"><b>审核通过</b><br>向量化入库</div>
+      <div class="link dashed"><b>爬虫免审</b><br>直接入库</div>
+    </div>
+
+    <!-- 知识中枢 -->
+    <div class="col">
+      <div class="col-head">
+        <h2>知识中枢：加工与存储（数据载体）</h2>
+        <p>将原始文档转化为结构化、可检索、可溯源的知识</p>
+      </div>
+      <div class="col-body">
+        <div style="display:grid; grid-template-columns:1fr 1.15fr; gap:10px;">
+          <div>
+            <div class="chip">
+              <h4>向量索引</h4>
+              <p>汇聚全部知识向量<br>语义检索的检索主力</p>
+            </div>
+            <div class="chip">
+              <h4>元数据管理</h4>
+              <p>文档 / 分块 / 审核 / 日志<br>与知识条目一一关联</p>
+            </div>
+            <div class="chip">
+              <h4>对象存储</h4>
+              <p>保留原始文件<br>按需授权下载</p>
+            </div>
+            <div class="hint">向量 · 元数据 · 原件&nbsp;&nbsp;三层分工</div>
+          </div>
+          <div>
+            <div class="chip">
+              <h4>解析引擎</h4>
+              <p>多格式文档解析<br>扫描件可识别成文本</p>
+            </div>
+            <div class="chip">
+              <h4>分块引擎</h4>
+              <p>按语义合理拆分<br>表格整块保留不裁断</p>
+            </div>
+            <div class="chip">
+              <h4>向量化</h4>
+              <p>统一转为语义向量<br>本地 / 云端双通道</p>
+            </div>
+            <div class="chip">
+              <h4>索引管道</h4>
+              <p>异步流水线：解析 → 分块<br>→ 向量化 → 入库</p>
+            </div>
+          </div>
+        </div>
+        <div class="core-box">
+          <h4>核心作用：先审核后索引</h4>
+          <p>仅审核通过且完成索引的文档才可被检索 —— 未审内容在问答中完全不可见</p>
+        </div>
+        <div class="flow-arrow">↑ <b>提供知识服务</b></div>
+        <div class="tags">
+          <div class="tag"><b>知识检索</b><span>多路召回融合</span></div>
+          <div class="tag"><b>引用溯源</b><span>文档 + 页码</span></div>
+          <div class="tag"><b>数据查询</b><span>结构化查询</span></div>
+          <div class="tag"><b>表格问答</b><span>表格智能问答</span></div>
+          <div class="tag"><b>FAQ 快答</b><span>短问题直返</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 连接器 2 -->
+    <div class="connector">
+      <div class="link solid"><b>多路召回</b><br>输出知识上下文</div>
+      <div class="link dashed"><b>低置信兜底</b><br>拒答 / 联网搜索</div>
+    </div>
+
+    <!-- AI 问答侧 -->
+    <div class="col">
+      <div class="col-head">
+        <h2>AI 问答侧：价值输出（数据消费）</h2>
+        <p>用户以自然语言获取知识，使用数据反哺系统进化</p>
+      </div>
+      <div class="col-body">
+        <div class="card">
+          <h3>现状：一次问答的完整链路</h3>
+          <ul>
+            <li>提问 → 敏感内容过滤</li>
+            <li>自动识别问题意图，分流处理</li>
+            <li>知识检索 / 数据查询双通道</li>
+            <li>AI 流式生成，答案逐字呈现</li>
+          </ul>
+        </div>
+        <div class="flow-arrow"><b>服务形态</b> ↓</div>
+        <div class="card">
+          <h3>触达用户的方式</h3>
+          <ul>
+            <li>文字 / 语音问答，语音转文字</li>
+            <li>热点广场：引用详情（管理 / 审核可见）</li>
+          </ul>
+        </div>
+        <div class="flow-arrow"><b>反哺要求</b> ↓</div>
+        <div class="card">
+          <h3>问答对知识库的要求</h3>
+          <ul>
+            <li>覆盖全：爬虫补全，先审后索引</li>
+            <li>可溯源：引用到页码，学院 / 部门隔离</li>
+          </ul>
+        </div>
+        <div class="tags">
+          <div class="tag"><b>可信可溯</b><span>答案带引用</span></div>
+          <div class="tag"><b>流式体验</b><span>逐字输出</span></div>
+          <div class="tag"><b>权限隔离</b><span>学院 × 部门隔离</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 底部总结 -->
+  <div class="summary">
+    <div class="sum-title">数据链路<br>总结</div>
+    <div class="sum-box">
+      <h4>知识汇入</h4>
+      <p>上传 / 爬虫 / 问答沉淀<br>提供数据原料</p>
+    </div>
+    <div class="sum-arrow">→</div>
+    <div class="sum-box">
+      <h4>知识中枢</h4>
+      <p>审核治理 → 解析分块<br>→ 向量化入库</p>
+    </div>
+    <div class="sum-arrow">→</div>
+    <div class="sum-box">
+      <h4>AI 问答</h4>
+      <p>检索召回 + 流式生成<br>输出可信回答</p>
+    </div>
+    <div class="sum-arrow">→</div>
+    <div class="sum-box">
+      <h4>反馈回流</h4>
+      <p>点赞点踩 / 提问日志<br>→ FAQ / 答疑池 → 新知识</p>
+    </div>
+    <div class="sum-arrow">→</div>
+    <div class="sum-value">
+      <h4>形成数据闭环价值</h4>
+      <ul>
+        <li>先审后索引，知识可信</li>
+        <li>引用到页码，答案可溯源</li>
+        <li>检索响应快，体验流畅</li>
+        <li>问答数据反哺，越用越准</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="conclusion">
+    核心结论：知识汇入解决 <b>“数据从哪里来”</b>，知识中枢解决 <b>“如何可靠存放”</b>，AI 问答解决 <b>“知识用来做什么”</b>；反馈再回流成新知识，四环相扣形成数据飞轮。
+  </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,16 @@
+[Unit]
+Description=Campus Resource Celery Beat (定时调度爬虫等任务)
+After=network.target campus-celery.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/www/wwwroot/campus_resource/backend
+Environment=DJANGO_SETTINGS_MODULE=config.settings
+ExecStart=/www/wwwroot/campus_resource/backend/venv/bin/celery -A config beat --loglevel=info --logfile=/home/ubuntu/apps/logs/celery-beat.log --scheduler django_celery_beat.schedulers:DatabaseScheduler
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

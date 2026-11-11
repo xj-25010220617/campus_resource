@@ -1274,7 +1274,7 @@ def authorized_knowledge_docs(
 # ------------------------------------------------------------------
 # 提问范围限定（@文档 / #标签）
 # ------------------------------------------------------------------
-SCOPE_MAX_DOCS = 20  # @/# 引用限定的文档数量上限，超出截断
+SCOPE_MAX_DOCS = 50  # @/# 引用限定的文档数量上限，超出截断并提示用户缩小范围
 
 
 def resolve_scope_doc_ids(
@@ -1344,10 +1344,14 @@ def resolve_scope_doc_ids(
     if not docs_by_id:
         return {
             'doc_ids': [], 'doc_titles': [], 'tag_names': tag_names,
-            'superseded_pairs': [],
+            'superseded_pairs': [], 'truncated': False,
         }
 
+    truncated = len(docs_by_id) > SCOPE_MAX_DOCS
     docs = sorted(docs_by_id.values(), key=lambda d: d['id'])[:SCOPE_MAX_DOCS]
+    if truncated:
+        logger.info('@/# 引用范围过大已截断: 命中 %d 份，仅纳入前 %d 份',
+                    len(docs_by_id), SCOPE_MAX_DOCS)
     superseded_pairs = [
         {
             'title': d['title'],
@@ -1360,6 +1364,7 @@ def resolve_scope_doc_ids(
         'doc_titles': [d['title'] for d in docs],
         'tag_names': tag_names,
         'superseded_pairs': superseded_pairs,
+        'truncated': truncated,
     }
 
 
@@ -1681,6 +1686,99 @@ def _recency_factor(publish_date, today=None) -> float:
     return RAG_RECENCY_MIN_FACTOR + (1 - RAG_RECENCY_MIN_FACTOR) * (
         0.5 ** (days / RAG_RECENCY_HALF_LIFE_DAYS)
     )
+
+
+# ------------------------------------------------------------------
+# 文件网 1 跳扩展（命中文档的关联文档作为低分补充候选）
+# ------------------------------------------------------------------
+# 仅沿「前置知识/补充材料/引用来源」扩展；replaces（新版替代）由版本机制处理；
+# same_course 语义太宽，容易把整门课的资料都拉进来，不扩展。
+RELATION_EXPAND_TYPES = ('prerequisite', 'supplement', 'citation')
+RELATION_EXPAND_MAX = 5            # 一次检索最多扩展出的关联文档数
+RELATION_EXPAND_SCORE_FACTOR = 0.6  # 关联文档分数 = 源文档分数 × 系数
+
+
+def _expand_by_doc_relations(results: List[dict], user_context: dict) -> List[dict]:
+    """沿命中文档的出边做 1 跳扩展，把关联文档追加为低分候选。
+
+    仅在常规检索（非 @/# 限定范围）时启用：限定范围时用户明确要求
+    「仅依据指定文档作答」，扩展会引入范围外文档，违背该意图。
+
+    目标文档同样过 authorized_knowledge_docs() 权限过滤与 status='indexed'；
+    已在结果中的文档不重复；visited 防止环。
+    """
+    from apps.knowledge.models import DocRelation, KnowledgeDoc
+
+    src_by_id = {r['doc_id']: r for r in results if r.get('doc_id')}
+    if not src_by_id:
+        return results
+
+    edges = list(
+        DocRelation.objects.filter(
+            source_doc_id__in=src_by_id.keys(),
+            relation_type__in=RELATION_EXPAND_TYPES,
+            is_deleted=False,
+        ).values('source_doc_id', 'target_doc_id', 'relation_type')
+    )
+    if not edges:
+        return results
+
+    # 候选目标：排除已命中的文档（visited），经权限与索引状态过滤
+    target_ids = {e['target_doc_id'] for e in edges} - set(src_by_id.keys())
+    if not target_ids:
+        return results
+    authorized = {
+        d['id']: d for d in authorized_knowledge_docs(user_context)
+        .filter(id__in=target_ids, status='indexed')
+        .values(
+            'id', 'title', 'description', 'source_type', 'source_url',
+            'file_name', 'oss_key', 'created_at', 'indexed_at', 'freshness_date',
+        )
+    }
+
+    expanded: List[dict] = []
+    visited = set(src_by_id.keys())
+    for edge in edges:
+        if len(expanded) >= RELATION_EXPAND_MAX:
+            break
+        tid = edge['target_doc_id']
+        if tid in visited:
+            continue
+        meta = authorized.get(tid)
+        if not meta:
+            continue  # 无权限/未索引/旧版：静默跳过
+        visited.add(tid)
+        src = src_by_id[edge['source_doc_id']]
+        expanded.append({
+            'doc_id': tid,
+            'doc_title': meta['title'],
+            'content': f"{meta['title']}\n{(meta.get('description') or '')[:500]}",
+            'score': round(src.get('score', 0) * RELATION_EXPAND_SCORE_FACTOR, 4),
+            'page': 0,
+            'chunk_index': None,
+            'vector_id': '',
+            'source_type': meta.get('source_type') or '',
+            'source_url': meta.get('source_url') or '',
+            'file_name': meta.get('file_name') or '',
+            'oss_key': meta.get('oss_key') or '',
+            'created_at': to_iso(meta.get('created_at')),
+            'created_at_display': format_business_time(meta.get('created_at')),
+            'indexed_at': to_iso(meta.get('indexed_at')),
+            'indexed_at_display': format_business_time(meta.get('indexed_at')),
+            'freshness_date': (
+                meta['freshness_date'].isoformat() if meta.get('freshness_date') else None
+            ),
+            # 标记扩展来源，供前端/日志区分「直接命中」与「关联推荐」
+            'expanded_from_doc_id': src['doc_id'],
+            'expanded_relation_type': edge['relation_type'],
+        })
+
+    if expanded:
+        logger.info(
+            '文件网扩展: 源文档=%d 条，追加关联文档 %d 条', len(src_by_id), len(expanded),
+        )
+        results = sorted(results + expanded, key=lambda r: r['score'], reverse=True)
+    return results
 
 
 def _enrich_with_doc_meta(hits: List[dict], min_score: float) -> List[dict]:
@@ -2117,6 +2215,11 @@ def _retrieve_pipeline(
     # 5. 权限校验
     results = _filter_by_permission(enriched, user_context)
 
+    # 5.1 文件网 1 跳扩展：命中文档的关联文档作为低分补充候选
+    # （@/# 限定范围时跳过——用户明确要求仅依据指定文档作答）
+    if results and doc_scope is None:
+        results = _expand_by_doc_relations(results, user_context)
+
     # 5.5 检索质量监控日志（学校投入使用后用于诊断与告警）
     # 向量命中率 = 向量命中的去重文档数 / 硬过滤候选数，反映向量通道覆盖率；
     # 持续偏低说明向量库损坏/维度不匹配/Embedding 失效（曾因中文路径导致全失效）。
@@ -2215,6 +2318,12 @@ def retrieve(
     rewrite_questions = rewrite_query(question)
     if len(rewrite_questions) > 1:
         logger.debug('Query 改写: %s -> %s', question[:30], rewrite_questions)
+
+    # 小范围引用（@ 1~3 份文档要求"总结全文"类问题）：放宽分数阈值并加大召回，
+    # 保证整篇内容能被拉进上下文，避免 min_score 把正文中段的相关块砍掉。
+    if doc_scope is not None and 0 < len(doc_scope) <= 3:
+        top_k = top_k * 2
+        min_score = 0.0
 
     results = _retrieve_pipeline(
         question=question,
