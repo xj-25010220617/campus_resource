@@ -78,6 +78,10 @@ class QwenProvider(LLMProvider):
         self.base_url = getattr(settings, 'QWEN_BASE_URL', 'https://dashscope.aliyuncs.com/compatible-mode')
         self.chat_model = getattr(settings, 'QWEN_CHAT_MODEL', 'qwen-flash')
         self.vl_model = getattr(settings, 'QWEN_VL_MODEL', 'qwen-vl-plus')
+        # DeepSeek V4 Flash 默认开启思考模式（effort=high），会导致首字延迟飙升
+        # 必须显式关闭，避免重蹈 qwen3.8-max 60-75s 超时的覆辙
+        # 其他模型（qwen-flash / qwen3.8-flash 等）默认就是纯非推理，不需要这个参数
+        self._disable_thinking = 'deepseek' in self.base_url.lower()
 
     @property
     def headers(self):
@@ -101,17 +105,20 @@ class QwenProvider(LLMProvider):
         last_error = None
         for attempt in range(retries):
             try:
+                body = {
+                    'model': model or self.chat_model,
+                    'messages': messages,
+                    'temperature': temperature,
+                    'max_tokens': max_tokens,
+                    'stream': False,
+                }
+                if self._disable_thinking:
+                    body['thinking'] = {'type': 'disabled'}
                 resp = ExternalClient.post(
                     'llm_chat',
                     f'{self.base_url}/v1/chat/completions',
                     headers=self.headers,
-                    json={
-                        'model': model or self.chat_model,
-                        'messages': messages,
-                        'temperature': temperature,
-                        'max_tokens': max_tokens,
-                        'stream': False,
-                    },
+                    json=body,
                     **request_kwargs,
                 )
                 resp.raise_for_status()
@@ -143,17 +150,20 @@ class QwenProvider(LLMProvider):
         last_error = None
         for attempt in range(MAX_RETRIES):
             try:
+                body = {
+                    'model': model or self.vl_model,
+                    'messages': [{'role': 'user', 'content': content}],
+                    'temperature': temperature,
+                    'max_tokens': max_tokens,
+                    'stream': False,
+                }
+                if self._disable_thinking:
+                    body['thinking'] = {'type': 'disabled'}
                 resp = ExternalClient.post(
                     'llm_vision',
                     f'{self.base_url}/v1/chat/completions',
                     headers=self.headers,
-                    json={
-                        'model': model or self.vl_model,
-                        'messages': [{'role': 'user', 'content': content}],
-                        'temperature': temperature,
-                        'max_tokens': max_tokens,
-                        'stream': False,
-                    },
+                    json=body,
                 )
                 resp.raise_for_status()
                 data = resp.json()
@@ -182,17 +192,20 @@ class QwenProvider(LLMProvider):
         last_error = None
         for attempt in range(MAX_RETRIES):
             try:
+                body = {
+                    'model': model or self.chat_model,
+                    'messages': messages,
+                    'temperature': temperature,
+                    'max_tokens': max_tokens,
+                    'stream': True,
+                }
+                if self._disable_thinking:
+                    body['thinking'] = {'type': 'disabled'}
                 resp = ExternalClient.post(
                     'llm_stream',
                     f'{self.base_url}/v1/chat/completions',
                     headers=self.headers,
-                    json={
-                        'model': model or self.chat_model,
-                        'messages': messages,
-                        'temperature': temperature,
-                        'max_tokens': max_tokens,
-                        'stream': True,
-                    },
+                    json=body,
                     stream=True,
                 )
                 resp.raise_for_status()
@@ -254,6 +267,7 @@ class QwenProvider(LLMProvider):
                             'temperature': temperature,
                             'max_tokens': max_tokens,
                             'stream': True,
+                            **({'thinking': {'type': 'disabled'}} if self._disable_thinking else {}),
                         },
                     ) as resp:
                         resp.raise_for_status()

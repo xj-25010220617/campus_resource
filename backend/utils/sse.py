@@ -285,7 +285,13 @@ def build_references_events(
                     doc.freshness_date.isoformat() if doc.freshness_date else None
                 ),
             }
-            if doc.oss_key:
+            # 私密文档不返回下载链接：仅上传者本人与超管可下载
+            can_download = (
+                doc.visibility == 'public'
+                or context.get('role') == 'super_admin'
+                or doc.uploader_id == context.get('user_id')
+            )
+            if doc.oss_key and can_download:
                 try:
                     entry['download_url'] = oss_client.get_download_url(
                         doc.oss_key, expires=300, file_name=doc.file_name,
@@ -293,6 +299,8 @@ def build_references_events(
                 except Exception as exc:
                     logger.warning('生成文档下载链接失败 doc_id=%s: %s', doc.id, exc)
                     entry['download_url'] = ''
+            else:
+                entry['download_url'] = ''
             detail.append(entry)
             continue
 

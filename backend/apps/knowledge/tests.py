@@ -116,7 +116,7 @@ class RagRetrievalTests(TestCase):
         self.assertIsNotNone(results[0]['content'])
 
     def test_keyword_table_respects_permissions(self):
-        """普通用户不能通过 Keyword 表检索到私有文档。"""
+        """普通用户不能通过 Keyword 表检索到超管专属空间的私密文档。"""
         doc = self._create_doc(visibility='private')
         Keyword.objects.create(
             doc=doc, phrase='贡嘎杯', weight=5, created_by=self.admin,
@@ -175,7 +175,7 @@ class RagRetrievalTests(TestCase):
         self.assertIn('贡嘎杯', results[0]['content'])
 
     def test_chunk_content_search_respects_permissions(self):
-        """普通用户不能通过 DocChunk.content 检索到私有文档。"""
+        """普通用户不能通过 DocChunk.content 检索到超管专属空间的私密文档。"""
         doc = self._create_doc(visibility='private')
         self._create_chunks(doc, ['贡嘎杯跳绳比赛于四月举行。'])
 
@@ -225,7 +225,7 @@ class RagRetrievalTests(TestCase):
         self.assertEqual(find_pending_index_docs('贡嘎杯 跳绳', self.admin_ctx), [])
 
     def test_find_pending_respects_permissions(self):
-        """普通用户不能通过 pending 提示感知私有文档存在。"""
+        """普通用户不能通过 pending 提示感知超管专属空间的私密文档存在。"""
         self._create_doc(visibility='private', status='embedding')
 
         from utils.rag import find_pending_index_docs
@@ -260,7 +260,7 @@ class RagRetrievalTests(TestCase):
         self.assertGreaterEqual(results[0]['score'], 0.35)
 
     def test_retrieve_respects_permissions(self):
-        """retrieve() 整体不向普通用户泄露私有文档。"""
+        """retrieve() 整体不向普通用户泄露超管专属空间的私密文档。"""
         doc = self._create_doc(visibility='private')
         self._create_chunks(doc, ['贡嘎杯跳绳比赛于四月举行。'])
         Keyword.objects.create(

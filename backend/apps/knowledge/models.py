@@ -574,3 +574,48 @@ class DocVersionCandidate(models.Model):
 
     def __str__(self):
         return f'{self.new_doc_id} 疑似替代 {self.old_doc_id} [{self.status}]'
+
+
+class CrawlRun(models.Model):
+    """官网采集运行记录——用于观测"持续更新"是否真的在推进。
+
+    每次定时/手动爬取落一条记录，可查最近一次成功时间、本次新增数、跳过数，
+    便于判断覆盖是否停滞（新增长期为 0 说明已抓完或抓取被阻断）。
+    """
+    TRIGGER_CHOICES = [
+        ('scheduled', '定时任务'),
+        ('manual', '手动触发'),
+    ]
+    STATUS_CHOICES = [
+        ('running', '运行中'),
+        ('success', '成功'),
+        ('failed', '失败'),
+    ]
+
+    trigger = models.CharField(
+        max_length=16, choices=TRIGGER_CHOICES, default='scheduled',
+        verbose_name='触发方式',
+    )
+    status = models.CharField(
+        max_length=16, choices=STATUS_CHOICES, default='running',
+        db_index=True, verbose_name='状态',
+    )
+    max_pages = models.IntegerField(default=0, verbose_name='本次页数上限')
+    pages_fetched = models.IntegerField(default=0, verbose_name='抓取页面数')
+    docs_saved = models.IntegerField(default=0, verbose_name='新增文档数')
+    files_saved = models.IntegerField(default=0, verbose_name='新增附件数')
+    skipped_saved = models.IntegerField(default=0, verbose_name='跳过已入库数')
+    duration_sec = models.FloatField(default=0.0, verbose_name='耗时(秒)')
+    message = models.CharField(max_length=512, blank=True, default='', verbose_name='结果说明')
+    started_at = models.DateTimeField(auto_now_add=True, db_index=True, verbose_name='开始时间')
+    finished_at = models.DateTimeField(null=True, blank=True, verbose_name='结束时间')
+
+    class Meta:
+        db_table = 'crawl_run'
+        verbose_name = '官网采集记录'
+        verbose_name_plural = verbose_name
+        ordering = ['-started_at']
+        db_table_comment = '官网采集运行记录表(观测持续更新是否推进；docs_saved长期为0说明覆盖已停滞)'
+
+    def __str__(self):
+        return f'[{self.trigger}] {self.started_at:%Y-%m-%d %H:%M} 新增{self.docs_saved} 状态{self.status}'

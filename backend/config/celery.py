@@ -35,13 +35,19 @@ app.conf.beat_schedule = {
     },
     'crawl-neusoft-website-daily': {
         'task': 'apps.knowledge.tasks.crawl_neusoft_website_task',
-        'schedule': crontab(hour=4, minute=0),  # 每天 04:00
-        'kwargs': {'max_pages': 100, 'uploader_id': 1, 'download_files': True},
+        'schedule': crontab(hour=4, minute=0),  # 每天 04:00 增量推进
+        'kwargs': {
+            'max_pages': 300, 'section_page_limit': 100,
+            'uploader_id': 1, 'download_files': True,
+        },
     },
     'crawl-neusoft-website-weekly-full': {
         'task': 'apps.knowledge.tasks.crawl_neusoft_website_task',
-        'schedule': crontab(hour=5, minute=0, day_of_week=0),  # 每周日 05:00
-        'kwargs': {'max_pages': 300, 'uploader_id': 1, 'download_files': True},
+        'schedule': crontab(hour=5, minute=0, day_of_week=0),  # 每周日 05:00 深度全量
+        'kwargs': {
+            'max_pages': 1500, 'section_page_limit': 400,
+            'uploader_id': 1, 'download_files': True,
+        },
     },
     'refresh-daily-context': {
         'task': 'apps.knowledge.tasks.refresh_daily_context_task',

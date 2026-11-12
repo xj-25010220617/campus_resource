@@ -6,6 +6,7 @@ from .school_views import (
     AdmissionRuleYearView,
     CollegeDetailView,
     CollegeListView,
+    CrawlStatusView,
     MajorDetailView,
     MajorListView,
     ScholarshipListView,
@@ -37,4 +38,7 @@ urlpatterns = [
 
     # 校历
     path('calendar/', AcademicCalendarListView.as_view(), name='academic_calendar'),
+
+    # 官网持续更新健康状态
+    path('crawl-status/', CrawlStatusView.as_view(), name='crawl_status'),
 ]

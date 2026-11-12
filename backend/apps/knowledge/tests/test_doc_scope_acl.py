@@ -6,6 +6,8 @@
 - 旧 scope=college/department 但归属字段未回填的文档不当作校级公开
 - 浏览、删除、AI 检索三条链路使用同一判定
 """
+from unittest.mock import patch
+
 from django.test import TestCase
 from rest_framework.test import APIClient
 
@@ -155,4 +157,113 @@ class DocScopeAclTests(TestCase):
             ids,
             {self.school_doc.id, self.school_doc_null_scope.id,
              self.legacy_school_doc.id},
+        )
+
+
+class DocVisibilityDownloadTests(TestCase):
+    """公开/私密语义（2026-11 调整）。
+
+    public：问答可检索 + 可下载；
+    private：问答同样可检索，但仅上传者本人与超管可下载。
+    """
+
+    def setUp(self):
+        self.client = APIClient()
+        self.dept = Department.objects.create(name='教学管理部')
+        self.uploader = User.objects.create_user(
+            username='up', password='pass12345', role='dept_admin',
+            department=self.dept,
+        )
+        self.colleague = User.objects.create_user(
+            username='col', password='pass12345', role='dept_admin',
+            department=self.dept,
+        )
+        self.super_admin = User.objects.create_user(
+            username='root', password='pass12345', role='super_admin',
+        )
+        self.private_doc = self._make_doc('私密资料', 'private')
+        self.public_doc = self._make_doc('公开资料', 'public')
+
+    def _make_doc(self, title, visibility):
+        return KnowledgeDoc.objects.create(
+            title=title,
+            source_type='upload',
+            file_name=f'{title}.pdf',
+            file_type='pdf',
+            oss_key=f'docs/{title}.pdf',
+            uploader=self.uploader,
+            department=self.dept,
+            visibility=visibility,
+            review_status='approved',
+            status='indexed',
+        )
+
+    def _download_status(self, user, doc):
+        self.client.force_authenticate(user)
+        with patch('apps.knowledge.views.oss_client') as oss:
+            oss.get_download_url.return_value = 'https://example.com/download'
+            resp = self.client.get(f'/api/knowledge/docs/{doc.id}/download/')
+        return resp.status_code
+
+    def test_public_doc_downloadable_by_colleague(self):
+        self.assertEqual(
+            self._download_status(self.colleague, self.public_doc), 200,
+        )
+
+    def test_private_doc_not_downloadable_by_colleague(self):
+        self.assertEqual(
+            self._download_status(self.colleague, self.private_doc), 404,
+        )
+
+    def test_private_doc_downloadable_by_uploader(self):
+        self.assertEqual(
+            self._download_status(self.uploader, self.private_doc), 200,
+        )
+
+    def test_private_doc_downloadable_by_super_admin(self):
+        self.assertEqual(
+            self._download_status(self.super_admin, self.private_doc), 200,
+        )
+
+    def test_private_doc_in_scope_still_retrievable(self):
+        ctx = {
+            'role': 'dept_admin',
+            'user_id': self.colleague.id,
+            'college_id': None,
+            'department_id': self.dept.id,
+        }
+        ids = set(authorized_knowledge_docs(ctx).values_list('id', flat=True))
+        self.assertIn(self.private_doc.id, ids)
+
+    def test_private_doc_reference_has_no_download_url(self):
+        from utils.sse import build_references_events
+
+        events = build_references_events(
+            [{'doc_id': self.private_doc.id, 'score': 0.9, 'content': '片段'}],
+            'dept_admin', self.colleague.id,
+            user_context={
+                'role': 'dept_admin', 'user_id': self.colleague.id,
+                'department_id': self.dept.id,
+            },
+        )
+        self.assertEqual(events['references_detail'][0]['download_url'], '')
+
+    def _detail_download_url(self, user, doc):
+        self.client.force_authenticate(user)
+        with patch('apps.knowledge.serializers.oss_client') as oss:
+            oss.get_download_url.return_value = 'https://example.com/download'
+            oss.get_preview_url.return_value = 'https://example.com/preview'
+            resp = self.client.get(f'/api/knowledge/docs/{doc.id}/')
+        self.assertEqual(resp.status_code, 200, resp.data)
+        return resp.data['download_url']
+
+    def test_private_doc_detail_hides_download_url(self):
+        self.assertEqual(
+            self._detail_download_url(self.colleague, self.private_doc), '',
+        )
+
+    def test_public_doc_detail_exposes_download_url(self):
+        self.assertEqual(
+            self._detail_download_url(self.colleague, self.public_doc),
+            'https://example.com/download',
         )

@@ -231,8 +231,11 @@ def _is_detail_page(url: str) -> bool:
 
     nsu.edu.cn 详情页：/HTML/{section}/article_{N}.html
     （新闻类含日期子目录，如 /HTML/news/2026/09/article_4924.html）
+    兼容 .htm/.shtml 后缀与 content_/detail_ 命名，避免整栏目抓不到。
     """
-    return bool(re.search(r"/article_\d+\.html", url, re.IGNORECASE))
+    return bool(
+        re.search(r"/(?:article|content|detail)_\d+\.(?:html?|shtml)$", url, re.IGNORECASE)
+    )
 
 
 def _is_section_page(url: str) -> bool:
@@ -241,8 +244,10 @@ def _is_section_page(url: str) -> bool:
 
 
 def _is_page_list(url: str) -> bool:
-    """判断是否为列表翻页页（/HTML/{section}/list_N.html）。"""
-    return bool(re.search(r"/list_\d+\.html$", url, re.IGNORECASE))
+    """判断是否为列表翻页页（/HTML/{section}/list_N.html，兼容 .htm/.shtml）。"""
+    return bool(
+        re.search(r"/list(?:_\d+)?\.(?:html?|shtml)$", url, re.IGNORECASE)
+    )
 
 
 def _is_important_section(url: str) -> bool:
@@ -373,6 +378,26 @@ class NeusoftSpider:
         self.max_files = max_files
         self.seen_file_urls: Set[str] = set()  # 附件 URL 去重（运行内）
         self.file_links: List[dict] = []       # 发现的附件 {"url","text","source_page"}
+        # 已入库页面 URL（断点续爬：命中即跳过，且不消耗本次页数配额）
+        self._saved_urls: Optional[Set[str]] = None
+        self.skipped_saved = 0                 # 本次跳过的已入库页面数
+
+    def _load_saved_urls(self) -> Set[str]:
+        """懒加载数据库中已入库的官网页面 URL 集合（一次查询，运行内复用）。"""
+        if self._saved_urls is not None:
+            return self._saved_urls
+        try:
+            from apps.knowledge.models import KnowledgeDoc
+            self._saved_urls = set(
+                KnowledgeDoc.objects
+                .filter(source_type="website")
+                .exclude(source_url="")
+                .values_list("source_url", flat=True)
+            )
+        except Exception as e:
+            logger.warning(f"读取已入库 URL 失败，断点续爬降级为关闭: {e}")
+            self._saved_urls = set()
+        return self._saved_urls
 
     def _fetch(self, url: str) -> Optional[str]:
         """请求 URL 返回 HTML，失败返回 None。JS 页面自动尝试 Playwright 渲染。"""
@@ -477,10 +502,12 @@ class NeusoftSpider:
         """爬取单个栏目下的所有文章。
 
         从列表页开始，提取文章详情页链接 → 逐个抓取详情。
+        已入库的详情页直接跳过且不占用 max_pages 配额，保证每次运行都能向深层推进。
         """
         results = []
         to_visit = [section_url]
         visited_list_pages = set()
+        saved_urls = self._load_saved_urls()
 
         while to_visit and len(results) < max_pages:
             url = to_visit.pop(0)
@@ -507,6 +534,10 @@ class NeusoftSpider:
                         self.collect_file_links(excluded_html, link)
 
                 elif _is_detail_page(link) and link not in self.seen_urls:
+                    # 断点续爬：已入库页面跳过，不占用本次配额
+                    if link in saved_urls:
+                        self.skipped_saved += 1
+                        continue
                     page_data = self.crawl_page(link)
                     if page_data:
                         # 内容去重
@@ -530,14 +561,18 @@ class NeusoftSpider:
 
         return results
 
-    def start_crawl(self, max_pages: int = 100) -> List[dict]:
+    def start_crawl(self, max_pages: int = 100, section_page_limit: int = 200) -> List[dict]:
         """全站爬取入口。
 
         1. 先爬首页
         2. 提取所有重要栏目链接
-        3. 逐个栏目爬取
+        3. 逐个栏目爬取（单栏目最多 section_page_limit 篇）
+
+        Args:
+            max_pages: 本次运行总计最多新增页数
+            section_page_limit: 单个栏目本次最多新增页数
         """
-        logger.info(f"开始全站爬取: max_pages={max_pages}")
+        logger.info(f"开始全站爬取: max_pages={max_pages}, section_page_limit={section_page_limit}")
         all_results = []
 
         # 1. 获取首页 HTML（一次性：用于栏目链接提取；首页为导航枢纽，
@@ -570,7 +605,7 @@ class NeusoftSpider:
                 break
             section_results = self.crawl_section(
                 section_url,
-                max_pages=min(20, remaining),
+                max_pages=min(section_page_limit, remaining),
             )
             all_results.extend(section_results)
             remaining = max_pages - len(all_results)
@@ -1019,17 +1054,21 @@ def crawl_and_index(
     download_files: Optional[bool] = None,
     file_types: Optional[str] = None,
     max_files: Optional[int] = None,
+    section_page_limit: int = 200,
+    trigger: str = 'manual',
 ) -> int:
     """全站爬取并自动索引到知识库。
 
     Args:
-        max_pages: 本次爬取最大页数
+        max_pages: 本次本次新增页数上限
         uploader_id: 上传者用户 ID
         college_id: 所属学院 ID
         discipline_id: 学科方向 ID（可选，默认自动推断）
         download_files: 是否下载文档类附件（None=取设置 CRAWLER_DOWNLOAD_FILES）
         file_types: 附件扩展名白名单覆盖，逗号分隔（如 "pdf,docx"），None=取设置
         max_files: 本次最多下载附件数，None=取设置 CRAWLER_MAX_FILES
+        section_page_limit: 单栏目本次最多新增页数
+        trigger: 触发方式 scheduled/manual，用于 CrawlRun 记录
 
     Returns:
         成功保存的文档数（页面 + 附件）
@@ -1046,28 +1085,71 @@ def crawl_and_index(
         allowed_exts=allowed_exts,
         max_files=max_files or MAX_FILES_PER_RUN,
     )
-    pages = spider.start_crawl(max_pages=max_pages)
 
-    saved = 0
-    for page in pages:
-        doc_id = save_page_as_knowledge_doc(
-            page,
-            uploader_id=uploader_id,
-            college_id=college_id,
-            discipline_id=discipline_id,
+    # 运行记录（失败也要落一条，便于发现持续更新中断）
+    from apps.knowledge.models import CrawlRun
+    run = CrawlRun.objects.create(
+        trigger=trigger, status='running', max_pages=max_pages,
+    )
+    t0 = time.time()
+
+    try:
+        pages = spider.start_crawl(
+            max_pages=max_pages, section_page_limit=section_page_limit,
         )
-        if doc_id:
-            saved += 1
 
-    # 页面爬取完成后统一下载附件入库
-    if download_files:
-        stats = download_and_save_files(
-            spider,
-            uploader_id=uploader_id,
-            college_id=college_id,
-            discipline_id=discipline_id,
+        saved = 0
+        for page in pages:
+            doc_id = save_page_as_knowledge_doc(
+                page,
+                uploader_id=uploader_id,
+                college_id=college_id,
+                discipline_id=discipline_id,
+            )
+            if doc_id:
+                saved += 1
+
+        # 页面爬取完成后统一下载附件入库
+        files_saved = 0
+        if download_files:
+            stats = download_and_save_files(
+                spider,
+                uploader_id=uploader_id,
+                college_id=college_id,
+                discipline_id=discipline_id,
+            )
+            files_saved = stats["saved"]
+            saved += files_saved
+
+        from django.utils import timezone
+        run.status = 'success'
+        run.pages_fetched = len(pages)
+        run.docs_saved = saved - files_saved
+        run.files_saved = files_saved
+        run.skipped_saved = spider.skipped_saved
+        run.duration_sec = round(time.time() - t0, 1)
+        run.finished_at = timezone.now()
+        run.message = (
+            f'抓取 {len(pages)} 页，新增页面 {saved - files_saved}、附件 {files_saved}，'
+            f'跳过已入库 {spider.skipped_saved}'
         )
-        saved += stats["saved"]
+        run.save(update_fields=[
+            'status', 'pages_fetched', 'docs_saved', 'files_saved',
+            'skipped_saved', 'duration_sec', 'message', 'finished_at',
+        ])
 
-    logger.info(f"爬取并索引完成: 共爬取 {len(pages)} 页，保存 {saved} 篇文档（含附件）")
-    return saved
+        logger.info(f"爬取并索引完成: 共爬取 {len(pages)} 页，保存 {saved} 篇文档（含附件）")
+        return saved
+    except Exception as e:
+        from django.utils import timezone
+        run.status = 'failed'
+        run.pages_fetched = len(spider.seen_urls)
+        run.skipped_saved = spider.skipped_saved
+        run.duration_sec = round(time.time() - t0, 1)
+        run.finished_at = timezone.now()
+        run.message = str(e)[:500]
+        run.save(update_fields=[
+            'status', 'pages_fetched', 'skipped_saved',
+            'duration_sec', 'message', 'finished_at',
+        ])
+        raise

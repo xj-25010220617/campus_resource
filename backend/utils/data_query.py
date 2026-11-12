@@ -339,6 +339,11 @@ def find_user_docs(
     from utils.oss import oss_client
 
     def _get_dl_url(doc) -> str:
+        # 私密文档不返回下载链接：仅上传者本人与超管可下载
+        if doc.visibility != 'public':
+            is_owner = doc.uploader_id == getattr(user, 'id', None)
+            if getattr(user, 'role', None) != 'super_admin' and not is_owner:
+                return ''
         if doc.oss_key:
             url = oss_client.get_download_url(
                 doc.oss_key, expires=3600, file_name=doc.file_name,

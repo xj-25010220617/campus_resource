@@ -109,16 +109,21 @@ def crawl_neusoft_website_task(
     college_id: Optional[int] = None,
     discipline_id: int = None,
     download_files: Optional[bool] = None,
+    section_page_limit: int = 200,
 ):
     """
     爬取成都东软学院官网并索引到知识库。
 
+    断点续爬：已入库页面跳过且不占配额，因此每次运行都会向更深的列表页推进，
+    无需人工干预即可持续扩充覆盖范围。
+
     Args:
-        max_pages: 本次爬取最大页数
+        max_pages: 本次爬取最大新增页数
         uploader_id: 上传者用户 ID
         college_id: 所属学院 ID（默认 None=校级公开）
         discipline_id: 学科方向 ID（可选，默认自动推断）
         download_files: 是否下载文档类附件（None=取设置 CRAWLER_DOWNLOAD_FILES）
+        section_page_limit: 单栏目本次最多新增页数
     """
     from utils.crawler import crawl_and_index
 
@@ -129,6 +134,8 @@ def crawl_neusoft_website_task(
             college_id=college_id,
             discipline_id=discipline_id,
             download_files=download_files,
+            section_page_limit=section_page_limit,
+            trigger='scheduled',
         )
         logger.info(f'官网爬取任务完成: 保存 {saved} 篇文档')
         return saved

@@ -1215,8 +1215,12 @@ def authorized_knowledge_docs(
 ):
     """返回当前用户可检索的 KnowledgeDoc QuerySet。
 
-    授权逻辑必须在召回和引用签名前保持一致。超管可查看全部文档（其他超管上传的
-    private 文档除外），其他角色仅可查看公开的学校/本部门或本人上传文档。
+    授权逻辑必须在召回和引用签名前保持一致。可见性不再影响检索：public 与
+    private 文档都参与智能问答召回，二者只在下载环节区分（见
+    KnowledgeDocDownloadView，private 仅上传者本人与超管可下载）。
+
+    例外：超管专属空间的 private 文档仍仅该超管本人可检索，避免个人文件
+    进入公共问答。其他角色按学校/本部门/本人上传范围检索。
 
     include_superseded=True 时不再排除已被新版本替代的旧版文档：仅用于
     「用户显式 @ 了旧版文档」的场景，让用户能针对历史版本提问；默认 False，
@@ -1237,12 +1241,13 @@ def authorized_knowledge_docs(
         # 已被新版本替代的旧版默认不参与问答检索
         qs = qs.filter(superseded_by__isnull=True)
 
-    # 超管上传的私密文档：仅该超管本人可见（与浏览链路 _admin_scope_filter 对齐）
+    # 超管专属空间的私密文档：仅该超管本人可检索（与浏览链路 _admin_scope_filter 对齐）
     super_private = Q(visibility='private', uploader__role='super_admin')
     if role == 'super_admin':
         return qs.exclude(super_private & ~Q(uploader_id=user_id))
 
-    qs = qs.filter(visibility='public')
+    # 可见性不参与检索过滤：private 文档同样可被问答搜到，仅限制下载
+    qs = qs.exclude(super_private)
     # 校级文档：无学院/部门归属，且没有残留的旧 scope 标记（与浏览链路共用判定）
     school_level = school_level_q()
     if role in ('admin', 'college_admin'):

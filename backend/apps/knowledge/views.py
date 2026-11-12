@@ -261,8 +261,9 @@ class KnowledgeDocListView(generics.ListAPIView):
     @staticmethod
     def _rag_scope_filter(queryset, user_context):
         """AI 检索权限过滤（通过 college_id/department_id 判断归属）：
-        - private 文档绝不检索
-        - super_admin：所有 public 文档
+        - 可见性不参与检索过滤：public / private 文档都可被问答搜到，
+          仅下载环节区分（private 仅上传者本人与超管可下载）
+        - super_admin：所有文档（其他超管的私密文档除外）
         - college_admin / admin：校级文档 + 本院文档（含部门级） + 自己上传
         - dept_admin：校级文档 + 本部门文档 + 自己上传
         - user：校级文档 + 本院文档 + 本部门文档 + 自己上传
@@ -274,7 +275,7 @@ class KnowledgeDocListView(generics.ListAPIView):
         user_id = user_context.get('user_id')
         college_id = user_context.get('college_id')
         dept_id = user_context.get('department_id')
-        qs = queryset.filter(visibility='public')
+        qs = queryset
         if role == 'super_admin':
             return qs
         if role in ('college_admin', 'admin'):
@@ -502,12 +503,11 @@ class KnowledgeDocDownloadView(generics.RetrieveAPIView):
     GET /api/knowledge/docs/{id}/download/
     功能：为指定文档生成阿里云 OSS 签名下载 URL（有效期 300 秒），前端拿到后直接跳转或 <a> 下载
     权限规则：
-        - super_admin（超级管理员）: 可下载平台全部文档的源文件
-        - admin（学院管理员）: 仅能下载自己上传的文档
-        - 普通登录用户: 仅能下载自己上传的文档
+        - super_admin（超级管理员）: 可下载其可见范围内的全部文档（含本人私密文档）
+        - 其他角色: 仅可在可见范围内下载公开文档，私密文档仅上传者本人可下载
     处理流程：
         1. IsLoginUser 校验登录状态
-        2. get_queryset 按角色限制可下载范围（超管全放行，其余仅限本人上传）
+        2. get_queryset 按角色限制可见范围，私密文档对非上传者排除
         3. oss_client.get_download_url(instance.oss_key) 生成签名 URL
     返回：{"download_url": "https://bucket.oss-cn-hangzhou.aliyuncs.com/...?Expires=...&Signature=..."}
     """
@@ -515,8 +515,14 @@ class KnowledgeDocDownloadView(generics.RetrieveAPIView):
 
     def get_queryset(self):
         user = self.request.user
-        queryset = KnowledgeDoc.objects.all()
-        return KnowledgeDocListView._admin_scope_filter(queryset, user)
+        queryset = KnowledgeDocListView._admin_scope_filter(
+            KnowledgeDoc.objects.all(), user,
+        )
+        if user.role == 'super_admin':
+            # 超管可下载可见范围内全部文档（含本人私密文档）
+            return queryset
+        # 私密文档仅上传者本人可下载
+        return queryset.filter(Q(visibility='public') | Q(uploader_id=user.id))
 
     def retrieve(self, request, *args, **kwargs):
         instance = self.get_object()

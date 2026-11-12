@@ -65,12 +65,24 @@ class KnowledgeDocSerializer(serializers.ModelSerializer):
         ]
 
     def get_download_url(self, obj) -> str:
-        """带原始文件名的签名下载 URL（附件下载）"""
-        if not obj.oss_key:
+        """带原始文件名的签名下载 URL（附件下载）。
+
+        私密文档不返回下载链接：仅上传者本人与超管可下载（公开文档不限）。
+        """
+        if not obj.oss_key or not self._can_download(obj):
             return ''
         return oss_client.get_download_url(
             obj.oss_key, expires=604800, file_name=obj.file_name,
         )
+
+    def _can_download(self, obj) -> bool:
+        if obj.visibility == 'public':
+            return True
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if user is None or not user.is_authenticated:
+            return False
+        return user.role == 'super_admin' or obj.uploader_id == user.id
 
     def get_oss_url(self, obj) -> str:
         """签名预览 URL（无 attachment，浏览器内联显示）"""

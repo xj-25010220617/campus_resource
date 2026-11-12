@@ -8,11 +8,13 @@
 """
 from django.test import TestCase
 
+from apps.accounts.models import College
 from apps.knowledge.models import DocChunk, DocTag, KnowledgeDoc, Tag
 from utils import rag
 
 
-def _make_doc(title, status='indexed', visibility='public', uploader_id=None):
+def _make_doc(title, status='indexed', visibility='public', uploader_id=None,
+              college=None):
     doc = KnowledgeDoc.objects.create(
         title=title,
         source_type='upload',
@@ -21,6 +23,7 @@ def _make_doc(title, status='indexed', visibility='public', uploader_id=None):
         status=status,
         visibility=visibility,
         uploader_id=uploader_id,
+        college=college,
     )
     DocChunk.objects.create(
         doc=doc, chunk_index=0,
@@ -94,14 +97,15 @@ class TestTagTableSearch(TagCacheTestMixin, TestCase):
         assert self.doc.id in [h['doc_id'] for h in hits]
         assert pending.id not in [h['doc_id'] for h in hits]
 
-    def test_unauthorized_private_doc_excluded(self):
-        priv = _make_doc('内部评定名单', visibility='private', uploader_id=999999)
+    def test_private_doc_in_scope_is_searchable(self):
+        """可见性不参与检索过滤：private 文档也能被问答搜到（仅下载受限）。"""
+        priv = _make_doc('内部评定名单', visibility='private')
         _tag_doc(priv, self.tag)
         hits = rag._tag_table_search(
             [{'tag_id': self.tag.id, 'name': self.tag.name}],
             {'role': 'user', 'user_id': 1},
         )
-        assert priv.id not in [h['doc_id'] for h in hits]
+        assert priv.id in [h['doc_id'] for h in hits]
 
     def test_respects_candidate_ids_scope(self):
         hits = rag._tag_table_search(
@@ -144,14 +148,16 @@ class TestTagListing(TagCacheTestMixin, TestCase):
         results, name = rag.try_expand_tag_listing('图书馆的所有文件列出来', self.ctx)
         assert (results, name) == (None, None)
 
-    def test_unauthorized_docs_excluded_from_listing(self):
-        priv = _make_doc('内部评定名单', visibility='private', uploader_id=999999)
-        _tag_doc(priv, self.tag)
+    def test_out_of_scope_docs_excluded_from_listing(self):
+        """范围外（其他学院）的文档不得出现在标签穷举清单中。"""
+        college = College.objects.create(name='外国语学院', code='FL')
+        other = _make_doc('内部评定名单', college=college)
+        _tag_doc(other, self.tag)
         results, name = rag.try_expand_tag_listing(
             '奖学金评定所有文件', {'role': 'user', 'user_id': 1},
         )
         assert name == '奖学金评定'
-        assert priv.id not in [r['doc_id'] for r in results]
+        assert other.id not in [r['doc_id'] for r in results]
         assert {r['doc_id'] for r in results} == {self.doc_a.id, self.doc_b.id}
 
     def test_max_docs_cap(self):

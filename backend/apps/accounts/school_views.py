@@ -191,3 +191,58 @@ class AcademicCalendarListView(ListAPIView):
     permission_classes = [AllowAny]
     serializer_class = AcademicCalendarSerializer
     queryset = AcademicCalendar.objects.all().order_by('sort_order')
+
+
+class CrawlStatusView(APIView):
+    """GET /api/school/crawl-status/ — 官网持续更新健康状态
+
+    返回最近采集记录与知识库覆盖统计，用于判断"持续更新"是否仍在推进。
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        from apps.knowledge.models import CrawlRun, KnowledgeDoc, DocChunk
+
+        runs = CrawlRun.objects.all()[:10]
+        last_success = CrawlRun.objects.filter(status='success').first()
+
+        website_qs = KnowledgeDoc.objects.filter(source_type='website')
+        # 连续新增为 0 的运行次数（判断覆盖是否停滞）
+        recent = list(CrawlRun.objects.filter(status='success')[:5])
+        zero_streak = 0
+        for r in recent:
+            if r.docs_saved == 0 and r.files_saved == 0:
+                zero_streak += 1
+            else:
+                break
+
+        return Response({
+            'summary': {
+                'website_docs': website_qs.count(),
+                'website_indexed': website_qs.filter(status='indexed').count(),
+                'total_chunks': DocChunk.objects.count(),
+                'last_success_at': last_success.finished_at if last_success else None,
+                'last_success_new_docs': (
+                    last_success.docs_saved + last_success.files_saved
+                    if last_success else 0
+                ),
+                'zero_growth_streak': zero_streak,
+                'stalled': zero_streak >= 3,
+            },
+            'runs': [
+                {
+                    'trigger': r.trigger,
+                    'status': r.status,
+                    'started_at': r.started_at,
+                    'finished_at': r.finished_at,
+                    'duration_sec': r.duration_sec,
+                    'max_pages': r.max_pages,
+                    'pages_fetched': r.pages_fetched,
+                    'docs_saved': r.docs_saved,
+                    'files_saved': r.files_saved,
+                    'skipped_saved': r.skipped_saved,
+                    'message': r.message,
+                }
+                for r in runs
+            ],
+        })
