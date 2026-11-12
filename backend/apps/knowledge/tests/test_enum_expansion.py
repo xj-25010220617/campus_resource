@@ -119,10 +119,11 @@ class TestExpandEnumeration(TestCase):
         assert title is None
 
     def test_unauthorized_doc_not_expand(self):
-        # 普通用户语境下 private 文档越权命中 → 扩展必须拒绝
+        # 私密不再等于不可检索；用普通用户无权限的学院验证范围过滤
         self.doc_2015.visibility = 'private'
         self.doc_2015.uploader_id = 999999
-        self.doc_2015.save(update_fields=['visibility', 'uploader_id'])
+        self.doc_2015.college_id = 999999
+        self.doc_2015.save(update_fields=['visibility', 'uploader_id', 'college_id'])
         user_ctx = {'role': 'user', 'user_id': 1}
         expanded, title = rag.try_expand_enumeration(
             '15级优秀毕业生有谁', self.results, user_ctx,

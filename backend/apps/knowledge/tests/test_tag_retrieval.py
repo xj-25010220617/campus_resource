@@ -95,7 +95,11 @@ class TestTagTableSearch(TagCacheTestMixin, TestCase):
         assert pending.id not in [h['doc_id'] for h in hits]
 
     def test_unauthorized_private_doc_excluded(self):
+        # 私密文档仍参与检索，但只能被授权范围内的用户看到：
+        # 这里把文档放到当前用户看不到的学院，验证的是范围越权而不是 visibility。
         priv = _make_doc('内部评定名单', visibility='private', uploader_id=999999)
+        priv.college_id = 999999
+        priv.save(update_fields=['college_id'])
         _tag_doc(priv, self.tag)
         hits = rag._tag_table_search(
             [{'tag_id': self.tag.id, 'name': self.tag.name}],
@@ -145,7 +149,10 @@ class TestTagListing(TagCacheTestMixin, TestCase):
         assert (results, name) == (None, None)
 
     def test_unauthorized_docs_excluded_from_listing(self):
+        # 私密不再等于不可检索；用用户无权限的学院验证范围过滤
         priv = _make_doc('内部评定名单', visibility='private', uploader_id=999999)
+        priv.college_id = 999999
+        priv.save(update_fields=['college_id'])
         _tag_doc(priv, self.tag)
         results, name = rag.try_expand_tag_listing(
             '奖学金评定所有文件', {'role': 'user', 'user_id': 1},

@@ -457,7 +457,7 @@ class RetrievalVisibilityTests(ReviewTestBase):
 
 
 class PersonalSpaceTests(ReviewTestBase):
-    """超管专属空间：私有文档的隔离、上传归属与 MD5 去重。"""
+    """可见性回归：公开/私密不影响浏览范围，仅影响 AI 引用区下载。"""
 
     DOC_LIST_URL = '/api/knowledge/docs/'
 
@@ -485,22 +485,21 @@ class PersonalSpaceTests(ReviewTestBase):
         ids = {row['id'] for row in resp.data['results']}
         self.assertEqual(ids, {mine.id})
 
-    def test_other_super_admin_cannot_open_or_delete_private_doc(self):
+    def test_other_super_admin_can_open_private_doc(self):
+        # 新语义：私密不再限制浏览可见范围，只限制 AI 引用区的源文件下载
         mine = self._private_doc(self.super_admin, 'A 的私密资料')
         self._auth(self.super_admin_b)
 
         detail = self.client.get(f'/api/knowledge/docs/{mine.id}/')
-        self.assertEqual(detail.status_code, 404)
+        self.assertEqual(detail.status_code, 200, detail.data)
 
-        deleted = self.client.delete(f'/api/knowledge/docs/{mine.id}/delete/')
-        self.assertEqual(deleted.status_code, 404)
-
-    def test_non_super_admin_cannot_delete_super_private_doc(self):
+    def test_non_super_admin_scope_applies_to_private_doc(self):
+        # 校级私密文档对其他管理角色同样按范围可见，不再因上传者是超管而隔离
         mine = self._private_doc(self.super_admin, 'A 的私密资料')
         self._auth(self.dept_admin)
 
-        deleted = self.client.delete(f'/api/knowledge/docs/{mine.id}/delete/')
-        self.assertEqual(deleted.status_code, 404)
+        detail = self.client.get(f'/api/knowledge/docs/{mine.id}/')
+        self.assertEqual(detail.status_code, 200, detail.data)
 
     def test_super_admin_text_upload_honors_college_scope(self):
         with patch('apps.knowledge.views.oss_client', _oss_stub()), \

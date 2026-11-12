@@ -216,27 +216,20 @@ class KnowledgeDocListView(generics.ListAPIView):
     @staticmethod
     def _admin_scope_filter(queryset, user):
         """管理后台权限过滤（通过 college_id/department_id 判断归属）：
-        - super_admin：全量，但其他超管上传的 private 文档不可见（仅该超管本人可见）
+        - super_admin：全量
         - college_admin / admin：校级文档 + 本院文档（含部门级） + 自己上传的
         - dept_admin：校级文档 + 本部门文档 + 自己上传的
         - user：仅本人上传的文档（对齐接口文档「普通用户仅能查看/下载自己上传的文档」，
-          避免泄露他人私密/未完成文档）
+          避免泄露他人未完成文档）
+        公开/私密只影响 AI 引用区的源文件下载，不再影响浏览可见范围。
         未绑定学院/部门的账号不能参与范围匹配：Q(college_id=None) 会命中所有
         学院字段为空的部门级文档，导致越权看到其他部门的文件，故 fail-closed。
         """
         # 校级文档：无学院/部门归属，且没有残留的旧 scope 标记（见 acl.py）
         SCHOOL_LEVEL = school_level_q()
 
-        # 超管上传的私密文档：仅该超管本人可见。超管上传时 college_id/department_id
-        # 均为 null（校级文档），会被下文的 SCHOOL_LEVEL 命中而向所有管理角色泄露，
-        # 故在角色过滤前先按「private + 上传者为超管」剔除（上传者本人除外）。
-        super_private = Q(visibility='private', uploader__role='super_admin')
-
         if user.role == 'super_admin':
-            return queryset.exclude(super_private & ~Q(uploader_id=user.id))
-
-        # 非超管：超管上传的私密文档一律不可见
-        queryset = queryset.exclude(super_private)
+            return queryset
 
         if user.role == 'reviewer':
             # 审核员：审核范围（本部门文档 / 本学院学院级文档）+ 校级文档。
@@ -261,8 +254,8 @@ class KnowledgeDocListView(generics.ListAPIView):
     @staticmethod
     def _rag_scope_filter(queryset, user_context):
         """AI 检索权限过滤（通过 college_id/department_id 判断归属）：
-        - private 文档绝不检索
-        - super_admin：所有 public 文档
+        - 公开/私密都可检索；私密只限制 AI 引用区的源文件下载
+        - super_admin：所有文档
         - college_admin / admin：校级文档 + 本院文档（含部门级） + 自己上传
         - dept_admin：校级文档 + 本部门文档 + 自己上传
         - user：校级文档 + 本院文档 + 本部门文档 + 自己上传
@@ -274,7 +267,7 @@ class KnowledgeDocListView(generics.ListAPIView):
         user_id = user_context.get('user_id')
         college_id = user_context.get('college_id')
         dept_id = user_context.get('department_id')
-        qs = queryset.filter(visibility='public')
+        qs = queryset
         if role == 'super_admin':
             return qs
         if role in ('college_admin', 'admin'):
@@ -407,19 +400,15 @@ class KnowledgeDocDeleteView(generics.DestroyAPIView):
     def _filter_deletable(queryset, user):
         """按角色过滤可删除的文档（通过 college_id/department_id 判断归属）
 
+        公开/私密不影响删除范围，与 _admin_scope_filter 保持一致。
         未绑定学院/部门的账号 fail-closed，避免 Q(college_id=None) 命中
         其他部门的文档（与 _admin_scope_filter 保持一致）。
         """
         # 校级文档：无学院/部门归属，且没有残留的旧 scope 标记（见 acl.py）
         SCHOOL_LEVEL = school_level_q()
-        # 超管上传的私密文档仅本人可见，删除权限也保持一致
-        super_private = Q(visibility='private', uploader__role='super_admin')
 
         if user.role == 'super_admin':
-            return queryset.exclude(super_private & ~Q(uploader_id=user.id))
-
-        # 非超管：超管上传的私密文档一律不可见/不可删
-        queryset = queryset.exclude(super_private)
+            return queryset
 
         if user.role in ('college_admin', 'admin'):
             conditions = SCHOOL_LEVEL | Q(uploader_id=user.id)

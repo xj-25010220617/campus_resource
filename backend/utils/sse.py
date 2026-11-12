@@ -262,10 +262,15 @@ def build_references_events(
     from .oss import oss_client
 
     detail = []
+    caller_id = context.get('user_id')
     for result in qualified:
         doc_id = result.get('doc_id')
         doc = docs_by_id.get(int(doc_id)) if doc_id else None
         if doc is not None:
+            # 公开文档所有人可下载；私密文档仅上传者本人可下载源文件
+            downloadable = doc.visibility == 'public' or (
+                caller_id is not None and doc.uploader_id == caller_id
+            )
             entry = {
                 'doc_id': doc.id,
                 'doc_title': doc.title,
@@ -276,6 +281,8 @@ def build_references_events(
                 'score': result.get('score', 0),
                 'content_snippet': result.get('content', '')[:200],
                 'source_url': doc.source_url or '',
+                'visibility': doc.visibility,
+                'downloadable': downloadable,
                 # 上传时间与索引完成时间分开返回，前端不得混用
                 'created_at': to_iso(doc.created_at),
                 'created_at_display': format_business_time(doc.created_at),
@@ -285,14 +292,14 @@ def build_references_events(
                     doc.freshness_date.isoformat() if doc.freshness_date else None
                 ),
             }
-            if doc.oss_key:
+            entry['download_url'] = ''
+            if downloadable and doc.oss_key:
                 try:
                     entry['download_url'] = oss_client.get_download_url(
                         doc.oss_key, expires=300, file_name=doc.file_name,
                     ) or ''
                 except Exception as exc:
                     logger.warning('生成文档下载链接失败 doc_id=%s: %s', doc.id, exc)
-                    entry['download_url'] = ''
             detail.append(entry)
             continue
 

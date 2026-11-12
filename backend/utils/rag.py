@@ -1215,8 +1215,9 @@ def authorized_knowledge_docs(
 ):
     """返回当前用户可检索的 KnowledgeDoc QuerySet。
 
-    授权逻辑必须在召回和引用签名前保持一致。超管可查看全部文档（其他超管上传的
-    private 文档除外），其他角色仅可查看公开的学校/本部门或本人上传文档。
+    授权逻辑必须在召回和引用签名前保持一致。超管可检索全部文档；其他角色可检索
+    校级/本院/本部门以及本人上传的文档。公开/私密不再影响检索范围，私密只限制
+    AI 引用区的源文件下载。
 
     include_superseded=True 时不再排除已被新版本替代的旧版文档：仅用于
     「用户显式 @ 了旧版文档」的场景，让用户能针对历史版本提问；默认 False，
@@ -1237,12 +1238,9 @@ def authorized_knowledge_docs(
         # 已被新版本替代的旧版默认不参与问答检索
         qs = qs.filter(superseded_by__isnull=True)
 
-    # 超管上传的私密文档：仅该超管本人可见（与浏览链路 _admin_scope_filter 对齐）
-    super_private = Q(visibility='private', uploader__role='super_admin')
     if role == 'super_admin':
-        return qs.exclude(super_private & ~Q(uploader_id=user_id))
+        return qs
 
-    qs = qs.filter(visibility='public')
     # 校级文档：无学院/部门归属，且没有残留的旧 scope 标记（与浏览链路共用判定）
     school_level = school_level_q()
     if role in ('admin', 'college_admin'):
