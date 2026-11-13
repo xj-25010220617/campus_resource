@@ -212,12 +212,14 @@ def build_references_events(
     if not search_results:
         return {'references': {'count': 0, 'summary': '未找到相关参考资料'}}
 
-    from .rag import RAG_REFERENCE_THRESHOLD, authorized_knowledge_docs
+    from .rag import active_reference_threshold, authorized_knowledge_docs
 
-    # 引用阈值独立于向量融合分数，避免 0.7 权重把相关来源全部过滤掉。
+    # 引用阈值按当前融合算法解析：加权=min(0.65,0.35)，RRF=独立标定值，
+    # 避免把加权分的 0.35 套到 0.0x 量级的 RRF 分数上导致引用全空。
+    reference_threshold = active_reference_threshold()
     qualified = [
         result for result in search_results
-        if result.get('score', 0) >= min(RAG_REFERENCE_THRESHOLD, 0.35)
+        if result.get('score', 0) >= reference_threshold
     ]
     if not qualified:
         return {'references': {'count': 0, 'summary': '暂无高相关度参考资料'}}

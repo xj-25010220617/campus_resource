@@ -1,6 +1,14 @@
 """Django settings for campus resource management system."""
 import os
+import sys
 from pathlib import Path
+
+# 阶段 6.4：Celery 队列声明。kombu.Queue 在 broker 包里，settings 早于 celery app 加载，
+# 所以这里直接 import；celery 未装时回退为 None，CELERY_QUEUES 整体注释掉走默认队列。
+try:
+    from kombu import Queue  # noqa: F401
+except ImportError:
+    Queue = None  # type: ignore[assignment]
 from decouple import config
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -163,13 +171,33 @@ SIMPLE_JWT = {
 }
 
 # 缓存 — 文件缓存，跨进程共享，无需 Redis
-CACHES = {
-    'default': {
-        'BACKEND': 'django.core.cache.backends.filebased.FileBasedCache',
-        'LOCATION': BASE_DIR / 'cache',
-        'TIMEOUT': 120,
+REDIS_CACHE_URL = config('REDIS_CACHE_URL', default='')
+if REDIS_CACHE_URL:
+    # 生产：多进程共享缓存（embedding/rerank/判定缓存才真正生效）
+    CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+            'LOCATION': REDIS_CACHE_URL,
+            'TIMEOUT': 300,
+            'KEY_PREFIX': 'campus',
+        }
     }
-}
+else:
+    # 开发/单进程：文件缓存（写操作见 utils/cache_safe.py，Redis 故障不影响问答）
+    CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.filebased.FileBasedCache',
+            'LOCATION': BASE_DIR / 'cache',
+            'TIMEOUT': 120,
+        }
+    }
+
+# 检索级语义缓存（阶段 5.2）：只缓存"证据"不缓存"答案"，
+# 命中后仍走正常生成，引用天然一致；问答类禁用词见 utils/semantic_cache.py
+SEMANTIC_CACHE_ENABLED = config('SEMANTIC_CACHE_ENABLED', default=False, cast=bool)
+SEMANTIC_CACHE_THRESHOLD = config('SEMANTIC_CACHE_THRESHOLD', default=0.95, cast=float)
+SEMANTIC_CACHE_TTL = config('SEMANTIC_CACHE_TTL', default=600, cast=int)
+SEMANTIC_CACHE_MAX_ENTRIES = config('SEMANTIC_CACHE_MAX_ENTRIES', default=50, cast=int)
 
 # DRF Spectacular (API docs)
 SPECTACULAR_SETTINGS = {
@@ -213,10 +241,36 @@ TABULAR_SQL_LLM_TIMEOUT = config('TABULAR_SQL_LLM_TIMEOUT', default=8.0, cast=fl
 TABULAR_MAX_ROWS = config('TABULAR_MAX_ROWS', default=100000, cast=int)
 TABULAR_RESULT_MAX_ROWS = config('TABULAR_RESULT_MAX_ROWS', default=100, cast=int)
 
+# Text-to-SQL 增强：AST 校验（sqlglot）+ 执行自愈 + 结果自检
+TABULAR_SQL_VALIDATOR = config('TABULAR_SQL_VALIDATOR', default='auto')  # auto|sqlglot|regex
+TABULAR_SQL_SELF_HEAL = config('TABULAR_SQL_SELF_HEAL', default=True, cast=bool)
+TABULAR_SQL_MAX_HEAL = config('TABULAR_SQL_MAX_HEAL', default=1, cast=int)
+TABULAR_SQL_SELF_CHECK = config('TABULAR_SQL_SELF_CHECK', default=True, cast=bool)
+
+# Schema Linking：列过多时只注入相关列；多 sheet 时按问句选 sheet
+TABULAR_SCHEMA_MAX_COLUMNS = config('TABULAR_SCHEMA_MAX_COLUMNS', default=20, cast=int)
+TABULAR_SCHEMA_SAMPLE_VALUES = config('TABULAR_SCHEMA_SAMPLE_VALUES', default=5, cast=int)
+
+# Few-shot 示例库：成功问答自动登记（待人工 verified），仅已验证示例注入 Prompt
+TABULAR_FEWSHOT_ENABLED = config('TABULAR_FEWSHOT_ENABLED', default=False, cast=bool)
+TABULAR_FEWSHOT_TOP_N = config('TABULAR_FEWSHOT_TOP_N', default=3, cast=int)
+
+# 父子块分块（阶段 1.2）：子块进向量库负责"检得准"，父块只存 MySQL 供回填负责"答得全"
+CHUNK_CHILD_SIZE = config('CHUNK_CHILD_SIZE', default=350, cast=int)
+CHUNK_CHILD_OVERLAP = config('CHUNK_CHILD_OVERLAP', default=80, cast=int)
+CHUNK_PARENT_SIZE = config('CHUNK_PARENT_SIZE', default=1200, cast=int)
+
 # Embedding 后端切换（aliyun / local / mock）
 EMBED_BACKEND = config('EMBED_BACKEND', default='local')
 ALIYUN_EMBED_API_KEY = config('ALIYUN_EMBED_API_KEY', default='')
-ALIYUN_EMBED_MODEL = config('ALIYUN_EMBED_MODEL', default='text-embedding-v3')
+ALIYUN_EMBED_MODEL = config('ALIYUN_EMBED_MODEL', default='text-embedding-v4')
+# 单批条数：百炼同步 Embedding 接口每次最多 10 条，调大可能被服务端拒绝
+ALIYUN_EMBED_BATCH_SIZE = config('ALIYUN_EMBED_BATCH_SIZE', default=10, cast=int)
+# 单条文本截断字符数：一条超长 chunk 会导致整批失败，截断比丢批划算
+ALIYUN_EMBED_MAX_CHARS = config('ALIYUN_EMBED_MAX_CHARS', default=2000, cast=int)
+# 可选维度参数：v4 支持 512/768/1024/1536/2048；0 表示不传，用模型默认（1024）
+# 显式指定后必须同步把 EMBED_VECTOR_DIM 调成相同值，否则写 Milvus 会维度不匹配
+ALIYUN_EMBED_DIMENSIONS = config('ALIYUN_EMBED_DIMENSIONS', default=0, cast=int)
 ALIYUN_EMBED_BASE_URL = config(
     'ALIYUN_EMBED_BASE_URL',
     default='https://dashscope.aliyuncs.com/compatible-mode/v1',
@@ -246,6 +300,9 @@ if _hf_endpoint:
 # 的 "Cannot open header file" 问题），项目目录含中文，故库默认放用户主目录（纯 ASCII）。
 from pathlib import Path as _Path
 MILVUS_URI = config('MILVUS_URI', default=str(_Path.home() / '.campus_milvus.db'))
+# 集合名版本化：新模型/新分块先写入新集合（如 campus_knowledge_v2），
+# 评测通过后再切本变量，出问题改回一条 env 即可回滚（需重启进程）。
+MILVUS_COLLECTION = config('MILVUS_COLLECTION', default='campus_knowledge')
 CHROMA_DB_PATH = _Path(config('CHROMA_DB_PATH', default=str(_Path.home() / '.campus_chroma_db')))
 
 # ------------------------------------------------------------------
@@ -260,6 +317,40 @@ CELERY_TIMEZONE = 'Asia/Shanghai'
 CELERY_TASK_TIME_LIMIT = 300
 CELERY_TASK_SOFT_TIME_LIMIT = 240
 CELERY_TASK_TRACK_STARTED = True
+
+# --- 阶段 6.4：队列拆分 ---
+# parse 队列：解析 + 分块 + Embedding + Milvus（重活，需 rate limit 防打百炼配额）
+# crawl 队列：官网爬虫（独立流量尖峰，避免阻塞索引队列）
+# faq   队列：FAQ 自动生成（低频、不阻塞主链路）
+# sys   队列：系统心跳 + 清理 + 版本识别（后台运维类）
+if Queue is not None:
+    CELERY_QUEUES = (
+        Queue('parse',  routing_key='parse.#'),
+        Queue('crawl',  routing_key='crawl.#'),
+        Queue('faq',    routing_key='faq.#'),
+        Queue('sys',    routing_key='sys.#'),
+        Queue('default', routing_key='default.#'),  # 保留兜底
+    )
+
+# 任务 → 队列映射；shared_task 装饰器上 queue= 与这里二选一，
+# 两者都写是防御性配置——装饰器覆盖优先级更高，celery.py 的 beat_schedule 里
+# 动态取 task.queue 字段注入，不会被路由表覆盖。
+CELERY_TASK_ROUTES = {
+    'apps.knowledge.tasks.index_document_task':           {'queue': 'parse'},
+    'apps.knowledge.tasks.extract_freshness_task':       {'queue': 'parse'},
+    'apps.knowledge.tasks.detect_version_task':          {'queue': 'sys'},
+    'apps.knowledge.tasks.auto_link_relations_task':    {'queue': 'sys'},
+    'apps.knowledge.tasks.crawl_neusoft_website_task':  {'queue': 'crawl'},
+    'apps.knowledge.tasks.refresh_daily_context_task':  {'queue': 'sys'},
+    'apps.knowledge.tasks.cleanup_expired_upload_sessions_task': {'queue': 'sys'},
+    'apps.faq.tasks.generate_faq_weekly':               {'queue': 'faq'},
+    'apps.faq.tasks.generate_faq_from_website':         {'queue': 'faq'},
+}
+
+# Embedding rate limit：百炼免费额度每天 200w token，索引一条文档 ~50 次调用，
+# 高峰期（爬虫 + 上传）可能并发 10+ 条。80/m 限制能让 10 并发下单条任务串行化
+# Embedding 批次调用，而不是 10 条任务同时打 API。
+EMBED_RATE_LIMIT = config('EMBED_RATE_LIMIT', default='80/m')
 
 # ------------------------------------------------------------------
 # SSO 单点登录
@@ -345,6 +436,75 @@ SYNONYM_DICT_CUSTOM_PATH = config('SYNONYM_DICT_CUSTOM_PATH', default='')
 # 关闭后走 rag._merge_and_rerank 的加权融合（原有兜底逻辑）；部署到 GPU 机器可在 .env 置 True 开启。
 CROSS_ENCODER_ENABLED = config('CROSS_ENCODER_ENABLED', default=False, cast=bool)
 CROSS_ENCODER_MODEL = config('CROSS_ENCODER_MODEL', default='BAAI/bge-reranker-v2-m3')
+
+# 精排后端：off（关闭）| local（本地 Cross-Encoder，需 CROSS_ENCODER_ENABLED=True）。
+# api / onnx 后端尚未接入，配置成这两个值时会自动降级为 off 并打 warning。
+RERANK_BACKEND = config('RERANK_BACKEND', default='off')
+# 各后端独立阈值：精排分数已归一化到 [0,1]（见 reranker._normalize_rerank_scores），
+# 不再复用加权融合的 RAG_SCORE_THRESHOLD，避免换后端后阈值整体失效。
+RERANK_MIN_SCORE = config('RERANK_MIN_SCORE', default=0.30, cast=float)
+RERANK_TOP_N = config('RERANK_TOP_N', default=20, cast=int)
+
+# ------------------------------------------------------------------
+# 检索与解析开关（阶段化改造的回滚开关，默认全部保持旧行为）
+# ------------------------------------------------------------------
+# 融合算法：weighted（现有手写加权）| rrf（倒数排名融合）
+RETRIEVAL_FUSION = config('RETRIEVAL_FUSION', default='weighted')
+# RRF 分数与加权重排完全不重量纲，必须独立标定阈值，禁止复用 RAG_SCORE_THRESHOLD。
+RRF_K = config('RRF_K', default=60, cast=int)
+RRF_SCORE_THRESHOLD = config('RRF_SCORE_THRESHOLD', default=0.006, cast=float)
+RRF_RETRY_TRIGGER_SCORE = config('RRF_RETRY_TRIGGER_SCORE', default=0.015, cast=float)
+RRF_RETRY_MIN_SCORE = config('RRF_RETRY_MIN_SCORE', default=0.004, cast=float)
+# 引用展示阈值：RRF 下一次榜首命中约 1/(K+1)=0.016，0.02 约等于"多通道命中或高位命中"
+RRF_REFERENCE_THRESHOLD = config('RRF_REFERENCE_THRESHOLD', default=0.02, cast=float)
+# 管理员拒答 / 联网兜底的置信阈值：加权口径 0.5，RRF 下折算为约"两票高位命中"
+RRF_ADMIN_MIN_SCORE = config('RRF_ADMIN_MIN_SCORE', default=0.03, cast=float)
+RRF_WEB_SEARCH_MIN_SCORE = config('RRF_WEB_SEARCH_MIN_SCORE', default=0.03, cast=float)
+# 解析后端：
+#   legacy     —— 现有 PyMuPDF / python-docx / openpyxl 直读（默认，可回滚）
+#   markitdown —— DOCX/PPTX 走 MarkItDown 转 Markdown（保留标题层级）；
+#                 XLSX/CSV 仍走 legacy，因为表格结构化记录要喂 Text-to-SQL
+#   service    —— PDF 走外部解析服务（docling-serve / MinerU sidecar），失败回落本地
+PARSER_BACKEND = config('PARSER_BACKEND', default='legacy')
+# 复杂版式 PDF 解析服务（PARSER_BACKEND=service 时生效），留空则直接用本地解析
+DOC_PARSE_SERVICE_URL = config('DOC_PARSE_SERVICE_URL', default='')
+DOC_PARSE_SERVICE_TIMEOUT = config('DOC_PARSE_SERVICE_TIMEOUT', default=120, cast=int)
+# OCR 后端：auto（优先 RapidOCR，缺失回退 EasyOCR）| rapidocr | easyocr
+OCR_BACKEND = config('OCR_BACKEND', default='auto')
+# 低成本 Contextual Retrieval（阶段 1.2 可选增强）：Embedding 前拼接
+# 「文档标题 > 标题路径」，无需调 LLM。开启后必须整库重灌才生效。
+CONTEXTUAL_EMBED_ENABLED = config('CONTEXTUAL_EMBED_ENABLED', default=False, cast=bool)
+# 向量通道质量门：最高分过低/分数无差异时把向量权重从 0.7 降到 0.2。
+# 默认关闭：当前 bge 后端实测开启后 Recall@5 由 90.0% 降到 86.7%（阈值
+# 0.25/0.02 是按更高相似度分布的模型标的，与本地余弦分布不匹配）。
+# 换 Embedding 后端后，用 scripts/eval_retrieval.py 标定阈值再打开。
+RAG_VECTOR_GATE_ENABLED = config('RAG_VECTOR_GATE_ENABLED', default=False, cast=bool)
+RAG_VECTOR_GATE_LOW_TOP = config('RAG_VECTOR_GATE_LOW_TOP', default=0.25, cast=float)
+RAG_VECTOR_GATE_MIN_SPREAD = config('RAG_VECTOR_GATE_MIN_SPREAD', default=0.02, cast=float)
+# 正文分块通道走 MySQL ngram FULLTEXT（迁移 0017 建索引）；索引缺失或
+# 后端不支持时自动回退 icontains，召回不退化、只影响速度。
+RAG_FULLTEXT_ENABLED = config('RAG_FULLTEXT_ENABLED', default=True, cast=bool)
+
+# 检索证据充分性判定（CRAG 最小闭环）：开启后每轮问答多一次轻量 LLM 判定，
+# 判定"资料不足"时扩大检索一次，并在 Prompt 中禁止编造。默认关闭。
+RAG_GRADER_ENABLED = config('RAG_GRADER_ENABLED', default=False, cast=bool)
+RAG_GRADER_RETRY_ENABLED = config('RAG_GRADER_RETRY_ENABLED', default=True, cast=bool)
+RAG_GRADER_MAX_HITS = config('RAG_GRADER_MAX_HITS', default=5, cast=int)
+RAG_GRADER_SNIPPET_CHARS = config('RAG_GRADER_SNIPPET_CHARS', default=400, cast=int)
+RAG_GRADER_TIMEOUT = config('RAG_GRADER_TIMEOUT', default=8, cast=float)
+RAG_GRADER_CACHE_TTL = config('RAG_GRADER_CACHE_TTL', default=600, cast=int)
+
+# 多问题查询分解（阶段 3.3）：命中"对比/分别/各学院/历年"等提示词时，
+# 先拆成最多 N 个子问题各自召回再合并。默认关闭。
+RAG_DECOMPOSE_ENABLED = config('RAG_DECOMPOSE_ENABLED', default=False, cast=bool)
+RAG_DECOMPOSE_MAX_SUBQUERIES = config('RAG_DECOMPOSE_MAX_SUBQUERIES', default=3, cast=int)
+RAG_DECOMPOSE_TIMEOUT = config('RAG_DECOMPOSE_TIMEOUT', default=8, cast=float)
+
+# 测试进程强制关闭依赖真实模型的在线开关：保证用例确定性、可离线运行。
+# 线上仍由 env 控制，不受此处影响。
+if 'test' in sys.argv:
+    RAG_GRADER_ENABLED = False
+    RAG_DECOMPOSE_ENABLED = False
 
 # ------------------------------------------------------------------
 # 多轮对话摘要

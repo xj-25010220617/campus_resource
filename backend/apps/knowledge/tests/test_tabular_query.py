@@ -170,3 +170,232 @@ class ExecutionTests(TestCase):
         # pdf 不在表格类型白名单 → 定位失败回退
         self.assertFalse(result['success'])
         self.assertEqual(result['fallback'], 'rag')
+
+
+# ------------------------------------------------------------------
+# AST 校验（sqlglot）与自愈/自检
+# ------------------------------------------------------------------
+class SchemaLinkingTests(TestCase):
+    _SCHEMA = {
+        'sheets': [
+            {
+                'name': '教材订购',
+                'columns': [{'name': '姓名', 'dtype': 'VARCHAR'}, {'name': '数量', 'dtype': 'DOUBLE'}],
+                'row_count': 3,
+                'sample_rows': [['张三', '3'], ['李四', '5']],
+            },
+            {
+                'name': '期末成绩表',
+                'columns': [
+                    {'name': '学号', 'dtype': 'VARCHAR'},
+                    {'name': '课程', 'dtype': 'VARCHAR'},
+                    {'name': '成绩', 'dtype': 'DOUBLE'},
+                ],
+                'row_count': 2,
+                'sample_rows': [['2025001', '高数', '88'], ['2025002', '英语', '92']],
+            },
+        ],
+    }
+
+    def test_pick_sheet_by_question(self):
+        sheet = tabular_query._pick_sheet(self._SCHEMA, '期末成绩表里高数成绩是多少')
+        self.assertEqual(sheet['name'], '期末成绩表')
+        sheet = tabular_query._pick_sheet(self._SCHEMA, '教材订购数量')
+        self.assertEqual(sheet['name'], '教材订购')
+
+    def test_columns_limited_but_keep_matched(self):
+        cols = [{'name': f'列{i}', 'dtype': 'VARCHAR'} for i in range(30)]
+        cols.append({'name': '目标列', 'dtype': 'VARCHAR'})
+        schema = {'sheets': [{'name': 'S', 'columns': cols, 'row_count': 1,
+                              'sample_rows': [['x'] * len(cols)]}]}
+        with self.settings(TABULAR_SCHEMA_MAX_COLUMNS=5):
+            prompt = tabular_query._schema_prompt(schema, '目标列是多少')
+        self.assertIn('目标列', prompt)
+        self.assertIn('未展示', prompt)
+
+    def test_enum_values_included(self):
+        prompt = tabular_query._schema_prompt(self._SCHEMA, '教材订购数量')
+        self.assertIn('候选值', prompt)
+        self.assertIn('张三', prompt)
+
+
+class FewShotTests(TestCase):
+    def test_disabled_records_nothing(self):
+        from apps.knowledge.models import TabularFewShot
+        from utils import tabular_fewshot
+
+        with mock.patch('utils.llm.llm_client.embed_one', return_value=[1.0, 0.0]):
+            tabular_fewshot.record_example('有多少条记录', 'SELECT COUNT(*) FROM data')
+        self.assertEqual(TabularFewShot.objects.count(), 0)
+        self.assertEqual(tabular_fewshot.format_examples('有多少条记录'), '')
+
+    def test_unverified_not_injected(self):
+        from utils import tabular_fewshot
+
+        with self.settings(TABULAR_FEWSHOT_ENABLED=True), \
+             mock.patch('utils.llm.llm_client.embed_one', return_value=[1.0, 0.0]):
+            tabular_fewshot.record_example('有多少条记录', 'SELECT COUNT(*) FROM data')
+            self.assertEqual(tabular_fewshot.retrieve_examples('有多少条记录'), [])
+
+    def test_verified_example_retrieved(self):
+        from apps.knowledge.models import TabularFewShot
+        from utils import tabular_fewshot
+
+        with self.settings(TABULAR_FEWSHOT_ENABLED=True), \
+             mock.patch('utils.llm.llm_client.embed_one', return_value=[1.0, 0.0]):
+            tabular_fewshot.record_example('有多少条记录', 'SELECT COUNT(*) FROM data')
+            TabularFewShot.objects.update(verified=True)
+            examples = tabular_fewshot.retrieve_examples('一共有多少条记录')
+            self.assertEqual(len(examples), 1)
+            self.assertIn('COUNT(*)', examples[0]['sql'])
+
+    def test_dissimilar_example_filtered(self):
+        from apps.knowledge.models import TabularFewShot
+        from utils import tabular_fewshot
+
+        with self.settings(TABULAR_FEWSHOT_ENABLED=True), \
+             mock.patch('utils.llm.llm_client.embed_one', side_effect=[[1.0, 0.0], [0.0, 1.0]]):
+            tabular_fewshot.record_example('有多少条记录', 'SELECT COUNT(*) FROM data')
+            TabularFewShot.objects.update(verified=True)
+            self.assertEqual(tabular_fewshot.retrieve_examples('重修怎么申请'), [])
+
+
+class AstValidateTests(TestCase):
+    def test_cte_select_allowed(self):
+        sql = validate_sql('WITH t AS (SELECT 姓名 FROM data) SELECT * FROM t')
+        self.assertIn('LIMIT', sql.upper())
+
+    def test_select_into_rejected(self):
+        with self.assertRaises(TabularError):
+            validate_sql('SELECT * INTO backup FROM data')
+
+    def test_attach_rejected(self):
+        with self.assertRaises(TabularError):
+            validate_sql('ATTACH DATABASE \'x.db\' AS x')
+
+    def test_comment_bypass_rejected(self):
+        with self.assertRaises(TabularError):
+            validate_sql('SELECT * FROM data; /* hi */ DROP TABLE data')
+
+    def test_nested_other_table_rejected(self):
+        with self.assertRaises(TabularError):
+            validate_sql('SELECT * FROM (SELECT * FROM secret) AS s')
+
+    def test_regex_backend_still_available(self):
+        with self.settings(TABULAR_SQL_VALIDATOR='regex'):
+            sql = validate_sql('SELECT * FROM data')
+        self.assertIn('LIMIT', sql.upper())
+
+
+class ResultSuspicionTests(TestCase):
+    def test_group_question_single_row(self):
+        reason = tabular_query._result_suspicion('各班级的学生名单', ['班级'], [['软件1班']])
+        self.assertIn('GROUP BY', reason)
+
+    def test_count_question_multi_rows(self):
+        reason = tabular_query._result_suspicion('共有多少条记录', ['姓名'], [['张三'], ['李四']])
+        self.assertIn('聚合', reason)
+
+    def test_consistent_result_no_warning(self):
+        self.assertIsNone(
+            tabular_query._result_suspicion('共有多少条记录', ['COUNT(*)'], [[3]]),
+        )
+        self.assertIsNone(
+            tabular_query._result_suspicion('各班级人数', ['班级', '人数'], [['1班', 2], ['2班', 3]]),
+        )
+
+
+class SelfHealTests(TestCase):
+    def _doc(self):
+        return KnowledgeDoc.objects.create(
+            title='软件工程25201-25206教材订购意愿',
+            source_type='upload',
+            file_name='软件工程25201-25206教材订购意愿.xlsx',
+            file_type='xls',
+            status='indexed',
+            visibility='public',
+            table_schema={
+                'sheets': [{
+                    'name': 'Sheet1',
+                    'columns': [
+                        {'name': '姓名', 'dtype': 'VARCHAR'},
+                        {'name': '班级', 'dtype': 'VARCHAR'},
+                        {'name': '数量', 'dtype': 'DOUBLE'},
+                    ],
+                    'row_count': 3,
+                    'sample_rows': [['张三', '软件工程25206', '3']],
+                }],
+            },
+        )
+
+    def _conn(self):
+        import sqlite3
+        conn = sqlite3.connect(':memory:')
+        conn.execute('CREATE TABLE data("姓名" TEXT, "班级" TEXT, "数量" REAL)')
+        conn.executemany('INSERT INTO data VALUES (?,?,?)', [
+            ('张三', '软件工程25206', 3.0),
+            ('李四', '软件工程25206', 5.0),
+            ('王五', '软件工程25201', 2.0),
+        ])
+        return conn
+
+    def test_repair_after_execution_error(self):
+        import threading
+        doc = self._doc()
+        with mock.patch.object(
+                tabular_query, '_visible_tabular_docs',
+                return_value=KnowledgeDoc.objects.filter(pk=doc.id)), \
+             mock.patch.object(tabular_query, '_get_conn', return_value=(self._conn(), threading.Lock())), \
+             mock.patch.object(tabular_query, 'generate_sql', return_value='SELECT 不存在的列 FROM data'), \
+             mock.patch.object(tabular_query, '_repair_sql', return_value='SELECT COUNT(*) FROM data'):
+            result = tabular_query.run_tabular_query(user=None, question='有多少条记录', doc_id=doc.id)
+
+        self.assertTrue(result['success'])
+        self.assertIn('COUNT', result['data']['sql'].upper())
+        self.assertEqual(result['data']['rows'][0][0], 3)
+
+    def test_repair_when_result_suspicious(self):
+        import threading
+        doc = self._doc()
+        with mock.patch.object(
+                tabular_query, '_visible_tabular_docs',
+                return_value=KnowledgeDoc.objects.filter(pk=doc.id)), \
+             mock.patch.object(tabular_query, '_get_conn', return_value=(self._conn(), threading.Lock())), \
+             mock.patch.object(tabular_query, 'generate_sql', return_value='SELECT "班级" FROM data LIMIT 1'), \
+             mock.patch.object(
+                 tabular_query, '_repair_sql',
+                 return_value='SELECT "班级", COUNT(*) AS 人数 FROM data GROUP BY "班级"',
+             ):
+            result = tabular_query.run_tabular_query(user=None, question='各班级的学生名单', doc_id=doc.id)
+
+        self.assertTrue(result['success'])
+        self.assertIn('GROUP BY', result['data']['sql'].upper())
+        self.assertEqual(result['data']['row_count'], 2)
+
+    def test_keep_original_when_repair_no_better(self):
+        import threading
+        doc = self._doc()
+        with mock.patch.object(
+                tabular_query, '_visible_tabular_docs',
+                return_value=KnowledgeDoc.objects.filter(pk=doc.id)), \
+             mock.patch.object(tabular_query, '_get_conn', return_value=(self._conn(), threading.Lock())), \
+             mock.patch.object(tabular_query, 'generate_sql', return_value='SELECT "班级" FROM data LIMIT 1'), \
+             mock.patch.object(tabular_query, '_repair_sql', return_value='SELECT "班级" FROM data LIMIT 1'):
+            result = tabular_query.run_tabular_query(user=None, question='各班级的学生名单', doc_id=doc.id)
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['data']['row_count'], 1)
+
+    def test_heal_disabled_falls_back(self):
+        import threading
+        doc = self._doc()
+        with self.settings(TABULAR_SQL_SELF_HEAL=False):
+            with mock.patch.object(
+                    tabular_query, '_visible_tabular_docs',
+                    return_value=KnowledgeDoc.objects.filter(pk=doc.id)), \
+                 mock.patch.object(tabular_query, '_get_conn', return_value=(self._conn(), threading.Lock())), \
+                 mock.patch.object(tabular_query, 'generate_sql', return_value='SELECT 不存在的列 FROM data'):
+                result = tabular_query.run_tabular_query(user=None, question='有多少条记录', doc_id=doc.id)
+
+        self.assertFalse(result['success'])
+        self.assertEqual(result['fallback'], 'rag')

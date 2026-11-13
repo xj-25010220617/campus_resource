@@ -734,7 +734,7 @@ class AskView(APIView):
             refuse_text = '知识库暂无相关资料，无法给出可靠回答。'
         if not should_refuse and rag.is_strict_role(user_role):
             top_score = max((r.get('score', 0) for r in results), default=0.0)
-            if not results or top_score < rag.ADMIN_MIN_SCORE:
+            if not results or top_score < rag.active_admin_min_score():
                 should_refuse = True
                 logger.info(
                     '管理员低置信拒答 role=%s top_score=%.3f results=%d q=%s',
@@ -747,7 +747,7 @@ class AskView(APIView):
         web_search_used = False
         pending_docs = []
         top_score = max((r.get('score', 0) for r in results), default=0.0)
-        low_confidence = bool(results) and top_score < rag.WEB_SEARCH_MIN_SCORE
+        low_confidence = bool(results) and top_score < rag.active_web_search_min_score()
         if (
             not should_refuse
             and doc_scope is None  # @/# 限定范围时不联网兜底，答案只来自引用文档
@@ -1491,7 +1491,6 @@ class VoiceAskView(APIView):
                 hits = rag.retrieve(
                     question=question, user_context=user_context,
                     parsed_filters=parsed, top_k=rag.RAG_TOP_K,
-                    min_score=rag.RAG_SCORE_THRESHOLD,
                 )
                 # 标签穷举：命中唯一标签且含列举意图时给出全量文件清单
                 tag_list_name = None

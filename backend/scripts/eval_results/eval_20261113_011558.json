@@ -1,0 +1,672 @@
+{
+  "created_at": "2026-11-13T01:15:58",
+  "config": {
+    "role": "super_admin",
+    "user_id": null,
+    "college_id": null,
+    "top_k": 15,
+    "retry": 1,
+    "rewrite": false,
+    "rerank": true,
+    "fusion": "weighted",
+    "rerank_backend": "off",
+    "milvus_collection": "campus_knowledge_embedv4",
+    "dataset": "auto"
+  },
+  "metrics": {
+    "samples": 30,
+    "errors": 0,
+    "labeled_samples": 30,
+    "recall@1": 0.6667,
+    "recall@3": 0.9333,
+    "recall@5": 0.9667,
+    "recall@10": 0.9667,
+    "mrr@5": 0.8083,
+    "ndcg@5": 0.8493,
+    "context_precision": 0.2267,
+    "zero_recall_rate": 0.0,
+    "avg_elapsed_ms": 561.0,
+    "max_elapsed_ms": 2418.8,
+    "avg_hit_count": 5.0,
+    "per_type": {
+      "auto_title": {
+        "samples": 30,
+        "recall@5": 0.9667,
+        "zero_recall_rate": 0.0,
+        "labeled": 30
+      }
+    }
+  },
+  "details": [
+    {
+      "question": "实验中心2026年秋季实验室开放安排",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        111
+      ],
+      "rank": 1,
+      "ndcg@5": 1.0,
+      "context_precision": 0.2,
+      "hit_count": 5,
+      "top_doc_ids": [
+        111,
+        109,
+        100,
+        110,
+        34
+      ],
+      "top_score": 0.7794,
+      "elapsed_ms": 2418.8,
+      "source": "auto"
+    },
+    {
+      "question": "教务部2026-2027学年第一学期选课通知",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        110
+      ],
+      "rank": 1,
+      "ndcg@5": 1.0,
+      "context_precision": 0.2,
+      "hit_count": 5,
+      "top_doc_ids": [
+        110,
+        100,
+        34,
+        99,
+        100
+      ],
+      "top_score": 0.7565,
+      "elapsed_ms": 442.1,
+      "source": "auto"
+    },
+    {
+      "question": "科研部2026年度科研项目申报通知",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        109
+      ],
+      "rank": 1,
+      "ndcg@5": 1.0,
+      "context_precision": 0.2,
+      "hit_count": 5,
+      "top_doc_ids": [
+        109,
+        111,
+        110,
+        100,
+        99
+      ],
+      "top_score": 0.7228,
+      "elapsed_ms": 458.5,
+      "source": "auto"
+    },
+    {
+      "question": "四川省教育厅-《关于民办高校新增本（专）科拟招生专业学费备案的函》-职业本科",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        106
+      ],
+      "rank": 1,
+      "ndcg@5": 1.0,
+      "context_precision": 0.2,
+      "hit_count": 5,
+      "top_doc_ids": [
+        106,
+        105,
+        102,
+        103,
+        53
+      ],
+      "top_score": 0.7556,
+      "elapsed_ms": 479.6,
+      "source": "auto"
+    },
+    {
+      "question": "四川省教育厅-《关于民办高校新增本（专）科拟招生专业学费备案的函》-普通本科",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        105
+      ],
+      "rank": 2,
+      "ndcg@5": 0.6309,
+      "context_precision": 0.2,
+      "hit_count": 5,
+      "top_doc_ids": [
+        106,
+        105,
+        102,
+        103,
+        53
+      ],
+      "top_score": 0.7955,
+      "elapsed_ms": 396.9,
+      "source": "auto"
+    },
+    {
+      "question": "《四川省教育厅关于民办高校新增本（专）科拟招生专业学费备案的函——中外合作办学》",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        103
+      ],
+      "rank": 1,
+      "ndcg@5": 1.0,
+      "context_precision": 0.2,
+      "hit_count": 5,
+      "top_doc_ids": [
+        103,
+        106,
+        105,
+        102,
+        53
+      ],
+      "top_score": 0.7876,
+      "elapsed_ms": 413.4,
+      "source": "auto"
+    },
+    {
+      "question": "附件：《四川省教育厅关于2026 年民办高校新增本（专）科拟招生专业学费备案的函》——川教函〔2026〕153 号",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        102
+      ],
+      "rank": 1,
+      "ndcg@5": 1.0,
+      "context_precision": 0.2,
+      "hit_count": 5,
+      "top_doc_ids": [
+        102,
+        106,
+        105,
+        103,
+        99
+      ],
+      "top_score": 0.8223,
+      "elapsed_ms": 397.3,
+      "source": "auto"
+    },
+    {
+      "question": "关于修订《成都东软学院学杂费退费管理办法》的通知",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        100
+      ],
+      "rank": 1,
+      "ndcg@5": 1.0,
+      "context_precision": 0.6,
+      "hit_count": 5,
+      "top_doc_ids": [
+        100,
+        48,
+        100,
+        100,
+        47
+      ],
+      "top_score": 0.8177,
+      "elapsed_ms": 441.9,
+      "source": "auto"
+    },
+    {
+      "question": "《四川省教育厅关于民办高校2027年学费标准调整备案的函》川教函【2026】321号",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        99
+      ],
+      "rank": 1,
+      "ndcg@5": 1.0,
+      "context_precision": 0.2,
+      "hit_count": 5,
+      "top_doc_ids": [
+        99,
+        102,
+        106,
+        105,
+        47
+      ],
+      "top_score": 0.7957,
+      "elapsed_ms": 443.8,
+      "source": "auto"
+    },
+    {
+      "question": "校发[2025]46号-成都东软学院关于表彰荣获2024-2025学年华天奖学金、东软睿新奖学金学生的决定",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        98
+      ],
+      "rank": 1,
+      "ndcg@5": 1.0,
+      "context_precision": 0.2,
+      "hit_count": 5,
+      "top_doc_ids": [
+        98,
+        95,
+        93,
+        97,
+        89
+      ],
+      "top_score": 0.815,
+      "elapsed_ms": 841.9,
+      "source": "auto"
+    },
+    {
+      "question": "校发[2024]33号-成都东软学院关于开展2023－2024学年度华天、东软教育奖学金评选工作的通知",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        97
+      ],
+      "rank": 1,
+      "ndcg@5": 1.0,
+      "context_precision": 0.2,
+      "hit_count": 5,
+      "top_doc_ids": [
+        97,
+        95,
+        83,
+        93,
+        98
+      ],
+      "top_score": 0.8303,
+      "elapsed_ms": 527.8,
+      "source": "auto"
+    },
+    {
+      "question": "校发[2024]22号-成都东软学院关于表彰2024届优秀毕业生的决定",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        96
+      ],
+      "rank": 1,
+      "ndcg@5": 1.0,
+      "context_precision": 0.2,
+      "hit_count": 5,
+      "top_doc_ids": [
+        96,
+        5,
+        92,
+        94,
+        88
+      ],
+      "top_score": 0.8001,
+      "elapsed_ms": 488.5,
+      "source": "auto"
+    },
+    {
+      "question": "校发[2023]39号-成都东软学院关于表彰荣获2022-2023学年华天奖学金、东软教育奖学金学生的决定",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        95
+      ],
+      "rank": 1,
+      "ndcg@5": 1.0,
+      "context_precision": 0.2,
+      "hit_count": 5,
+      "top_doc_ids": [
+        95,
+        93,
+        97,
+        83,
+        85
+      ],
+      "top_score": 0.8042,
+      "elapsed_ms": 699.0,
+      "source": "auto"
+    },
+    {
+      "question": "成都东软学院关于表彰2023届优秀毕业生的决定",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        94
+      ],
+      "rank": 1,
+      "ndcg@5": 1.0,
+      "context_precision": 0.2,
+      "hit_count": 5,
+      "top_doc_ids": [
+        94,
+        5,
+        96,
+        92,
+        86
+      ],
+      "top_score": 0.7847,
+      "elapsed_ms": 600.3,
+      "source": "auto"
+    },
+    {
+      "question": "校发【2022】27号 - 关于表彰荣获2021-2022学年华天奖学金、东软教育奖学金学生的决定",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        93
+      ],
+      "rank": 1,
+      "ndcg@5": 1.0,
+      "context_precision": 0.2,
+      "hit_count": 5,
+      "top_doc_ids": [
+        93,
+        91,
+        95,
+        89,
+        87
+      ],
+      "top_score": 0.761,
+      "elapsed_ms": 724.8,
+      "source": "auto"
+    },
+    {
+      "question": "成都东软学院关于表彰2022届优秀毕业生的决定",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        92
+      ],
+      "rank": 2,
+      "ndcg@5": 0.6309,
+      "context_precision": 0.2,
+      "hit_count": 5,
+      "top_doc_ids": [
+        5,
+        92,
+        96,
+        94,
+        86
+      ],
+      "top_score": 0.7796,
+      "elapsed_ms": 546.4,
+      "source": "auto"
+    },
+    {
+      "question": "校发【2021】29号 - 关于表彰荣获2020-2021学年度华天奖学金、东软教育奖学金学生的决定",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        91
+      ],
+      "rank": 1,
+      "ndcg@5": 1.0,
+      "context_precision": 0.2,
+      "hit_count": 5,
+      "top_doc_ids": [
+        91,
+        89,
+        93,
+        87,
+        95
+      ],
+      "top_score": 0.7617,
+      "elapsed_ms": 463.5,
+      "source": "auto"
+    },
+    {
+      "question": "院发【2021】8号 - 成都东软学院关于表彰2021届优秀毕业生的决定",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        90
+      ],
+      "rank": 1,
+      "ndcg@5": 1.0,
+      "context_precision": 0.2,
+      "hit_count": 5,
+      "top_doc_ids": [
+        90,
+        5,
+        94,
+        92,
+        96
+      ],
+      "top_score": 0.7771,
+      "elapsed_ms": 401.1,
+      "source": "auto"
+    },
+    {
+      "question": "院发【2020】31号 - 关于表彰荣获2019-2020学年度华天奖学金、东软教育奖学金学生的决定",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        89
+      ],
+      "rank": 2,
+      "ndcg@5": 0.6309,
+      "context_precision": 0.2,
+      "hit_count": 5,
+      "top_doc_ids": [
+        91,
+        89,
+        87,
+        95,
+        93
+      ],
+      "top_score": 0.736,
+      "elapsed_ms": 454.5,
+      "source": "auto"
+    },
+    {
+      "question": "院发【2020】16号 - 关于表彰2020届优秀毕业生的决定",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        88
+      ],
+      "rank": 1,
+      "ndcg@5": 1.0,
+      "context_precision": 0.2,
+      "hit_count": 5,
+      "top_doc_ids": [
+        88,
+        5,
+        90,
+        96,
+        84
+      ],
+      "top_score": 0.6317,
+      "elapsed_ms": 451.6,
+      "source": "auto"
+    },
+    {
+      "question": "东软教科发〔2019〕43号-关于表彰2018-2019学年度三地学院华天奖学金获奖学生的决定",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        87
+      ],
+      "rank": 1,
+      "ndcg@5": 1.0,
+      "context_precision": 0.2,
+      "hit_count": 5,
+      "top_doc_ids": [
+        87,
+        95,
+        85,
+        89,
+        98
+      ],
+      "top_score": 0.7743,
+      "elapsed_ms": 408.6,
+      "source": "auto"
+    },
+    {
+      "question": "院发【2019】15号 - 成都东软学院关于表彰2019届优秀大学毕业生的决定",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        86
+      ],
+      "rank": 1,
+      "ndcg@5": 1.0,
+      "context_precision": 0.2,
+      "hit_count": 5,
+      "top_doc_ids": [
+        86,
+        5,
+        94,
+        96,
+        88
+      ],
+      "top_score": 0.7848,
+      "elapsed_ms": 469.9,
+      "source": "auto"
+    },
+    {
+      "question": "关于表彰荣获2017-2018学年度华天奖学金、东软控股奖学金学生的决定宣读版",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        85
+      ],
+      "rank": 2,
+      "ndcg@5": 0.6309,
+      "context_precision": 0.2,
+      "hit_count": 5,
+      "top_doc_ids": [
+        87,
+        85,
+        95,
+        89,
+        91
+      ],
+      "top_score": 0.7413,
+      "elapsed_ms": 462.2,
+      "source": "auto"
+    },
+    {
+      "question": "院发【2018】20号 -关于表彰2018届优秀大学毕业生的决定",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        84
+      ],
+      "rank": 2,
+      "ndcg@5": 0.6309,
+      "context_precision": 0.2,
+      "hit_count": 5,
+      "top_doc_ids": [
+        5,
+        84,
+        79,
+        77,
+        68
+      ],
+      "top_score": 0.632,
+      "elapsed_ms": 359.8,
+      "source": "auto"
+    },
+    {
+      "question": "院发【2017】23号-关于表彰荣获2016-2017学年度华天奖学金、东软控股奖学金学生的决定",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        83
+      ],
+      "rank": 0,
+      "ndcg@5": 0.0,
+      "context_precision": 0.0,
+      "hit_count": 5,
+      "top_doc_ids": [
+        87,
+        85,
+        95,
+        89,
+        93
+      ],
+      "top_score": 0.7456,
+      "elapsed_ms": 396.7,
+      "source": "auto"
+    },
+    {
+      "question": "2017届优秀毕业生",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        82
+      ],
+      "rank": 2,
+      "ndcg@5": 0.6309,
+      "context_precision": 0.2,
+      "hit_count": 5,
+      "top_doc_ids": [
+        18,
+        82,
+        74,
+        77,
+        79
+      ],
+      "top_score": 0.6731,
+      "elapsed_ms": 558.0,
+      "source": "auto"
+    },
+    {
+      "question": "2016届优秀毕业生",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        81
+      ],
+      "rank": 4,
+      "ndcg@5": 0.4307,
+      "context_precision": 0.2,
+      "hit_count": 5,
+      "top_doc_ids": [
+        18,
+        74,
+        77,
+        81,
+        79
+      ],
+      "top_score": 0.6728,
+      "elapsed_ms": 416.8,
+      "source": "auto"
+    },
+    {
+      "question": "2015－2016学年度获华天奖学金、东软·亿达奖学金学生",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        80
+      ],
+      "rank": 2,
+      "ndcg@5": 0.6309,
+      "context_precision": 0.6,
+      "hit_count": 5,
+      "top_doc_ids": [
+        83,
+        80,
+        80,
+        80,
+        18
+      ],
+      "top_score": 0.7366,
+      "elapsed_ms": 507.7,
+      "source": "auto"
+    },
+    {
+      "question": "2015届优秀毕业生",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        79
+      ],
+      "rank": 1,
+      "ndcg@5": 1.0,
+      "context_precision": 0.2,
+      "hit_count": 5,
+      "top_doc_ids": [
+        79,
+        18,
+        5,
+        74,
+        77
+      ],
+      "top_score": 0.6751,
+      "elapsed_ms": 455.7,
+      "source": "auto"
+    },
+    {
+      "question": "2014－2015学年度获华天奖学金、东软·亿达奖学金学生",
+      "type": "auto_title",
+      "expected_doc_ids": [
+        78
+      ],
+      "rank": 2,
+      "ndcg@5": 0.6309,
+      "context_precision": 0.4,
+      "hit_count": 5,
+      "top_doc_ids": [
+        83,
+        78,
+        78,
+        18,
+        80
+      ],
+      "top_score": 0.7264,
+      "elapsed_ms": 702.7,
+      "source": "auto"
+    }
+  ]
+}

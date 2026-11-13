@@ -215,16 +215,17 @@ def _quote_ident(name: str) -> str:
     return '"{}"'.format(str(name).replace('"', '""'))
 
 
-def _get_conn(doc):
-    """加载文档首个结构化 sheet 到 sqlite3 内存表 data（进程内缓存）。"""
+def _get_conn(doc, sheet_name=None):
+    """加载指定 sheet（默认第一个）到 sqlite3 内存表 data（进程内缓存）。"""
     schema = doc.table_schema or {}
     sheets = schema.get('sheets') or []
     if not sheets:
         raise TabularError('文档无表格结构元数据')
-    sheet = sheets[0]
+    sheet = next((s for s in sheets if s.get('name') == sheet_name), sheets[0])
+    cache_key = (doc.id, sheet.get('name') or '')
 
     with _CACHE_GUARD:
-        entry = _CACHE.get(doc.id)
+        entry = _CACHE.get(cache_key)
         if entry and entry[1] == doc.updated_at:
             return entry[0], entry[2]
 
@@ -280,7 +281,7 @@ def _get_conn(doc):
 
     lock = threading.Lock()
     with _CACHE_GUARD:
-        old = _CACHE.get(doc.id)
+        old = _CACHE.get(cache_key)
         if old:
             try:
                 old[0].close()
@@ -293,7 +294,7 @@ def _get_conn(doc):
             except Exception:
                 pass
             _CACHE.pop(evict_id, None)
-        _CACHE[doc.id] = (conn, doc.updated_at, lock)
+        _CACHE[cache_key] = (conn, doc.updated_at, lock)
     logger.info('表格问答加载: doc_id=%d sheet=%s rows=%d', doc.id, sheet['name'], len(rows))
     return conn, lock
 
@@ -307,6 +308,9 @@ _SQL_SYSTEM_PROMPT = """你是 SQL 生成器。根据用户问题，为 SQLite �
 表结构：
 {schema}
 
+参考示例（历史已验证问答，仅参考写法，不要照抄表名列名）：
+{examples}
+
 规则：
 - 只输出一条 SQL，不要解释，不要 Markdown 代码块
 - 表名只能是 data；列名必须用双引号包裹（含中文列名）
@@ -317,21 +321,107 @@ _SQL_SYSTEM_PROMPT = """你是 SQL 生成器。根据用户问题，为 SQLite �
 - 拿不准的列优先用样本行中出现过的取值"""
 
 
-def _schema_prompt(schema: dict) -> str:
-    parts = []
-    for sheet in (schema or {}).get('sheets', [])[:1]:
-        cols = '、'.join(f'"{c["name"]}"({c.get("dtype", "VARCHAR")})' for c in sheet.get('columns', []))
-        parts.append(f'工作表「{sheet.get("name", "")}」，共 {sheet.get("row_count", 0)} 行')
-        parts.append(f'列：{cols}')
-        samples = sheet.get('sample_rows') or []
-        if samples:
-            header = [c['name'] for c in sheet.get('columns', [])]
-            for row in samples[:3]:
-                pairs = '；'.join(
-                    f'{header[i]}={row[i]}' for i in range(min(len(header), len(row))) if row[i]
-                )
-                parts.append(f'样本行：{pairs}')
+def _tokens(text: str) -> set:
+    """粗粒度分词：中文 2-gram + 英文/数字整词，用于问句与列名/表名的匹配。"""
+    text = (text or '').lower()
+    words = set(re.findall(r'[a-z0-9_]+', text))
+    cjk = re.findall(r'[\u4e00-\u9fff]', text)
+    words.update(a + b for a, b in zip(cjk, cjk[1:]))
+    words.update(cjk)
+    return words
+
+
+def _pick_sheet(schema: dict, question: str) -> dict:
+    """多 sheet 时按"表名 + 列名"与问句的重合度选 sheet；单 sheet 直接返回。"""
+    sheets = (schema or {}).get('sheets') or []
+    if not sheets:
+        raise TabularError('文档无表格结构元数据')
+    if len(sheets) == 1:
+        return sheets[0]
+
+    q_tokens = _tokens(question)
+    best, best_score = sheets[0], -1
+    for sheet in sheets:
+        score = len(q_tokens & _tokens(sheet.get('name', ''))) * 2
+        for col in sheet.get('columns', []):
+            score += len(q_tokens & _tokens(col.get('name', '')))
+        if score > best_score:
+            best, best_score = sheet, score
+    return best
+
+
+def _schema_prompt(schema: dict, question: str = '') -> str:
+    sheet = _pick_sheet(schema, question)
+    columns = sheet.get('columns', [])
+    samples = sheet.get('sample_rows') or []
+
+    # 列很多时只注入"问句提到的列 + 其余列"，避免 Prompt 膨胀、也减少模型乱选列
+    max_cols = int(getattr(settings, 'TABULAR_SCHEMA_MAX_COLUMNS', 20) or 20)
+    shown = columns
+    omitted = 0
+    if len(columns) > max_cols:
+        q_tokens = _tokens(question)
+        matched = [c for c in columns if q_tokens & _tokens(c.get('name', ''))]
+        rest = [c for c in columns if c not in matched]
+        shown = (matched + rest)[:max_cols]
+        omitted = len(columns) - len(shown)
+
+    parts = [f'工作表「{sheet.get("name", "")}」，共 {sheet.get("row_count", 0)} 行']
+    parts.append('列：' + '、'.join(
+        f'"{c["name"]}"({c.get("dtype", "VARCHAR")})' for c in shown
+    ))
+    if omitted:
+        parts.append(f'（另有 {omitted} 列未展示，可用 SELECT * 查看）')
+
+    # 低基数列附上候选值，帮模型对齐"学院/班级/类别"等枚举写法
+    enum_limit = int(getattr(settings, 'TABULAR_SCHEMA_SAMPLE_VALUES', 5) or 5)
+    enums = []
+    for idx, col in enumerate(columns):
+        if col.get('dtype') == 'DOUBLE':
+            continue
+        vals = []
+        for row in samples:
+            if idx < len(row) and row[idx] and row[idx] not in vals:
+                vals.append(row[idx])
+        if 1 < len(vals) <= enum_limit:
+            enums.append(f'{col["name"]}：{"、".join(vals)}')
+    if enums:
+        parts.append('候选值（来自样本行）：' + '；'.join(enums))
+
+    if samples:
+        header = [c['name'] for c in columns]
+        for row in samples[:3]:
+            pairs = '；'.join(
+                f'{header[i]}={row[i]}' for i in range(min(len(header), len(row))) if row[i]
+            )
+            parts.append(f'样本行：{pairs}')
     return '\n'.join(parts)
+
+
+def _system_prompt(schema: dict, question: str) -> str:
+    """拼 SQL 生成用 system prompt（含 schema linking 与少样本示例）。"""
+    examples = ''
+    try:
+        from utils.tabular_fewshot import format_examples
+        examples = format_examples(question)
+    except Exception:
+        examples = ''
+    return _SQL_SYSTEM_PROMPT.format(
+        schema=_schema_prompt(schema, question),
+        examples=examples or '（暂无）',
+    )
+
+
+def _clean_sql(raw: str) -> str:
+    """去掉 Markdown 包裹与结尾分号；空结果抛 TabularError。"""
+    sql = (raw or '').strip()
+    match = re.search(r'```(?:sql)?\s*(.*?)```', sql, re.S | re.I)
+    if match:
+        sql = match.group(1).strip()
+    sql = sql.rstrip(';').strip()
+    if not sql:
+        raise TabularError('模型未生成 SQL')
+    return sql
 
 
 def generate_sql(question: str, schema: dict) -> str:
@@ -340,7 +430,7 @@ def generate_sql(question: str, schema: dict) -> str:
 
     raw = llm_client.chat(
         [
-            {'role': 'system', 'content': _SQL_SYSTEM_PROMPT.format(schema=_schema_prompt(schema))},
+            {'role': 'system', 'content': _system_prompt(schema, question)},
             {'role': 'user', 'content': question[:500]},
         ],
         temperature=0.0,
@@ -348,15 +438,30 @@ def generate_sql(question: str, schema: dict) -> str:
         timeout=getattr(settings, 'TABULAR_SQL_LLM_TIMEOUT', 8.0),
         max_retries=1,
     )
-    sql = (raw or '').strip()
-    # 去除可能的 Markdown 代码块包裹
-    match = re.search(r'```(?:sql)?\s*(.*?)```', sql, re.S | re.I)
-    if match:
-        sql = match.group(1).strip()
-    sql = sql.rstrip(';').strip()
-    if not sql:
-        raise TabularError('模型未生成 SQL')
-    return sql
+    return _clean_sql(raw)
+
+
+def _repair_sql(question: str, schema: dict, prev_sql: str, problem: str) -> str:
+    """把错误信息/可疑原因回喂模型，要求重写 SQL（阶段 4.4 自愈）。"""
+    from utils.llm import llm_client
+
+    prompt = (
+        f'原 SQL：{prev_sql}\n'
+        f'问题：{problem}\n'
+        '请修正该 SQL，使其在 SQLite 上能正确回答用户问题。'
+        '只输出修正后的 SQL，不要解释，不要 Markdown 代码块。'
+    )
+    raw = llm_client.chat(
+        [
+            {'role': 'system', 'content': _system_prompt(schema, question)},
+            {'role': 'user', 'content': prompt},
+        ],
+        temperature=0.0,
+        max_tokens=256,
+        timeout=getattr(settings, 'TABULAR_SQL_LLM_TIMEOUT', 8.0),
+        max_retries=1,
+    )
+    return _clean_sql(raw)
 
 
 _FORBIDDEN_SQL_RE = re.compile(
@@ -368,12 +473,70 @@ _FROM_JOIN_RE = re.compile(r'\b(?:FROM|JOIN)\s+"?([\w一-鿿]+)"?', re.IGNORECAS
 _LIMIT_RE = re.compile(r'\bLIMIT\b', re.IGNORECASE)
 
 
+def _validate_sql_ast(sql: str) -> str:
+    """sqlglot AST 级校验：单条只读查询、仅 data 表、自动补 LIMIT。
+
+    比正则更可靠：正则挡不住 `SELECT ... INTO`、注释绕过、嵌套 DDL 等写法。
+    """
+    from sqlglot import exp, parse
+    from sqlglot.errors import ParseError
+
+    try:
+        statements = [s for s in parse(sql, read='sqlite') if s]
+    except ParseError as exc:
+        raise TabularError(f'SQL 语法解析失败: {str(exc)[:80]}') from exc
+    if len(statements) != 1:
+        raise TabularError('只允许单条 SQL 语句')
+
+    root = statements[0]
+    if not isinstance(root, (exp.Select, exp.Union, exp.Subquery)):
+        raise TabularError('只允许 SELECT 查询')
+
+    forbidden_names = (
+        'Insert', 'Update', 'Delete', 'Drop', 'Create', 'Alter', 'Command',
+        'Pragma', 'Attach', 'Detach', 'Set', 'Use', 'Transaction', 'Commit',
+        'Rollback', 'Grant', 'Into',
+    )
+    forbidden = tuple(getattr(exp, n) for n in forbidden_names if hasattr(exp, n))
+    for node in root.walk():
+        if isinstance(node, forbidden):
+            raise TabularError('SQL 包含禁止的语句类型')
+
+    # CTE 别名不算真实表，需排除后再校验；内层引用的真实表仍会被检查
+    cte_names = {cte.alias_or_name.lower() for cte in root.find_all(exp.CTE)}
+    tables = {t.name.lower() for t in root.find_all(exp.Table)} - cte_names
+    if not tables or any(t != 'data' for t in tables):
+        raise TabularError('只允许查询 data 表')
+
+    if not any(isinstance(n, exp.Limit) for n in root.walk()):
+        sql = f'SELECT * FROM ({sql}) AS _t LIMIT 1000'
+    return sql
+
+
 def validate_sql(sql: str) -> str:
     """白名单校验：单语句、只读、仅查 data 表；自动补 LIMIT。
+
+    TABULAR_SQL_VALIDATOR=sqlglot 强制 AST 校验；=regex 用旧正则；
+    默认 auto：优先 AST，sqlglot 未安装时自动回退正则。
 
     Raises:
         TabularError: 校验不通过
     """
+    backend = getattr(settings, 'TABULAR_SQL_VALIDATOR', 'auto')
+    if backend != 'regex':
+        try:
+            return _validate_sql_ast(sql)
+        except TabularError:
+            raise
+        except ImportError:
+            if backend == 'sqlglot':
+                raise TabularError('sqlglot 未安装，无法进行 AST 校验')
+            logger.warning('sqlglot 不可用，回退正则校验')
+    return _validate_sql_regex(sql)
+
+
+def _validate_sql_regex(sql: str) -> str:
+    """旧版正则校验（保留作为兜底）。"""
     statements = [s for s in sqlparse.parse(sql) if str(s).strip()]
     if len(statements) != 1:
         raise TabularError('只允许单条 SQL 语句')
@@ -413,9 +576,79 @@ def _execute(conn, lock, sql: str):
     return columns, [list(r) for r in rows], truncated
 
 
+_COUNT_HINTS = ('多少', '几个', '人数', '总数', '合计', '一共', '总共', '数量是')
+_GROUP_HINTS = ('各', '分别', '每个', '按', '分学院', '分专业', '逐年', '历年')
+
+
+def _result_suspicion(question: str, columns, rows) -> Optional[str]:
+    """结果自检（阶段 4.5）：识别"问法"与"结果形状"明显矛盾的查询。
+
+    只做形状级判断、不做语义判断，命中后最多触发一次重写；
+    重写无改善则保留原结果，避免把正确结果改坏。
+    """
+    if not rows:
+        return None
+    q = question or ''
+    wants_group = any(h in q for h in _GROUP_HINTS)
+    wants_count = any(h in q for h in _COUNT_HINTS)
+
+    if wants_group and not wants_count and len(rows) == 1 and len(columns) <= 2:
+        return '问题要求按维度分别统计，但只返回一行，可能缺少 GROUP BY'
+    if wants_count and not wants_group and len(rows) > 1 and len(columns) <= 2:
+        return '问题问的是数量/总数，但返回了多行明细，可能缺少聚合函数'
+    return None
+
+
 # ------------------------------------------------------------------
 # 编排入口
 # ------------------------------------------------------------------
+
+
+def _execute_with_heal(conn, lock, question, schema, sql):
+    """执行 SQL；失败或结果明显可疑时重写一次（阶段 4.4/4.5）。
+
+    返回 (sql, columns, rows, truncated)：sql 为最终实际执行的语句。
+    """
+    heal_enabled = bool(getattr(settings, 'TABULAR_SQL_SELF_HEAL', True))
+    max_heal = int(getattr(settings, 'TABULAR_SQL_MAX_HEAL', 1) or 0)
+    check_enabled = bool(getattr(settings, 'TABULAR_SQL_SELF_CHECK', True))
+    healed = 0
+
+    while True:
+        try:
+            columns, rows, truncated = _execute(conn, lock, sql)
+        except TabularError as exc:
+            if not heal_enabled or healed >= max_heal:
+                raise
+            healed += 1
+            logger.info('[Tabular自愈] 执行失败，重写 SQL(%d/%d): %s', healed, max_heal, exc)
+            sql = validate_sql(_repair_sql(question, schema, sql, str(exc)))
+            continue
+
+        reason = _result_suspicion(question, columns, rows) if check_enabled else None
+        if not reason or not heal_enabled or healed >= max_heal:
+            return sql, columns, rows, truncated
+
+        healed += 1
+        logger.info('[Tabular自检] %s，尝试重写(%d/%d)', reason, healed, max_heal)
+        try:
+            new_sql = validate_sql(_repair_sql(question, schema, sql, reason))
+        except TabularError:
+            return sql, columns, rows, truncated
+        if new_sql == sql:
+            return sql, columns, rows, truncated
+
+        try:
+            new_columns, new_rows, new_truncated = _execute(conn, lock, new_sql)
+        except TabularError as exc:
+            logger.info('[Tabular自检] 重写后执行失败，保留原结果: %s', exc)
+            return sql, columns, rows, truncated
+
+        # 重写后仍可疑 → 保留原始结果，不拿更差的结果替换
+        if _result_suspicion(question, new_columns, new_rows):
+            logger.info('[Tabular自检] 重写后仍可疑，保留原结果')
+            return sql, columns, rows, truncated
+        return new_sql, new_columns, new_rows, new_truncated
 
 
 def run_tabular_query(user, question: str, doc_id=None, keywords=None) -> dict:
@@ -449,9 +682,20 @@ def run_tabular_query(user, question: str, doc_id=None, keywords=None) -> dict:
             return {'success': False, 'fallback': 'rag', 'error': '未定位到表格文档'}
 
         doc = located
-        conn, lock = _get_conn(doc)
-        sql = validate_sql(generate_sql(question, doc.table_schema))
-        columns, rows, truncated = _execute(conn, lock, sql)
+        schema = doc.table_schema
+        sheet_name = _pick_sheet(schema or {}, question).get('name')
+        conn, lock = _get_conn(doc, sheet_name)
+        sql = validate_sql(generate_sql(question, schema))
+        sql, columns, rows, truncated = _execute_with_heal(
+            conn, lock, question, schema, sql,
+        )
+
+        # 成功问答登记为候选示例（verified=False，人工确认后才注入 Prompt）
+        try:
+            from utils.tabular_fewshot import record_example
+            record_example(question, sql, doc.title)
+        except Exception:
+            pass
 
         max_result = getattr(settings, 'TABULAR_RESULT_MAX_ROWS', 100)
         shown = rows[:max_result]

@@ -21,7 +21,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from django.test import SimpleTestCase, TestCase
+from django.test import SimpleTestCase, TestCase, override_settings
 from PIL import Image
 
 # 够长，能通过单页最小字数阈值
@@ -55,6 +55,7 @@ class _FakeReader:
         return [self.text] if self.text else []
 
 
+@override_settings(OCR_BACKEND='easyocr', PARSER_BACKEND='legacy')
 class _ParserHarness(SimpleTestCase):
     """临时目录 + 假 OCR 通道 + PDF/图片构造工具。"""
 
@@ -674,6 +675,10 @@ class TestIndexTaskFailureVisibility(TestCase):
         self.assertEqual(doc.status, 'indexed')
         self.assertEqual(doc.index_error, '')
         self.assertGreater(doc.chunk_count, 0)
+        # chunk_count 只统计进向量库的子块；父块只存 MySQL
         self.assertEqual(
-            DocChunk.objects.filter(doc=doc).count(), doc.chunk_count,
+            DocChunk.objects.filter(doc=doc, chunk_level=1).count(), doc.chunk_count,
+        )
+        self.assertGreater(
+            DocChunk.objects.filter(doc=doc, chunk_level=0).count(), 0,
         )

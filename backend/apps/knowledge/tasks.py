@@ -12,6 +12,9 @@
 """
 import logging
 import re
+import time
+
+from django.conf import settings
 from typing import Optional
 
 from utils.shared_task_compat import shared_task
@@ -19,7 +22,56 @@ from utils.shared_task_compat import shared_task
 logger = logging.getLogger(__name__)
 
 
-@shared_task(bind=True, max_retries=2, default_retry_delay=30, ignore_result=True)
+def _embedding_rate_limit(batch_size: int):
+    """Embedding 全局限流（Redis 滑动窗口）。
+
+    settings.EMBED_RATE_LIMIT 默认 '80/m'，每分钟最多 80 次 Embedding 调用。
+    Redis 不可用时静默跳过——开发/测试环境没有 Redis 也不会炸。
+
+    Args:
+        batch_size: 本次 embed 批次大小，仅用于日志（不参与阈值计算，阈值按调用次数计）
+    """
+    import datetime as _dt
+    try:
+        import redis as _redis
+    except ImportError:
+        return
+    try:
+        # 从 CELERY_BROKER_URL 取 Redis 连接，或 settings.CACHES 的 default
+        from django.conf import settings as _s
+        broker = getattr(_s, 'CELERY_BROKER_URL', '') or ''
+        if not broker.startswith('redis'):
+            return
+        # 解析 rate limit 字符串：'80/m' → 80
+        rate_str = getattr(_s, 'EMBED_RATE_LIMIT', '80/m')
+        try:
+            limit = int(rate_str.split('/')[0])
+        except (ValueError, IndexError):
+            limit = 80
+
+        r = _redis.Redis.from_url(broker, decode_responses=True)
+        now = _dt.datetime.now()
+        key = f'embedding:rate:{now.strftime("%Y%m%d%H%M")}'
+        count = r.incr(key)
+        if count == 1:
+            r.expire(key, 70)  # 留 10s 缓冲避免边界抖动
+        if count > limit:
+            # 等下一分钟窗口
+            seconds_left = 60 - now.second + 1
+            if seconds_left <= 0:
+                seconds_left = 60
+            logger.warning(
+                'Embedding rate limit hit (%d > %d). 等待 %ds...',
+                count, limit, seconds_left,
+            )
+            time.sleep(min(seconds_left, 30))
+    except Exception as e:
+        # Redis 连接失败等静默跳过，不阻塞 Embedding 主链路
+        logger.debug('Embedding rate limit skip: %s', type(e).__name__)
+        return
+
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=30, ignore_result=True, queue='parse')
 def extract_freshness_task(self, doc_id: int):
     """异步提取文档发布日期。
 
@@ -42,7 +94,7 @@ def extract_freshness_task(self, doc_id: int):
         raise self.retry(exc=e)
 
 
-@shared_task(bind=True, max_retries=1, default_retry_delay=60, ignore_result=True)
+@shared_task(bind=True, max_retries=1, default_retry_delay=60, ignore_result=True, queue='sys')
 def auto_link_relations_task(self, doc_id: int):
     """上传完成后异步执行 AI 自动关联：分析文档并自动创建与相关文档的有向关联边（文件网）。
 
@@ -74,7 +126,7 @@ def auto_link_relations_task(self, doc_id: int):
         raise self.retry(exc=e)
 
 
-@shared_task(bind=True, max_retries=1, default_retry_delay=120, ignore_result=True)
+@shared_task(bind=True, max_retries=1, default_retry_delay=120, ignore_result=True, queue='sys')
 def detect_version_task(self, doc_id: int):
     """索引完成后异步识别"疑似新旧版本"，命中只生成待上传者确认的候选。
 
@@ -102,7 +154,7 @@ def detect_version_task(self, doc_id: int):
         raise self.retry(exc=e)
 
 
-@shared_task(bind=True, max_retries=3, default_retry_delay=120, ignore_result=True)
+@shared_task(bind=True, max_retries=3, default_retry_delay=120, ignore_result=True, queue='crawl')
 def crawl_neusoft_website_task(
     self, max_pages: int = 100,
     uploader_id: int = 1,
@@ -144,7 +196,7 @@ def crawl_neusoft_website_task(
         raise self.retry(exc=e)
 
 
-@shared_task(bind=True, ignore_result=True)
+@shared_task(bind=True, ignore_result=True, queue='sys')
 def refresh_daily_context_task(self):
     """每日 00:05 心跳：刷新"每日数据"上下文，记录日期切换。
 
@@ -163,7 +215,7 @@ def refresh_daily_context_task(self):
     return {'time': time_str, 'briefing_chars': len(briefing)}
 
 
-@shared_task(bind=True, max_retries=2, default_retry_delay=60, ignore_result=True)
+@shared_task(bind=True, max_retries=2, default_retry_delay=60, ignore_result=True, queue='parse')
 def index_document_task(self, doc_id: int):
     """文档索引入库：解析 → 滑动窗口分块 → Embedding → Milvus + MySQL。
 
@@ -186,7 +238,7 @@ def index_document_task(self, doc_id: int):
 
     from apps.knowledge.extractor import extract_text_from_oss_detailed
     from apps.knowledge.models import DocChunk, KnowledgeDoc
-    from apps.knowledge.utils import chunk_document, chunk_records
+    from apps.knowledge.utils import chunk_document, chunk_records, contextual_embed_text
     from utils.llm import llm_client
     from utils.milvus import milvus_client
 
@@ -238,8 +290,44 @@ def index_document_task(self, doc_id: int):
         doc.status = 'chunking'
         doc.save(update_fields=['status', 'updated_at'])
 
-        raw_chunks = chunk_records(text, chunk_size=500) if parsed.structured \
-            else chunk_document(text, chunk_size=500, overlap=100)
+        page_texts = getattr(parsed, 'pages', None) or []
+        child_size = int(getattr(settings, 'CHUNK_CHILD_SIZE', 350) or 350)
+        child_overlap = int(getattr(settings, 'CHUNK_CHILD_OVERLAP', 80) or 80)
+        parent_size = int(getattr(settings, 'CHUNK_PARENT_SIZE', 1200) or 1200)
+
+        if len(page_texts) > 1:
+            # 多页文档（PDF）：按页分块，块携带页码，引用才能定位到具体页。
+            # 跨页不分块——切在页边界上比切在句子中间更安全，代价是每页
+            # 各自保留 overlap，块数略增。
+            raw_chunks = []
+            for page in page_texts:
+                page_chunks = (
+                    chunk_records(page['text'], chunk_size=500)
+                    if parsed.structured
+                    else chunk_document(
+                        page['text'], chunk_size=child_size,
+                        overlap=child_overlap, parent_size=parent_size,
+                    )
+                )
+                offset = len(raw_chunks)
+                for chunk in page_chunks:
+                    chunk['page_start'] = page['page_no']
+                    chunk['page_end'] = page['page_no']
+                    # chunk_index/parent_index 都是页内序号，拼到全文时统一加偏移
+                    if chunk.get('parent_index', -1) >= 0:
+                        chunk['parent_index'] += offset
+                    chunk['chunk_index'] = offset + chunk['chunk_index']
+                    raw_chunks.append(chunk)
+        else:
+            raw_chunks = chunk_records(text, chunk_size=500) if parsed.structured \
+                else chunk_document(
+                    text, chunk_size=child_size,
+                    overlap=child_overlap, parent_size=parent_size,
+                )
+            if len(page_texts) == 1:
+                for chunk in raw_chunks:
+                    chunk['page_start'] = page_texts[0]['page_no']
+                    chunk['page_end'] = page_texts[0]['page_no']
         if not raw_chunks:
             logger.warning(f'doc_id={doc_id} 分块结果为空，跳过索引')
             doc.status = 'failed'
@@ -248,13 +336,26 @@ def index_document_task(self, doc_id: int):
             doc.save(update_fields=['status', 'index_error', 'failed_at', 'updated_at'])
             return None
 
-        # 3. Embedding
+        # 父块只入 MySQL（供检索命中子块后回填全文），子块才进向量库
+        child_chunks = [c for c in raw_chunks if c.get('chunk_level', 1) != 0]
+
+        # 3. Embedding（只对子块）
         doc.status = 'embedding'
         doc.save(update_fields=['status', 'updated_at'])
 
-        texts = [c['content'] for c in raw_chunks]
+        texts = [c['content'] for c in child_chunks]
+        if getattr(settings, 'CONTEXTUAL_EMBED_ENABLED', False):
+            # Contextual Retrieval：向量化文本前置「标题 > 标题路径」，
+            # 只改送 Embedding 的文本，落库内容仍是原始片段。
+            texts = [contextual_embed_text(doc.title, c) for c in child_chunks]
+
+        # Embedding 全局限流：百炼免费配额每天 200w token，高峰期多任务并发
+        # 会同时打爆配额。80/m 滑动窗口（Redis INCR + EXPIRE）让单任务内批次
+        # 串行化，Redis 不可用时降级为直接调用。
+        _embedding_rate_limit(len(texts))
+
         embeddings = llm_client.embed(texts)
-        if not embeddings or len(embeddings) != len(raw_chunks):
+        if not embeddings or len(embeddings) != len(child_chunks):
             logger.error(f'doc_id={doc_id} Embedding 失败或数量不匹配')
             raise RuntimeError('Embedding 失败')
 
@@ -267,29 +368,37 @@ def index_document_task(self, doc_id: int):
 
         milvus_client.ensure_collection()
         milvus_chunks = []
-        for i, c in enumerate(raw_chunks):
+        for i, c in enumerate(child_chunks):
             milvus_chunks.append({
                 'vector_id': f'doc_{doc_id}_chunk_{i}',
                 'doc_id': doc_id,
                 'chunk_index': c['chunk_index'],
                 'chunk_text': c['content'],
-                'page_number': 0,
+                'page_number': c.get('page_start') or 0,
                 'seq_order': i,
+                'parent_index': int(c.get('parent_index', -1)),
             })
 
         vector_ids = milvus_client.insert_chunks(milvus_chunks, embeddings)
+        vector_map = {c['chunk_index']: vector_ids[i] for i, c in enumerate(child_chunks)
+                      if i < len(vector_ids)}
 
-        # 5. 写入 MySQL DocChunk
+        # 5. 写入 MySQL DocChunk（子块 + 父块）
         doc_chunks = []
-        for i, c in enumerate(raw_chunks):
+        for c in raw_chunks:
             doc_chunks.append(DocChunk(
                 doc=doc,
                 chunk_index=c['chunk_index'],
                 content=c['content'],
                 token_count=0,
-                vector_id=vector_ids[i] if i < len(vector_ids) else f'doc_{doc_id}_chunk_{i}',
-                page_start=None,
-                page_end=None,
+                vector_id=vector_map.get(c['chunk_index'], ''),
+                page_start=c.get('page_start'),
+                page_end=c.get('page_end'),
+                chunk_level=int(c.get('chunk_level', 1)),
+                parent_index=int(c.get('parent_index', -1)),
+                heading_path=(c.get('heading_path') or '')[:500],
+                char_start=int(c.get('char_start', 0)),
+                char_end=int(c.get('char_end', 0)),
             ))
 
         DocChunk.objects.bulk_create(doc_chunks, batch_size=100)
@@ -300,7 +409,7 @@ def index_document_task(self, doc_id: int):
         # 否则不完整解析会被当成完整成功。
         doc.index_error = parse_warning[:500]
         doc.failed_at = None
-        doc.chunk_count = len(raw_chunks)
+        doc.chunk_count = len(child_chunks)
         doc.indexed_at = timezone.now()
         # 表格结构元数据（仅 xlsx/csv 结构化文档非空），供表格问答引擎生成 SQL
         doc.table_schema = parsed.table_schema
@@ -310,8 +419,8 @@ def index_document_task(self, doc_id: int):
         ])
 
         logger.info(
-            '索引完成: doc_id=%d  %d 块 → Milvus + MySQL',
-            doc_id, len(raw_chunks),
+            '索引完成: doc_id=%d  子块 %d / 父块 %d → Milvus + MySQL',
+            doc_id, len(child_chunks), len(raw_chunks) - len(child_chunks),
         )
         # 索引成功后再做新旧版本识别：识别依赖已落库的 DocChunk 文本
         try:
@@ -343,7 +452,7 @@ def index_document_task(self, doc_id: int):
         raise
 
 
-@shared_task(bind=True, ignore_result=True)
+@shared_task(bind=True, ignore_result=True, queue='sys')
 def cleanup_expired_upload_sessions_task(self, expire_hours: int = 24):
     """清理超时未完成的分片上传会话。
 

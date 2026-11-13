@@ -3,6 +3,7 @@ RAG 检索管道
 - 问题向量化（含 LRU 缓存）→ Milvus 搜索 → 关键词匹配 → 重排序 → Top-K 结果
 - 上下文组装：将检索结果拼接为 LLM Prompt
 """
+import contextvars
 import logging
 import threading
 import time
@@ -396,8 +397,6 @@ def build_school_knowledge_from_db() -> str:
 
 SYSTEM_PROMPT = """你是成都东软学院的AI智能助手，负责回答学院教学、科研、管理相关问题以及常识性问题。
 
-{context}
-
 ## 学校内建知识库（可直接使用）
 {knowlege}
 
@@ -405,6 +404,9 @@ SYSTEM_PROMPT = """你是成都东软学院的AI智能助手，负责回答学�
 ---
 {references}
 ---
+
+## 实时上下文（每次请求可能不同）
+{context}
 
 指令：
 1. 学院概况、院系专业、校园服务等问题，优先用内建知识库回答
@@ -575,7 +577,10 @@ def build_rag_prompt(
     for i, chunk in enumerate(chunks, 1):
         title = chunk.get('doc_title', '未知文档')
         page = chunk.get('page', 0)
-        content = chunk.get('content', '')
+        content = chunk.get('parent_content') or chunk.get('content', '')
+        heading_path = chunk.get('heading_path') or ''
+        if heading_path:
+            content = f'（{heading_path}）\n{content}'
         ref_block = f'### 参考资料{i}（来源：{title}'
         if page:
             ref_block += f' 第{page}页'
@@ -605,6 +610,16 @@ def build_rag_prompt(
         references=refs_text,
         context=build_system_context(),
     )
+
+    # 证据不足标记（由 retrieve 写入）：明确要求模型在资料找不到答案时
+    # 回答"知识库暂无"，而不是用常识补全。仅提示，不改变正常作答路径。
+    if any(c.get('evidence_insufficient') for c in chunks):
+        system_content += (
+            '\n\n## 证据充分性提示\n'
+            '本轮检索到的资料可能不足以完整回答问题。请仅依据参考资料作答；'
+            '若资料中找不到答案，必须明确回答「知识库中暂无相关说明」，'
+            '并建议用户补充上传或联系管理员，禁止推测、编造或使用你的先验知识补全。'
+        )
 
     messages = [{'role': 'system', 'content': system_content}]
 
@@ -849,6 +864,8 @@ def _build_doc_results(docs, keywords: List[str], score: float) -> List[dict]:
             'page': page,
             'chunk_index': chunk_index,
             'vector_id': vector_id,
+            'parent_index': chunk.parent_index if chunk else -1,
+            'heading_path': chunk.heading_path if chunk else '',
             'source_type': doc.source_type,
             'source_url': doc.source_url,
             'file_name': doc.file_name,
@@ -892,17 +909,32 @@ def _keyword_search(
         'file_name', 'oss_key',
     )[:top_k]:
         excerpt = (doc['description'] or '')[:300]
+        # 匹配强度分：所有文档原本都是常数 0.55，通道内并列时排序由数据库
+        # 默认顺序决定（等价随机）。RRF 只看名次不看分数，名次随机会直接
+        # 传导成噪声；这里按"查询词覆盖率"给文档排出真实先后（标题权重更高）。
+        title_lower = (doc['title'] or '').lower()
+        meta_lower = ' '.join([
+            title_lower, (doc['description'] or '').lower(),
+            (doc['file_name'] or '').lower(),
+        ])
+        n_terms = max(len(keywords), 1)
+        title_cov = sum(1 for kw in keywords if kw.lower() in title_lower) / n_terms
+        meta_cov = sum(1 for kw in keywords if kw.lower() in meta_lower) / n_terms
         results.append({
             'doc_id': doc['id'],
             'doc_title': doc['title'],
             'content': f"{doc['title']} {excerpt}".strip(),
+            # score 保持常数 0.55：加权融合已验证该口径下排序最稳（见评测基线），
+            # match_strength 只供 RRF 在通道内排真实先后（RRF 不看分数只看名次）。
             'score': 0.55,
+            'match_strength': round(2.0 * title_cov + meta_cov, 4),
             'page': 0,
             'source_type': doc['source_type'],
             'source_url': doc['source_url'],
             'file_name': doc['file_name'],
             'oss_key': doc['oss_key'],
         })
+    results.sort(key=lambda r: r['score'], reverse=True)
     return results
 
 
@@ -1043,6 +1075,11 @@ def _chunk_content_search(
     if not keywords:
         return []
 
+    # 单字词在 ngram(2) 索引里检索不到，先滤掉，避免"能查却查不到"的假阴性
+    keywords = [kw for kw in keywords if kw and len(kw) >= 2]
+    if not keywords:
+        return []
+
     from django.db.models import Q
     from apps.knowledge.models import DocChunk
 
@@ -1052,17 +1089,38 @@ def _chunk_content_search(
     if doc_ids is not None:
         allowed_docs = allowed_docs.filter(id__in=[d for d in doc_ids if d > 0])
 
-    chunk_query = Q()
-    for kw in keywords:
-        chunk_query |= Q(content__icontains=kw)
-
-    chunks = (
+    base_qs = (
         DocChunk.objects
         .filter(doc__in=allowed_docs)
-        .filter(chunk_query)
         .select_related('doc')
-        .order_by('doc_id', 'chunk_index')[:top_k * 3]
+        .order_by('doc_id', 'chunk_index')
     )
+
+    chunks = []
+    used_fulltext = False
+    ft_query = ' '.join(dict.fromkeys(keywords))
+    if ft_query and getattr(settings, 'RAG_FULLTEXT_ENABLED', True):
+        try:
+            chunks = list(
+                base_qs.extra(
+                    where=['MATCH(content) AGAINST (%s IN NATURAL LANGUAGE MODE)'],
+                    params=[ft_query],
+                )[:top_k * 3]
+            )
+            used_fulltext = True
+        except Exception as e:
+            # 索引缺失/后端不支持（如 SQLite）时静默回退，功能优先于性能
+            logger.warning('FULLTEXT 检索不可用，回退 icontains: %s', e)
+
+    # 兜底：FULLTEXT 未生效，或 ngram 分词没命中（长词被切成 2-gram 后仍可能有
+    # 边界差异）时，用原 icontains 再查一次，保证召回不因提速而退化
+    if not chunks:
+        if used_fulltext:
+            trace_log('rag_chunk_ft_empty', 'keywords=%s', ft_query)
+        chunk_query = Q()
+        for kw in keywords:
+            chunk_query |= Q(content__icontains=kw)
+        chunks = list(base_qs.filter(chunk_query)[:top_k * 3])
 
     results = []
     for chunk in chunks:
@@ -1154,6 +1212,8 @@ def _merge_and_rerank(
             'source_url': hit.get('source_url', ''),
             'file_name': hit.get('file_name', ''),
             'oss_key': hit.get('oss_key', ''),
+            'parent_index': hit.get('parent_index', -1),
+            'heading_path': hit.get('heading_path', ''),
             'score': hit['score'] * vector_weight,
         }
 
@@ -1191,6 +1251,8 @@ def _merge_and_rerank(
                 'source_url': hit.get('source_url', ''),
                 'file_name': hit.get('file_name', ''),
                 'oss_key': hit.get('oss_key', ''),
+                'parent_index': hit.get('parent_index', -1),
+                'heading_path': hit.get('heading_path', ''),
             }
 
     # 关键词权重加成
@@ -1202,6 +1264,210 @@ def _merge_and_rerank(
                 if word.lower() in content:
                     extra += weight / 50.0
             hit['score'] += extra
+
+    return sorted(merged.values(), key=lambda x: x['score'], reverse=True)
+
+
+# ------------------------------------------------------------------
+# 融合算法切换与阈值解析
+# ------------------------------------------------------------------
+# 加权融合与 RRF 的分数完全不重量纲（加权 ~0.x，RRF ~0.0x），
+# 所有阈值必须按当前算法解析，禁止把 RAG_SCORE_THRESHOLD 直接套到 RRF 上。
+def fusion_mode() -> str:
+    """当前启用的融合算法：weighted | rrf。"""
+    mode = str(getattr(settings, 'RETRIEVAL_FUSION', 'weighted') or 'weighted').lower()
+    return mode if mode in ('weighted', 'rrf') else 'weighted'
+
+
+def active_score_threshold() -> float:
+    if fusion_mode() == 'rrf':
+        return float(getattr(settings, 'RRF_SCORE_THRESHOLD', 0.008))
+    return RAG_SCORE_THRESHOLD
+
+
+def active_retry_trigger() -> float:
+    if fusion_mode() == 'rrf':
+        return float(getattr(settings, 'RRF_RETRY_TRIGGER_SCORE', 0.015))
+    return RAG_RETRY_TRIGGER_SCORE
+
+
+def active_reference_threshold() -> float:
+    """引用展示阈值：加权下沿用 min(0.65, 0.35) 的既有口径，RRF 下独立标定。"""
+    if fusion_mode() == 'rrf':
+        return float(getattr(settings, 'RRF_REFERENCE_THRESHOLD', 0.02))
+    return min(RAG_REFERENCE_THRESHOLD, 0.35)
+
+
+def active_admin_min_score() -> float:
+    """管理员低置信拒答阈值（按融合算法解析，RRF 下 0.5 会拒掉全部结果）。"""
+    if fusion_mode() == 'rrf':
+        return float(getattr(settings, 'RRF_ADMIN_MIN_SCORE', 0.03))
+    return ADMIN_MIN_SCORE
+
+
+def active_web_search_min_score() -> float:
+    """联网兜底触发阈值（按融合算法解析）。"""
+    if fusion_mode() == 'rrf':
+        return float(getattr(settings, 'RRF_WEB_SEARCH_MIN_SCORE', 0.03))
+    return WEB_SEARCH_MIN_SCORE
+
+
+# ------------------------------------------------------------------
+# 向量通道质量门
+# ------------------------------------------------------------------
+# 向量最高分过低（Embedding 失效/维度错配）或分数几乎没有差异（无区分度）时，
+# 说明向量通道这次没有提供有效排序信息，降权让关键词通道主导，避免噪声块
+# 挤掉真正命中的文档。向量为空时不惩罚关键词侧（见 _merge_and_rerank）。
+# 阈值可由 settings 覆盖：不同 Embedding 后端的余弦分布差异很大，
+# 换模型/换集合后必须用评测重新标定（scripts/eval_retrieval.py）。
+_VECTOR_GATE_LOW_TOP = 0.25
+_VECTOR_GATE_MIN_SPREAD = 0.02
+_VECTOR_WEIGHT_NORMAL = 0.7
+_VECTOR_WEIGHT_GATED = 0.2
+
+
+def _vector_channel_weight(vector_hits: List[dict]) -> Tuple[float, str]:
+    """返回 (向量权重, 触发原因)。未触发质量门时权重为 0.7。"""
+    if not vector_hits:
+        return _VECTOR_WEIGHT_GATED, 'no_vector'
+    if not bool(getattr(settings, 'RAG_VECTOR_GATE_ENABLED', True)):
+        return _VECTOR_WEIGHT_NORMAL, ''
+    low_top = float(getattr(settings, 'RAG_VECTOR_GATE_LOW_TOP', _VECTOR_GATE_LOW_TOP))
+    min_spread = float(
+        getattr(settings, 'RAG_VECTOR_GATE_MIN_SPREAD', _VECTOR_GATE_MIN_SPREAD),
+    )
+    scores = [float(h.get('score', 0) or 0) for h in vector_hits]
+    top = max(scores)
+    spread = top - min(scores)
+    if top < low_top:
+        return _VECTOR_WEIGHT_GATED, f'low_top={top:.3f}'
+    if len(scores) > 1 and spread < min_spread:
+        return _VECTOR_WEIGHT_GATED, f'low_spread={spread:.4f}'
+    return _VECTOR_WEIGHT_NORMAL, ''
+
+
+# ------------------------------------------------------------------
+# RRF 倒数排名融合
+# ------------------------------------------------------------------
+def _best_by_doc(hits: List[dict]) -> List[dict]:
+    """关键词类通道按文档聚合：同文档只保留最高分一条，再按分数降序。
+
+    关键词通道的命中是"文档级证据"，同文档多块逐条计票会让长文档靠
+    分块数量堆高排名（见 _merge_and_rerank 同名逻辑）。
+
+    通道内名次：优先 match_strength（查询词覆盖率，由 _keyword_search 计算），
+    其次 score；都没有时退化为原顺序。RRF 只看名次，通道内并列会让排序
+    变成数据库默认序（等价随机），必须用覆盖率把并列拆开。
+    """
+    best: Dict[int, dict] = {}
+    for hit in hits or []:
+        did = hit.get('doc_id')
+        if did is None:
+            continue
+        key = (hit.get('match_strength', 0), hit.get('score', 0))
+        if did not in best:
+            best[did] = hit
+            continue
+        cur = (best[did].get('match_strength', 0), best[did].get('score', 0))
+        if key > cur:
+            best[did] = hit
+    return sorted(
+        best.values(),
+        key=lambda h: (h.get('match_strength', 0), h.get('score', 0)),
+        reverse=True,
+    )
+
+
+def _rrf_merge_and_rerank(
+    vector_hits: List[dict],
+    keyword_channels: List[List[dict]],
+    k: int = 60,
+    vector_weight: float = 1.0,
+    keywords_boost: Optional[dict] = None,
+) -> List[dict]:
+    """RRF 融合：score(d) = Σ_channel w_c / (k + rank_c(d) + 1)。
+
+    所有通道都按 **文档级** 计票：一个文档在某个通道内只贡献一票，
+    名次取该文档在该通道内最靠前的位置。若按块级计票，向量通道一次
+    返回 15 个块会把"只有一块命中的长文档"和"被 15 个块覆盖的文档"
+    拉开数量级差距，精确命中的单块文档反而被挤下去（实测 Recall@5
+    比加权融合低 10pt）。块级差异只用于同文档内的展示顺序。
+
+    Returns:
+        与 _merge_and_rerank 同构的结果列表（同文档多块保留，供拼上下文）。
+    """
+    keywords_boost = keywords_boost or {}
+
+    doc_scores: Dict[int, float] = {}
+    doc_best: Dict[int, dict] = {}
+    vector_order: Dict[int, int] = {}   # 文档在向量通道中的最好名次
+    vector_chunks: List[dict] = []
+
+    # 1) 向量通道（文档级计票，块级保留）
+    for rank, hit in enumerate(vector_hits or []):
+        did = hit.get('doc_id')
+        if did is None:
+            continue
+        vector_chunks.append(hit)
+        if did not in vector_order:
+            vector_order[did] = rank
+            doc_scores[did] = doc_scores.get(did, 0.0) + vector_weight / (k + rank + 1)
+            doc_best[did] = hit
+
+    # 2) 关键词类通道（文档级计票）
+    for hits in keyword_channels:
+        for rank, hit in enumerate(_best_by_doc(hits)):
+            did = hit.get('doc_id')
+            doc_scores[did] = doc_scores.get(did, 0.0) + 1.0 / (k + rank + 1)
+            doc_best.setdefault(did, hit)
+
+    # 3) 向量块 → 结果条目：同文档共享文档分，用极小 epsilon 保持块内原顺序
+    merged: Dict[str, dict] = {}
+    total_chunks = max(len(vector_chunks), 1)
+    for idx, hit in enumerate(vector_chunks):
+        did = hit.get('doc_id')
+        key = hit.get('vector_id') or f"v_{did}_{hit.get('chunk_index')}"
+        merged[key] = {
+            'doc_id': did,
+            'chunk_index': hit.get('chunk_index'),
+            'vector_id': hit.get('vector_id'),
+            'content': hit.get('chunk_text', ''),
+            'page': hit.get('page_number', 0),
+            'doc_title': hit.get('doc_title', ''),
+            'source_type': hit.get('source_type', ''),
+            'source_url': hit.get('source_url', ''),
+            'file_name': hit.get('file_name', ''),
+            'oss_key': hit.get('oss_key', ''),
+            'score': doc_scores.get(did, 0.0) + (total_chunks - idx) * 1e-6,
+        }
+
+    # 4) 只有关键词侧命中的文档：单独成条
+    for did, score in doc_scores.items():
+        if did in vector_order:
+            continue
+        hit = doc_best[did]
+        merged[f"kw_{did}"] = {
+            'doc_id': did,
+            'doc_title': hit.get('doc_title', ''),
+            'content': hit.get('content', ''),
+            'page': hit.get('page', 0),
+            'vector_id': '',
+            'chunk_index': hit.get('chunk_index'),
+            'score': score,
+            'source_type': hit.get('source_type', ''),
+            'source_url': hit.get('source_url', ''),
+            'file_name': hit.get('file_name', ''),
+            'oss_key': hit.get('oss_key', ''),
+        }
+
+    # 5) 关键词权重加成：换算成"一票"量级（weight=10 ≈ 一次榜首命中）
+    if keywords_boost:
+        unit = 1.0 / (k + 1)
+        for hit in merged.values():
+            content = (hit.get('content') or '').lower()
+            for word, weight in keywords_boost.items():
+                if word and word.lower() in content:
+                    hit['score'] += unit * (weight / 10.0)
 
     return sorted(merged.values(), key=lambda x: x['score'], reverse=True)
 
@@ -1829,6 +2095,10 @@ def _enrich_with_doc_meta(hits: List[dict], min_score: float) -> List[dict]:
             'page': hit.get('page', 0),
             'chunk_index': hit.get('chunk_index'),
             'vector_id': hit.get('vector_id', ''),
+            # 父子块字段：从上游 merge 结果透传，若上游未带则取默认
+            'parent_index': hit.get('parent_index', -1),
+            'heading_path': hit.get('heading_path', ''),
+            'parent_content': hit.get('parent_content'),  # 可能为 None / 字符串
             'source_type': meta.get('source_type') or hit.get('source_type', ''),
             'source_url': meta.get('source_url') or hit.get('source_url', ''),
             'file_name': meta.get('file_name') or hit.get('file_name', ''),
@@ -2052,11 +2322,18 @@ def _should_retry_retrieval(results: List[dict]) -> Tuple[bool, str]:
     if not results:
         return True, 'empty'
     top_score = _retrieval_top_score(results)
-    if top_score < RAG_RETRY_TRIGGER_SCORE:
+    if fusion_mode() == 'rrf':
+        # RRF 分数尺度完全不同（~0.0x），重试阈值必须独立标定
+        trigger = active_retry_trigger()
+        single = trigger * 1.5
+    else:
+        trigger = RAG_RETRY_TRIGGER_SCORE
+        single = RAG_RETRY_SINGLE_RESULT_SCORE
+    if top_score < trigger:
         return True, f'low_top_score={top_score:.3f}'
     if (
         len(results) < RAG_RETRY_MIN_RESULTS
-        and top_score < RAG_RETRY_SINGLE_RESULT_SCORE
+        and top_score < single
     ):
         return True, f'few_results={len(results)},top_score={top_score:.3f}'
     return False, ''
@@ -2195,22 +2472,44 @@ def _retrieve_pipeline(
         matched_tags, user_context, top_k=top_k, doc_ids=candidate_ids,
     ) if matched_tags else []
 
-    # 3. 合并 + 关键词权重加成
-    merged = _merge_and_rerank(
-        vector_hits,
-        keyword_hits + keyword_table_hits + chunk_hits + tag_hits,
-        keywords_boost=_keywords_boost_from_filters(parsed_filters),
-    )
+    # 3. 合并 + 关键词权重加成（融合算法由 settings.RETRIEVAL_FUSION 切换）
+    keyword_channels = [keyword_hits, keyword_table_hits, chunk_hits, tag_hits]
+    vector_weight, gate_reason = _vector_channel_weight(vector_hits)
+    if gate_reason:
+        logger.info('[RAG向量质量门] 向量通道降权 %.1f（%s）', vector_weight, gate_reason)
+        trace_log('rag_vector_gate', 'weight=%.1f reason=%s', vector_weight, gate_reason)
+    boost = _keywords_boost_from_filters(parsed_filters)
+    if fusion_mode() == 'rrf':
+        merged = _rrf_merge_and_rerank(
+            vector_hits,
+            keyword_channels,
+            k=int(getattr(settings, 'RRF_K', 60)),
+            vector_weight=vector_weight,
+            keywords_boost=boost,
+        )
+    else:
+        merged = _merge_and_rerank(
+            vector_hits,
+            keyword_hits + keyword_table_hits + chunk_hits + tag_hits,
+            vector_weight=vector_weight,
+            keywords_boost=boost,
+        )
 
     # 3.5 Cross-Encoder 精排（候选 >=3 即触发）
     # 二次检索的重试轮传 apply_rerank=False：精排只在首轮跑一次，
     # 避免 CPU 上精排耗时随重试翻倍（曾导致 80~100s 超时）
     if apply_rerank:
         try:
-            from utils.reranker import CROSS_ENCODER_TOP_K_OUTPUT, rerank_with_cross_encoder
+            from utils.reranker import rerank_with_cross_encoder
             if len(merged) >= 3:
                 merged = rerank_with_cross_encoder(question, merged)
                 logger.debug('Cross-Encoder 重排序后: %d 条', len(merged))
+                # 精排分数已校准到 [0,1]，改用精排后端的独立阈值过滤，
+                # 不再复用加权融合/RRF 的分数量纲
+                if any('rerank_raw_score' in c for c in merged):
+                    min_score = max(
+                        min_score, float(getattr(settings, 'RERANK_MIN_SCORE', 0.30)),
+                    )
         except ImportError:
             pass  # reranker 模块不存在，静默跳过
 
@@ -2261,7 +2560,7 @@ def retrieve_wider(
     user_context: Optional[dict] = None,
     parsed_filters: Optional[dict] = None,
     top_k: int = RAG_RETRY_TOP_K,
-    min_score: float = RAG_RETRY_MIN_SCORE,
+    min_score: Optional[float] = None,
     rewrite_questions: Optional[List[str]] = None,
     apply_rerank: bool = True,
 ) -> List[dict]:
@@ -2272,6 +2571,11 @@ def retrieve_wider(
     """
     if _is_time_question(question):
         return []
+    if min_score is None:
+        min_score = (
+            float(getattr(settings, 'RRF_RETRY_MIN_SCORE', 0.004))
+            if fusion_mode() == 'rrf' else RAG_RETRY_MIN_SCORE
+        )
     return _retrieve_pipeline(
         question=question,
         user_context=user_context or {'role': 'user'},
@@ -2283,12 +2587,213 @@ def retrieve_wider(
     )
 
 
+# 子查询召回期间置 True：跳过分解与证据判定，避免递归和重复计费
+_IN_DECOMPOSITION = contextvars.ContextVar('rag_in_decomposition', default=False)
+
+
+def _attach_parent_context(results: List[dict]) -> List[dict]:
+    """父子块回填：命中子块后挂上父块全文，供 Prompt 提供完整上下文；
+
+    同时把子块自己的 heading_path（章节路径）从 MySQL 挂上，因为它没存进
+    Milvus schema，需要 DB 查询。两个目的：让 build_rag_prompt 优先用
+    parent_content + heading_path 组合，比只用子块片段回答更完整。
+    """
+    pairs = {
+        (h.get('doc_id'), h.get('parent_index'))
+        for h in results
+        if h.get('doc_id') and (h.get('parent_index', -1) or -1) >= 0
+    }
+    # 子块 heading_path 查询（按 (doc_id, chunk_index) 批量）
+    child_pairs = {
+        (h.get('doc_id'), h.get('chunk_index'))
+        for h in results
+        if h.get('doc_id') and h.get('chunk_index') is not None
+    }
+    if not pairs and not child_pairs:
+        return results
+    try:
+        from apps.knowledge.models import DocChunk
+        # 父块：取 content
+        parents = {}
+        if pairs:
+            parents = {
+                (row['doc_id'], row['chunk_index']): row['content']
+                for row in DocChunk.objects.filter(
+                    chunk_level=0, doc_id__in={d for d, _ in pairs},
+                ).values('doc_id', 'chunk_index', 'content')
+            }
+        # 子块：取 heading_path
+        child_heads = {}
+        if child_pairs:
+            child_heads = {
+                (row['doc_id'], row['chunk_index']): row['heading_path'] or ''
+                for row in DocChunk.objects.filter(
+                    chunk_level=1, doc_id__in={d for d, _ in child_pairs},
+                ).values('doc_id', 'chunk_index', 'heading_path')
+            }
+    except Exception as exc:
+        logger.warning('父块/heading_path 回填失败（忽略）: %s', type(exc).__name__)
+        return results
+
+    for hit in results:
+        pid = hit.get('parent_index')
+        if pid is not None and pid >= 0:
+            text = parents.get((hit.get('doc_id'), pid))
+            if text:
+                hit['parent_content'] = text
+        # heading_path 优先用 hit 里已有的（重打包链路已带上），否则从 DB 补
+        if not hit.get('heading_path'):
+            head = child_heads.get((hit.get('doc_id'), hit.get('chunk_index')))
+            if head:
+                hit['heading_path'] = head
+    return results
+
+
+def _merge_subquery_results(groups: List[List[dict]], limit: int, quota: int = 0) -> List[dict]:
+    """合并多个子查询的召回结果。
+
+    给定 quota 时先按「每个子问题保底 quota 条」入选，再用全局高分补齐：
+    纯按分数合并会让强子问题挤掉弱子问题，恰恰造成"答一半"。
+    """
+    def _key(hit):
+        return hit.get('vector_id') or (hit.get('doc_id'), hit.get('chunk_index'))
+
+    picked: List[dict] = []
+    seen = set()
+    if quota > 0:
+        for hits in groups:
+            for hit in sorted(hits, key=lambda h: h.get('score') or 0, reverse=True)[:quota]:
+                key = _key(hit)
+                if key in seen:
+                    continue
+                seen.add(key)
+                picked.append(hit)
+
+    best: Dict[tuple, dict] = {}
+    for hits in groups:
+        for hit in hits:
+            key = _key(hit)
+            if key in seen:
+                continue
+            prev = best.get(key)
+            if prev is None or (hit.get('score') or 0) > (prev.get('score') or 0):
+                best[key] = hit
+    merged = picked + sorted(best.values(), key=lambda h: h.get('score') or 0, reverse=True)
+    merged_len = limit if limit else len(merged)
+    # 保底块必须活着：先按分数排保底段，再拼其余，避免在最终截断时被高分噪声挤掉
+    picked.sort(key=lambda h: h.get('score') or 0, reverse=True)
+    return (picked + merged[len(picked):])[:merged_len]
+
+
+def _grade_and_maybe_widen(
+    question: str,
+    results: List[dict],
+    *,
+    user_context: dict,
+    parsed_filters: dict,
+    rewrite_questions: list,
+    doc_scope: Optional[List[int]],
+    attempts: int,
+) -> List[dict]:
+    """证据充分性判定；不足时扩大检索一次，仍不足则给命中块打标记。"""
+    from utils.rag_grader import grade_sufficiency
+
+    grade = grade_sufficiency(question, results, user_context)
+    if not grade or grade.get('sufficient'):
+        return results
+
+    if (
+        doc_scope is None
+        and attempts == 0
+        and getattr(settings, 'RAG_GRADER_RETRY_ENABLED', True)
+    ):
+        retry_results = retrieve_wider(
+            question=question,
+            user_context=user_context,
+            parsed_filters=parsed_filters,
+            top_k=RAG_RETRY_TOP_K,
+            min_score=None,
+            rewrite_questions=rewrite_questions,
+            apply_rerank=False,
+        )
+        results = _merge_retry_results(results, retry_results)
+        logger.info(
+            '[RAG证据判定] 不足(missing=%s) → 扩大检索 %d 条，合并后 %d 条',
+            (grade.get('missing') or '')[:60], len(retry_results), len(results),
+        )
+        grade = grade_sufficiency(question, results, user_context)
+
+    if grade and not grade.get('sufficient'):
+        for hit in results:
+            hit['evidence_insufficient'] = True
+        trace_log(
+            'rag_grader', 'sufficient=0 hits=%d missing=%s',
+            len(results), (grade.get('missing') or '')[:80],
+        )
+    return results
+
+
+def _retrieve_decomposed(
+    question: str,
+    *,
+    user_context: dict,
+    parsed_filters: dict,
+    top_k: int,
+    min_score: Optional[float],
+) -> Optional[List[dict]]:
+    """分解后逐子问题召回并合并；拆不出有效子问题时返回 None。"""
+    from utils.query_decomposer import decompose_question
+
+    sub_questions = decompose_question(question)
+    if not sub_questions:
+        return None
+
+    per_k = max(8, top_k // len(sub_questions) + 4)
+    token = _IN_DECOMPOSITION.set(True)
+    groups: List[List[dict]] = []
+    try:
+        for sub_q in sub_questions:
+            groups.append(retrieve(
+                sub_q,
+                user_context=user_context,
+                parsed_filters=parsed_filters,
+                top_k=per_k,
+                min_score=min_score,
+            ))
+    finally:
+        _IN_DECOMPOSITION.reset(token)
+
+    quota = max(2, top_k // len(sub_questions))
+    merged = _merge_subquery_results(groups, top_k * 2, quota=quota)
+    logger.info(
+        '[RAG查询分解] %d 个子问题 → 各自召回 %s 条，保底%d条/子问题，合并后 %d 条',
+        len(sub_questions), [len(g) for g in groups], quota, len(merged),
+    )
+    trace_log(
+        'rag_decompose', 'subs=%d per=%d merged=%d',
+        len(sub_questions), per_k, len(merged),
+    )
+    merged = _grade_and_maybe_widen(
+        question, merged,
+        user_context=user_context,
+        parsed_filters=parsed_filters,
+        rewrite_questions=[],
+        doc_scope=None,
+        attempts=0,
+    )
+    merged = merged[:top_k] if top_k else merged
+    merged = _attach_parent_context(merged)
+    from utils.semantic_cache import store as _semantic_store
+    _semantic_store(question, user_context, parsed_filters, None, merged)
+    return merged
+
+
 def retrieve(
     question: str,
     user_context: Optional[dict] = None,
     parsed_filters: Optional[dict] = None,
     top_k: int = RAG_TOP_K,
-    min_score: float = RAG_SCORE_THRESHOLD,
+    min_score: Optional[float] = None,
     doc_scope: Optional[List[int]] = None,
 ) -> List[dict]:
     """
@@ -2312,11 +2817,36 @@ def retrieve(
     user_context = user_context or {'role': 'user'}
     parsed_filters = dict(parsed_filters or {})
 
+    # 阈值按当前融合算法解析：RRF 与加权不重量纲，不能共用 0.30
+    if min_score is None:
+        min_score = active_score_threshold()
+
     # 纯时间/日期问题直接跳过检索（由系统注入的「当前时间」回答），
     # 避免命中无关文档、污染参考答案。
     if _is_time_question(question):
         logger.info('纯时间问题，跳过 RAG 检索: %s', question[:30])
         return []
+
+    # 检索级语义缓存（默认关闭）：只复用"证据"，答案仍现生成，引用不会过期
+    from utils.semantic_cache import lookup as _semantic_lookup, store as _semantic_store
+    cached_hits = _semantic_lookup(question, user_context, parsed_filters, doc_scope)
+    if cached_hits is not None:
+        floor = min_score or 0.0
+        kept = [h for h in cached_hits if (h.get('score') or 0) >= floor] or cached_hits
+        return kept[:top_k] if top_k else kept
+
+    # 多目标问句（对比/分别/各学院/历年）：先拆子问题分别召回再合并。
+    # @/# 限定范围时不拆，避免把用户显式指定的范围拆散。
+    if doc_scope is None and not _IN_DECOMPOSITION.get():
+        decomposed = _retrieve_decomposed(
+            question,
+            user_context=user_context,
+            parsed_filters=parsed_filters,
+            top_k=top_k,
+            min_score=min_score,
+        )
+        if decomposed is not None:
+            return decomposed
 
     # Query 改写只做一次，首次与重试共用，避免重复调用改写模型。
     from utils.query_rewriter import rewrite_query
@@ -2355,7 +2885,7 @@ def retrieve(
             user_context=user_context,
             parsed_filters=parsed_filters,
             top_k=RAG_RETRY_TOP_K,
-            min_score=RAG_RETRY_MIN_SCORE,
+            min_score=None,  # 按融合算法解析重试阈值（weighted=0.15 / rrf 独立）
             rewrite_questions=rewrite_questions,
             apply_rerank=False,  # 重试轮跳过精排，整个请求最多精排一次
         )
@@ -2373,6 +2903,20 @@ def retrieve(
         if not retry_results:
             break
 
+    # 证据充分性判定：分数过线不代表"答得上"，例如问"各学院人数"却只召回制度文件。
+    # 子查询召回阶段（_IN_DECOMPOSITION=True）跳过，避免每个子问题各判一次。
+    if not _IN_DECOMPOSITION.get():
+        results = _grade_and_maybe_widen(
+            question, results,
+            user_context=user_context,
+            parsed_filters=parsed_filters,
+            rewrite_questions=rewrite_questions,
+            doc_scope=doc_scope,
+            attempts=attempts,
+        )
+
     if top_k and len(results) > top_k:
         results = results[:top_k]
+    results = _attach_parent_context(results)
+    _semantic_store(question, user_context, parsed_filters, doc_scope, results)
     return results

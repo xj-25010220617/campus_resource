@@ -8,8 +8,14 @@ CPU 环境注意：bge-reranker-v2-m3 在纯 CPU 上单次精排需 40~60s，
 曾因叠加二次检索把问答首字拖到 80~100s（超过前端 30s 超时）。
 为此内置三道保险，任何情况下精排都不能拖死问答：
 1. 硬耗时预算：超时自动放弃精排，回退加权融合排序；
-2. 自适应触发：候选过少或融合分 top1 明显领先时跳过；
+2. 自适应触发：候选过少时跳过；加权融合下 top1 明显领先时跳过
+   （RRF 分数尺度约 0.0x，该跳过去重不再启用，避免误跳过）；
 3. 结果缓存：相同问题+候选集直接命中，零模型调用。
+
+分数语义（三分数分离，供不同用途）：
+- rerank_raw_score：后端原始分（可能为负/无界），只用于排序；
+- rerank_score / score：按后端校准到 [0,1]，用于阈值过滤与引用展示；
+- rank：精排后的名次（1 起）。
 """
 import hashlib
 import json
@@ -34,11 +40,63 @@ CROSS_ENCODER_TOP_K_OUTPUT = 5      # Cross-Encoder 输出前 5
 CROSS_ENCODER_MAX_LENGTH = 256      # 每段文本最大长度
 CROSS_ENCODER_MIN_TRIGGER = 3       # 候选数 >=3 才触发 Rerank（3 以下不值得）
 CROSS_ENCODER_TIMEOUT = 5           # 精排硬预算（秒），超时回退融合排序
-CROSS_ENCODER_SKIP_GAP = 0.15       # 融合分 top1 领先 top2 超过该值时跳过精排
+CROSS_ENCODER_SKIP_GAP = 0.15       # 加权融合下 top1 领先该值时跳过精排（RRF 下不启用）
 CROSS_ENCODER_CACHE_TTL = 600       # 精排结果缓存 10 分钟
 
 _cross_encoder = None
 _cross_encoder_init_attempted = False
+_backend_warned = False
+
+
+def _resolve_backend() -> str:
+    """解析精排后端：off | local。
+
+    settings.RERANK_BACKEND 为唯一入口；为兼容旧配置，未显式设置时
+    由 CROSS_ENCODER_ENABLED 推导。api / onnx 尚未接入，配成这两个值
+    时降级为 off 并打一次 warning，避免"以为开了其实没开"。
+    """
+    global _backend_warned
+    backend = str(getattr(settings, 'RERANK_BACKEND', '') or '').lower()
+    if backend in ('api', 'onnx'):
+        if not _backend_warned:
+            logger.warning(
+                'RERANK_BACKEND=%s 尚未实现，本次降级为 off（回退融合排序）', backend,
+            )
+            _backend_warned = True
+        return 'off'
+    if backend in ('off', 'local'):
+        if backend == 'local':
+            return 'local'
+        # RERANK_BACKEND=off 时仍尊重旧开关，避免升级后精排被静默关掉
+        return 'local' if getattr(settings, 'CROSS_ENCODER_ENABLED', False) else 'off'
+    return 'local' if getattr(settings, 'CROSS_ENCODER_ENABLED', False) else 'off'
+
+
+def _normalize_rerank_scores(scores: List[float]) -> List[float]:
+    """把精排分数校准到 [0,1]（对齐 RAGFlow NormalizeRerankScores 策略）。
+
+    - 已经是 [0,1]（sigmoid 类后端）→ 原样返回，保留绝对分含义；
+    - 有负数/上界超过 1（logits 类后端）→ batch 内 min-max；
+    - 分数几乎无差异（span < 1e-3）→ 直接截断到 [0,1]，避免除零放大噪声。
+    """
+    if not scores:
+        return scores
+    min_s, max_s = min(scores), max(scores)
+    if 0.0 <= min_s and max_s <= 1.0:
+        return scores
+    span = max_s - min_s
+    if span < 1e-3:
+        return [max(0.0, min(1.0, s)) for s in scores]
+    inv = 1.0 / span
+    return [(s - min_s) * inv for s in scores]
+
+
+def _input_top_n() -> int:
+    """送入精排的候选数：settings.RERANK_TOP_N（默认 20）。"""
+    try:
+        return max(CROSS_ENCODER_MIN_TRIGGER, int(getattr(settings, 'RERANK_TOP_N', 20)))
+    except (TypeError, ValueError):
+        return CROSS_ENCODER_TOP_N_INPUT
 
 # 单 worker 线程池 + 忙标记：同一时刻最多一个精排在跑；
 # 上一次未结束时新请求直接跳过精排，避免 CPU 任务堆积拖垮整站
@@ -56,8 +114,8 @@ def _get_cross_encoder():
 
     _cross_encoder_init_attempted = True
 
-    if not getattr(settings, 'CROSS_ENCODER_ENABLED', True):
-        logger.debug('Cross-Encoder 已通过配置禁用')
+    if _resolve_backend() != 'local':
+        logger.debug('精排后端非 local，Cross-Encoder 不加载')
         _cross_encoder = False
         return None
 
@@ -82,32 +140,45 @@ def _get_cross_encoder():
 
 
 def _cache_key(question: str, input_candidates: List[dict]) -> str:
-    """缓存键：问题 + 送入精排的候选 id 序列（内容不参与，避免 key 过长）。"""
+    """缓存键：问题 + 送入精排的候选 id 序列 + 精排后端版本。
+
+    候选内容不参与（避免 key 过长）；后端/模型进 key，换模型后旧缓存自动失效。
+    """
     ids = [
         [c.get('doc_id'), c.get('chunk_index')]
         for c in input_candidates
     ]
-    raw = json.dumps({'q': question, 'ids': ids}, ensure_ascii=False)
+    raw = json.dumps({
+        'q': question,
+        'ids': ids,
+        'backend': _resolve_backend(),
+        'model': CROSS_ENCODER_MODEL,
+    }, ensure_ascii=False)
     return 'rerank:' + hashlib.md5(raw.encode('utf-8')).hexdigest()
 
 
 def _apply_cached(candidates: List[dict], cached: list) -> Optional[List[dict]]:
-    """按缓存的精排顺序与分数重排当前候选。
+    """按缓存的精排顺序与原始分数重排当前候选。
 
     任一缓存项在当前候选集中找不到（候选集已变化）则返回 None 视为缓存失效。
+    归一化分数每次重算，保证缓存与实时路径的分数语义一致。
     """
     by_key = {}
     for c in candidates:
         by_key.setdefault((c.get('doc_id'), c.get('chunk_index')), c)
 
+    raw_scores = [float(item[2]) for item in cached]
+    normalized = _normalize_rerank_scores(raw_scores)
+
     ranked, used = [], set()
-    for doc_id, chunk_index, score in cached:
+    for idx, (doc_id, chunk_index, _raw) in enumerate(cached):
         key = (doc_id, chunk_index)
         c = by_key.get(key)
         if c is None or key in used:
             return None
-        c['rerank_score'] = float(score)
-        c['score'] = c['rerank_score']
+        c['rerank_raw_score'] = raw_scores[idx]
+        c['rerank_score'] = normalized[idx]
+        c['score'] = normalized[idx]
         ranked.append(c)
         used.add(key)
 
@@ -116,6 +187,9 @@ def _apply_cached(candidates: List[dict], cached: list) -> Optional[List[dict]]:
         key = (c.get('doc_id'), c.get('chunk_index'))
         if key not in used:
             ranked.append(c)
+
+    for idx, c in enumerate(ranked, start=1):
+        c['rank'] = idx
     return ranked
 
 
@@ -154,16 +228,20 @@ def rerank_with_cross_encoder(
     if len(candidates) < CROSS_ENCODER_MIN_TRIGGER:
         return candidates[:top_k]
 
-    # 自适应跳过：融合排序 top1 已明显领先时，精排不改变结论
-    if len(candidates) >= 2:
-        s1 = candidates[0].get('score', 0) or 0
-        s2 = candidates[1].get('score', 0) or 0
-        if s1 - s2 >= CROSS_ENCODER_SKIP_GAP:
-            logger.debug('融合分领先明显(top1=%.3f top2=%.3f)，跳过精排', s1, s2)
-            return candidates[:top_k]
+    # 自适应跳过：仅加权融合下有效（RRF 分数量级 ~0.0x，0.15 的差距永不出现，
+    # 强行套用会变成"永远不跳过"或"永远跳过"，故 RRF 下禁用该策略）
+    skip_gap = float(getattr(settings, 'RERANK_SKIP_GAP', CROSS_ENCODER_SKIP_GAP) or 0.0)
+    if skip_gap > 0 and len(candidates) >= 2:
+        from .rag import fusion_mode
+        if fusion_mode() == 'weighted':
+            s1 = candidates[0].get('score', 0) or 0
+            s2 = candidates[1].get('score', 0) or 0
+            if s1 - s2 >= skip_gap:
+                logger.debug('融合分领先明显(top1=%.3f top2=%.3f)，跳过精排', s1, s2)
+                return candidates[:top_k]
 
-    # 截取 Top-N 送入 Cross-Encoder
-    input_candidates = candidates[:CROSS_ENCODER_TOP_N_INPUT]
+    # 截取 Top-N 送入 Cross-Encoder（数量由 settings.RERANK_TOP_N 控制）
+    input_candidates = candidates[:_input_top_n()]
 
     # 缓存命中直接返回，零模型调用（控制 token/CPU 成本）
     cache_key = _cache_key(question, input_candidates)
@@ -214,21 +292,29 @@ def rerank_with_cross_encoder(
         logger.warning('Cross-Encoder 预测失败: %s', e)
         return candidates[:top_k]
 
-    # 将 Cross-Encoder 得分写入候选集
+    # 将 Cross-Encoder 得分写入候选集：原始分只用于排序，归一化分用于阈值/引用
+    raw_scores = [
+        float(scores[i]) if i < len(scores) else float(c.get('score', 0) or 0)
+        for i, c in enumerate(input_candidates)
+    ]
+    normalized = _normalize_rerank_scores(raw_scores)
     for i, c in enumerate(input_candidates):
-        c['rerank_score'] = float(scores[i]) if i < len(scores) else c.get('score', 0)
-        c['score'] = c['rerank_score']
+        c['rerank_raw_score'] = raw_scores[i]
+        c['rerank_score'] = normalized[i]
+        c['score'] = normalized[i]
 
-    # 按 rerank_score 降序排列
+    # 按 rerank_raw_score 降序排列（排序用原始分，不受归一化截断影响）
     ranked = sorted(
         input_candidates,
-        key=lambda x: x.get('rerank_score', 0),
+        key=lambda x: x.get('rerank_raw_score', 0),
         reverse=True,
     )
+    for idx, c in enumerate(ranked, start=1):
+        c['rank'] = idx
 
     try:
         cache.set(cache_key, [
-            [c.get('doc_id'), c.get('chunk_index'), c.get('rerank_score', 0)]
+            [c.get('doc_id'), c.get('chunk_index'), c.get('rerank_raw_score', 0)]
             for c in ranked
         ], CROSS_ENCODER_CACHE_TTL)
     except Exception as e:

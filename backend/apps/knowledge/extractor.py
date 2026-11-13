@@ -11,8 +11,8 @@ import logging
 import os
 import re
 import tempfile
-from dataclasses import dataclass
-from typing import Optional, Tuple
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
 
 # 2. Django
 from django.conf import settings
@@ -69,6 +69,10 @@ class ParseResult:
     structured: bool = False        # 表格/名单类文档已按『字段名：值』结构化
     record_count: int = 0           # 结构化记录条数（供计数类问题精确作答）
     table_schema: Optional[dict] = None  # 表格结构元数据（供表格问答引擎生成 SQL）
+    # 页级正文 [{'page_no': 1, 'text': '...'}]：索引层据此按页分块并把
+    # 页码写进 DocChunk.page_start/page_end 与 Milvus page_number，
+    # 引用才能定位到具体页（此前 tasks.py 一律写 0，引用无页码）。
+    pages: List[dict] = field(default_factory=list)
 
     @property
     def is_empty(self) -> bool:
@@ -89,8 +93,41 @@ class ParseResult:
 # ------------------------------------------------------------------
 # 扫描件 OCR（文字层抽取为空时的兜底）
 # ------------------------------------------------------------------
+# 后端：auto（优先 RapidOCR，缺失回退 EasyOCR）| rapidocr | easyocr
+# RapidOCR 走 ONNX 推理，CPU 更快，且不依赖 torch/easyocr 的模型下载。
+_rapidocr_engine = None
+_rapidocr_engine_failed = False
 _easyocr_reader = None
 _easyocr_reader_failed = False
+
+
+def _ocr_backend() -> str:
+    """解析当前生效的 OCR 后端（auto 时按可用性选择）。"""
+    from django.conf import settings as _settings
+    configured = (getattr(_settings, 'OCR_BACKEND', 'auto') or 'auto').lower()
+    if configured in ('rapidocr', 'easyocr'):
+        return configured
+
+    try:
+        import importlib.util
+        if importlib.util.find_spec('rapidocr_onnxruntime') is not None:
+            return 'rapidocr'
+    except Exception:
+        pass
+    return 'easyocr'
+
+
+def _get_rapidocr_engine():
+    """RapidOCR 懒加载单例：首次 OCR 才加载 ONNX 模型，失败后不再重试。"""
+    global _rapidocr_engine, _rapidocr_engine_failed
+    if _rapidocr_engine is None and not _rapidocr_engine_failed:
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+            _rapidocr_engine = RapidOCR()
+        except Exception as e:
+            logger.error(f'RapidOCR 初始化失败: {e}')
+            _rapidocr_engine_failed = True
+    return _rapidocr_engine
 
 
 def _get_easyocr_reader():
@@ -117,24 +154,55 @@ def _render_page_to_image(page) -> Optional[bytes]:
 
 
 def _ocr_image_detailed(image_bytes: bytes) -> Tuple[str, str]:
-    """本地 easyocr 识别，返回 (text, error)。
+    """本地 OCR 识别，返回 (text, error)。
 
     error 非空表示 OCR 通道本身不可用（未安装 / 初始化失败 / 解码异常），
     与「图片里本来就没有文字」（返回空文本、error 为空）区分开，
     避免后者被误记成依赖故障、前者被误记成正常空页。
-    """
-    reader = _get_easyocr_reader()
-    if reader is None:
-        return '', 'EasyOCR 不可用（未安装或初始化失败）'
 
+    后端由 settings.OCR_BACKEND 决定，auto 时优先 RapidOCR。
+    """
+    if _ocr_backend() == 'rapidocr':
+        return _ocr_via_rapidocr(image_bytes)
+    return _ocr_via_easyocr(image_bytes)
+
+
+def _to_rgb_array(image_bytes: bytes):
+    """图片字节 → RGB numpy 数组（HTML/透明图统一转三通道，OCR 才吃得下）。"""
     import io
     import numpy as np
     from PIL import Image
 
+    img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+    return np.asarray(img)
+
+
+def _ocr_via_rapidocr(image_bytes: bytes) -> Tuple[str, str]:
+    """RapidOCR（ONNX）识别，返回 (text, error)。"""
+    engine = _get_rapidocr_engine()
+    if engine is None:
+        return '', 'RapidOCR 不可用（未安装或初始化失败）'
+
     try:
-        img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-        arr = np.asarray(img)
-        results = reader.readtext(arr, detail=0, paragraph=True)
+        result, _elapse = engine(_to_rgb_array(image_bytes))
+        if not result:
+            return '', ''
+        lines = [str(item[1]).strip() for item in result
+                 if len(item) >= 2 and str(item[1]).strip()]
+        return '\n'.join(lines).strip(), ''
+    except Exception as e:
+        logger.warning(f'RapidOCR 识别失败: {e}')
+        return '', f'OCR 识别失败: {type(e).__name__}: {e}'
+
+
+def _ocr_via_easyocr(image_bytes: bytes) -> Tuple[str, str]:
+    """EasyOCR 识别，返回 (text, error)（旧通道，保留作回退）。"""
+    reader = _get_easyocr_reader()
+    if reader is None:
+        return '', 'EasyOCR 不可用（未安装或初始化失败）'
+
+    try:
+        results = reader.readtext(_to_rgb_array(image_bytes), detail=0, paragraph=True)
         return '\n'.join(str(t) for t in results).strip(), ''
     except Exception as e:
         logger.warning(f'easyocr 识别失败: {e}')
@@ -142,7 +210,7 @@ def _ocr_image_detailed(image_bytes: bytes) -> Tuple[str, str]:
 
 
 def _ocr_image_local(image_bytes: bytes) -> str:
-    """本地 easyocr 识别（主通道，仅取文本，丢弃失败原因）。"""
+    """本地 OCR 识别（仅取文本，丢弃失败原因）。"""
     return _ocr_image_detailed(image_bytes)[0]
 
 
@@ -185,6 +253,7 @@ def _parse_pdf(file_path: str) -> ParseResult:
         return result
 
     parts = []
+    page_texts: List[dict] = []
     ocr_attempts = 0
     try:
         result.pages_total = doc.page_count
@@ -203,12 +272,14 @@ def _parse_pdf(file_path: str) -> ParseResult:
                 result.record_count += table_count
                 result.pages_native += 1
                 parts.append(table_text)
+                page_texts.append({'page_no': page_no, 'text': table_text})
                 continue
 
             # 1) 该页文字层足够 → 直接用原生文字，不付 OCR 成本
             if len(native) >= page_min_chars:
                 result.pages_native += 1
                 parts.append(native)
+                page_texts.append({'page_no': page_no, 'text': native})
                 continue
 
             # 2) 该页文字层不足 → 该页转图片 OCR
@@ -234,6 +305,7 @@ def _parse_pdf(file_path: str) -> ParseResult:
             if ocr_text:
                 result.pages_ocr += 1
                 parts.append(ocr_text)
+                page_texts.append({'page_no': page_no, 'text': ocr_text})
             else:
                 # OCR 通道正常但该页没识别出文字
                 result.pages_ocr_failed += 1
@@ -241,6 +313,7 @@ def _parse_pdf(file_path: str) -> ParseResult:
         doc.close()
 
     result.text = '\n'.join(parts)
+    result.pages = page_texts
     if result.truncated:
         logger.warning(
             f'PDF 共 {result.pages_total} 页，OCR 上限 {max_ocr_pages} 页已用尽，'
@@ -284,6 +357,7 @@ def _parse_image(file_path: str) -> ParseResult:
     result.text = text
     if text:
         result.pages_ocr = 1
+        result.pages = [{'page_no': 1, 'text': text}]
     else:
         # 通道正常但图中没有可识别文字（纯色图/照片等）
         result.pages_ocr_failed = 1
@@ -455,6 +529,90 @@ def _pdf_page_tables(page_no: int, page) -> Tuple[str, int]:
             texts.append(f'第{page_no}页表格\n' + text)
             total += n
     return '\n\n'.join(texts), total
+
+
+_MARKITDOWN_EXTENSIONS = {'docx', 'pptx'}
+
+
+def _parser_backend() -> str:
+    return (getattr(settings, 'PARSER_BACKEND', 'legacy') or 'legacy').lower()
+
+
+def _parse_office_via_markitdown(file_path: str, ext: str) -> Optional[ParseResult]:
+    """MarkItDown 解析 DOCX/PPTX → Markdown（保留标题层级）。
+
+    返回 None 表示「不可用 / 失败 / 内容为空」，调用方回落 legacy 解析，
+    保证 MarkItDown 只是增强通道，不会让原本能解析的文档变成失败。
+    """
+    try:
+        from markitdown import MarkItDown
+    except ImportError:
+        logger.warning('MarkItDown 未安装，%s 回落 legacy 解析（pip install markitdown）', ext)
+        return None
+
+    try:
+        converted = MarkItDown(enable_plugins=False).convert(file_path)
+        text = (converted.text_content or '').strip()
+        if not text:
+            return None
+        return ParseResult(text=text)
+    except Exception as e:
+        logger.warning(f'MarkItDown 解析 {ext} 失败，回落 legacy: {e}')
+        return None
+
+
+def _parse_pdf_via_service(file_path: str) -> Optional[ParseResult]:
+    """外部解析服务（docling-serve / MinerU sidecar）解析 PDF。
+
+    sidecar 约定返回 JSON：
+        {"markdown": "...", "pages": [{"page_no": 1, "text|markdown": "..."}]}
+    返回 None 表示服务未配置/不可用，调用方回落本地 PyMuPDF + OCR。
+    服务做成独立进程而不是塞进 Django venv，避免 torch 依赖吃光内存。
+    """
+    url = (getattr(settings, 'DOC_PARSE_SERVICE_URL', '') or '').strip()
+    if not url:
+        return None
+
+    timeout = int(getattr(settings, 'DOC_PARSE_SERVICE_TIMEOUT', 120) or 120)
+    try:
+        with open(file_path, 'rb') as f:
+            resp = requests.post(
+                url,
+                files={'file': (os.path.basename(file_path), f, 'application/pdf')},
+                timeout=timeout,
+            )
+        resp.raise_for_status()
+        payload = resp.json() or {}
+    except Exception as e:
+        logger.warning(f'PDF 解析服务不可用，回落本地解析: {type(e).__name__}: {e}')
+        return None
+
+    pages = []
+    for i, page in enumerate(payload.get('pages') or [], start=1):
+        if not isinstance(page, dict):
+            continue
+        text = (page.get('text') or page.get('markdown') or '').strip()
+        if not text:
+            continue
+        try:
+            page_no = int(page.get('page_no') or i)
+        except (TypeError, ValueError):
+            page_no = i
+        pages.append({'page_no': page_no, 'text': text})
+
+    text = (payload.get('markdown') or payload.get('text') or '').strip()
+    if not text:
+        text = '\n'.join(p['text'] for p in pages)
+    if not text.strip():
+        logger.warning('PDF 解析服务返回空内容，回落本地解析')
+        return None
+
+    return ParseResult(
+        text=text,
+        pages=pages,
+        pages_total=len(payload.get('pages') or []) or len(pages),
+        pages_native=len(pages),
+    )
 
 
 def _parse_docx(file_path: str) -> ParseResult:
@@ -737,8 +895,24 @@ def parse_file(file_path: str, extension: str) -> ParseResult:
     - 文档类（docx/pptx/xlsx/csv…）：沿用原解析器，只取文本
     - 纯文本类：UTF-8 读取
     - 其余（含所有二进制类型）：判「不支持」，绝不按文本读取
+
+    解析后端由 PARSER_BACKEND 控制（legacy / markitdown / service），
+    增强通道不可用时自动回落 legacy，不会把原本可解析的文档变成失败。
     """
     ext = (extension or '').lower().lstrip('.')
+    backend = _parser_backend()
+
+    # 增强通道 1：DOCX/PPTX 走 MarkItDown，保留 Markdown 标题层级
+    if backend == 'markitdown' and ext in _MARKITDOWN_EXTENSIONS:
+        converted = _parse_office_via_markitdown(file_path, ext)
+        if converted is not None:
+            return converted
+
+    # 增强通道 2：复杂版式 PDF 交给独立解析服务，失败回落本地
+    if backend == 'service' and ext == 'pdf':
+        served = _parse_pdf_via_service(file_path)
+        if served is not None:
+            return served
 
     if ext in _DETAILED_EXTRACTORS:
         return _DETAILED_EXTRACTORS[ext](file_path)

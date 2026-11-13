@@ -5,7 +5,7 @@
 """
 from unittest.mock import patch
 
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, override_settings
 
 from utils import rag
 
@@ -21,8 +21,13 @@ def _hit(doc_id, score, chunk_index=0):
 
 
 @patch('utils.query_rewriter.rewrite_query', return_value=['测试问题'])
+@override_settings(RAG_GRADER_ENABLED=False, RAG_DECOMPOSE_ENABLED=False)
 class RetrievalRetryTests(SimpleTestCase):
-    """retrieve() 的二次检索触发、合并、去重与上限。"""
+    """retrieve() 的二次检索触发、合并、去重与上限。
+
+    显式关闭证据判定与查询分解：它们会调用真实模型，属于线上开关，
+    不应影响编排逻辑的确定性断言。
+    """
 
     def test_confident_first_pass_does_not_retry(self, _rewrite):
         first = [_hit(1, 0.9), _hit(2, 0.7)]

@@ -33,7 +33,7 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 
-@shared_task(bind=True, max_retries=2, default_retry_delay=120)
+@shared_task(bind=True, max_retries=2, default_retry_delay=120, queue='faq')
 def generate_faq_weekly(self, log_id=None):
     """
     主入口：每周 FAQ 自动提取流程。
@@ -238,7 +238,7 @@ def generate_faq_weekly(self, log_id=None):
         raise self.retry(exc=e)
 
 
-@shared_task(bind=True, max_retries=1, default_retry_delay=120)
+@shared_task(bind=True, max_retries=1, default_retry_delay=120, queue='faq')
 def generate_faq_from_website(self, log_id=None, max_pages=None, max_docs=None):
     """抓取学校官网，并仅从抓取文档中生成待审核 FAQ 草稿。"""
     from apps.knowledge.extractor import extract_text_from_oss

@@ -32,6 +32,7 @@ app.conf.beat_schedule = {
     'generate-faq-weekly': {
         'task': 'apps.faq.tasks.generate_faq_weekly',
         'schedule': crontab(hour=3, minute=0, day_of_week=1),  # 每周一 03:00
+        'options': {'queue': 'faq'},
     },
     'crawl-neusoft-website-daily': {
         'task': 'apps.knowledge.tasks.crawl_neusoft_website_task',
@@ -40,6 +41,7 @@ app.conf.beat_schedule = {
             'max_pages': 300, 'section_page_limit': 100,
             'uploader_id': 1, 'download_files': True,
         },
+        'options': {'queue': 'crawl'},
     },
     'crawl-neusoft-website-weekly-full': {
         'task': 'apps.knowledge.tasks.crawl_neusoft_website_task',
@@ -48,14 +50,17 @@ app.conf.beat_schedule = {
             'max_pages': 1500, 'section_page_limit': 400,
             'uploader_id': 1, 'download_files': True,
         },
+        'options': {'queue': 'crawl'},
     },
     'refresh-daily-context': {
         'task': 'apps.knowledge.tasks.refresh_daily_context_task',
         'schedule': crontab(hour=0, minute=5),  # 每天 00:05
+        'options': {'queue': 'sys'},
     },
     'cleanup-expired-upload-sessions': {
         'task': 'apps.knowledge.tasks.cleanup_expired_upload_sessions_task',
         'schedule': crontab(hour=3, minute=30),  # 每天 03:30
+        'options': {'queue': 'sys'},
     },
 }
 

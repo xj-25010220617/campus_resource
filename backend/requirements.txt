@@ -1,10 +1,10 @@
-Django==4.2
-djangorestframework==3.14.0
-djangorestframework-simplejwt==5.3.1
-django-cors-headers==4.3.1
-django-filter==23.5
-mysqlclient==2.2.0
-drf-spectacular==0.27.1
+Django==5.2.19
+djangorestframework>=3.16.0,<3.17
+djangorestframework-simplejwt>=5.3.1
+django-cors-headers>=4.3.1
+django-filter>=24.2,<25
+mysqlclient>=2.2.0
+drf-spectacular>=0.28.0,<0.30
 python-decouple==3.8
 faster-whisper>=1.0.0
 modelscope
@@ -48,7 +48,14 @@ openpyxl>=3.1.0
 # xlrd 必须固定 1.2.0：2.0+ 移除 .xlsx 支持且 API 变化，_parse_xls 依赖旧版接口
 xlrd==1.2.0
 docx2txt>=0.8
+# 解析增强（阶段 1.1，均由 PARSER_BACKEND / OCR_BACKEND 开关控制，缺失自动回落旧通道）
+# - markitdown：DOCX/PPTX → Markdown，保留标题层级（PARSER_BACKEND=markitdown）
+# - rapidocr_onnxruntime：ONNX OCR，CPU 更快且不依赖 torch（OCR_BACKEND=auto 时优先）
+markitdown[docx,pptx]>=0.1
+rapidocr_onnxruntime>=1.3
 # 表格问答引擎（utils/tabular_query.py）：sqlparse 做 SQL 白名单校验
 # 执行引擎用 Python 标准库 sqlite3（:memory: 内存表），不引入 duckdb：
 # 本地 WDAC 策略拦截 duckdb 原生 DLL，sqlite3 零依赖且跨平台行为一致
 sqlparse>=0.5.0
+# Text-to-SQL AST 级校验（替代正则白名单）
+sqlglot>=25.0

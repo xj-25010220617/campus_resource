@@ -453,6 +453,13 @@ class DocChunk(models.Model):
     )
     page_start = models.IntegerField(null=True, blank=True, verbose_name='起始页码')
     page_end = models.IntegerField(null=True, blank=True, verbose_name='结束页码')
+    # 父子块（阶段 1.2）：chunk_level=0 为父块（只存 MySQL，不进向量库），
+    # =1 为子块（进向量库）；parent_index 指向父块的 chunk_index，-1 表示无父块。
+    chunk_level = models.SmallIntegerField(default=1, db_index=True, verbose_name='块层级')
+    parent_index = models.IntegerField(default=-1, verbose_name='父块序号')
+    heading_path = models.CharField(max_length=500, blank=True, default='', verbose_name='标题路径')
+    char_start = models.IntegerField(default=0, verbose_name='起始字符偏移')
+    char_end = models.IntegerField(default=0, verbose_name='结束字符偏移')
     created_at = models.DateTimeField(
         auto_now_add=True, db_index=True, verbose_name='创建时间',
     )
@@ -619,3 +626,30 @@ class CrawlRun(models.Model):
 
     def __str__(self):
         return f'[{self.trigger}] {self.started_at:%Y-%m-%d %H:%M} 新增{self.docs_saved} 状态{self.status}'
+
+
+class TabularFewShot(models.Model):
+    """Text-to-SQL 少样本示例（阶段 4.3）。
+
+    成功执行的问答对自动入库（verified=False），管理员确认后才注入 Prompt，
+    避免把错误 SQL 当成"标准答案"教给模型。
+    """
+
+    question = models.CharField(max_length=500, verbose_name='问题')
+    question_hash = models.CharField(max_length=32, unique=True, verbose_name='问题哈希')
+    sql = models.TextField(verbose_name='SQL')
+    doc_title = models.CharField(max_length=255, blank=True, default='', verbose_name='来源文档')
+    embedding = models.TextField(blank=True, default='', verbose_name='问题向量(JSON)')
+    verified = models.BooleanField(default=False, db_index=True, verbose_name='是否已验证')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        db_table = 'tabular_few_shot'
+        verbose_name = '表格问答示例'
+        verbose_name_plural = verbose_name
+        ordering = ['-updated_at']
+        db_table_comment = 'Text-to-SQL 少样本示例库(verified=True 才会注入 Prompt)'
+
+    def __str__(self):
+        return f'{"✓" if self.verified else "?"} {self.question[:30]}'

@@ -21,8 +21,11 @@ class TestMilvusLazyConnect(SimpleTestCase):
         from utils.milvus import MilvusClient
 
         c = MilvusClient()
-        with mock.patch.object(c, 'connect', return_value=True) as mc:
+        # search() 现在先走 ensure_collection()（内部含懒连接 + 集合就绪校验），
+        # 这里 mock 掉它以避免测试依赖真实 Milvus 连接；懒连接行为由
+        # test_connect_idempotent 覆盖。
+        with mock.patch.object(c, 'ensure_collection', return_value=True) as mec:
             with mock.patch.object(c, '_search_milvus', return_value=[]) as ms:
                 c.search([0.1] * 768, top_k=3)
-                mc.assert_called_once()
+                mec.assert_called_once()
                 ms.assert_called_once()

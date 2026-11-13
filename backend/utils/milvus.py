@@ -18,7 +18,9 @@ class MilvusClient:
     唯一向量事实源；首次向量操作时懒连接，失败自动降级重试。
     """
 
-    COLLECTION_NAME = 'campus_knowledge'
+    # 集合名由 settings.MILVUS_COLLECTION 提供，便于新分块/新 Embedding 先写新集合、
+    # 评测通过后一条 env 切换（回滚同理），旧集合保留不动。
+    COLLECTION_NAME = getattr(settings, 'MILVUS_COLLECTION', 'campus_knowledge')
     # 向量维度唯一事实源：settings.EMBED_VECTOR_DIM（由 EMBED_BACKEND 派生，可 env 覆盖）。
     # 禁止在各处硬编码维度——Embedding 后端与集合维度不一致时插入必然失败。
     VECTOR_DIM = getattr(settings, 'EMBED_VECTOR_DIM', 768)
@@ -106,18 +108,32 @@ class MilvusClient:
                 FieldSchema(name='chunk_text', dtype=DataType.VARCHAR, max_length=8192),
                 FieldSchema(name='page_number', dtype=DataType.INT32),
                 FieldSchema(name='seq_order', dtype=DataType.INT32),
+                FieldSchema(name='parent_index', dtype=DataType.INT32),
                 FieldSchema(name='embedding', dtype=DataType.FLOAT_VECTOR, dim=self.VECTOR_DIM),
             ]
             schema = CollectionSchema(fields, description='校园知识库向量集合')
             collection = Collection(name=self.COLLECTION_NAME, schema=schema)
 
-            # BRUTE_FORCE：精确检索（无近似，100% 召回），无需 faiss；
-            # 数据量 ~3k 量级时比 IVF_FLAT 更快且更准。
-            index_params = {
-                'metric_type': 'COSINE',
-                'index_type': 'BRUTE_FORCE',
-                'params': {},
-            }
+            # Lite vs Standalone 索引类型：
+            #   Lite: BRUTE_FORCE（唯一支持的精确检索索引）
+            #   Standalone: AUTOINDEX（Milvus 2.4+ 推荐，自动选最优索引）
+            milvus_uri = str(getattr(settings, 'MILVUS_URI', ''))
+            is_standalone = milvus_uri.startswith(('http://', 'https://'))
+            if is_standalone:
+                index_type = 'AUTOINDEX'
+                index_params = {
+                    'metric_type': 'COSINE',
+                    'index_type': 'AUTOINDEX',
+                    'params': {},
+                }
+            else:
+                index_type = 'BRUTE_FORCE'
+                index_params = {
+                    'metric_type': 'COSINE',
+                    'index_type': 'BRUTE_FORCE',
+                    'params': {},
+                }
+            logger.info(f'Milvus index type: {index_type} (uri={milvus_uri[:50]})')
             collection.create_index(field_name='embedding', index_params=index_params)
             collection.load()
             logger.info(f'Milvus collection "{self.COLLECTION_NAME}" created')
@@ -165,6 +181,7 @@ class MilvusClient:
             [c.get('chunk_text', '') for c in chunks],
             [c.get('page_number', 0) for c in chunks],
             [c.get('seq_order', 0) for c in chunks],
+            [c.get('parent_index', -1) for c in chunks],
             embeddings,
         ]
         collection.insert(data)
@@ -223,7 +240,7 @@ class MilvusClient:
                 limit=top_k,
                 expr=expr,
                 output_fields=['vector_id', 'doc_id', 'chunk_index',
-                               'chunk_text', 'page_number', 'seq_order'],
+                               'chunk_text', 'page_number', 'seq_order', 'parent_index'],
             )
             hits = []
             for hit in results[0]:
@@ -234,6 +251,7 @@ class MilvusClient:
                     'chunk_text': hit.entity.get('chunk_text', ''),
                     'page_number': hit.entity.get('page_number', 0),
                     'seq_order': hit.entity.get('seq_order', 0),
+                    'parent_index': hit.entity.get('parent_index', -1),
                     'score': hit.score,
                 })
             return hits

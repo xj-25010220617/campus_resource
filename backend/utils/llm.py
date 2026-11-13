@@ -31,7 +31,17 @@ EMBED_BACKEND = getattr(settings, 'EMBED_BACKEND', 'local')
 
 # 阿里云百炼 Embedding
 ALIYUN_EMBED_API_KEY = getattr(settings, 'ALIYUN_EMBED_API_KEY', '')
-ALIYUN_EMBED_MODEL = getattr(settings, 'ALIYUN_EMBED_MODEL', 'text-embedding-v3')
+ALIYUN_EMBED_MODEL = getattr(settings, 'ALIYUN_EMBED_MODEL', 'text-embedding-v4')
+# 单批条数（百炼同步接口上限 10；留给 env 调整但做上限保护）
+ALIYUN_EMBED_BATCH_SIZE = max(
+    1, min(int(getattr(settings, 'ALIYUN_EMBED_BATCH_SIZE', 10) or 10), 25),
+)
+# 单条文本截断长度：一条超长文本会让整批请求失败，截断比整批重试更划算
+ALIYUN_EMBED_MAX_CHARS = max(
+    1, int(getattr(settings, 'ALIYUN_EMBED_MAX_CHARS', 2000) or 2000),
+)
+# 可选维度参数（0=不传，用模型默认；v4 默认 1024）
+ALIYUN_EMBED_DIMENSIONS = int(getattr(settings, 'ALIYUN_EMBED_DIMENSIONS', 0) or 0)
 ALIYUN_EMBED_BASE_URL = getattr(
     settings, 'ALIYUN_EMBED_BASE_URL',
     'https://dashscope.aliyuncs.com/compatible-mode/v1',
@@ -180,35 +190,69 @@ class LLMClient:
 
     def _embed_via_aliyun(self, texts: List[str]) -> Optional[List[List[float]]]:
         """通过阿里云百炼（OpenAI 兼容模式）获取向量。
-        自动分批次（阿里云限制每批 ≤ 10 条）。
+
+        自动分批（条数由 ALIYUN_EMBED_BATCH_SIZE 控制，默认 10）；单条文本
+        超过 ALIYUN_EMBED_MAX_CHARS 时先截断——一条超长 chunk 会让整批失败，
+        截断比丢整批划算。设置了 ALIYUN_EMBED_DIMENSIONS 时透传 dimensions
+        参数（v4 支持 512~2048）。
 
         API 格式 (OpenAI-compatible):
             POST {base_url}/embeddings
-            {"model": "text-embedding-v3", "input": ["text1", "text2"]}
+            {"model": "text-embedding-v4", "input": ["text1", "text2"]}
             → {"data": [{"embedding": [...], "index": 0}, ...]}
         """
         url = f'{self.embed_base_url.rstrip("/")}/embeddings'
-        BATCH_SIZE = 10
-        all_embeddings = []
+        batch_size = ALIYUN_EMBED_BATCH_SIZE
 
-        for start in range(0, len(texts), BATCH_SIZE):
-            batch = texts[start:start + BATCH_SIZE]
+        # 截断 + 空串保护（空 input 部分后端会直接 400）
+        prepared = []
+        truncated = 0
+        for text in texts:
+            if not text or not text.strip():
+                prepared.append(' ')
+                continue
+            if len(text) > ALIYUN_EMBED_MAX_CHARS:
+                truncated += 1
+                prepared.append(text[:ALIYUN_EMBED_MAX_CHARS])
+            else:
+                prepared.append(text)
+        if truncated:
+            logger.warning(
+                '阿里云 Embedding 截断 %d/%d 条超长文本（上限 %d 字符）',
+                truncated, len(texts), ALIYUN_EMBED_MAX_CHARS,
+            )
+
+        payload_base = {'model': ALIYUN_EMBED_MODEL}
+        if ALIYUN_EMBED_DIMENSIONS > 0:
+            payload_base['dimensions'] = ALIYUN_EMBED_DIMENSIONS
+
+        all_embeddings = []
+        for start in range(0, len(prepared), batch_size):
+            batch = prepared[start:start + batch_size]
             for attempt in range(MAX_RETRIES):
                 try:
                     resp = ExternalClient.post(
                         'aliyun_embed',
                         url,
                         headers=self.embed_headers,
-                        json={
-                            'model': ALIYUN_EMBED_MODEL,
-                            'input': batch,
-                        },
+                        json={**payload_base, 'input': batch},
                         timeout=30,
                     )
                     if resp.status_code == 200:
                         data = resp.json()
                         data['data'].sort(key=lambda x: x['index'])
-                        all_embeddings.extend([item['embedding'] for item in data['data']])
+                        vectors = [item['embedding'] for item in data['data']]
+                        # 维度校验：只查首批即可暴露"模型/维度配置不一致"，
+                        # 否则错误会推迟到写 Milvus 时才以 expected dim 报出。
+                        if vectors and len(vectors[0]) != self.VECTOR_DIM:
+                            logger.error(
+                                '阿里云 Embedding 维度不一致：模型 %s 返回 %d 维，'
+                                'settings.EMBED_VECTOR_DIM=%d。请改 EMBED_VECTOR_DIM '
+                                '或 ALIYUN_EMBED_DIMENSIONS，并重跑 reindex_all 重建集合',
+                                ALIYUN_EMBED_MODEL, len(vectors[0]), self.VECTOR_DIM,
+                            )
+                            return None
+                        all_embeddings.extend(vectors)
                         break  # batch done, next
                     else:
                         logger.warning(
