@@ -141,7 +141,7 @@ class OSSClient:
 
         if not self.access_key_id:
             # 本地开发：返回签名直传 URL（有效期 300 秒）
-            upload_url = self.bucket.sign_url('PUT', oss_key, 300) if self.bucket else ''
+            upload_url = self.bucket.sign_url('PUT', oss_key, 300, headers={'Content-Type': 'application/octet-stream'}, slash_safe=True) if self.bucket else ''
             return {
                 'oss_key': oss_key,
                 'upload_url': upload_url,
@@ -165,7 +165,7 @@ class OSSClient:
             # }
             # resp = sts_client.assume_role(...)
             # return {AccessKeyId, AccessKeySecret, SecurityToken, ...}
-            upload_url = self.bucket.sign_url('PUT', oss_key, 300)
+            upload_url = self.bucket.sign_url('PUT', oss_key, 300, headers={'Content-Type': 'application/octet-stream'}, slash_safe=True)
             return {
                 'oss_key': oss_key,
                 'upload_url': upload_url,
@@ -218,7 +218,7 @@ class OSSClient:
                 'response-content-disposition': self._build_content_disposition(file_name),
             }
         try:
-            return self.bucket.sign_url('GET', oss_key, expires, params=params)
+            return self.bucket.sign_url('GET', oss_key, expires, params=params, slash_safe=True)
         except Exception as e:
             logger.error(f'生成下载 URL 失败 oss_key={oss_key}: {e}')
             return ''
@@ -241,7 +241,7 @@ class OSSClient:
         if not self.bucket:
             return ''
         try:
-            return self.bucket.sign_url('GET', oss_key, expires)
+            return self.bucket.sign_url('GET', oss_key, expires, slash_safe=True)
         except Exception as e:
             logger.error(f'生成预览 URL 失败 oss_key={oss_key}: {e}')
             return ''

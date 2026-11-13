@@ -115,7 +115,7 @@ class MilvusClient:
             collection = Collection(name=self.COLLECTION_NAME, schema=schema)
 
             # Lite vs Standalone 索引类型：
-            #   Lite: BRUTE_FORCE（唯一支持的精确检索索引）
+            #   Lite: FLAT（milvus-lite 不支持 BRUTE_FORCE，FLAT 同为精确检索）
             #   Standalone: AUTOINDEX（Milvus 2.4+ 推荐，自动选最优索引）
             milvus_uri = str(getattr(settings, 'MILVUS_URI', ''))
             is_standalone = milvus_uri.startswith(('http://', 'https://'))
@@ -127,10 +127,10 @@ class MilvusClient:
                     'params': {},
                 }
             else:
-                index_type = 'BRUTE_FORCE'
+                index_type = 'FLAT'
                 index_params = {
                     'metric_type': 'COSINE',
-                    'index_type': 'BRUTE_FORCE',
+                    'index_type': 'FLAT',
                     'params': {},
                 }
             logger.info(f'Milvus index type: {index_type} (uri={milvus_uri[:50]})')
