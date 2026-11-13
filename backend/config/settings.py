@@ -324,13 +324,19 @@ CELERY_TASK_TRACK_STARTED = True
 # faq   队列：FAQ 自动生成（低频、不阻塞主链路）
 # sys   队列：系统心跳 + 清理 + 版本识别（后台运维类）
 if Queue is not None:
-    CELERY_QUEUES = (
+    # 注意：Celery 5 的配置键是 task_queues，namespace='CELERY' 下对应 Django 设置项
+    # CELERY_TASK_QUEUES。写成 CELERY_QUEUES 不会被识别，worker 只会订阅默认
+    # 'celery' 队列，按业务路由到 parse/crawl/faq/sys 的任务将无人消费。
+    CELERY_TASK_QUEUES = (
         Queue('parse',  routing_key='parse.#'),
         Queue('crawl',  routing_key='crawl.#'),
         Queue('faq',    routing_key='faq.#'),
         Queue('sys',    routing_key='sys.#'),
         Queue('default', routing_key='default.#'),  # 保留兜底
     )
+
+# 未显式指定队列的任务（如 debug_task）落到 default，确保有 worker 消费
+CELERY_TASK_DEFAULT_QUEUE = 'default'
 
 # 任务 → 队列映射；shared_task 装饰器上 queue= 与这里二选一，
 # 两者都写是防御性配置——装饰器覆盖优先级更高，celery.py 的 beat_schedule 里
